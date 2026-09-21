@@ -1,0 +1,33 @@
+[package]
+name = "benagen-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# ⚠️ `float_roundtrip` **不是可选项**（2026-09-21，任务 7 的 R30 ② 查出来的）：
+#    `serde_json` 默认的浮点解析是**快速但非正确舍入**的，偶尔会差 **1 ULP**。
+#    状态文件里的 `mtime` 正是 `f64`（`engine::mtime_secs` 的 `float64(UnixNano())/1e9`
+#    口径，与 Go 同形），而 `Entry::matches` 是**逐位比较、没有 epsilon**（Go 同形）。
+#    ⇒ 往返一次之后 `mtime` 差 1 ULP ⇒ 那个文件被判成"不完整" ⇒ **每次重跑都重下一遍**
+#    （实测：三个文件的夹具上约 1/3 的运行会命中一个文件，客户在 50 GB 批次上是几十分钟）。
+#    Go 的 `encoding/json` 走 `strconv.ParseFloat`（正确舍入），所以这一条也是**与 Go 对齐**。
+serde_json = { version = "1", features = ["float_roundtrip"] }
+crc = "3"
+ureq = "2"
+
+# 没有 `[dev-dependencies]`：测试的桩一律是裸 `std::net::TcpListener`
+# （`src/testutil.rs` 的 `StubHttp`）。`wiremock` 曾经在这里躺了很久——
+# 它是纯异步 API，驱动它必须引入 tokio，而"不新增依赖"是一等约束，
+# 所以它从来没有被任何一条测试用过，只是白白让 `Cargo.lock` 多锁上百个包、
+# 每次 `cargo test` 多编译一遍。已删除（理由也留在 `testutil.rs` 的文件头）。
+
+[[bin]]
+name = "benagen-core"
+path = "src/main.rs"
+
+# CLI 工具（spec 的 `benagen-dl`）。**薄入口**：编排在 lib 的 `cli/mod.rs` 里，
+# 与图形客户端的后端共用同一份内核语义（`kernel::dispatch`）。
+[[bin]]
+name = "benagen-dl"
+path = "src/bin/benagen-dl.rs"

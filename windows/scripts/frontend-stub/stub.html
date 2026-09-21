@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<!--
+  windows/scripts/frontend-stub/stub.html —— **受控 stub**（常驻夹具）。
+
+  跑法（一条命令）：bash windows/scripts/check_frontend_stub.sh
+
+  ⚠️⚠️ **它为什么住在这里，而不是 `windows/web/` 下**：
+      `shell-win/tauri.conf.json` 的 `build.frontendDist = "../web"` ⇒ **`windows/web/`
+      下的任何文件都会被编进 exe**。测试夹具放在那里 = **把测试代码发给客户**。
+      （任务 9 的修复轮就是因此把同一个夹具用完即删的 —— 那份记录在任务 9 报告 §10.4。）
+      本目录**不在** frontendDist 里；这条"别放错地方"由
+      `windows/scripts/check_frontend_copy.sh` 的文件清单判据守着。
+
+  ===========================================================================
+  它验的是哪一件事
+  ===========================================================================
+  **"宿主/内核说的那句失败原文，真的原样到了客户眼前吗"**（约束 3：错误原文逐字透传）。
+
+  为什么需要它（任务 9 的审查者发现的那个结构性盲区）：
+  · 无头验证**默认跑的是"没有 Tauri"那条分支**（`resolveInvoke()` 抛出 `Error`，
+    有 `message`）—— 而 Tauri 真实世界里 reject 出来的常常是**一个裸字符串**
+    （参数反序列化失败 / 命令不存在 / 权限被 ACL 挡下）。那种形状取 `.message`
+    得到 `undefined` ⇒ 界面上是一个**没有文字的红三角**，而"看起来只是界面丑"。
+    缺陷 I-1 就是这么漏过去的（它恰好打在本代最要紧的纪律上）。
+  · ⇒ 只有**受控地装一个 `window.__TAURI__`**，才能把三种拒绝形状各验一遍。
+
+  ===========================================================================
+  手法（照任务 9 修复轮那份临时夹具，逐条）
+  ===========================================================================
+  · `<iframe src="/windows/web/index.html">` —— 跑的是**真**页面、真模块、真轮询；
+  · `iframe.onload` 之后把 `contentWindow.__TAURI__` 装上去。
+    ⚠️ 后装就行：`invoke.js` 的 `resolveInvoke()` 是**每次调用现取**的
+    （不用模块级常量缓存）⇒ **下一拍**就生效，`index.html` 一个字节都不用改；
+  · 一拍一拍地读 `contentDocument`（`state` 的节拍是 1 s，所以每步等 1.4 s）。
+  · 结论写进 `<pre id="out">`，最后一行是 `DONE ok=N fail=M` ——
+    `check_frontend_stub.sh` 只认那一行（**空跑也算失败**，同 `test.sh` 第 3 步）。
+
+  ⚠️ 夹具里的中文**不归 §3.2 管**：它不是交付物（不进 exe）。判据只扫 `windows/web/**`。
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>受控 stub：失败原文透传（常驻夹具）</title>
+  <style>
+    body { font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; margin: 12px; }
+    iframe { width: 1120px; height: 640px; border: 1px solid #ccc; }
+    #out { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <!-- 结论先写在这里；`--dump-dom` 会把它的文本一起打出来（见 check_frontend_stub.sh 的解析）。 -->
+  <pre id="out">（夹具还没跑完 —— 看到这一行说明它没跑到 DONE）</pre>
+
+  <!-- 跑的是**真** index.html：同一套模块、同一条 `state` 轮询。 -->
+  <iframe id="frame" src="/windows/web/index.html" width="1120" height="640"></iframe>
+
+  <script type="module">
+    // ⚠️ **屏注册表直接 import 进来**（任务 10b 加的，理由见下面 I-3b 那一段）：
+    //    "未注册的屏"这条路由在**应用里已经不可达**（三个分区都有屏了），
+    //    所以那条断言只能落回**产生它的那个东西**上。这两个模块都是纯声明
+    //    （没有顶层副作用，`shell.js` 只 import `dom.js`），在父页面里 import 是安全的。
+    //    ⚠️ 路径用**绝对路径**：本页面由 `check_frontend_stub.sh` 从仓库根起服务。
+    import { screenFor, screenIds } from "/windows/web/js/screens/registry.js";
+    import { SECTIONS } from "/windows/web/js/shell.js";
+
+    const out = document.getElementById("out");
+    const f = document.getElementById("frame");
+    const lines = [];
+    let ok = 0;
+    let fail = 0;
+
+    function flush() {
+      out.textContent = lines.join("\n") + "\n";
+    }
+
+    function check(label, got, want) {
+      const pass = got === want;
+      if (pass) ok += 1; else fail += 1;
+      lines.push(`[${label}] ${pass ? "OK" : "FAIL"}  实际=${JSON.stringify(got)}  期望=${JSON.stringify(want)}`);
+      flush();
+    }
+
+    function checkTrue(label, cond, detail) {
+      if (cond) ok += 1; else fail += 1;
+      lines.push(`[${label}] ${cond ? "OK" : "FAIL"}  ${detail}`);
+      flush();
+    }
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // 一拍 `state` 的节拍是 1 s（`js/poll.js` 的 INTERVALS_MS.state）⇒ 每步等 1.4 s。
+    const TICK = 1400;
+
+    // ---- 受控 stub：前端以为自己在跟 Tauri 说话 -----------------------------
+    // ⚠️ 只实现 `core.invoke`（`invoke.js` 认的那一格）。`mode` 由下面的剧本改。
+    let mode = { kind: "reject", value: new Error("（还没装 __TAURI__，不该走到这里）") };
+    /**
+     * **按命令分派**的载荷表（`null` = 还没切到分派模式，那时所有命令共用 `mode`）。
+     *
+     * 为什么要多这一样：上面那些断言验的是"**一个**载荷驱动界面"，而 F-1/F-4/F-5
+     * 要的是"**三条命令各答各的**"（侧栏徽标的数只有 `transfers()`/`verify()` 有，
+     * 进度只有 `tree()` 有）。表里没有的命令一律答一个空的成功回执。
+     */
+    let byCmd = null;
+
+    function invoke(cmd, args) {
+      if (byCmd) {
+        const entry = byCmd[cmd];
+        if (entry === undefined) return Promise.resolve({ ok: true, data: {} });
+        if (entry && entry.kind === "reject") return Promise.reject(entry.value);
+        return Promise.resolve(entry);
+      }
+      if (mode.kind === "reject") return Promise.reject(mode.value);
+      return Promise.resolve({ ok: true, data: mode.data });
+    }
+
+    // ---- 读界面（**只看 DOM**，不碰模块内部状态）----------------------------
+    const doc = () => f.contentDocument;
+
+    // ---- 读界面（**只看 DOM**，不碰模块内部状态）----------------------------
+    function textOf(id) {
+      const el = f.contentDocument.getElementById(id);
+      return el ? el.textContent : "";
+    }
+
+    /** 常驻提示行的**第一条**正文（`localFailure` 排在 `state()` 自己的那些之前）。 */
+    function noticeText() {
+      const el = f.contentDocument.querySelector("#notices .notice__text");
+      return el ? el.textContent : "";
+    }
+
+    /**
+     * 工具栏引擎徽标里那张图形（`<svg>` 是 `dom.js:icon()` 画的）。
+     *
+     * ⚠️ 读的是 **`innerHTML` 而不是 `textContent`** —— 那条路**实测**踩过一次：
+     *    `<svg><path d="…"/></svg>` 的子节点是**元素**、不是文本节点，
+     *    所以 `textContent` 是**空串**，判据会以"图形没了"的理由假红。
+     *    （假红的代价在本仓库是记账过的：它会让人把守卫整个关掉。）
+     */
+    function badgeIcon() {
+      const el = f.contentDocument.getElementById("engine-icon");
+      return el ? el.innerHTML : "";
+    }
+
+    f.addEventListener("load", async () => {
+      try {
+        // ------------------------------------------------------------------
+        // ⓪ 对照（负控制）：**还没注入 `__TAURI__`** 时，前端必须说出那句诊断。
+        //    没有这一条，"界面上什么都没有"与"我的断言写错了/探针根本没起"
+        //    就分不开 —— 而一个分不出这两种情况的自检，与没有自检等价。
+        // ------------------------------------------------------------------
+        await sleep(TICK);
+        const diag = noticeText();
+        checkTrue("I-0 未注入 __TAURI__（对照）", diag.length > 0 && diag.includes("Tauri"),
+                  `提示行=${JSON.stringify(diag.slice(0, 90))}`);
+
+        // 注入。⇒ **下一拍**起，前端就在跟我们的 stub 说话了。
+        f.contentWindow.__TAURI__ = { core: { invoke } };
+
+        // ------------------------------------------------------------------
+        // ① 三种拒绝形状 —— **每一条都要求原文逐字回到界面上**（约束 3）
+        //    ⚠️ 期望值就是**我们自己注入的那个字符串**：这是一次往返，
+        //       不是在抄一份前端里的字面量（那样两边会一起漂移，判据就废了）。
+        // ------------------------------------------------------------------
+        const BARE = "state not found";
+        mode = { kind: "reject", value: BARE };
+        await sleep(TICK);
+        check("I-1a 裸字符串拒绝", noticeText(), BARE);
+
+        const ERR = "内核原文：管道断了";
+        mode = { kind: "reject", value: new Error(ERR) };
+        await sleep(TICK);
+        check("I-1b Error 拒绝", noticeText(), ERR);
+
+        const OBJ = "对象形状的拒绝原文";
+        mode = { kind: "reject", value: { message: OBJ } };
+        await sleep(TICK);
+        check("I-1c {message} 形状的拒绝", noticeText(), OBJ);
+
+        // ⚠️ 这一条钉的是"**不加工**"：不 trim、不折行、不加前缀。
+        //    （它正是"看起来只是界面丑"那一类缺陷的判据。）
+        const RAW = "  首尾有空格\n且中间有换行  ";
+        mode = { kind: "reject", value: RAW };
+        await sleep(TICK);
+        check("I-1d 逐字：不 trim / 不折行 / 不加前缀", noticeText(), RAW);
+
+        // ------------------------------------------------------------------
+        // ② 载荷驱动：**值全在载荷里，JS 只摆位置**（§3.2）——
+        //    这是任务 10/11/12 要验的同一件事的模板：换个载荷，看界面跟不跟。
+        // ------------------------------------------------------------------
+        mode = {
+          kind: "ok",
+          data: {
+            allows_requests: true,
+            engine: { kind: "running", text: "运行中", icon: "bolt.fill" },
+            load: { kind: "idle" },
+          },
+        };
+        await sleep(TICK);
+        check("I-2a 徽标正文来自载荷", textOf("engine-text"), "运行中");
+        const icon1 = badgeIcon();
+        checkTrue("I-2a 徽标图形来自载荷里的图标名", icon1.includes("<path"),
+                  `图形=${icon1}`);
+
+        // 只换**图标名**那一格 ⇒ 图形必须跟着换（名字→图形的映射在 `dom.js:ICONS`，
+        // 而"该用哪个名字"是 Rust 给的 ⇒ 前端不许自己按 kind 猜一个）。
+        mode = {
+          kind: "ok",
+          data: {
+            allows_requests: true,
+            engine: { kind: "running", text: "运行中", icon: "circle.dashed" },
+            load: { kind: "idle" },
+          },
+        };
+        await sleep(TICK);
+        const icon2 = badgeIcon();
+        checkTrue("I-2b 图形随载荷里的图标名变", icon2.length > 0 && icon2 !== icon1,
+                  `图形=${icon2}`);
+
+        // ------------------------------------------------------------------
+        // ③ 路由到一个**没注册**的屏 + 数据驱动的摘要
+        //    `load.kind === "loaded"` ⇒ 路由去找 `files` 那一屏，而它在任务 10 之前
+        //    没有注册（`js/screens/registry.js` 的 SCREENS）⇒ **必须有一句话说得出来**
+        //    （不然用户看到的是"加载成功之后主区一片空白"）。
+        //    ⚠️ 这里只断言"说得出来、且指到了 files"，**不复述那句话的全文**：
+        //       那句话的唯一属主是 `registry.js`（复述一份就会漂移）。
+        // ------------------------------------------------------------------
+        mode = {
+          kind: "ok",
+          data: {
+            allows_requests: true,
+            load: {
+              kind: "loaded",
+              summary: {
+                code: "C24-8",
+                files_text: "12 个文件",
+                size_text: "3.4 GB",
+                validity_text: "有效期至 2026-10-01",
+                expired_badge_text: null,
+              },
+            },
+          },
+        };
+        await sleep(TICK);
+        check("I-3a 摘要的交付码逐字来自载荷", textOf("summary-code"), "C24-8");
+        check("I-3a 摘要的文件数逐字来自载荷", textOf("summary-files"), "12 个文件");
+
+        // ------------------------------------------------------------------
+        // I-3b **未注册的屏说得出来（不是静默空白）**
+        //
+        // 🔴 这条断言 2026-09-20（任务 10b）改了**触发方式**，理由：
+        //    它原来走的是"把 `load.kind` 置成 `loaded` ⇒ 路由去找 `files` 那一屏"，
+        //    而任务 10 把 `files` 注册进 SCREENS 之后**那条路不再抛** ⇒ 提示行是空的，
+        //    断言红了（而它一直没人跑 —— 这条命令当时没接进 `test.sh`）。
+        //    它**红得对**：那句话的前提（"存在一个没注册的屏"）在应用里**已经不成立**了。
+        //
+        // ⚠️ **判据没有放宽**（"把'说得出来'降级成'不崩就算'"是不行的）：下面两条
+        //    合起来要求的仍然是同一件事，而且比原来更严 ——
+        //      · 负向（I-3b）：拿一个**确定没注册**的 id 问注册表，它必须**抛出**，
+        //        而且那句话里必须**有那个 id**（"指名道姓"就是"说得出来"）；
+        //      · 正向（I-3c）：`SECTIONS` 里的每一项都必须有屏 —— 这正是"未注册的屏"
+        //        这条路的**来路**（改了 `SECTIONS` 而没改 `SCREENS` 就是它）。
+        //    原来那条只说明了"走到那一步时 UI 上有字"；这一对还多守住了"今天走不到那一步"。
+        //
+        // ⚠️ **如实记账（这一条不再断言的东西）**：`app.js:applyRoute` 里
+        //    `catch → 常驻提示行` 那一段**今天没有断言覆盖**了 —— 那条分支要有
+        //    "一个没注册的屏"才会走到，而那在今天**不可达**（上面 I-3c 正是"不可达"的凭据）。
+        //    那段管道本身由 I-1a～I-1d 覆盖（同一句 `failureText` → 同一条提示行）。
+        // ------------------------------------------------------------------
+        const PROBE = "__benagen_unregistered_probe__";
+        let thrown = "";
+        try {
+          screenFor(PROBE);
+        } catch (error) {
+          // 与 `invoke.js:failureText` 同一条取法：拒绝/抛出**不一定是 Error**。
+          thrown = error && error.message ? String(error.message) : String(error);
+        }
+        checkTrue("I-3b 未注册的屏说得出来（抛出且指名道姓）",
+                  thrown.length > 0 && thrown.includes(PROBE),
+                  `抛出=「${thrown.slice(0, 90)}」`);
+        const registered = screenIds();
+        const missingScreens = SECTIONS.filter((s) => !registered.includes(s));
+        checkTrue("I-3c 每个侧栏分区都有屏（I-3b 那条路的来路）",
+                  missingScreens.length === 0,
+                  `已注册=${JSON.stringify(registered)} 缺屏的分区=${JSON.stringify(missingScreens)}`);
+
+        // =================================================================
+        // F-1 / F-3 / F-4 / F-5（2026-09-20 整分支审查的修复轮）
+        //
+        // 这四条都是**跨模块交互**出来的：每一块单独看都对，合起来才错 ——
+        // 而上面那些断言（以及四套整屏验收）在它们上面**全都是绿的**。
+        // =================================================================
+
+        // 载荷：能取夹具的**一律取夹具**（`wire-fixtures.json` 由 Rust 倒出来，
+        // 另有 `check_wire_fixtures.sh` 守着它不漂移）。
+        const FIX = await (await fetch("/windows/scripts/frontend-stub/wire-fixtures.json")).json();
+
+        // ⚠️ **校验页那一份是手写的**：`api::verify` 今天不在 `wire-fixtures.json` 里
+        //    （那一屏还没有整屏验收；把 `verify` 加进生成器要改
+        //    `shell-core/examples/**`，本轮边界之外）。
+        //    它**只用来验"读屏"与"跨格复制"这两件事**（`aria-*` 与选区的文本），
+        //    **不用来验字段名** —— 字段名写错时那几格会是空白，下面每一条断言当场就红
+        //    （fail-closed，不会静默变绿）。要收口：把 `verify` 加进
+        //    `examples/dump_wire_fixtures.rs`。
+        const verifyFixture = {
+          ok: true,
+          data: {
+            all_good: false,
+            badge_count: 3,
+            classified_count: 12,
+            classified_text: "已校验 12 项",
+            failed_count: 3,
+            headline: "3 项未通过",
+            headline_color: "Red",
+            headline_icon: "exclamationmark.triangle.fill",
+            rows: [
+              {
+                kind: "ok",
+                label: "校验通过",
+                color: "Green",
+                icon_name: "checkmark.circle.fill",
+                count_text: "9 项",
+                note: null,
+                paths: ["client-test/C24-8_x/reads 1.fq.gz"],
+              },
+              {
+                kind: "bad",
+                label: "内容不符",
+                color: "Red",
+                icon_name: "xmark.circle.fill",
+                count_text: "3 项",
+                note: null,
+                paths: [],
+              },
+            ],
+            verdict: { Failed: 3 },
+          },
+        };
+
+        byCmd = {
+          state: FIX.stateLoaded,
+          tree: FIX.treeWhole,
+          transfers: FIX.transfersSnapshot,
+          verify: verifyFixture,
+        };
+
+        /** 载荷的**浅拷贝**：只改我要改的那一格（其余逐字来自夹具）。 */
+        const withData = (fx, patch) => {
+          const copy = JSON.parse(JSON.stringify(fx));
+          copy.data = Object.assign({}, copy.data, patch);
+          return copy;
+        };
+        /** 只换这一批的交付码（换批那条判据的触发条件）。 */
+        const withCode = (fx, code) => {
+          const copy = JSON.parse(JSON.stringify(fx));
+          copy.data.load.summary.code = code;
+          return copy;
+        };
+        /** 点侧栏某一项（换分区走的就是这条路）。 */
+        const navClick = (section) => {
+          doc()
+            .getElementById("nav-" + section)
+            .dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+        };
+        /** 侧栏某一格徽标现在的样子。 */
+        const badge = (section) => {
+          const el = doc().getElementById("badge-" + section);
+          return { hidden: el.hidden, text: el.textContent };
+        };
+
+        await sleep(TICK);
+
+        // -----------------------------------------------------------------
+        // F-1：侧栏那三个未完成计数徽标
+        //
+        // 修之前：`shell.setNavBadge` 的**调用点为零**、三个 `#badge-*` 恒 `hidden`
+        // —— 而 `SidebarBadge` 那 9 条单测、三个槽位、`.nav-badge` 的样式**全都齐了**。
+        // 三个任务各交付了自己那一半，接口那一段从来没有被指派给任何人。
+        // -----------------------------------------------------------------
+        const b0 = { files: badge("files"), transfers: badge("transfers"), verify: badge("verify") };
+        checkTrue("F-1a 还没访问过那些屏 ⇒ 三个徽标都藏着（与 macOS 首帧 `model.transfers == nil` 同义）",
+                  b0.files.hidden && b0.transfers.hidden && b0.verify.hidden,
+                  `files=${JSON.stringify(b0.files)} transfers=${JSON.stringify(b0.transfers)} verify=${JSON.stringify(b0.verify)}`);
+
+        // 切到「传输列表」：那一屏把载荷里的 `badge_count`（**Rust 算的**）报给壳。
+        const wantTransfers = FIX.transfersSnapshot.data.badge_count;
+        navClick("transfers");
+        await sleep(TICK * 3); // 换屏在下一拍 `state()`；报数再下一拍
+        const b1 = badge("transfers");
+        checkTrue("F-1b 访问过传输列表 ⇒ 徽标显示载荷里的 `badge_count`（Rust 算的那一格）",
+              b1.hidden === false && b1.text === String(wantTransfers),
+              `徽标=${JSON.stringify(b1)}；载荷里的 badge_count=${wantTransfers}`);
+
+        // 🔴 对照组：把载荷里那个数改成 0 ⇒ 徽标必须跟着藏回去。
+        //    （少了它，"挂上去之后再也不下来"也能让上面那一条绿。）
+        byCmd.transfers = withData(FIX.transfersSnapshot, { badge_count: 0 });
+        await sleep(TICK);
+        const b2 = badge("transfers");
+        checkTrue("F-1c 对照组：载荷里的计数变 0 ⇒ 徽标藏回去（证明它真由载荷说了算）",
+                  b2.hidden === true, `徽标=${JSON.stringify(b2)}`);
+        byCmd.transfers = FIX.transfersSnapshot;
+        await sleep(TICK);
+        const b3 = badge("transfers");
+        checkTrue("F-1d 计数回到非 0 ⇒ 徽标回来", b3.hidden === false && b3.text === String(wantTransfers),
+              `徽标=${JSON.stringify(b3)}`);
+
+        // 切回文件页 ⇒ 那颗徽标**还在**（它记在壳上，不随屏销毁 —— "去那一屏看看"这句
+        // 提示的全部意义就在这里）；而 `files` 那一格**恒不给徽标**（macOS 对 files 给 0）。
+        navClick("files");
+        await sleep(TICK * 2);
+        const b4 = badge("transfers");
+        const b5 = badge("files");
+        checkTrue("F-1e 切回文件页 ⇒ 传输列表那颗徽标**还在**（它活过换屏）",
+                  b4.hidden === false && b4.text === String(wantTransfers), `徽标=${JSON.stringify(b4)}`);
+        checkTrue("F-1e `files` 那一格**不许有徽标**（macOS 对 files 恒给 0）",
+                  b5.hidden === true, `徽标=${JSON.stringify(b5)}`);
+
+        navClick("verify");
+        await sleep(TICK * 3);
+        const wantVerify = verifyFixture.data.badge_count;
+        const b6 = badge("verify");
+        checkTrue("F-1f 访问过校验页 ⇒ 徽标显示载荷里的 `badge_count`",
+              b6.hidden === false && b6.text === String(wantVerify),
+              `徽标=${JSON.stringify(b6)}；载荷里的 badge_count=${wantVerify}`);
+
+        // 换批 ⇒ 那几个数**一起清零**（上一批的"还有 4 个没落定的"摆在这一批的侧栏上，
+        // 是一个没有任何提示的错数）。判据与 `ProgressSummary::of` 的 `tree_code == code`、
+        // `verify.js:render` 的 `shownCode` 同源；macOS 侧是 `verify = nil`。
+        //
+        // ⚠️ **量的是「传输列表」那一格**：此刻挂着的是校验屏，它下一拍（1 s）就会把
+        //    **这一批**的数报回来 ⇒ 拿它当读数会读到"已经报回来了"的样子。
+        //    而传输列表那一屏**没挂载** ⇒ 它的数只可能来自壳上那一份缓存 ——
+        //    清零没做的话它会一直显示 4（正是这条要抓的东西）。
+        byCmd.state = withCode(FIX.stateLoaded, "R.a1b2C3d4E5f6G7h8I9j-换批");
+        await sleep(TICK * 2);
+        const b7 = badge("transfers");
+        checkTrue("F-1g 换批 ⇒ 侧栏那几个未完成计数一起清零（不把上一批的数挂在这一批上）",
+                  b7.hidden === true, `传输列表那一格=${JSON.stringify(b7)}（换批前是 ${wantTransfers}）`);
+        byCmd.state = FIX.stateLoaded;
+        await sleep(TICK * 2);
+
+        // -----------------------------------------------------------------
+        // F-4：那一格百分比**由 Rust 给**，JS 一个数都不许换算
+        //
+        // 修之前 `verify.js` 写的是 `Math.round(fraction * 100)` —— 那正是 §3.2 点名的
+        // 那一类"JS 自己算出来的显示值"（一个非 ASCII 字都没有，所以指纹守卫
+        // **结构上**照不到它），而且与 Rust 的**向零截断**口径相反。
+        // -----------------------------------------------------------------
+        navClick("verify");
+        await sleep(TICK * 2);
+        const barEl = doc().getElementById("verify-bar");
+        const percentEl = doc().getElementById("verify-percent");
+        const prog = FIX.treeWhole.data.progress;
+        checkTrue("F-4a `aria-valuenow` 是 Rust 给的那个**原始比例**（不是 JS 算出来的百分比）",
+              barEl.getAttribute("aria-valuenow") === String(prog.fraction),
+              `aria-valuenow=${barEl.getAttribute("aria-valuenow")}；Rust 的 fraction=${prog.fraction}`);
+        checkTrue("F-4b 值域是 0…1（与传输列表那一屏逐字同款），不是 0…100",
+              barEl.getAttribute("aria-valuemin") === "0" && barEl.getAttribute("aria-valuemax") === "1",
+              `min=${barEl.getAttribute("aria-valuemin")} max=${barEl.getAttribute("aria-valuemax")}`);
+        checkTrue("F-4c `aria-valuetext` 就是屏幕上那一格的字（读屏读到的 = 看到的）",
+              barEl.getAttribute("aria-valuetext") === percentEl.textContent,
+              `aria-valuetext=${JSON.stringify(barEl.getAttribute("aria-valuetext"))} 屏幕=${JSON.stringify(percentEl.textContent)}`);
+
+        // 🔴 组合判据（审查原文那一档）：199/200 ⇒ Rust 给 `percent_text = "99%"`、
+        //    `fraction = 0.995`。修之前 JS 会写 `String(Math.round(0.995*100))` = `"100"`
+        //    ⇒ **读屏读到 100% 而屏幕上写着 99%**（客户以为下完了）。
+        byCmd.tree = withData(FIX.treeWhole, {
+          progress: Object.assign({}, prog, { fraction: 0.995, percent_text: "99%" }),
+        });
+        await sleep(TICK * 2);
+        const bar2 = doc().getElementById("verify-bar");
+        const percent2 = doc().getElementById("verify-percent");
+        checkTrue("F-4d 199/200：读屏拿到的与屏幕上是**同一个数**（99%，不是 100%）",
+              bar2.getAttribute("aria-valuetext") === "99%"
+                && percent2.textContent === "99%"
+                && bar2.getAttribute("aria-valuenow") === "0.995",
+              `aria-valuetext=${JSON.stringify(bar2.getAttribute("aria-valuetext"))} `
+                + `aria-valuenow=${JSON.stringify(bar2.getAttribute("aria-valuenow"))} `
+                + `屏幕=${JSON.stringify(percent2.textContent)}`);
+        byCmd.tree = FIX.treeWhole;
+        await sleep(TICK * 2);
+
+        // -----------------------------------------------------------------
+        // F-5：跨格复制的那一个换行 —— **同族的第二处**（标签 + 计数）
+        //
+        // 路径那两格配了处理器与保守性断言，而每一类那一行的「标签 + 计数」也是
+        // 两个被 blockify 的相邻格子（`.verify__class-head` 是 flex），却漏了。
+        // -----------------------------------------------------------------
+        const wdoc = doc();
+        const win = f.contentWindow;
+        const row0 = wdoc.querySelectorAll(".verify__class")[0];
+        const labelEl = row0.querySelector(".verify__class-label");
+        const countEl = row0.querySelector(".verify__class-count");
+        const labelText = labelEl.textContent;
+        const countText = countEl.textContent;
+        checkTrue("F-5a 夹具前提：那一行确实切成了「标签 + 计数」两格，且都非空",
+                  labelText !== "" && countText !== "",
+                  `标签=${JSON.stringify(labelText)} 计数=${JSON.stringify(countText)}`);
+        const range = wdoc.createRange();
+        range.setStartBefore(labelEl);
+        range.setEndAfter(countEl);
+        const sel = win.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        const rawText = sel.toString();
+        checkTrue("F-5b 前提：跨格选区里**确实**有浏览器插进去的那个换行（否则这条判据什么都测不到）",
+                  rawText.includes(labelText + "\n" + countText),
+                  `选区=${JSON.stringify(rawText)}`);
+
+        /** 派发一次 `copy`，把结果（剪贴板文本 / 有没有被接管）读回来。 */
+        const dispatchCopy = (target) => {
+          const transfer = new DataTransfer();
+          let prevented = null;
+          const spy = (event) => {
+            prevented = event.defaultPrevented;
+          };
+          // ⚠️ 监听挂在 **document** 上（冒泡的更外层）：`verify.js` 的处理器挂在
+          //    `#verify-classes` 上（先跑），于是这一条读到的就是**它处理之后**的
+          //    `defaultPrevented`。挂在同一个元素上是读不准的（先注册的先跑）。
+          wdoc.addEventListener("copy", spy);
+          target.dispatchEvent(
+            new ClipboardEvent("copy", { clipboardData: transfer, bubbles: true, cancelable: true })
+          );
+          wdoc.removeEventListener("copy", spy);
+          return { text: transfer.getData("text/plain"), prevented };
+        };
+        const hit = dispatchCopy(row0);
+        checkTrue("F-5c 复制出来的文本与屏幕上呈现的**逐字相同**（那个换行被还原掉了）",
+              hit.text === labelText + countText,
+              `剪贴板=${JSON.stringify(hit.text)} 期望=${JSON.stringify(labelText + countText)}`);
+        checkTrue("F-5d 命中时处理器**接管了**这一次复制（`preventDefault`）",
+                  hit.prevented === true, `defaultPrevented=${hit.prevented}`);
+
+        // 🔴 对照组（保守性）：选区里**没有**那一对格子 ⇒ 一个字符都不许碰。
+        const only = wdoc.createRange();
+        only.selectNodeContents(labelEl);
+        sel.removeAllRanges();
+        sel.addRange(only);
+        const miss = dispatchCopy(labelEl);
+        checkTrue("F-5e 对照组：匹配不上 ⇒ 既不写剪贴板、也不 preventDefault（一个字符都不碰）",
+                  miss.prevented === false && miss.text === "",
+                  `defaultPrevented=${miss.prevented} 剪贴板=${JSON.stringify(miss.text)}`);
+
+        // -----------------------------------------------------------------
+        // F-3：壳那三格**值没变就不许重写文本节点**
+        //
+        // `setText` 干的是 `el.textContent = …` ⇒ 它**换掉文本节点** ⇒ 客户拖着选中的
+        // 那段文字被清掉。而这三格每秒被喂一次、一秒里几乎从不变化
+        // ⇒ 唯一的后果就是"**每秒清一次选区**"（实测：交付码选不动）。
+        // 这是同一类缺陷的**第三次**出现，而前两次的结论是"要么做成判据、要么重新论证"。
+        // -----------------------------------------------------------------
+        const SHELL_CELLS = ["summary-code", "engine-text", "tb-code-value"];
+        const nodesBefore = SHELL_CELLS.map((id) => doc().getElementById(id).firstChild);
+        // 🔴 **观察器**（对着 `#summary-code` 这一格）：若干拍里 `childList` / `characterData`
+        //    变更数必须是 **0**。
+        const seen = [];
+        const mo = new win.MutationObserver((records) => {
+          for (const r of records) seen.push(r.type);
+        });
+        mo.observe(doc().getElementById("summary-code"), {
+          childList: true,
+          characterData: true,
+          subtree: true,
+        });
+
+        /** 把某一格整格选上，等若干拍，看选区还在不在。 */
+        const selectionSurvives = async (el, ticks) => {
+          const s = win.getSelection();
+          const r = wdoc.createRange();
+          r.selectNodeContents(el);
+          s.removeAllRanges();
+          s.addRange(r);
+          const first = s.toString();
+          await sleep(TICK * ticks);
+          return { first, after: s.toString() };
+        };
+        const codeEl = doc().getElementById("summary-code");
+        const sCode = await selectionSurvives(codeEl, 3);
+        const sCtrl = await selectionSurvives(wdoc.querySelector(".nav-label"), 3);
+
+        const nodesAfter = SHELL_CELLS.map((id) => doc().getElementById(id).firstChild);
+        const replaced = SHELL_CELLS.filter((id, i) => nodesBefore[i] !== nodesAfter[i]);
+
+        checkTrue("F-3a 三拍过去，壳那三格的**文本节点还是同一个**（值没变就不许重写）",
+              replaced.length === 0,
+              `被换掉的格子=${JSON.stringify(replaced)}（未变的 ${SHELL_CELLS.length - replaced.length}/${SHELL_CELLS.length}）`);
+        checkTrue("F-3b 那三拍里 `#summary-code` 上一次 `childList`/`characterData` 变更都没有",
+                  seen.length === 0, `变更记录 ${seen.length} 条：${JSON.stringify(seen.slice(0, 6))}`);
+        checkTrue("F-3c 交付码那一格的**选区活过了三拍**（客户能把这一批的码复制出去）",
+                  sCode.first !== "" && sCode.after === sCode.first,
+                  `选前=${JSON.stringify(sCode.first)} 选后=${JSON.stringify(sCode.after)}`);
+        checkTrue("F-3c 对照组：`.nav-label`（没有任何每拍写入者）的选区同样活着 ⇒ 量法有效",
+                  sCtrl.first !== "" && sCtrl.after === sCtrl.first,
+                  `选前=${JSON.stringify(sCtrl.first)} 选后=${JSON.stringify(sCtrl.after)}`);
+
+        // 🔴 **对照组二**：让交付码**真变一次** ⇒ 观察器必须真的记到变更
+        //    （少了它，"观察器根本没装上"也能让 F-3b 那个 0 变绿）。
+        byCmd.state = withCode(FIX.stateLoaded, "R.换了一批码");
+        await sleep(TICK * 2);
+        const codeNow = doc().getElementById("summary-code").textContent;
+        checkTrue("F-3d 对照组：交付码真变一次 ⇒ 观察器记到了变更，且那一格显示的是新码",
+                  seen.length > 0 && codeNow === "R.换了一批码",
+                  `变更记录 ${seen.length} 条；那一格=${JSON.stringify(codeNow)}`);
+        mo.disconnect();
+        byCmd.state = FIX.stateLoaded;
+        await sleep(TICK);
+      } catch (error) {
+        // 夹具自己炸了也是失败 —— 但**必须留下 DONE**，否则跑的人分不清
+        // "夹具失败了"与"夹具根本没跑起来"（后者是环境问题，前者是判据问题）。
+        fail += 1;
+        lines.push(`[夹具自身] FAIL  ${String(error && error.stack ? error.stack : error)}`);
+        flush();
+      } finally {
+        lines.push(`DONE ok=${ok} fail=${fail}`);
+        document.title = `DONE ok=${ok} fail=${fail}`;
+        flush();
+      }
+    });
+  </script>
+</body>
+</html>

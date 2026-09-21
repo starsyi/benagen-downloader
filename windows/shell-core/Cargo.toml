@@ -1,0 +1,15 @@
+[package]
+name = "shell-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# ⚠️ 这里**不许**出现 eframe / egui / winapi 之类——本 crate 必须保持纯逻辑、跨平台，
+#    否则"能在 macOS 上跑壳的测试"这条就没了（规格 §4.3 与 §14.2）。
+#    要加 UI 依赖请加到 `shell-win`。
+#
+# 本 crate 也**不依赖 `core`**：协议类型在壳里写一份 Rust 镜像（规格 §5 要点 1）。
+# 依赖它会把"语言中立的进程边界"降级成"两个 crate 的编译期耦合"，
+# 日后内核换语言时这条边界就报错了——而那正是上游 §4.3 要保住的东西。

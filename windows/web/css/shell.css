@@ -1,0 +1,389 @@
+/* shell.css —— 壳（骨架 / 侧栏 / 工具栏 / 常驻提示行）。
+ *
+ * 这一层是**每一屏都在**的那些东西：任务 10/11/12 只往 `#page` 那个宿主里挂自己的屏，
+ * **不要**碰本文件（改了它就是四屏一起改，而其中三屏的验收是别人的）。
+ * 需要新的**壳级**样式（例如工具栏上多一颗按钮）时，改这里并在报告里点名 ——
+ * 落在屏样式里的话，切到别的屏那颗按钮就没了。
+ *
+ * 所有值一律取 `tokens.css` 的令牌，本文件里**不出现任何字面色值**。
+ */
+
+/* ---- 骨架：左栏固定宽 + 主区吃掉剩余（侧边栏 220/240/280）-------------------
+ *
+ * ⚠️ **下面三条必须写在同一条规则里。** 写成两条时，后一条的 `min-height` 会把
+ *    前一条的 `min-height:100vh` **覆盖掉**（同权重、后写的赢）⇒ 视口再高页面也只到
+ *    640px、下面留一片白。**这个缺陷是被无头渲染截图抓到的** —— 三条机械验证
+ *    （抽块编译 / `bash -n` / 字体子集扫描）和两位实现者都没抓到，因为它们**看不见渲染**。
+ *    （这一段逐字来自样张：那个坑在样张上真的发生过，别在这里重演一次。）
+ *
+ * `max(var(--win-min-h), 100vh)` 表达的正是 macOS 那条窗口下界
+ * （`RootView.swift:269` 的 `minWidth:1120, minHeight:640`）在 Web 上的对应物：
+ * **至少 640，但铺满视口**。
+ *
+ * ⚠️ Tauri 那一侧也配了 `minWidth/minHeight`（`shell-win/tauri.conf.json`）——
+ *    两处**都要有**，不是冗余：Tauri 那个管"窗口拖不小"，这一条管
+ *    "窗口被系统/用户摆成更小时，内容按 1120 排版"（否则主区会被挤成一列）。
+ */
+.app {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  min-width: var(--win-min-w);
+  min-height: max(var(--win-min-h), 100vh);
+}
+
+/* ---- 侧边栏 ---------------------------------------------------------------- */
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--c-separator); /* 系统 Divider 的近似 */
+}
+
+.nav {
+  flex: 1;
+  padding: var(--sp-8) var(--sp-8);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/* ⚠️ 样张里这一项是 `<a href="#">`；这里用 `<button>`，**视觉逐条对齐**。
+   为什么换：它是**导航控件**，不是超链接 —— `<a href="#">` 会往历史里塞一条、
+   并且点击会跳一下锚点，而"当前分区"这件事本来就没有 URL 可言。
+   ⇒ 因为它换了元素，下面这几条**必须显式写出来**（`<a>` 的默认外观并不等于
+   `<button>` 的）：`font: inherit` / `text-align` / `width` / `background` / `border`。
+   少一条都会让这一项与样张长得不一样，而那是"看着不对但说不出哪里不对"的那类偏差。 */
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  width: 100%;
+  padding: var(--sp-6) var(--sp-8);
+  border: 0;
+  border-radius: var(--r-6);
+  background: transparent;
+  font: inherit;
+  font-size: var(--text-body);
+  text-align: left;
+  color: var(--c-label);
+  cursor: default;
+}
+.nav-item:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+/* 选中态：macOS 用系统 accent 选中行。Web 上这里是 accent 底 + 白字，
+   是**样式上的一处另造** —— 样张阶段目视对齐（macOS 的选中行是整行铺 accent）。 */
+.nav-item.is-selected {
+  background: var(--bg-selected);
+  color: #fff;
+}
+/* 分区图标（`SidebarSection.systemImage` 的三个 SF Symbol，图形内联在 index.html）。
+   ⚠️ 尺寸取 `--row-icon-w`（16px）—— 那是本仓库**实测过的唯一图标尺寸**
+      （文件行的图标），样张的工具栏徽标也是这个数。侧栏这一行与它们同一档，
+      **不要**在这里另写一个 16px 的字面量（令牌改一次要能带着它一起走）。
+   ⚠️ 颜色是 `currentColor`：选中态（`.nav-item.is-selected` 的 `color:#FFF`）
+      自动带下去，所以下面**没有**任何一条"选中时的图标颜色"规则 ——
+      加了那条，改选中态配色时就会有两处要改。 */
+.nav-icon {
+  flex: none;
+  width: var(--row-icon-w);
+  height: var(--row-icon-w);
+}
+.nav-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 未完成计数徽标（`SidebarBadge`，计数口径在 shell-core 的有单测侧）。
+   ⚠️ `[hidden]` 由 JS 挂 —— 0 的时候**这一格不渲染**（macOS 的 `.badge(0)`
+      什么都不画；"0 = 这个分区没有未落定的东西"）。 */
+.nav-badge {
+  flex: none;
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+}
+.nav-item.is-selected .nav-badge {
+  color: var(--c-label);
+}
+
+/* 底部批次摘要（`Sidebar.swift` 的 `safeAreaInset(edge:.bottom)`：h12/v8）
+   ⚠️ 它整块由 `state().load.summary` 驱动 —— 没有生效批次时**整块不渲染**
+      （`DeliverySummary::of_load_state` 给 `None` 就是"这块不该出现"）。 */
+.batch-summary {
+  padding: var(--sp-8) var(--sp-12);
+  border-top: 1px solid var(--c-separator);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.batch-summary__title {
+  font-size: var(--text-caption);
+  font-weight: 600;
+  color: var(--c-secondary);
+}
+.batch-summary__head {
+  display: flex;
+  gap: var(--sp-4);
+  font-size: var(--text-caption2);
+  font-weight: 500;
+}
+.batch-summary__code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap; /* 数据：可截断 */
+}
+/* 「已过期」角标 —— 文案本身是 Rust 给的（`DeliverySummary.expired_badge_text`），
+   这里只负责它是红的。`Option` 为 `None` 时那一格是空的（**不是空串**）。 */
+.batch-summary__expired {
+  flex: none;
+  font-weight: 600;
+  color: var(--c-red);
+}
+.batch-summary__meta {
+  display: flex;
+  gap: var(--sp-4);
+  font-size: var(--text-caption2);
+  color: var(--c-secondary);
+}
+.batch-summary__validity {
+  font-size: var(--text-caption2);
+  color: var(--c-tertiary);
+}
+
+/* ---- 主区 ------------------------------------------------------------------ */
+.detail {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* 工具栏（**四项、顺序固定**）。
+   ⚠️ 样张在这里**撤销**了 egui 壳的一处形态偏离：它当时把引擎徽标从工具栏挪到了底栏，
+      理由是"egui 没有工具栏"。Web 有 ⇒ 回到 macOS 的形态。 */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  padding: var(--sp-6) var(--pad-bar-x);
+  border-bottom: 1px solid var(--c-separator);
+}
+/* ⚠️ `display:inline-flex` + `gap` 是**必需**的，不是排版偏好：macOS 的工具栏
+   每一项都是"图标 + 文字"（`.labelStyle(.titleAndIcon)`），只用 `padding` 摆不出来。
+   ⚠️ 这段注释的出处：`RootView.swift:155-158` 记着"默认只渲染图标、文字掉进
+   `.help` 浮层，本仓库栽过三次" —— 前端这边对应的是"**不许只留图标**"。
+   🔴 `flex:none` 是**修一个真跑出来的缺陷**（任务 14 在宿主窗口上抓到的），不是排版偏好：
+   弹性盒的默认 `flex-shrink:1` 会让工具栏里**最宽的那一格**（引擎徽标 —— 它的文案是
+   内核给的、长度不受前端控制）把**其余每一项按比例压扁**。实测（长引擎文案那一档，
+   1120 宽的窗口）：`tb-code` 被压到 48px 宽 ⇒ 「交付码」三个字**竖着排成三行**
+   （`h=57`）、`tb-settings` 两行（`h=40`）—— 而那一格**本来只需要 76px**。
+   ⇒ 按钮**一律不参与收缩**；宽出来的那一格由徽标自己**截断**（它的 `overflow:hidden`
+   + `text-overflow:ellipsis` 就是为这个写的，全文在下面那条常驻提示行里逐字可见）。 */
+.tb-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-6);
+  font: inherit;
+  font-size: var(--text-callout);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-6);
+  padding: var(--sp-2) var(--sp-6);
+  cursor: pointer;
+  color: var(--c-label);
+}
+.tb-btn:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.05);
+}
+.tb-btn:disabled {
+  color: var(--c-tertiary);
+  cursor: default;
+}
+/* 图标：`currentColor` 取父级颜色 ⇒ 禁用态、引擎徽标的语义色都自动跟着走，
+   不需要为每种状态各写一条图标颜色规则。 */
+.tb-ico {
+  flex: none;
+  width: var(--toolbar-icon-w);
+  height: var(--toolbar-icon-w);
+}
+.tb-spacer {
+  flex: 1;
+}
+/* 工具栏那一项的文案格。**空的时候整格不占位**：`data-bind` 还没被填上时，
+   按钮就是"图标 + 空白"，而不是"图标 + 半个按钮宽的空洞"。
+   两条都写是因为 `[hidden]` 管的是"有没有这一格"，`:empty` 管的是"格里有字没有"。 */
+.tb-btn > [data-bind]:empty {
+  display: none;
+}
+.engine-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-6);
+  font-size: var(--text-callout);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis; /* 数据：可截断 */
+}
+/* 徽标那枚图形的**格子**。图形本身由 `shell.setEngineBadge` 按载荷里的图标名
+   （`engine.icon` ← `EngineStatusPresentation::icon_name`）现造、塞进这一格 ——
+   所以 `index.html` 里这一格是**空的**（写死一颗闪电就是前端自己挑图标名，§3.2 明禁）。
+   ⚠️ `inline-flex` 是必需的：里面那枚 `<svg>`（`.tb-ico`，16×16）与旁边的文字
+      要在同一条基线上，块级元素会让徽标变成一个两行的东西。 */
+.engine-badge__icon {
+  display: inline-flex;
+  flex: none;
+}
+/* 徽标那**一格的文字**（载荷里的 `engine.text`）。
+   🔴 截断的落点是**这里**，不是 `.engine-badge` —— 上面那条 `text-overflow:ellipsis`
+   写在徽标上时是**一条死声明**：徽标是 `inline-flex`，而 `text-overflow` 只对
+   **块容器里的行内内容**生效（弹性容器的孩子是弹性项，没有行内内容可截）。
+   实测（任务 14，宿主窗口，引擎文案是一段内核找不到的长原文）：
+   写成上面那样时，徽标尾部是**硬切**的 —— 半句话、一个路径**切在中间**、
+   连一个省略号都没有，而人眼无法区分"这就是全文"和"后面还有"。
+   ⇒ `min-width:0` 让它能被压（弹性项默认的 `min-width:auto` 不许它压到内容宽以下），
+      再让省略号画在它自己身上。全文仍然在下面那条常驻提示行里**逐字可见**。 */
+.engine-badge__text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 引擎在跑（`EngineState::Running`）—— 绿字。这一条与 `EngineStatusBadge` 同款：
+   颜色**按状态从令牌取**，不在 SVG 上写死 hex。 */
+.engine-badge.is-running {
+  color: var(--c-green);
+}
+.engine-badge.is-unavailable {
+  color: var(--c-red);
+}
+
+/* ---- 常驻提示行（5 条槽位）-------------------------------------------------
+ *
+ * 顺序是**承重的**（`RootView.swift` 的 `VStack`:102-133）：谁能救场（「重试」）
+ * 永远在"发生了什么"（回执）之上。今天只有 ①② 有来源：
+ *   ① 引擎横幅        ← `state().banner`（本任务接上）
+ *   ② 退回内核的披露  ← `state().fallback_notice`（W-2；本任务接上）
+ *   ③ 换码结果        ← 任务 13
+ *   ④ 历史写盘失败    ← 任务 13
+ *   ⑤ 改下载目录回执  ← 任务 13
+ * 每个槽位都往 `#notices` 里 append 一条 `.notice`；**没话说就不挂**（不是挂一条空的）。
+ *
+ * 🔴 高度不变量（规格 §12 / `ResidentNotice.swift` 文件头）：
+ *    **这些行的高度不许由外部文本/数据的长度决定** —— 下面锚着主区的底栏与侧栏摘要，
+ *    一段长文本就能把它们顶出可见区，而用户看到的是"底部整条不见了"。
+ *    ⇒ 散文用**有界可滚**（`max-height` + `overflow-y:auto`），**全文都在**、
+ *      **不许 ellipsis**（"失败原文必须完整可见"是硬要求）。
+ *      这里**不许**改成 `line-clamp` / `-webkit-line-clamp`：那是用"看不见"换"放得下"。
+ */
+.notices {
+  display: flex;
+  flex-direction: column;
+}
+.notice {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-8);
+  padding: var(--pad-bar-y) var(--pad-bar-x);
+  background: var(--bg-notice);
+}
+/* 图标颜色**按变体从令牌取**，不在 SVG 上写死 hex（写死的话，改令牌时这颗不动，
+   于是这颗唯一的警告橙会与别处慢慢分叉）。真机上图标颜色按 kind 变 ⇒ 变体挂在 notice 上。 */
+.notice__icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  align-self: center;
+  color: var(--c-secondary);
+}
+.notice.is-warning .notice__icon {
+  color: var(--c-orange);
+}
+.notice.is-error .notice__icon {
+  color: var(--c-red);
+}
+.notice__text {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-callout);
+  font-weight: 600;
+  max-height: var(--notice-text-max-h);
+  overflow-y: auto;
+}
+/* 壳写的补充说明（`banner.hint`）—— 它**只补充**，正文在上一格。`.caption` 档。 */
+.notice__hint {
+  flex: none;
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+}
+/* 引擎横幅那颗「重试」（`RootView.swift`）。**它取代了 ×**：出错现场不给"关掉它"
+   这个选项 —— 所以带 `shows_retry` 的那条 notice 里**没有** `.notice__dismiss`。 */
+.notice__retry,
+.notice__dismiss {
+  flex: none;
+  font: inherit;
+  font-size: var(--text-callout);
+  background: transparent;
+  border: 1px solid var(--c-separator);
+  border-radius: var(--r-6);
+  padding: var(--sp-2) var(--sp-8);
+  cursor: pointer;
+  color: var(--c-label);
+}
+.notice__dismiss {
+  border-color: transparent;
+  color: var(--c-secondary);
+}
+.notice__retry:hover,
+.notice__dismiss:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+/* 提示行的第二块：**列表**（逐条拒绝理由，上限 80px）。
+   ⚠️ 本任务**还没有**它的生产者（`enqueue` 的回执是任务 11 的），但槽位与上限先立好：
+      少了它，任务 11 会自己在屏样式里写一遍，而"80px 这条上限"就有两份。 */
+.notice__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: var(--notice-list-max-h);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+.notice__list li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-8);
+  font-size: var(--text-caption);
+}
+.notice__list .nl-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap; /* 数据：可截断 */
+}
+.notice__list .nl-reason {
+  color: var(--c-secondary);
+}
+
+/* ---- 屏宿主 -----------------------------------------------------------------
+   任务 10/11/12 的东西挂在 `#page` 里；每一屏自己顶满这一格。
+
+   两层是刻意的，别合成一层：
+     · `#page`  —— 壳的**槽位**，全局唯一。它只在 `index.html` 里出现一次。
+     · `.screen` —— **这一屏的根**，由 `app.js` 每次换屏时新建（`replaceChildren`）。
+   分开的收益是"换屏"只有一种写法（换掉 `.screen` 那一个孩子），
+   而屏自己不必知道 `#page` 在哪、也不必在 `unmount` 时把宿主擦干净
+   （`unmount` 只要管好自己建的东西）。 */
+.page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.screen {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}

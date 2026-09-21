@@ -1,0 +1,488 @@
+/* transfers.css —— 传输列表屏（行 + 行菜单 + 顶部全局摘要 + 空态）。
+ *
+ * 结构与尺寸照 `macos/Sources/BenagenDownloader/Views/TransfersView.swift` 与
+ * `TransferRowView.swift` 的字面量：
+ *   · 顶部/失败条：20/8 与 20/10 内边距（`--pad-bar-x` / `--pad-bar-y*`），头下面一条分隔线；
+ *   · 一行的六段：状态图标（`.frame(width: 16)`）· [标题 / 进度条 / 错误原文] ·
+ *     速度（`.frame(width: 88, alignment: .trailing)`）· 状态（`.frame(width: 64)`）·
+ *     行菜单（`.fixedSize()`）；行之间 `.padding(.vertical, 2)`，段之间 `spacing: 8`；
+ *   · 进度条 `.frame(width: 150)`、高 4（`ProgressView(.linear)` 的观感）；
+ *   · 错误原文 `caption` + 红色 + 可选中，**不设行数上限** ⇒ 全文展开。
+ *
+ * ⚠️ 这一屏**样张里没有**（`a0-proof.html` 画的是文件页）⇒ 与 `verify.css` 同一条口径：
+ *    令牌与样张同源（那是实测的），而布局常量来自 SwiftUI 源码、**没有被样张实测过**。
+ *
+ * ⚠️ 一个色值都不在这里写死：颜色一律 `var(--c-*)`（值只有 `tokens.css` 一份），
+ *    而"哪一档状态配哪个语义色"由 Rust 的 `RowColor` 决定，本文件只把那个档翻成类名
+ *    （翻法在 `js/screens/transfers.js` 的 `COLOR_CLASS` 里，理由在那里）。
+ *
+ * ⚠️ 本文件**一个中文都没有、也一个字面文案都没有**：这一屏会显示的字
+ *    （菜单项名、角标名、那颗「清空已完成」）住在 `index.html` 的
+ *    `tpl-screen-transfers*` 三个模板里，其余每一个字都从命令载荷来。
+ *    样式表里出现一句文案，就是"文案有了第二个家"。
+ *
+ * ⚠️ 类名前缀一律 `transfers__`（BEM），不与壳（`.nav` / `.toolbar` / `.notice`）、
+ *    也不与另外两屏（`.files__` / `.verify__`）撞名 —— 三屏并行时"某一屏的样式顺手
+ *    改了别人"是本仓库最怕的那种分叉。
+ */
+
+/* 这一屏的根。`.screen`（壳给的宿主）已经是 `flex:1` 的一列，这里照它继续往下分。 */
+.transfers {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* 行菜单要相对**这一屏**定位（它在 `.transfers` 里面、绝对定位）。 */
+  position: relative;
+}
+
+/* 一句"把剩下的推开"的空格。用独立的 `<span>` 而不是 `margin-left:auto`：
+   后者会让"这一行里谁在左、谁在右"这件事散在好几个类的 margin 里（`files.css` 同款）。 */
+.transfers__spacer {
+  flex: 1;
+  min-width: var(--sp-8);
+}
+
+/* ---- 顶部：全局速度 + 活动数 + 「清空已完成」--------------------------------- */
+.transfers__header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-8);
+  padding: var(--pad-bar-y-tall) var(--pad-bar-x);
+  font-size: var(--text-callout);
+  border-bottom: 1px solid var(--c-separator);
+}
+/* 那两格数据（图标 + 速度 + 活动数）**单独成组**：`global` 是 `null` 时整组 `hidden`
+   （不编"0 B/s / 活动 0"），而**整条栏与两颗按钮仍然在** —— 见 `transfers.js:paintGlobal`。 */
+.transfers__header-data {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-8);
+  min-width: 0;
+}
+.transfers__header-icon {
+  flex: none;
+  align-self: center;
+  width: var(--row-icon-w);
+  height: var(--row-icon-w);
+  color: var(--c-secondary);
+}
+/* 速度与活动数都是数字：等宽（macOS 的 `.monospacedDigit()` —— 不等宽的话，
+   速度每变一位数整行都会轻微跳动，而这一行每 200 ms 刷一次）。 */
+.transfers__speed {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.transfers__activity {
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+  font-variant-numeric: tabular-nums;
+}
+/* 「刷新」（macOS `TransfersView.swift:76-93`）：**图标 + 文字**（`.labelStyle(.titleAndIcon)`）
+   —— 本仓库在 macOS 上为"只留图标"栽过三次（`RootView.swift:155-158`），所以下面那个
+   `<span>刷新</span>` 不是可选的。形态照 `verify.css` 的 `.verify__refresh` 同款。 */
+.transfers__refresh {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-4);
+  font: inherit;
+  font-size: var(--text-callout);
+  padding: var(--sp-2) var(--sp-6);
+  border: 0;
+  border-radius: var(--r-6);
+  background: transparent;
+  color: var(--c-label);
+  cursor: pointer;
+}
+.transfers__refresh:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.05);
+}
+/* 禁用态：macOS 是 `.disabled(!engineAllowsActions)` ⇒ 变灰。
+   ⚠️ 这里**不补一句"为什么按不动"**：它由闸门那一侧说（引擎不可用时顶部横幅正在说
+      同一件事）。约束 4 那条"按钮灰着、界面什么都不说"指的是**没有别的东西在说**。 */
+.transfers__refresh:disabled {
+  color: var(--c-tertiary);
+  cursor: default;
+}
+.transfers__refresh-ico {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+
+.transfers__clear {
+  flex: none;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  font-size: var(--text-callout);
+  color: var(--c-accent);
+  cursor: pointer;
+}
+.transfers__clear:disabled {
+  color: var(--c-tertiary);
+  cursor: default;
+}
+
+/* ---- 失败条（动作失败 / 取列表失败，两格来源同一处落点）--------------------- */
+.transfers__failure {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-8);
+  padding: var(--pad-bar-y) var(--pad-bar-x);
+  background: var(--bg-notice);
+  font-size: var(--text-caption);
+}
+.transfers__failure-icon {
+  flex: none;
+  align-self: center;
+  width: var(--row-icon-w);
+  height: var(--row-icon-w);
+  /* 语义色由**这一个色值**带下去（图标一律 `currentColor`，见 `dom.js:icon`）。 */
+  color: var(--c-red);
+}
+.transfers__failure-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+/* 内核原文逐字：不 trim、不折行、不加前缀。`pre-wrap` 保留原文里的换行，
+   放不下就折行（**不是**截断 —— 详情看上面那条"不设行数上限"）。 */
+.transfers__failure-text {
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.transfers__dismiss {
+  flex: none;
+}
+.transfers__dismiss-svg {
+  display: block;
+  width: 12px;
+  height: 12px;
+}
+
+/* ---- 行 -------------------------------------------------------------------
+   ⚠️ 行容器的 `overflow: auto` 是承重的：错误原文**全文展开**之后一行可能很高，
+   而"列表自己能滚"与"整屏跟着滚"是两件事（后者会把顶部那条摘要顶出可见区）。 */
+.transfers__rows {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.transfers__row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-8);
+  padding: var(--sp-6) var(--pad-bar-x);
+}
+
+/* 状态图标：`.frame(width: 16)`，颜色跟着 `RowColor` 的类名走（见下面的语义色段）。 */
+.transfers__icon {
+  flex: none;
+  width: var(--row-icon-w);
+  height: var(--row-icon-w);
+  margin-top: 1px;
+  color: var(--c-secondary);
+}
+.transfers__state-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* 中间那一列：标题 / 进度 / 错误原文，三段都是整行的宽度。 */
+.transfers__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+/* ---- ① 标题 + 「已暂停」角标 ------------------------------------------------ */
+.transfers__title-line {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  min-width: 0;
+}
+/* 🔴 **中间省略**（macOS `.lineLimit(1)` + `.truncationMode(.middle)`，
+   `TransferRowView.swift:81-84` 逐字）—— **与 `verify.css` 的 `.verify__path` 同一套做法**，
+   理由在那份文件里写全了，这里只重复承重的那两句：
+     · 纯 CSS 做不到真正的中间省略（`text-overflow: ellipsis` 只画在**行尾**；
+       那个 `direction: rtl` 的经典手法截的是**开头**）⇒ 由 `transfers.js:paintTitle`
+       把标题按**最后一个分隔符**切成两格**紧邻**的 `<span>`，让 CSS 决定首段能放下多少；
+     · **首段**吃掉所有要缩的量（`flex: 0 1 auto` + `min-width: 0`）⇒ 省略号画在它末尾；
+       **尾段**不参与收缩（`flex: 0 0 auto`）⇒ 末段**一个省略号都没有**（文件名是完整的）。
+   ⚠️ `flex-grow` 必须是 **0**（给 1 的话首段会撑满整行、把尾段顶到最右端，
+      一条路径当场断成左右两半 —— `verify.css` 那次是**截图实测到**的）。
+   ⚠️ 尾段给 `max-width: 100%` 兜住"文件名比整行还长"那种极端。 */
+.transfers__title {
+  display: flex;
+  min-width: 0;
+  font-size: var(--text-body);
+  white-space: nowrap;
+}
+.transfers__title-head,
+.transfers__title-tail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.transfers__title-head {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.transfers__title-tail {
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+/* ⚠️ 两格之间**没有**任何空白（`transfers.js` 里不 append 文本节点）—— 多一个空格，
+   标题中间就会多出一道缝，而那是"显示出来的东西与内核给的原文不一样"。 */
+/* 「已暂停」角标：`state` 里 paused 与 waiting 长得一模一样（领域状态把两者合成了
+   同一个 `Waiting`），这个角标是它们在界面上**唯一**的区别（裁决 #88 / 规格 §8.4）。
+   字住在 `index.html` 的行模板里，JS 只切 `hidden`。
+   ⚠️ 两处与 macOS 源码的字面对位，**都是有意取近**（任务 14 逐条核过）：
+      · 圆角： macOS 是 `.background(Capsule())`（= 高度的一半）；这里取 `--r-6`
+        （"全仓只有 6/10/12 三档"那条纪律）。角标高度 ≈ 14px ⇒ 胶囊是 7px 圆角，
+        与 6px 差 1px，**肉眼分不出**；换来的是圆角仍然只有三档。
+      · 内边距 `0 5px`： 逐字来自 `TransferRowView.swift:90` 的 `.padding(.horizontal, 5)`
+        —— 它**不在** 2/4/6/8/12/16/20 的间距档里，是**量出来的值**，所以照写不换成令牌。
+        （macOS 还有一句 `.padding(.vertical, 1)`，这里靠 `line-height` 撑住同一高度。） */
+.transfers__badge {
+  flex: none;
+  font-size: var(--text-caption2);
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: var(--r-6);
+  background: var(--bg-card);
+  color: var(--c-secondary);
+}
+
+/* ---- ② 进度条 + 进度 + 百分比 ----------------------------------------------
+   🔴 那根条的宽度**完全由 Rust 给的 `progress_fraction` 决定**：JS 把那个 0.0–1.0
+   的数写进 `--transfers-fraction`（自定义属性），这里乘 100% —— 于是"百分比"
+   这个换算在前端**一次都不发生**（规格 §3.2：JS 只摆位置）。 */
+.transfers__progress-line {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  min-width: 0;
+}
+.transfers__bar {
+  flex: none;
+  width: 150px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--c-separator);
+  overflow: hidden;
+}
+.transfers__bar-fill {
+  height: 100%;
+  width: calc(var(--transfers-fraction, 0) * 100%);
+  background: var(--c-accent);
+}
+/* 进度与百分比都是数字（同上面那条"等宽"的理由）。 */
+.transfers__progress,
+.transfers__percent {
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- ③ 错误原文（**行下方全文展开**）---------------------------------------
+   🔴 约束 3 点名的那一格：**不截断、不折叠、可选中**。
+     · `white-space: pre-wrap` —— aria2 的 `errorMessage` 里会有换行（`transfer_row.rs`
+       的用例逐字钉着那条多行原文），原样展开；
+     · `overflow-wrap: anywhere` —— 长路径/长 URL 不撑破这一行；
+     · **没有** `max-height` / `line-clamp` / `text-overflow`：全文都在。
+     可选中由模板上的 `selectable` 类标记（`base.css`：浏览器默认**就是**可选的，
+     那个类只是"这一格是可复制的原文"这个标记 + `cursor: text`；解释在那一段注释里）。 */
+.transfers__error {
+  font-size: var(--text-caption);
+  color: var(--c-red);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ---- ④ 速度 / ⑤ 状态 ------------------------------------------------------- */
+.transfers__speed {
+  flex: none;
+  width: 88px;
+  text-align: right;
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.transfers__state {
+  flex: none;
+  width: 64px;
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+}
+
+/* ---- 语义色（`RowColor` 五档 → 四处的颜色）---------------------------------
+   ⚠️ 五档**一个都不能少**：少一档的后果是"那一档退回继承色"（看起来只是没上色），
+   而两档画成一样正是约束 4 明禁的（`every_task_state_maps_to_its_own_color` 钉着
+   五档两两不同）。⚠️ 取不到档位时**不着色**（继承正文色），不编一个默认色 —— 那会让
+   "Rust 加了第六档而这里没跟上"的表现从"这一行没有语义色"退化成"用了别人的颜色"。 */
+.transfers__state.is-secondary,
+.transfers__icon.is-secondary {
+  color: var(--c-secondary);
+}
+.transfers__state.is-blue,
+.transfers__icon.is-blue {
+  color: var(--c-blue);
+}
+.transfers__state.is-green,
+.transfers__icon.is-green {
+  color: var(--c-green);
+}
+.transfers__state.is-red,
+.transfers__icon.is-red {
+  color: var(--c-red);
+}
+.transfers__state.is-orange,
+.transfers__icon.is-orange {
+  color: var(--c-orange);
+}
+
+/* ---- ⑥ 行菜单那颗「⋯」------------------------------------------------------ */
+.transfers__menu-btn {
+  flex: none;
+  width: var(--row-icon-w);
+  height: var(--row-icon-w);
+  margin-top: 1px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--c-secondary);
+  cursor: pointer;
+}
+.transfers__menu-btn:disabled {
+  color: var(--c-tertiary);
+  cursor: default;
+}
+.transfers__menu-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* ---- 行菜单（浮动）---------------------------------------------------------
+   位置由 JS 给（`style.left/top`，相对**这一屏**）—— 这里只管外观。
+   三档圆角里取 10（与空态卡片、提示条同一档），阴影照 macOS 的浮层观感。 */
+.transfers__menu {
+  position: absolute;
+  z-index: 10;
+  min-width: 160px;
+  padding: var(--sp-4);
+  border: 1px solid var(--c-separator);
+  border-radius: var(--r-10);
+  background: var(--bg-window);
+}
+.transfers__menu-item {
+  display: block;
+  width: 100%;
+  padding: var(--sp-4) var(--sp-8);
+  border: 0;
+  border-radius: var(--r-6);
+  background: transparent;
+  font: inherit;
+  font-size: var(--text-body);
+  text-align: left;
+  color: var(--c-label);
+  cursor: pointer;
+}
+.transfers__menu-item:hover {
+  background: var(--bg-notice);
+}
+.transfers__menu-item:disabled {
+  color: var(--c-tertiary);
+  cursor: default;
+}
+.transfers__menu-item:disabled:hover {
+  background: transparent;
+}
+/* 「移除」是破坏性动作（macOS 的 `role: .destructive`）：那一项用错误色标出来。 */
+.transfers__menu-item.is-destructive {
+  color: var(--c-red);
+}
+.transfers__menu-item.is-destructive:disabled {
+  color: var(--c-tertiary);
+}
+.transfers__menu-sep {
+  display: block;
+  height: 1px;
+  margin: var(--sp-4) var(--sp-2);
+  background: var(--c-separator);
+}
+
+/* ---- "还没有快照"那一档（转圈 + 一句话）------------------------------------
+   照 `TransfersView.swift:113-121` 的 `centered { ProgressView(); Text(…) }`
+   （`.callout` 字号、secondary 色，两样之间 8）。 */
+.transfers__loading {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-8);
+  padding: var(--sp-20);
+}
+/* 与 `empty.css` / `files.css` 那两颗同一个做法（14px、2px 描边、只留一条透明边）。
+   ⚠️ **不用原生 `<progress>`**：各家 webview 给它的大脑门样式差别很大，而这里只要一颗
+      与另外两屏一样的圈（那一条取舍的完整论证在 `empty.css` 里）。 */
+.transfers__spinner {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--c-tertiary);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: transfers-spin 800ms linear infinite;
+}
+@keyframes transfers-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* ⚠️ 尊重系统的"减少动态效果"：这不是体贴，是无障碍要求
+   （前庭功能障碍的用户会因此不适），而 CSS 里它只需要一条媒体查询
+   —— 与 `empty.css` / `files.css` 那两条同源。 */
+@media (prefers-reduced-motion: reduce) {
+  .transfers__spinner {
+    animation-duration: 2400ms;
+  }
+}
+.transfers__loading-text {
+  font-size: var(--text-callout);
+  color: var(--c-secondary);
+}
+
+/* ---- 空态 ------------------------------------------------------------------
+   macOS `TransfersView.centered`：居中一列、间距 8、内边距 20。
+   ⚠️ 这一块**只在载荷给了那句话时**出现；引擎不可用那一档它整个不出现
+   （顶部那条常驻横幅已经在说同一句话）。 */
+.transfers__empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-8);
+  padding: var(--sp-20);
+}
+.transfers__empty-icon {
+  width: 32px;
+  height: 32px;
+  color: var(--c-tertiary);
+}
+.transfers__empty-text {
+  font-size: var(--text-callout);
+  color: var(--c-secondary);
+}

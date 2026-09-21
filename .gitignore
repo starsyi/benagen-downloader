@@ -1,0 +1,28 @@
+# 运行期与构建产物（可再生，不入库）
+__pycache__/
+*.py[cod]
+*.log
+
+# 客户端构建产物
+macos/dist/
+macos/.build/
+windows/dist/
+windows/target/
+downloader/dist/
+dist_cli/
+
+# Rust
+target/
+
+# 各语言的本地依赖缓存
+node_modules/
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ⚠️ 不要忽略 core/assets/ 与 downloader/internal/engine/assets/ ——
+# go:embed 与 include_bytes! 都要求下载引擎的二进制真实存在于包目录内，
+# 一旦被忽略将无法编译。

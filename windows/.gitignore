@@ -1,0 +1,17 @@
+# Rust 构建产物（可再生，不入库）。与 core/.gitignore 同形。
+# 工作区的产物落在 windows/target/（不是 shell-core/target/）。
+/target/
+
+# 单文件交付形态（任务 22）：`build_windows.sh` 产出
+#   windows/dist/BenagenDownloader-Windows-x86_64.exe
+# 与 `macos/dist/` 同一条纪律：**可再生产物，不入库** —— 它必须能被随时重建
+# （脚本现编内核 + 现编壳 + 现打包），源码才是唯一的真相；何况包里塞着内核 exe，
+# 提交进来会让仓库白白变重，也会让"发出去的是哪一个"说不清。
+/dist/
+
+# Tauri 的构建期代码生成（`tauri-build` 每跑一次重写一遍：权限 ACL 的 manifest 与
+# 几份 JSON schema）。**可再生产物，不入库** —— 与 `/target/`、`/dist/` 同一条纪律，
+# 也是 Tauri 官方模板的选择（它自己的 `src-tauri/.gitignore` 里就是这一条）。
+# ⚠️ 它必须**落盘**才能起作用：`shell-win/capabilities/default.json` 的 `$schema`
+#    指的就是这里的 `desktop-schema.json`（编辑器靠它给权限清单做提示/补全）。
+/shell-win/gen/

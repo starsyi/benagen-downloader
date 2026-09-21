@@ -1,0 +1,125 @@
+# `shell-win` —— Windows 壳的**可执行目标**（规格 §4.3、§7.1）。
+#
+# 与 `shell-core` 的分工（别把这条搞反）：
+#   `shell-core` = 跨平台纯逻辑（协议镜像、Presentation 移植、本地存储、所有纯计算），
+#                  **不含 OS 调用**，于是能在 macOS 上 `cargo test`；
+#   `shell-win`  = **Tauri 壳**：宿主进程装配、命令层（`invoke` 的全部面）、系统集成
+#                  （进程创建标志、原生消息框、WebView2 loader）。
+#                 ⚠️ 这一行的后半句改过两次，两次都记在这里，免得读者以为它一直是这样：
+#                   · 阶段 A 之前是"egui 视图（窗口、字体）"（随 `views/`、`fonts.rs` 删除）；
+#                   · 阶段 A 是"本地 HTTP 服务 + 系统浏览器"（第二代传输层，规格 §1.2 废掉，
+#                     本任务把它整个删掉：`server/`、`token.rs`、`heartbeat.rs`、`browser.rs`、
+#                     `assets.rs`、`envelope.rs`）。**界面重新回到进程里**（Tauri 的 webview），
+#                     但它不是 egui —— 前端是 `windows/web/` 里的 HTML/CSS/JS（规格 §6.1）。
+# 本 crate 里的每一处平台专属写法，都必须带着"为什么它是平台专属的"的注释——
+# 那是这条拆分的账本。
+[package]
+name = "shell-win"
+version = "0.1.0"
+edition = "2021"
+# ⚠️ 视图不单测（规格 §4.3）：能被写出断言的逻辑一律搬进 `shell-core`。
+#    本 crate 里的测试都只断言**"平台专属的那个值被传到了应用点"**，
+#    不断言平台行为本身（窗口有没有显示、转发函数在真 Windows 上对不对，规格 §9.2）：
+#      · `spawn.rs` 的 `CREATE_NO_WINDOW` 是否被传给 `Command`；
+#      · `wv2.rs` 的"哪一个符号没取到"那句话（纯函数，喂一个假的存在判据）。
+#    ⚠️ 上面这一串改过两次，两次都如实记账：阶段 A 之前列的是 `fonts.rs` 的两条、
+#       阶段 A 列的是 `browser.rs` 的候选挑选 —— 那两个模块都已随各自的代际删除。
+
+# ⚠️ 本 crate **同时**是 lib 与 bin（D1，理由见计划）：
+#   · lib  —— 新代码住在这里。bin target 里"没被 main 用到的 pub 项"会触发
+#             `dead_code` 告警（零告警是本仓库口径），lib 的公开面不算死代码，
+#             于是任务能自底向上做、每一步都编译干净；
+#   · bin  —— 装配入口（`src/main.rs`），交付形态就是它（`[[bin]]` 段在下面）。
+# ⚠️ lib 名与 crate 名不同名是**刻意的**：`shell-win` 不是合法标识符。
+[lib]
+name = "shell_win"
+path = "src/lib.rs"
+
+# 产物名是**交付形态的一部分**（规格 §11.4：`BenagenDownloader-Windows-x86_64.exe`）：
+# cargo 会产出 `BenagenDownloader.exe`，构建脚本再按规格把它改名。
+[[bin]]
+name = "BenagenDownloader"
+path = "src/main.rs"
+
+# ⚠️ 本 crate 有**构建脚本**（`build.rs`，任务 22 + 本任务）——cargo 按约定自动发现它，
+#    所以这里没有 `build = …` 那一行；但它的存在是这个清单的一部分，写在这里免得读者意外：
+#      · **`tauri_build::build()`**（本任务）：Tauri 的代码生成（上下文、权限 ACL 的 schema）；
+#      · **内嵌内核 exe**：把 `core/target/x86_64-pc-windows-gnu/release/benagen-core.exe`
+#        拷进 `OUT_DIR` 并**当场断言** PE 头/架构/子系统（W-1），再把它编成常量
+#        （`BENAGEN_CORE_SHA256`）交给 `src/embed.rs`；
+#      · **内嵌 WebView2Loader.dll**（本任务）：拷进 `OUT_DIR` 并**断言 sha256**，
+#        交给 `src/wv2.rs` 当编译期常量（单文件交付的判据，规格 §4）；
+#      · **manifest 与版本资源**（W-7）：生成 `.rc` → `windres` → 链进这个 exe。
+#     ⚠️ 上面**内核那一件**只在 Windows 靶上干活（宿主 `cargo test` 不该被要求先备好一个
+#        Windows 内核）；`tauri_build::build()` 与**两条断言**在所有靶上都跑
+#        （理由写在 `build.rs` 的对应函数上）。
+#        而"先编内核、再编壳"这个**顺序**由 `windows/scripts/build_windows.sh` 负责 ——
+#        cargo 不知道这层依赖（见 `build.rs` 文件头）。
+
+[build-dependencies]
+# Tauri 的构建期代码生成（规格 §9.0：壳在宿主上也要能编能跑）。
+# ⚠️ `features = []` 是**刻意的**：tauri 的 feature 会牵动整棵依赖树。
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+shell-core = { path = "../shell-core" }
+# 组 `hello` 的 params（`serde_json::json!`）与读内核回执的 JSON。
+# 这里**不**自己再定义一套协议类型：协议镜像只有 `shell-core` 那一份（规格 §5 要点 1）。
+serde_json = "1"
+# **宿主进程**（规格 §3.3）：窗口、webview、`invoke` 命令层、关窗事件。
+# ⚠️ **它是本代唯一新增的重量级依赖**，而且要接受两件已经知道的事：
+#   · 它把整棵依赖树拉起来（wry / tao / windows-sys / muda / …）——这是"界面回到进程里"
+#     的价钱（第二代那套 HTTP + 系统浏览器正是为了躲开它，而规格 §1.2 废掉了那条路）；
+#   · **它的默认 feature 是空集**（不需要 `devtools` / `protocol-asset` / 各种 bundle 能力），
+#     本代用不到的一个都不开 —— 与本 crate 其余依赖同一条口径。
+tauri = { version = "2", features = [] }
+# ⚠️ 这里**没有** `eframe`/`egui`（阶段 A 删的），也**没有** `tiny_http`/`getrandom`
+#    （本任务删的第二代传输层：HTTP 服务、一次性 token 的熵源）。
+#    字体不由壳加载，而是页面的 CSS（规格 §6.3）；本代**不监听任何端口**（规格 §3.3）。
+
+# 落点①②：**原生消息框**（`MessageBoxW`）与 **WebView2 loader 的装载**（`LoadLibraryW` /
+# `GetProcAddress`）。交付形态的子系统是 `windows`（**没有控制台**）⇒ 消息框是启动期失败时
+# 唯一还能跟人说话的通道（规格 §7、W-2）。
+#
+# ⚠️ **必须放在 `[target.'cfg(windows)'.dependencies]` 里**，不许放 `[dependencies]`：
+#    放错的话宿主构建也会去解析它，而宿主上 `Win32_*` 一个模块都不存在。
+# ⚠️ 体量：`windows-sys` 的**元数据**很大，但那不是产物体积 —— 只有被 enable 的
+#    feature 对应的绑定会被编出来。实测（`docs/superpowers/2026-09-19-tiny-http-crosscompile.md`）：
+#    产物只多出 `user32.dll` 一个**系统**导入，没有多出任何要随包发的文件。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    # `MessageBoxW`（`wv2.rs` 的失败出口、`main.rs` 的启动期致命失败与单实例那句话）。
+    "Win32_UI_WindowsAndMessaging",
+    # `LoadLibraryW` / `GetProcAddress`（`wv2.rs`：把内嵌的 DLL 装载起来，
+    # 再把 5 个 WebView2 loader 符号解析成函数指针）。
+    "Win32_System_LibraryLoader",
+    # `ShellExecuteW`（`reveal.rs`：「在资源管理器中显示」那一次调用）。
+    # ⚠️ **本代之前它是被移除的**（第二代那个"把 URL 交给系统默认浏览器"的用点随传输层
+    #    一起删了，规格 §8.1 ④）—— 任务 8 按规格 §7 那张表**把它加回来**：`explorer /select,`
+    #    只能经 `ShellExecuteW` 启动。多出来的导入是 `shell32.dll`（**系统 DLL**，
+    #    `build_windows.sh` 的依赖白名单里本来就有它）。
+    "Win32_UI_Shell",
+    # `CreateMutexW` / `CloseHandle`（`single_instance.rs`：单实例那一个命名互斥体）。
+    # ⚠️ `Win32_Security` 是**跟着来的**：`CreateMutexW` 的签名里有
+    #    `*const SECURITY_ATTRIBUTES`（我们传 `null`，但那个类型要在作用域里才编得过）。
+    "Win32_System_Threading",
+    "Win32_Security",
+    # `GetLastError` / `ERROR_ALREADY_EXISTS` / `HWND` / `HINSTANCE` / `BOOL`
+    # （单实例的判据读的就是那个错误码；`HWND` 与 `HINSTANCE` 是上面两个 API 的参数类型）。
+    #
+    # ⚠️ 下面两条是**「选择文件夹」那次改动**（2026-09-20 真机反馈）加的，各自只为一件事：
+    "Win32_Foundation",
+    # `SHBrowseForFolderW` / `SHGetPathFromIDListW` 与 `BROWSEINFOW` / `BIF_*`
+    # （`pickdir.rs`）。⚠️ **这一条是跟着来的、不是多余的**：那两个 API 的签名里有
+    # `*mut Common::ITEMIDLIST`（PIDL），而那个类型定义在 `Win32_UI_Shell_Common` 里
+    # —— 不开它，`Win32_UI_Shell` 里的这两个函数**根本不会被编出来**。
+    # `BIF_NEWDIALOGSTYLE`（= 规格 §2.1 要的 `canCreateDirectories`）也在这里。
+    "Win32_UI_Shell_Common",
+    # `CoTaskMemFree`（`pickdir.rs`）：**释放那个 PIDL**。
+    # ⚠️ 它看着像"随手多开一个 feature"，其实是别处没有这条 API：PIDL 的所有权契约是
+    #    "调用方用 `CoTaskMemFree` 释放"（`SHBrowseForFolderW` 的文档逐字），
+    #    而 `ILFree` / `SHFree` 在 windows-sys 0.59 里**一个都没有绑定**。
+    #    不开它就只能泄漏（每次点一次「选择…」漏一块）——那不叫省依赖，叫留一个洞。
+    # 代价：导入表里多出 `ole32.dll`（系统 DLL，构建脚本的白名单里本来就有它）。
+    "Win32_System_Com",
+] }

@@ -1,0 +1,94 @@
+/* app.css —— 样式汇总（唯一入口，由 `index.html` 的 `<link>` 加载）。
+ *
+ * 规格 §6.1：**没有构建步骤** ⇒ 这里用原生 `@import`，没有打包器。
+ *
+ * ⚠️ 除 `@import` 清单之外，本文件里**只有一块 `@font-face`**（在文件末尾）：
+ *    它是内嵌字体唯一的声明处，理由写在那一块上。**别往这里加选择器。**
+ *
+ * ⚠️ **顺序是承重的**，别按字母重排：
+ *   1. `tokens.css` 先（后面每一份都要 `var(--…)`，没令牌全塌）；
+ *   2. `base.css` 次（元素默认值，壳与屏都会覆盖它）；
+ *   3. `shell.css`（壳 —— 每屏都在）；
+ *   4. 屏样式最后（**只有它该覆盖壳**；反过来就成了"某一屏改了壳"）。
+ *
+ * 🔴 **新增一屏时只加一行**（任务 10/11/12 各加自己的那一行），
+ *    并且**不要**在这一行上面写任何选择器 —— 这份文件的全部内容就是这张清单。
+ *    屏与屏之间**不许**互相 `@import`：任务 10/11/12 是三个独立的屏，
+ *    一个屏的样式表里出现另一个屏的选择器，等于让它们从此不能分别改。
+ */
+@import url("./css/tokens.css");
+@import url("./css/base.css");
+@import url("./css/shell.css");
+
+/* ---- 屏样式（一屏一行）--------------------------------------------------- */
+@import url("./css/screens/empty.css");
+@import url("./css/screens/files.css");
+@import url("./css/screens/transfers.css");
+@import url("./css/screens/verify.css");
+
+/* ---- 模态层（任务 13）-----------------------------------------------------
+   ⚠️ 它**不是**一屏，所以**不放在 `css/screens/` 下**：屏挂在 `#page` 里、互斥，
+   而这一份管的是"压在窗口上"的那四扇（换码面板 / 设置 / 关于 / 许可）。
+   位置在屏样式**之后**：模态要压在屏之上（同一条"后面的覆盖前面的"）。
+   ⚠️ 仍是**一行**：新增一扇窗时，样式加在 `css/panels.css` 里面，这里不动。 */
+@import url("./css/panels.css");
+
+/* ===========================================================================
+   内嵌字体（规格 §6.3 / W-5）—— **本文件里唯一一块不是 `@import` 的东西**
+   ===========================================================================
+
+   这是本代界面**真正用的那一款字体的子集**：Noto Sans SC Regular（SIL OFL 1.1）。
+   样张（`windows/design/a0-proof.html`）声明的是同一款、同一个 family 名，所以
+   **样张上被批准的那个中文观感就是客户机上的观感** —— 样张 README 第 ① 条偏离
+   （"样张没有 Inter 子集"）到此收口：两边此刻渲染的是同一份文件。
+
+   🔴 **`src` 为什么写 `./fonts/…` 而不是 `../assets/…`**（这条是承重的，别改回去）
+      `shell-win/tauri.conf.json` 的 `build.frontendDist = "../web"` ⇒ **运行时
+      `windows/web/` 就是 webview 的根**。本文件在根上，`url()` 由浏览器相对**本文件
+      的 URL** 解析：`../assets/…` 在根上再往上退一级，会被 URL 标准的
+      "remove dot segments" 夹回根 —— 也就是请求 `/assets/ui-subset.otf`，
+      而那个路径下的文件**不存在**（字体不在 `web/` 里）。
+      后果不是报错，是**静默回退到系统字体**：页面看着"也能看"，但那不是交付的样子
+      —— 与样张 README 里 `file://` 那一坑是同一个失败形态（"没加载上而没人看得出来"）。
+      ⚠️ 交付版**必须**是 `./fonts/…`：字体在 `windows/web/fonts/` 下，取得到、且
+         与 `.css` 同级目录关系一目了然。
+
+   ⚠️ **两份副本的关系**（这是本文件最需要下一读者知道的一件事）
+      · **唯一真相**：`windows/assets/ui-subset.otf` —— 由
+        `windows/scripts/make_font_subset.sh` 生成，它的 sha256 被那份脚本的
+        `SUBSET_SHA256` 钉着（`--check` 逐字节核），字体覆盖判据（`test.sh` 第 0.6 步）
+        比的也是那一份。
+      · **交付副本**：`windows/web/fonts/ui-subset.otf` —— 就是本行 `url()` 指向的文件。
+        它与上面那份**逐字节相同**（改动时实测：两边 sha256 都是
+        `8b2c504a…f70f80`，等于 `SUBSET_SHA256`）。
+      · 🔴 **重新生成子集之后，必须把新产物拷到 `windows/web/fonts/`**：
+        `cp windows/assets/ui-subset.otf windows/web/fonts/`
+        （许可全文同理：`cp windows/assets/OFL-1.1.txt windows/web/fonts/`）
+        ⚠️ **忘了这一步会红**（判据是任务 18 补的，此前确实是"没有属主"），两条都会响：
+          ① `make_font_subset.sh --check` 的"交付副本"那一条（`test.sh` 第 0.5 步）；
+          ② `check_design_fonts.sh` 的字体判据（第 0.6 步）—— 它比对的是
+             **sha256**，交付副本停在上一版子集时 sha 不同 ⇒ 红。
+        忘了的后果本来是"判据全绿、而客户看到的是上一版子集"：新加的那个字在界面上是
+        **豆腐块**。今天这条路上有两盏灯，别把它们当成噪音。
+        （另一条同样成立的路是"构建脚本每次把 `assets/` 那份拷过来、`web/` 下不留
+        入库副本"—— 那要动 `build_windows.sh`，本代没走；**本文件这一块记着它没被排除**。）
+
+   ⚠️ **随附许可**：OFL 1.1 的条件 2 要求随附许可全文。两条路都在：
+      ① 同目录的 `fonts/OFL-1.1.txt`（与 `windows/assets/OFL-1.1.txt` **逐字节相同**，
+         也与官方包里的 `LICENSE` 逐字节相同 —— sha256 `6a73f954…e2bf2`）跟着字体走；
+      ② exe 里还有一份**能在界面上看到**的全文（`shell-win/src/licenses.rs` 的
+         `include_str!` → 设置里的「开源许可」那一扇），由 `build_windows.sh` 的四道判据守着。
+      字体自己的 name 表里也保留着版权与 OFL 声明（`make_font_subset.sh` 第 8 步断言）。
+
+   ⚠️ **只 `url()`、不写 `local()`**：`local("Noto Sans SC")` 会让**用户机器上装的那份
+      Noto** 抢在交付子集前面 —— 而"客户机上看到的就是样张上批准的那一款"是本任务的
+      全部意义（同一款字体的不同版本，字重与字距是看得出来的）。样张也是这么写的。
+      子集里**没有**的字（例如文件名里的生僻字）由 CSS 的**逐字符回退**接手：
+      family 列表的下一档 `system-ui` / `Segoe UI` —— 这正是 `make_font_subset.sh`
+      头部"子集不负责文件名里的生僻字"那一节的落地方式（那一节要求的就是这个分工）。 */
+@font-face {
+  font-family: "Noto Sans SC";
+  src: url("./fonts/ui-subset.otf") format("opentype");
+  font-weight: 400;      /* 子集里只有 Regular 一档，照样张写 */
+  font-display: swap;    /* 字体就 185 KB 且在本地磁盘上；swap 与样张一致 */
+}

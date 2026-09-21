@@ -1,0 +1,1307 @@
+{
+  "about": {
+    "data": {
+      "version": "0.1.0"
+    },
+    "ok": true
+  },
+  "aboutFallback": {
+    "data": {
+      "version": "版本未知（构建时取不到版本号：shell-win/build.rs 没交来 BENAGEN_VERSION 或 CARGO_PKG_VERSION）"
+    },
+    "ok": true
+  },
+  "enqueueNothing": {
+    "data": {
+      "rejections": [],
+      "summary": "没有需要下载的文件",
+      "switches_to_transfers": false
+    },
+    "ok": true
+  },
+  "enqueuePartial": {
+    "data": {
+      "rejections": [
+        {
+          "path": "z.bin",
+          "reason": "清单里没有 \"z.bin\"（既不是文件，也不是任何文件的目录前缀）"
+        }
+      ],
+      "summary": "已加入 3 个下载任务",
+      "switches_to_transfers": true
+    },
+    "ok": true
+  },
+  "historyEmpty": {
+    "data": {
+      "rows": []
+    },
+    "ok": true
+  },
+  "historyGet": {
+    "data": {
+      "rows": [
+        {
+          "base_url": "",
+          "code": "R.a1b2C3d4E5f6G7h8I9j",
+          "note": "客户张三 / 9月肿瘤数据",
+          "time_text": "2026-09-18 09:12",
+          "title": "客户张三 / 9月肿瘤数据"
+        },
+        {
+          "base_url": "http://delivery.example.com:8010",
+          "code": "R.9z8Y7x6W5v4U3t2S1r0",
+          "note": "",
+          "time_text": "2026-09-17 16:30",
+          "title": "R.9z8Y7x6W5v4U3t2S1r0"
+        },
+        {
+          "base_url": "",
+          "code": "R.ZZZZZZZZZZZZZZZZZZZZ",
+          "note": "",
+          "time_text": "2026-09-16 08:00",
+          "title": "R.ZZZZZZZZZZZZZZZZZZZZ"
+        }
+      ]
+    },
+    "ok": true
+  },
+  "mirrorCases": {
+    "noteDrafts": {
+      "cases": [
+        {
+          "name": "① 没有草稿 ⇒ 一个字节都不写（用户只是点了一下那一行）",
+          "ops": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "enter"
+            }
+          ],
+          "rows": [
+            {
+              "base_url": "",
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "旧备注",
+              "time_text": "09-18 09:12",
+              "title": "旧备注"
+            }
+          ],
+          "rule": "no-draft",
+          "writes": []
+        },
+        {
+          "name": "③ 与现值相同 ⇒ 不写（免得每次失焦都写一次盘）",
+          "ops": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "edit",
+              "text": "旧备注"
+            },
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "enter"
+            }
+          ],
+          "rows": [
+            {
+              "base_url": "",
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "旧备注",
+              "time_text": "09-18 09:12",
+              "title": "旧备注"
+            }
+          ],
+          "rule": "unchanged",
+          "writes": []
+        },
+        {
+          "name": "④ 有改动 ⇒ 把**用户敲的原文**交出去（回车那一个提交点）",
+          "ops": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "edit",
+              "text": "客户李四"
+            },
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "enter"
+            }
+          ],
+          "rows": [
+            {
+              "base_url": "",
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "旧备注",
+              "time_text": "09-18 09:12",
+              "title": "旧备注"
+            }
+          ],
+          "rule": "write",
+          "writes": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "客户李四"
+            }
+          ]
+        },
+        {
+          "name": "交完之后再把同一句交一次 ⇒ 不写（现值已经变成它了）",
+          "ops": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "edit",
+              "text": "客户李四"
+            },
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "enter"
+            },
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "edit",
+              "text": "客户李四"
+            },
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "enter"
+            }
+          ],
+          "rows": [
+            {
+              "base_url": "",
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "旧备注",
+              "time_text": "09-18 09:12",
+              "title": "旧备注"
+            }
+          ],
+          "rule": "after-write",
+          "writes": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "客户李四"
+            }
+          ]
+        },
+        {
+          "name": "用户把备注清空 ⇒ 那是**一个真的草稿**（`Some(\"\")`，不是「没碰过」）",
+          "ops": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "edit",
+              "text": ""
+            },
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "enter"
+            }
+          ],
+          "rows": [
+            {
+              "base_url": "",
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "旧备注",
+              "time_text": "09-18 09:12",
+              "title": "旧备注"
+            }
+          ],
+          "rule": "empty-is-a-draft",
+          "writes": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": ""
+            }
+          ]
+        },
+        {
+          "name": "失焦是**同一个判决**（第二个提交点，与回车不分叉）",
+          "ops": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "edit",
+              "text": "失焦那一句"
+            },
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "blur"
+            }
+          ],
+          "rows": [
+            {
+              "base_url": "",
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "旧备注",
+              "time_text": "09-18 09:12",
+              "title": "旧备注"
+            }
+          ],
+          "rule": "blur",
+          "writes": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "失焦那一句"
+            }
+          ]
+        },
+        {
+          "name": "⑤ 关面板 ⇒ 把还挂着的**全部**交出去，**按码排序**（第三个提交点）",
+          "ops": [
+            {
+              "code": "R.bbbbbbbbbbbbbbbbbbbb",
+              "op": "edit",
+              "text": "b 的新备注"
+            },
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "edit",
+              "text": "a 的新备注"
+            },
+            {
+              "op": "close"
+            }
+          ],
+          "rows": [
+            {
+              "base_url": "",
+              "code": "R.bbbbbbbbbbbbbbbbbbbb",
+              "note": "b 的旧备注",
+              "time_text": "09-18 09:12",
+              "title": "b 的旧备注"
+            },
+            {
+              "base_url": "",
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "a 的旧备注",
+              "time_text": "09-18 09:12",
+              "title": "a 的旧备注"
+            }
+          ],
+          "rule": "close-order",
+          "writes": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "a 的新备注"
+            },
+            {
+              "code": "R.bbbbbbbbbbbbbbbbbbbb",
+              "note": "b 的新备注"
+            }
+          ]
+        },
+        {
+          "name": "⑤ 关面板 ⇒ 没草稿的、以及没改过的**都不写**（只有那一条交出去）",
+          "ops": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "op": "edit",
+              "text": "a 的新备注"
+            },
+            {
+              "code": "R.bbbbbbbbbbbbbbbbbbbb",
+              "op": "edit",
+              "text": "b 的旧备注"
+            },
+            {
+              "op": "close"
+            }
+          ],
+          "rows": [
+            {
+              "base_url": "",
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "a 的旧备注",
+              "time_text": "09-18 09:12",
+              "title": "a 的旧备注"
+            },
+            {
+              "base_url": "",
+              "code": "R.bbbbbbbbbbbbbbbbbbbb",
+              "note": "b 的旧备注",
+              "time_text": "09-18 09:12",
+              "title": "b 的旧备注"
+            },
+            {
+              "base_url": "",
+              "code": "R.cccccccccccccccccccc",
+              "note": "c 的旧备注",
+              "time_text": "09-18 09:12",
+              "title": "c 的旧备注"
+            }
+          ],
+          "rule": "close-partial",
+          "writes": [
+            {
+              "code": "R.aaaaaaaaaaaaaaaaaaaa",
+              "note": "a 的新备注"
+            }
+          ]
+        }
+      ],
+      "notCoveredThroughTheDom": [
+        "② 这一行已经不在屏上了 ⇒ 丢掉草稿、不写：面板的行**只从它自己的载荷来**，而载荷只在这几处变（打开时读一次、写成功后用回执那一份重画）——\"草稿还挂着、那一行却没了\"在这个界面上**构造不出来**。Rust 那一侧的用例仍然钉着它（`batch_history.rs` 的用例）。"
+      ]
+    },
+    "settingsMatches": {
+      "cases": [
+        {
+          "current": {
+            "connections": 16,
+            "limit_mbps": 0,
+            "max_tries": 3,
+            "min_split_size": "21M",
+            "parallel": 8,
+            "retry_wait": 1,
+            "splits": 16
+          },
+          "dirty": false,
+          "form": {
+            "connections": 16,
+            "limit_mbps": 0,
+            "max_tries": 3,
+            "min_split_size": "21M",
+            "parallel": 8,
+            "retry_wait": 1,
+            "splits": 16
+          },
+          "name": "表里与内核那一份逐字段相同 ⇒ 「与内核当前参数一致」",
+          "rule": "same"
+        },
+        {
+          "current": {
+            "connections": 16,
+            "limit_mbps": 0,
+            "max_tries": 3,
+            "min_split_size": "21M",
+            "parallel": 8,
+            "retry_wait": 1,
+            "splits": 16
+          },
+          "dirty": true,
+          "form": {
+            "connections": 16,
+            "limit_mbps": 0,
+            "max_tries": 3,
+            "min_split_size": "21M",
+            "parallel": 4,
+            "retry_wait": 1,
+            "splits": 16
+          },
+          "name": "-j 从 8 改成 4 ⇒ 有未保存的改动",
+          "rule": "one-number-changed"
+        },
+        {
+          "current": {
+            "connections": 16,
+            "limit_mbps": 0,
+            "max_tries": 3,
+            "min_split_size": "21M",
+            "parallel": 8,
+            "retry_wait": 1,
+            "splits": 16
+          },
+          "dirty": false,
+          "form": {
+            "connections": 16,
+            "limit_mbps": 0,
+            "max_tries": 3,
+            "min_split_size": "21M",
+            "parallel": 8,
+            "retry_wait": 1,
+            "splits": 16
+          },
+          "name": "把 -j 敲成同一个值 ⇒ **不算**改动（判据是\"值一不一样\"，不是\"碰过就算\"）",
+          "rule": "number-touched-but-same"
+        },
+        {
+          "current": {
+            "connections": 16,
+            "limit_mbps": 0,
+            "max_tries": 3,
+            "min_split_size": "21M",
+            "parallel": 8,
+            "retry_wait": 1,
+            "splits": 16
+          },
+          "dirty": true,
+          "form": {
+            "connections": 16,
+            "limit_mbps": 0,
+            "max_tries": 3,
+            "min_split_size": "20M",
+            "parallel": 8,
+            "retry_wait": 1,
+            "splits": 16
+          },
+          "name": "-k 换成集合里的另一项（`20M`）⇒ 有未保存的改动",
+          "rule": "enum-changed"
+        },
+        {
+          "current": {
+            "connections": 16,
+            "limit_mbps": 0,
+            "max_tries": 3,
+            "min_split_size": "21M",
+            "parallel": 8,
+            "retry_wait": 1,
+            "splits": 16
+          },
+          "dirty": true,
+          "form": {
+            "connections": 1,
+            "limit_mbps": 100,
+            "max_tries": 100,
+            "min_split_size": "1M",
+            "parallel": 1,
+            "retry_wait": 60,
+            "splits": 1
+          },
+          "name": "七项全不一样 ⇒ 有未保存的改动",
+          "rule": "all-seven-differ"
+        },
+        {
+          "current": {
+            "connections": 4,
+            "limit_mbps": 250,
+            "max_tries": 7,
+            "min_split_size": "5M",
+            "parallel": 16,
+            "retry_wait": 30,
+            "splits": 2
+          },
+          "dirty": false,
+          "form": {
+            "connections": 4,
+            "limit_mbps": 250,
+            "max_tries": 7,
+            "min_split_size": "5M",
+            "parallel": 16,
+            "retry_wait": 30,
+            "splits": 2
+          },
+          "name": "载荷里那一份**不是**夹具初始的那一份（内核重启之后就是这样）⇒ 表里与它相同也算「一致」",
+          "rule": "current-is-not-the-fixture-one"
+        }
+      ],
+      "fieldOrder": [
+        "parallel",
+        "connections",
+        "splits",
+        "min_split_size",
+        "limit_mbps",
+        "max_tries",
+        "retry_wait"
+      ]
+    }
+  },
+  "preferencesCheckBad": {
+    "data": {
+      "check": "这个位置不存在：/nope",
+      "confirmation": "下载目录将从「/Volumes/Data/交付」改为「/nope」。\n\n改完会立刻重启内核，三条后果：\n1. 正在跑的任务会停（内核重启），没传完的文件要重新点一次下载；\n2. 新目录里没有记录的文件会重新校验（内核的状态文件就在下载目录里）；\n3. 旧目录里的文件不会被删、也不会被搬走。"
+    },
+    "ok": true
+  },
+  "preferencesCheckOk": {
+    "data": {
+      "check": null,
+      "confirmation": "下载目录将从「/Volumes/Data/交付」改为「/Volumes/Data/交付_新盘」。\n\n改完会立刻重启内核，三条后果：\n1. 正在跑的任务会停（内核重启），没传完的文件要重新点一次下载；\n2. 新目录里没有记录的文件会重新校验（内核的状态文件就在下载目录里）；\n3. 旧目录里的文件不会被删、也不会被搬走。"
+    },
+    "ok": true
+  },
+  "preferencesGet": {
+    "data": {
+      "dir": "/Volumes/Data/交付",
+      "display": "/Volumes/Data/交付",
+      "section_note": "没有设置过时，壳**不指定**下载目录，由内核用它自己的默认值。改变目录会立刻重启内核（正在跑的任务会停）。请尽量选**本机磁盘**上的目录：网络盘（NFS / SMB）会让界面明显变慢。"
+    },
+    "ok": true
+  },
+  "preferencesGetDefault": {
+    "data": {
+      "dir": "",
+      "display": "默认（~/Downloads/Benagen，由内核决定）",
+      "section_note": "没有设置过时，壳**不指定**下载目录，由内核用它自己的默认值。改变目录会立刻重启内核（正在跑的任务会停）。请尽量选**本机磁盘**上的目录：网络盘（NFS / SMB）会让界面明显变慢。"
+    },
+    "ok": true
+  },
+  "preferencesSetChanged": {
+    "data": {
+      "headline": "下载目录已改（内核已按新目录重启）",
+      "is_failure": false,
+      "notice_text": "下载目录已改为 /Volumes/Data/交付_新盘（内核已按新目录重启）",
+      "path_detail": "/Volumes/Data/交付_新盘"
+    },
+    "ok": true
+  },
+  "preferencesSetFailed": {
+    "data": {
+      "headline": "内核还在重启中，这一次没有改成。下载目录已经记下来了，下次启动会按它生效。",
+      "is_failure": true,
+      "notice_text": "内核还在重启中，这一次没有改成。下载目录已经记下来了，下次启动会按它生效。",
+      "path_detail": null
+    },
+    "ok": true
+  },
+  "preferencesSetUnchanged": {
+    "data": {
+      "headline": "下载目录没有变化，没有重启内核",
+      "is_failure": false,
+      "notice_text": "下载目录没有变化，没有重启内核",
+      "path_detail": null
+    },
+    "ok": true
+  },
+  "settingsGet": {
+    "data": {
+      "banner": {
+        "clean": "与内核当前参数一致",
+        "unsaved": "有未保存的改动"
+      },
+      "last_code": "R.a1b2C3d4E5f6G7h8I9j",
+      "min_split_size_note": "当前值「21M」不在内核给出的取值集合里。保存会按这个原值下发，由内核校验。",
+      "min_split_size_options": [
+        "1M",
+        "2M",
+        "5M",
+        "10M",
+        "20M",
+        "50M",
+        "100M",
+        "21M"
+      ],
+      "notes": {
+        "apply": "改动会写盘保存（重开应用仍是这一份）。并行数与限速对已启动的引擎即时生效；其余各项在添加新任务时生效，已在传输的任务不受影响。",
+        "limit_mbps": "0 = 不限速（不限制总下载速度）"
+      },
+      "parameters": [
+        {
+          "label": "并行文件数（-j）",
+          "max": 64,
+          "min": 1
+        },
+        {
+          "label": "单文件连接数（-x）",
+          "max": 16,
+          "min": 1
+        },
+        {
+          "label": "分片数（-s）",
+          "max": 16,
+          "min": 1
+        },
+        {
+          "label": "最小分片大小（-k）",
+          "max": null,
+          "min": null
+        },
+        {
+          "label": "限速（MB/s）",
+          "max": 100000,
+          "min": 0
+        },
+        {
+          "label": "重试次数",
+          "max": 100,
+          "min": 1
+        },
+        {
+          "label": "重试间隔（秒）",
+          "max": 60,
+          "min": 0
+        }
+      ],
+      "save_help": {
+        "clean": "与内核当前参数一致：没有要保存的改动",
+        "engine_unavailable": "引擎不可用，请先点顶部的「重试」",
+        "unsaved": "把七项参数下发给内核（set_settings）"
+      },
+      "settings": {
+        "connections": 16,
+        "limit_mbps": 0,
+        "max_tries": 3,
+        "min_split_size": "21M",
+        "parallel": 8,
+        "retry_wait": 1,
+        "splits": 16
+      }
+    },
+    "ok": true
+  },
+  "stateConnecting": {
+    "data": {
+      "allows_requests": false,
+      "banner": null,
+      "engine": {
+        "icon": "questionmark.circle",
+        "kind": "connecting",
+        "text": "正在连接内核…",
+        "tooltip": "内核尚未握手（壳正在启动它）"
+      },
+      "fallback_notice": null,
+      "handshake_reply": null,
+      "last_error": null,
+      "load": {
+        "kind": "loaded",
+        "summary": {
+          "code": "R.a1b2C3d4E5f6G7h8I9j",
+          "expired_badge_text": null,
+          "files_text": "128 个文件",
+          "size_text": "412.6 GB",
+          "validity_text": "有效期至 2026-03-18 23:59"
+        }
+      }
+    },
+    "ok": true
+  },
+  "stateEngineDown": {
+    "data": {
+      "allows_requests": false,
+      "banner": {
+        "hint": null,
+        "kind": "EngineUnavailable",
+        "shows_retry": true,
+        "text": "内核进程已退出"
+      },
+      "engine": {
+        "icon": "exclamationmark.triangle.fill",
+        "kind": "unavailable",
+        "reason": "内核进程已退出",
+        "text": "引擎不可用：内核进程已退出",
+        "tooltip": "内核进程已退出"
+      },
+      "fallback_notice": null,
+      "handshake_reply": null,
+      "last_error": "上一次请求失败了",
+      "load": {
+        "kind": "loaded",
+        "summary": {
+          "code": "R.a1b2C3d4E5f6G7h8I9j",
+          "expired_badge_text": null,
+          "files_text": "128 个文件",
+          "size_text": "412.6 GB",
+          "validity_text": "有效期至 2026-03-18 23:59"
+        }
+      }
+    },
+    "ok": true
+  },
+  "stateHandshakeTimeout": {
+    "data": {
+      "allows_requests": false,
+      "banner": {
+        "hint": "内核可能正卡在系统授权对话框上（例如\"想访问下载文件夹\"）。请查看屏幕上是否有该对话框并点「允许」，然后点「重试」。",
+        "kind": "EngineUnavailable",
+        "shows_retry": true,
+        "text": "内核无响应（等待超过 5 秒）"
+      },
+      "engine": {
+        "icon": "exclamationmark.triangle.fill",
+        "kind": "unavailable",
+        "reason": "内核无响应（等待超过 5 秒）",
+        "text": "内核无响应（等待超过 5 秒）",
+        "tooltip": "内核可能正卡在系统授权对话框上（例如\"想访问下载文件夹\"）。请查看屏幕上是否有该对话框并点「允许」，然后点「重试」。"
+      },
+      "fallback_notice": null,
+      "handshake_reply": null,
+      "last_error": null,
+      "load": {
+        "kind": "loaded",
+        "summary": {
+          "code": "R.a1b2C3d4E5f6G7h8I9j",
+          "expired_badge_text": null,
+          "files_text": "128 个文件",
+          "size_text": "412.6 GB",
+          "validity_text": "有效期至 2026-03-18 23:59"
+        }
+      }
+    },
+    "ok": true
+  },
+  "stateLoaded": {
+    "data": {
+      "allows_requests": true,
+      "banner": null,
+      "engine": {
+        "icon": "bolt.fill",
+        "kind": "running",
+        "text": "运行中",
+        "tooltip": "下载引擎正在运行"
+      },
+      "fallback_notice": null,
+      "handshake_reply": null,
+      "last_error": null,
+      "load": {
+        "kind": "loaded",
+        "summary": {
+          "code": "R.a1b2C3d4E5f6G7h8I9j",
+          "expired_badge_text": null,
+          "files_text": "128 个文件",
+          "size_text": "412.6 GB",
+          "validity_text": "有效期至 2026-03-18 23:59"
+        }
+      }
+    },
+    "ok": true
+  },
+  "transfersAfterRemove": {
+    "data": {
+      "badge_count": 4,
+      "empty_text": "没有正在传输的任务",
+      "global": {
+        "activity_text": "活动 1 · 等待 2 · 已停止 3",
+        "can_clear_finished": true,
+        "speed_text": "1.5 MB/s"
+      },
+      "rows": [
+        {
+          "available_actions": [
+            "pause",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-active",
+          "manifest_path": "01.RawData/C24-8_×_25WS024_L01_R1.fastq.gz",
+          "percent_text": "26%",
+          "progress_fraction": 0.2660921642230544,
+          "progress_text": "1.1 GB / 4.2 GB",
+          "shows_paused_badge": false,
+          "speed_text": "1.0 MB/s",
+          "state_color": "Blue",
+          "state_icon_name": "arrow.down.circle",
+          "state_label": "下载中",
+          "title": "01.RawData/C24-8_×_25WS024_L01_R1.fastq.gz"
+        },
+        {
+          "available_actions": [
+            "unpause",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-paused",
+          "manifest_path": "01.RawData/C24-8_×_25WS024_L01_R2.fastq.gz",
+          "percent_text": "20%",
+          "progress_fraction": 0.20443666273904615,
+          "progress_text": "858.3 MB / 4.1 GB",
+          "shows_paused_badge": true,
+          "speed_text": "—",
+          "state_color": "Secondary",
+          "state_icon_name": "clock",
+          "state_label": "等待中",
+          "title": "01.RawData/C24-8_×_25WS024_L01_R2.fastq.gz"
+        },
+        {
+          "available_actions": [
+            "pause",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-queued",
+          "manifest_path": "01.RawData/C24-8_×_25WS024_L02_R1.fastq.gz",
+          "percent_text": "0%",
+          "progress_fraction": 0.0,
+          "progress_text": "0 B / 3.9 GB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Secondary",
+          "state_icon_name": "clock",
+          "state_label": "等待中",
+          "title": "01.RawData/C24-8_×_25WS024_L02_R1.fastq.gz"
+        },
+        {
+          "available_actions": [
+            "retry",
+            "remove"
+          ],
+          "error_text": "连接超时（第 3 次重试）\n原因：Connection reset by peer",
+          "gid": "g-error",
+          "manifest_path": "01.RawData/QC 图.png",
+          "percent_text": "4%",
+          "progress_fraction": 0.041174261195544654,
+          "progress_text": "160.2 MB / 3.8 GB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Red",
+          "state_icon_name": "exclamationmark.triangle",
+          "state_label": "失败",
+          "title": "01.RawData/QC 图.png"
+        },
+        {
+          "available_actions": [],
+          "error_text": null,
+          "gid": "g-removed",
+          "manifest_path": null,
+          "percent_text": "0%",
+          "progress_fraction": 0.0,
+          "progress_text": "0 B / 1.0 MB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Orange",
+          "state_icon_name": "trash",
+          "state_label": "已移除",
+          "title": "（未知路径）"
+        }
+      ]
+    },
+    "ok": true
+  },
+  "transfersEmpty": {
+    "data": {
+      "badge_count": 0,
+      "empty_text": "没有正在传输的任务",
+      "global": null,
+      "rows": []
+    },
+    "ok": true
+  },
+  "transfersEngineDown": {
+    "data": {
+      "badge_count": 0,
+      "empty_text": null,
+      "global": null,
+      "rows": []
+    },
+    "ok": true
+  },
+  "transfersSnapshot": {
+    "data": {
+      "badge_count": 4,
+      "empty_text": "没有正在传输的任务",
+      "global": {
+        "activity_text": "活动 1 · 等待 2 · 已停止 3",
+        "can_clear_finished": true,
+        "speed_text": "1.5 MB/s"
+      },
+      "rows": [
+        {
+          "available_actions": [
+            "pause",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-active",
+          "manifest_path": "01.RawData/C24-8_×_25WS024_L01_R1.fastq.gz",
+          "percent_text": "26%",
+          "progress_fraction": 0.2660921642230544,
+          "progress_text": "1.1 GB / 4.2 GB",
+          "shows_paused_badge": false,
+          "speed_text": "1.0 MB/s",
+          "state_color": "Blue",
+          "state_icon_name": "arrow.down.circle",
+          "state_label": "下载中",
+          "title": "01.RawData/C24-8_×_25WS024_L01_R1.fastq.gz"
+        },
+        {
+          "available_actions": [
+            "unpause",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-paused",
+          "manifest_path": "01.RawData/C24-8_×_25WS024_L01_R2.fastq.gz",
+          "percent_text": "20%",
+          "progress_fraction": 0.20443666273904615,
+          "progress_text": "858.3 MB / 4.1 GB",
+          "shows_paused_badge": true,
+          "speed_text": "—",
+          "state_color": "Secondary",
+          "state_icon_name": "clock",
+          "state_label": "等待中",
+          "title": "01.RawData/C24-8_×_25WS024_L01_R2.fastq.gz"
+        },
+        {
+          "available_actions": [
+            "pause",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-queued",
+          "manifest_path": "01.RawData/C24-8_×_25WS024_L02_R1.fastq.gz",
+          "percent_text": "0%",
+          "progress_fraction": 0.0,
+          "progress_text": "0 B / 3.9 GB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Secondary",
+          "state_icon_name": "clock",
+          "state_label": "等待中",
+          "title": "01.RawData/C24-8_×_25WS024_L02_R1.fastq.gz"
+        },
+        {
+          "available_actions": [
+            "retry",
+            "remove"
+          ],
+          "error_text": "连接超时（第 3 次重试）\n原因：Connection reset by peer",
+          "gid": "g-error",
+          "manifest_path": "01.RawData/QC 图.png",
+          "percent_text": "4%",
+          "progress_fraction": 0.041174261195544654,
+          "progress_text": "160.2 MB / 3.8 GB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Red",
+          "state_icon_name": "exclamationmark.triangle",
+          "state_label": "失败",
+          "title": "01.RawData/QC 图.png"
+        },
+        {
+          "available_actions": [
+            "retry",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-done",
+          "manifest_path": "交付说明.pdf",
+          "percent_text": "100%",
+          "progress_fraction": 1.0,
+          "progress_text": "1.2 MB / 1.2 MB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Green",
+          "state_icon_name": "checkmark.circle",
+          "state_label": "已完成",
+          "title": "交付说明.pdf"
+        },
+        {
+          "available_actions": [],
+          "error_text": null,
+          "gid": "g-removed",
+          "manifest_path": null,
+          "percent_text": "0%",
+          "progress_fraction": 0.0,
+          "progress_text": "0 B / 1.0 MB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Orange",
+          "state_icon_name": "trash",
+          "state_label": "已移除",
+          "title": "（未知路径）"
+        }
+      ]
+    },
+    "ok": true
+  },
+  "transfersTick": {
+    "data": {
+      "badge_count": 4,
+      "empty_text": "没有正在传输的任务",
+      "global": {
+        "activity_text": "活动 1 · 等待 2 · 已停止 3",
+        "can_clear_finished": true,
+        "speed_text": "2.0 MB/s"
+      },
+      "rows": [
+        {
+          "available_actions": [
+            "pause",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-active",
+          "manifest_path": "01.RawData/C24-8_×_25WS024_L01_R1.fastq.gz",
+          "percent_text": "46%",
+          "progress_fraction": 0.4656612873903451,
+          "progress_text": "2.0 GB / 4.2 GB",
+          "shows_paused_badge": false,
+          "speed_text": "2.0 MB/s",
+          "state_color": "Blue",
+          "state_icon_name": "arrow.down.circle",
+          "state_label": "下载中",
+          "title": "01.RawData/C24-8_×_25WS024_L01_R1.fastq.gz"
+        },
+        {
+          "available_actions": [
+            "unpause",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-paused",
+          "manifest_path": "01.RawData/C24-8_×_25WS024_L01_R2.fastq.gz",
+          "percent_text": "20%",
+          "progress_fraction": 0.20443666273904615,
+          "progress_text": "858.3 MB / 4.1 GB",
+          "shows_paused_badge": true,
+          "speed_text": "—",
+          "state_color": "Secondary",
+          "state_icon_name": "clock",
+          "state_label": "等待中",
+          "title": "01.RawData/C24-8_×_25WS024_L01_R2.fastq.gz"
+        },
+        {
+          "available_actions": [
+            "pause",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-queued",
+          "manifest_path": "01.RawData/C24-8_×_25WS024_L02_R1.fastq.gz",
+          "percent_text": "0%",
+          "progress_fraction": 0.0,
+          "progress_text": "0 B / 3.9 GB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Secondary",
+          "state_icon_name": "clock",
+          "state_label": "等待中",
+          "title": "01.RawData/C24-8_×_25WS024_L02_R1.fastq.gz"
+        },
+        {
+          "available_actions": [
+            "retry",
+            "remove"
+          ],
+          "error_text": "连接超时（第 3 次重试）\n原因：Connection reset by peer",
+          "gid": "g-error",
+          "manifest_path": "01.RawData/QC 图.png",
+          "percent_text": "4%",
+          "progress_fraction": 0.041174261195544654,
+          "progress_text": "160.2 MB / 3.8 GB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Red",
+          "state_icon_name": "exclamationmark.triangle",
+          "state_label": "失败",
+          "title": "01.RawData/QC 图.png"
+        },
+        {
+          "available_actions": [
+            "retry",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-done",
+          "manifest_path": "交付说明.pdf",
+          "percent_text": "100%",
+          "progress_fraction": 1.0,
+          "progress_text": "1.2 MB / 1.2 MB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Green",
+          "state_icon_name": "checkmark.circle",
+          "state_label": "已完成",
+          "title": "交付说明.pdf"
+        },
+        {
+          "available_actions": [],
+          "error_text": null,
+          "gid": "g-removed",
+          "manifest_path": null,
+          "percent_text": "0%",
+          "progress_fraction": 0.0,
+          "progress_text": "0 B / 1.0 MB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Orange",
+          "state_icon_name": "trash",
+          "state_label": "已移除",
+          "title": "（未知路径）"
+        }
+      ]
+    },
+    "ok": true
+  },
+  "treeLevelFailure": {
+    "data": {
+      "breadcrumb": {
+        "path": "",
+        "segments": []
+      },
+      "failure": {
+        "message": "清单里没有目录 \"01.RawData\"",
+        "notice": "已返回上一层",
+        "path": ""
+      }
+    },
+    "ok": true
+  },
+  "treeLevelRoot": {
+    "data": {
+      "breadcrumb": {
+        "path": "",
+        "segments": []
+      },
+      "rows": [
+        {
+          "children_count": 10,
+          "detail_text": "10 项",
+          "icon_name": "folder",
+          "kind": "Dir",
+          "name": "01.RawData",
+          "path": "01.RawData",
+          "size": null,
+          "source_time_text": "—",
+          "state_color": "Secondary",
+          "state_label": "—"
+        },
+        {
+          "children_count": 6,
+          "detail_text": "6 项",
+          "icon_name": "folder",
+          "kind": "Dir",
+          "name": "02.CleanData",
+          "path": "02.CleanData",
+          "size": null,
+          "source_time_text": "—",
+          "state_color": "Secondary",
+          "state_label": "—"
+        },
+        {
+          "children_count": null,
+          "detail_text": "4.2 GB",
+          "icon_name": "doc",
+          "kind": "File",
+          "name": "C24-8_×_25WS024_L01_R1.fastq.gz",
+          "path": "C24-8_×_25WS024_L01_R1.fastq.gz",
+          "size": 4509715660,
+          "source_time_text": "2025-09-03 14:22",
+          "state_color": "Green",
+          "state_label": "已完成"
+        },
+        {
+          "children_count": null,
+          "detail_text": "4.1 GB",
+          "icon_name": "doc",
+          "kind": "File",
+          "name": "C24-8_×_25WS024_L01_R2.fastq.gz",
+          "path": "C24-8_×_25WS024_L01_R2.fastq.gz",
+          "size": 4402341478,
+          "source_time_text": "2025-09-03 14:22",
+          "state_color": "Blue",
+          "state_label": "下载中"
+        },
+        {
+          "children_count": null,
+          "detail_text": "3.9 GB",
+          "icon_name": "doc",
+          "kind": "File",
+          "name": "C24-8_×_25WS024_L02_R1.fastq.gz",
+          "path": "C24-8_×_25WS024_L02_R1.fastq.gz",
+          "size": 4187593113,
+          "source_time_text": "2025-09-03 14:31",
+          "state_color": "Secondary",
+          "state_label": "待下载"
+        },
+        {
+          "children_count": null,
+          "detail_text": "3.8 GB",
+          "icon_name": "doc",
+          "kind": "File",
+          "name": "C24-8_×_25WS024_L02_R2.fastq.gz",
+          "path": "C24-8_×_25WS024_L02_R2.fastq.gz",
+          "size": 4080218931,
+          "source_time_text": "2025-09-03 14:31",
+          "state_color": "Red",
+          "state_label": "失败"
+        },
+        {
+          "children_count": null,
+          "detail_text": "1.2 MB",
+          "icon_name": "doc",
+          "kind": "File",
+          "name": "交付说明.pdf",
+          "path": "交付说明.pdf",
+          "size": 1258291,
+          "source_time_text": "2025-09-03 15:02",
+          "state_color": "Secondary",
+          "state_label": "待下载"
+        }
+      ]
+    },
+    "ok": true
+  },
+  "treeLevelSub": {
+    "data": {
+      "breadcrumb": {
+        "path": "01.RawData",
+        "segments": [
+          {
+            "name": "01.RawData",
+            "path": "01.RawData"
+          }
+        ]
+      },
+      "rows": [
+        {
+          "children_count": null,
+          "detail_text": "4.2 GB",
+          "icon_name": "doc",
+          "kind": "File",
+          "name": "L01_R1.fastq.gz",
+          "path": "01.RawData/L01_R1.fastq.gz",
+          "size": 4509715660,
+          "source_time_text": "2025-09-03 14:22",
+          "state_color": "Secondary",
+          "state_label": "待下载"
+        },
+        {
+          "children_count": null,
+          "detail_text": "700.0 KB",
+          "icon_name": "doc",
+          "kind": "File",
+          "name": "QC 图.png",
+          "path": "01.RawData/QC 图.png",
+          "size": 716800,
+          "source_time_text": "2025-09-03 14:25",
+          "state_color": "Red",
+          "state_label": "失败"
+        }
+      ]
+    },
+    "ok": true
+  },
+  "treeWhole": {
+    "data": {
+      "action": {
+        "blocked_reason": null,
+        "button_title": "下载选中",
+        "empty_selection_hint": null
+      },
+      "breadcrumb": {
+        "path": "",
+        "segments": []
+      },
+      "progress": {
+        "bytes_text": "3.9 GB / 7.8 GB",
+        "fraction": 0.5,
+        "percent_text": "50%",
+        "speed_text": "1.0 MB/s"
+      },
+      "selected": [
+        "C24-8_×_25WS024_L02_R1.fastq.gz",
+        "C24-8_×_25WS024_L02_R2.fastq.gz"
+      ],
+      "selection": {
+        "count_text": "已选 2 项",
+        "size_text": "合计 7.7 GB"
+      }
+    },
+    "ok": true
+  },
+  "treeWholeBlocked": {
+    "data": {
+      "action": {
+        "blocked_reason": "选中的项太多，超过一次能发出的上限：请少选一些",
+        "button_title": "下载选中",
+        "empty_selection_hint": null
+      },
+      "breadcrumb": {
+        "path": "",
+        "segments": []
+      },
+      "progress": {
+        "bytes_text": "3.9 GB / 7.8 GB",
+        "fraction": 0.5,
+        "percent_text": "50%",
+        "speed_text": "1.0 MB/s"
+      },
+      "selected": [
+        "C24-8_×_25WS024_L02_R1.fastq.gz",
+        "C24-8_×_25WS024_L02_R2.fastq.gz"
+      ],
+      "selection": {
+        "count_text": "已选 200000 项",
+        "size_text": "合计 195.3 GB"
+      }
+    },
+    "ok": true
+  }
+}

@@ -1,0 +1,668 @@
+/* panels.css —— **模态层**（任务 13）：换码面板 / 设置窗口 / 关于 / 许可全文，
+ * 以及它们共用的背影与按钮。
+ *
+ * 为什么单独一份（而不是塞进 shell.css）：它们**不是壳**（壳是侧栏 + 工具栏 +
+ * 常驻提示行，永远在），也不是**屏**（屏挂在 `#page` 里、互斥）。把这份样式并进
+ * `shell.css` 就等于说"这三扇永远在" —— 而它们只在被打开时存在。
+ * 与 `app.css` 头部那条"屏与屏之间不许互相 @import"是同一个分工。
+ *
+ * 🔴 **本文件里一个会渲染的非 ASCII 字符都没有**：这里的注释里可以有中文
+ * （字体覆盖判据会把它们剥掉），但 `content:` 一类的属性一个都不许写中文
+ * —— 那与 JS 拼串是同一性质的东西（会走到客户眼前的一句话）。
+ *
+ * ⚠️ 所有尺寸/配色/圆角都取 `tokens.css` 的变量，**一个字面色值都不写**：
+ *    写一个 `#34C759` 就意味着"改令牌时这一块不动"（令牌那份文件头部记着这条）。
+ *    唯一的两处字面值是背影的黑色 alpha 与许可全文那一块的背景 —— 它们没有对应的
+ *    令牌，理由各自写在那一行旁边。
+ */
+
+/* ---------------------------------------------------------------------------
+   **中间截断**的两格（`truncationMode(.middle)` 在 web 上的落点）
+   ---------------------------------------------------------------------------
+   ⚠️ 纯 CSS 做不到真正的中间省略（`text-overflow: ellipsis middle` 至今没有浏览器
+   实现）。做法与 `verify.js:pathRow()` **逐字同一套**：把一个字符串切成**两段**放进
+   两个**紧邻**的格子里 —— 前一段允许被压缩（浏览器在它的**行尾**画省略号），
+   后一段不压缩 ⇒ 屏幕上就是「前半…后半」。切分与理由在 `dom.js:middleSplit`。
+   ⚠️ 两格之间**不许有空白文本节点**（模板里它们是紧挨着的）：多一个空白，
+   跨格选中复制出来的原文里就会多一个空格 —— 而"把码/路径原样复制走"正是这两格的用法。
+   ⚠️ 容器必须是 flex（`min-width: 0` 让它在自己的父级里真的能被压缩）。 */
+.mid__head {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mid__tail {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
+   模态层：背影 + 面板
+   --------------------------------------------------------------------------- */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;               /* 压在壳与所有屏之上 */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-20);
+  /* ⚠️ 背影用**黑色 alpha**：macOS 的 sheet 会把底下的窗口压暗一层，
+     而这一代的令牌里没有"蒙层"这一档（它不是 macOS 的语义色之一）。
+     0.18 是目视对齐的值，不是实测值 —— 如实记一笔。 */
+  background: rgba(0, 0, 0, .18);
+}
+
+.modal__panel {
+  background: var(--bg-window);
+  border-radius: var(--r-12);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .22);
+  max-width: 92vw;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ---------------------------------------------------------------------------
+   换码面板（`tpl-panel-switchcode`）
+   --------------------------------------------------------------------------- */
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-12);
+  width: 440px;               /* 与 macOS 的 `.frame(width: 440)` 同值 */
+  padding: var(--sp-20);
+}
+
+.panel__title {
+  margin: 0;
+  font-size: var(--text-title3);
+  font-weight: 600;
+  color: var(--c-label);
+}
+
+.panel__subtitle {
+  margin: 0;
+  font-size: var(--text-callout);
+  font-weight: 600;
+  color: var(--c-label);
+}
+
+.panel__note,
+.panel__hint {
+  margin: 0;
+  font-size: var(--text-callout);
+  color: var(--c-secondary);
+}
+
+.panel__input,
+.sc__note,
+.set__control {
+  font: inherit;
+  font-size: var(--text-body);
+  color: var(--c-label);
+  background: var(--bg-window);
+  border: 1px solid var(--c-separator);
+  border-radius: var(--r-6);
+  padding: var(--sp-6) var(--sp-8);
+}
+
+/* 焦点环：**同一条口径**（2px accent）—— 与 `base.css` 那条全局规则是同一个观感，
+   两处只有一点不同，都是**有意**的（任务 14 逐条核过，别当成漏的）：
+     · 这里用 `:focus` 而不是 `:focus-visible`：管的是**文本框**，而 macOS 的文本框
+       被**鼠标点中**时也画焦点环（按钮不是）—— `:focus-visible` 会让"点进去正在打字"
+       的那一格里一个环都看不见。`base.css` 那条 `button:focus:not(:focus-visible)`
+       只放行按钮，所以两处不冲突。
+     · `outline-offset: -1px`（全局是 +1px）：文本框自己有 1px 边框，
+       +1px 会把环推到**面板的 `overflow` 裁切边**上（面板边缘那一格会被切掉半条环）；
+       内缩 1px 落在边框内侧，四条边都完整。 */
+.panel__input:focus,
+.sc__note:focus,
+.set__control:focus {
+  outline: 2px solid var(--c-accent);
+  outline-offset: -1px;
+}
+
+.panel__input:disabled {
+  color: var(--c-tertiary);
+}
+
+/* 失败条：面板自己的、以及历史写盘失败那一条。形态与屏上的失败条同款。 */
+.panel__failure,
+.panel__history-failure,
+.set__failure,
+.dlg__failure {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-8);
+  padding: var(--sp-8);
+  border-radius: var(--r-6);
+  background: var(--bg-notice);
+  font-size: var(--text-callout);
+}
+
+.panel__failure-icon,
+.panel__failure .panel__failure-icon,
+.set__failure svg,
+.dlg__failure svg {
+  width: var(--toolbar-icon-w);
+  height: var(--toolbar-icon-w);
+  flex: none;
+  color: var(--c-red);
+  margin-top: 1px;
+}
+
+.panel__failure-text,
+.set__failure-text {
+  color: var(--c-label);
+  /* ⚠️ 有界可滚，**不是**截断：溢出时给的是可滚动的全文，一个字符都不少
+     （`resident_notice` 那条高度不变量的同一条口径 —— 常驻/就地提示的高度
+     不许由外部文本的长度决定）。 */
+  max-height: var(--notice-text-max-h);
+  overflow: auto;
+  word-break: break-word;
+}
+
+.panel__spacer,
+.set__spacer {
+  flex: 1 1 auto;
+}
+
+.panel__dismiss,
+.set__dismiss {
+  flex: none;
+  display: inline-flex;
+}
+
+.panel__foot,
+.dlg__foot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+}
+
+.panel__btn {
+  font: inherit;
+  font-size: var(--text-body);
+  color: var(--c-label);
+  background: var(--bg-card);
+  border: 1px solid transparent;
+  border-radius: var(--r-6);
+  padding: var(--sp-6) var(--sp-12);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.panel__btn:hover:not(:disabled) {
+  background: var(--c-separator);
+}
+
+.panel__btn:disabled {
+  color: var(--c-tertiary);
+  cursor: default;
+}
+
+.panel__btn.is-primary {
+  background: var(--c-accent);
+  color: #FFF;
+}
+
+.panel__btn.is-primary:hover:not(:disabled) {
+  background: var(--c-accent);
+  filter: brightness(1.06);
+}
+
+.panel__btn.is-primary:disabled {
+  background: var(--c-separator);
+  color: var(--c-tertiary);
+}
+
+/* ---- 历史列表 ------------------------------------------------------------ */
+.panel__history {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-8);
+}
+
+.panel__history-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-8);
+  /* 最多 50 条（`BatchHistory::MAXIMUM_ENTRIES`）⇒ 给一个上界高度、超了就在这一段里
+     滚。否则列表会把底下的「取消 / 加载」顶出屏幕（macOS 那边也是 `.frame(maxHeight:)`）。 */
+  max-height: 220px;
+  overflow: auto;
+  padding: var(--sp-2) 0;
+}
+
+.sc__row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-8);
+  border-radius: var(--r-6);
+  background: var(--bg-card);
+}
+
+.sc__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-6);
+  min-width: 0;
+}
+
+.sc__switch {
+  /* 标题那一格是"点一下切过去"的落点：flex:1 让它在视觉上就是行上最大的一块。
+     ⚠️ `display: flex` 是**中间截断**要求的（里面是 `.mid__head` + `.mid__tail`
+     两格，见文件上那一段）——写成块级的话那两格不会按同一条基线排。 */
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  text-align: left;
+  font: inherit;
+  color: var(--c-label);
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.sc__code {
+  /* ⚠️ 同样是两格的容器（中间截断）：上限 45% 是**这一格**的，两格按比例分。 */
+  flex: 0 1 45%;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+}
+
+.sc__time {
+  flex: none;
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+}
+
+.sc__note {
+  font-size: var(--text-caption);
+}
+
+/* ---------------------------------------------------------------------------
+   设置窗口（`tpl-window-settings`）/ 关于 / 许可：三扇共用 `.win__*` 那一套头尾
+   --------------------------------------------------------------------------- */
+.win {
+  display: flex;
+  flex-direction: column;
+  min-width: 520px;
+  max-width: 90vw;
+}
+
+.win__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  padding: var(--sp-12) var(--sp-20);
+  border-bottom: 1px solid var(--c-separator);
+}
+
+.win__title {
+  margin: 0;
+  flex: 1 1 auto;
+  font-size: var(--text-title3);
+  font-weight: 600;
+  color: var(--c-label);
+}
+
+.win__close {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: var(--r-6);
+  color: var(--c-secondary);
+  cursor: pointer;
+}
+
+.win__close:hover {
+  background: var(--bg-notice);
+}
+
+.win__close svg {
+  width: 12px;
+  height: 12px;
+}
+
+.win__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-16);
+  padding: var(--sp-16) var(--sp-20);
+  overflow: auto;
+}
+
+.win__foot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  padding: var(--sp-12) var(--sp-20);
+  border-top: 1px solid var(--c-separator);
+}
+
+/* ---- 下载目录那一段 + 参数表 -------------------------------------------- */
+.set__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-8);
+}
+
+.set__row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  min-width: 0;
+}
+
+.set__params {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+}
+
+.set__label {
+  flex: none;
+  width: 130px;
+  font-size: var(--text-body);
+  color: var(--c-label);
+}
+
+.set__value {
+  /* ⚠️ 两格的容器（中间截断，理由见文件上那一段）。 */
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  font-size: var(--text-body);
+  color: var(--c-secondary);
+}
+
+.set__control {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.set__btn {
+  flex: none;
+  font: inherit;
+  font-size: var(--text-callout);
+  color: var(--c-label);
+  background: var(--bg-card);
+  border: 1px solid transparent;
+  border-radius: var(--r-6);
+  padding: var(--sp-4) var(--sp-8);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.set__btn:hover:not(:disabled) {
+  background: var(--c-separator);
+}
+
+.set__note {
+  margin: 0;
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+}
+
+.set__inline-note {
+  flex: none;
+  font-size: var(--text-caption);
+  color: var(--c-orange);
+}
+
+.set__notes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.set__receipt {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-8);
+  font-size: var(--text-caption);
+  color: var(--c-label);
+}
+
+.set__receipt-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 回执的两行：**标题固定长、路径单独一行**（布局事故的修法，见 index.html 那段）。 */
+.dlg__receipt-headline {
+  display: block;
+}
+
+.dlg__receipt-path {
+  /* 单行 + **中间**截断 + 悬停看全文：路径可以是任意长，而这一行的高度**不许**
+     跟着它长（`resident_notice` 的高度不变量）。
+     ⚠️ 是**两格**（`.mid__head` + `.mid__tail`）—— 中间截断，见文件上那一段。 */
+  display: flex;
+  align-items: baseline;
+  max-width: 420px;
+  color: var(--c-secondary);
+}
+
+.dlg__receipt-icon {
+  flex: none;
+  display: inline-flex;
+  margin-top: 1px;
+  color: var(--c-green);
+}
+
+.dlg__receipt-icon.is-failure {
+  color: var(--c-red);
+}
+
+.dlg__receipt-svg {
+  width: var(--toolbar-icon-w);
+  height: var(--toolbar-icon-w);
+}
+
+.set__unavailable {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-12) 0;
+}
+
+.set__unavailable-title {
+  margin: 0;
+  font-size: var(--text-callout);
+  color: var(--c-label);
+}
+
+.set__unavailable-text {
+  margin: 0;
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+  max-height: var(--notice-text-max-h);
+  overflow: auto;
+}
+
+.set__link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-4);
+  font: inherit;
+  font-size: var(--text-callout);
+  color: var(--c-accent);
+  background: none;
+  border: 0;
+  padding: var(--sp-4);
+  border-radius: var(--r-6);
+  cursor: pointer;
+}
+
+.set__link:hover {
+  background: var(--bg-notice);
+}
+
+.set__link-ico {
+  width: var(--toolbar-icon-w);
+  height: var(--toolbar-icon-w);
+}
+
+.set__banner {
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
+   提示框（不可用 / 确认）+ 关于 + 许可
+   --------------------------------------------------------------------------- */
+.dlg {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-12);
+  padding: var(--sp-20);
+}
+
+.dlg--alert {
+  width: 420px;
+}
+
+.dlg__title {
+  margin: 0;
+  font-size: var(--text-title3);
+  font-weight: 600;
+  color: var(--c-label);
+}
+
+.dlg__body {
+  margin: 0;
+  font-size: var(--text-callout);
+  color: var(--c-label);
+  /* 三条后果是**多行**的（`DownloadDirectory::confirmation` 里带一个空行），
+     所以这一格用 `pre-wrap` 保住那几个换行 —— 它就是那段文案的排版。 */
+  white-space: pre-wrap;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.dlg--about {
+  min-width: 420px;
+  align-items: center;
+  text-align: center;
+}
+
+/* ⚠️ 关于那一扇的正文是**居中**的，但那一行头（标题 + 关闭）不能跟着缩成一团：
+   不写这一条的话，`align-items: center` 会把它按内容宽度居中 ——
+   屏幕上就是「关于 ✕」挤在中间（截图里能看到），而不是"标题靠左、✕ 靠右"。 */
+.dlg--about .win__head {
+  align-self: stretch;
+  text-align: left;
+}
+
+/* 关于窗口的全称 logo（任务 18；对位 `AboutView.swift` 的 `logoCard`）。
+   ⚠️ **宽度必须显式约束**：源图是 3451×934 的横版，不约束它会把窗口撑爆
+   （`.scaledToFit()` 只管比例、不限大小 —— macOS 那句 `.frame(width: 360)` 就是
+   这件事）。`height: auto` 让高跟着比例走，不去猜一个数。
+   ⚠️ 360 / 16 两个数都来自 macOS 的视图层字面量，照搬（16 恰好等于 `--sp-16`，
+   所以那一处走令牌）。
+   ⚠️ macOS 那一边还有一层白底圆角卡片（`.fill(.white)` + radius 12）—— 与空态那颗
+   图形标同一条口径：面板底色就是 `--bg-window`（#FFF）、本代又固定浅色 ⇒ 它**看不出
+   任何效果**，不贴（理由逐条在 `empty.css` 的 `.empty__mark` 上，别在这里复述成
+   第二份）。真要做深色外观时，两块白底一起回来。 */
+.dlg__logo {
+  box-sizing: content-box;
+  width: 360px;
+  height: auto;
+  padding: var(--sp-16);
+}
+
+.dlg__app {
+  margin: 0;
+  font-size: var(--text-title3);
+  font-weight: 600;
+  color: var(--c-label);
+}
+
+.dlg__version {
+  margin: 0;
+  font-size: var(--text-callout);
+  color: var(--c-secondary);
+}
+
+.dlg--license {
+  width: 720px;
+  max-width: 90vw;
+}
+
+.dlg__tabs {
+  display: flex;
+  gap: var(--sp-6);
+  flex-wrap: wrap;
+}
+
+.dlg__tab {
+  font: inherit;
+  font-size: var(--text-callout);
+  color: var(--c-label);
+  background: var(--bg-card);
+  border: 1px solid transparent;
+  border-radius: var(--r-6);
+  padding: var(--sp-4) var(--sp-8);
+  cursor: pointer;
+}
+
+.dlg__tab.is-current {
+  background: var(--bg-selected);
+  color: #FFF;
+}
+
+.dlg__why,
+.dlg__sha {
+  margin: 0;
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+}
+
+.dlg__sha-label {
+  margin-right: var(--sp-4);
+}
+
+.dlg__license-body {
+  overflow: auto;
+  max-height: 46vh;
+  border: 1px solid var(--c-separator);
+  border-radius: var(--r-6);
+  /* ⚠️ 这一块的白底是**刻意**的（不是漏了令牌）：许可全文是等宽正文，
+     与窗口面同色会让"这一块是个可滚动的文本区"看不出来。 */
+  background: var(--bg-window);
+}
+
+.dlg__license-text {
+  margin: 0;
+  padding: var(--sp-12);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--c-label);
+  /* ⚠️ **逐字**：许可全文的空行与缩进是它的一部分，不许折叠。 */
+  white-space: pre-wrap;
+  word-break: break-word;
+}

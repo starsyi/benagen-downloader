@@ -1,0 +1,1037 @@
+<!DOCTYPE html>
+<!--
+  windows/scripts/frontend-stub/panels-harness.html —— **任务 13 的无头验收夹具**（常驻）。
+
+  跑法（**一条命令**）：bash windows/scripts/check_panels_screen.sh
+  直接打开：/panels-harness.html（要先起本地静态服务，见 runner）
+
+  ===========================================================================
+  它验的是哪几件事
+  ===========================================================================
+  ① 🔴 **工具栏那颗下载按钮不再是死的**：两条路都验，各是一组断言 ——
+     · **可用那一支**（文件页，①a～①d）：有文案、可按，文案逐字等于 `tree()` 载荷里
+       `action.button_title`（`DownloadTargets::button_title`），点它 = 对当前勾选面
+       发 `enqueue`；
+     · **退化那一支**（非文件页，⑤a～⑤g）：在**校验页**与**空态页**上那颗按钮
+       `disabled === true` 且**文字是空的**（那两屏没有 `toolbarDownload()`）。
+       ⚠️ 这一组是**审查逼出来的**：第一版只有文件页那一组 —— 于是"行为成立"与
+       "被守住"之间那道缝**没有任何断言**（R-61 的通则：两者是两件事）。
+       它的**负控制**是"先确认那颗按钮真的被点亮过"（①b 在本组之前）——
+       没有它，一个"从来没被碰过、所以一直是 HTML 里的 disabled"的实现也能全绿。
+     这一条是这次任务的**起因**：在此之前那颗按钮永远停在 `disabled`、标题那一格永远空着。
+  ② **换码面板**：历史列表（三格值全部来自夹具）、**点一行直接切换**（`base_url`
+     跟着一起发；默认服务器那一行**不发那个键**）、备注就地编辑（回车 / 失焦 /
+     关面板三个提交点都发 `history_put`）、历史写盘失败**两个落点都在**、
+     换码失败**留在面板里显示原文**、成功**换了一批才关**、关掉之后**还能再打开**。
+  ③ **设置窗口**：下载目录段（显示值 / 脚注 / **先检查再确认** / 三条后果 / 回执）、
+     七项参数（标签与区间来自载荷、`-k` 是枚举且当前值被追加在末尾）、保存。
+  ④ **关于**与**许可全文**（三份、可切换、全文逐字）。
+  ⑦ 🔴 **R-5 的对位差分**（19 条）：`presentation/` 里那几条"判据在 Rust、行为在前端"的
+     东西（`NoteDrafts` / `SettingsForm::matches` / 开关面板的两条关闭路径），
+     把**从 Rust 倒出来的用例表**回放一遍，两边的结论必须一致。
+     ⚠️ 它与 ①～⑥ **不同**：那些判的是"这一屏画得对不对"，⑦ 判的是
+     "**同一组输入喂给 Rust 与前端，两边的判决一不一样**"。
+     为什么必须有它：本代最严重那个缺陷的形状就是"判据在 Rust、实现被抄进 JS、
+     分叉时谁都不会红"（`switchcode.js` 的文件头自己写着"抄了 `NoteDrafts` 一份"）。
+     详见 `runAll()` 里 ⑦ 那一段与 `check_presentation_mirrors.sh`。
+
+  ⚠️ 期望值**全部从 `windows/scripts/frontend-stub/wire-fixtures.json` 里读**
+     （那份夹具由 `make_wire_fixtures.sh` 从 Rust 现倒出来，**不是手抄的**）——
+     理由见 `files-harness.html` 的同一段（手抄的夹具与前端会犯同一个错）。
+
+  ⚠️ **唯一一处例外：许可载荷**（`licensePayload()`，见那里那段长注释）。
+     它的生产者 `shell-win/src/licenses.rs` 不在夹具生成器（`shell-core` 的
+     example）够得着的地方 —— 全文与 sha256 仍然取自**真文件**，只有三条
+     `name` / `why` 是写在这里的。**这是缺口，不是设计**（写进任务 13 报告）。
+     ⚠️ 第三条（WebView2 SDK / BSD-3）是**任务 15** 加的：它与那两条**同一条纪律**
+     —— 全文 `fetch` 仓库里那份真文件，`name`/`why` 逐字抄 `licenses.rs` 的
+     `LICENSES` 表。**加许可时这三处（`LICENSE_NAMES` / `licensePayload()` /
+     断言 ④c）要一起改**，否则这条验收会继续按"两份"全绿，而交付物里已经是三份。
+
+  ⚠️ 本目录**不在** frontendDist 里（`shell-win/tauri.conf.json` 的 `build.frontendDist
+     = "../web"`）⇒ 夹具不会被编进用户拿到的 exe。夹具里的中文也**不归 §3.2 管**。
+
+  结果怎么出来：与 `files-harness.html` 同一手法（POST `/__result`，见那份文件头）。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light">
+<title>panels harness</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; }
+  iframe { border: 0; display: block; width: 1120px; height: 720px; }
+  #out { margin: 0; padding: 8px 12px; font: 12px/1.5 ui-monospace, Menlo, monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<iframe id="f" src="/windows/web/index.html"></iframe>
+<pre id="out">loading fixtures…</pre>
+<script type="module">
+// ---- 夹具：**从 Rust 倒出来的那一份** --------------------------------------
+// ⚠️ **不是顶层 `await`**（原来是，改成现在这样是有原因的）：顶层 `await` 与本仓库
+//    截图用的 `--virtual-time-budget` **凑在一起会让页面卡住不往下走**（那份文件头
+//    记着同一条实测）。而这几格只要在**第一拍之前**填好就够 —— `run()` / `runShot()`
+//    的第一步就是 `await loadFixtures()`。
+let FIX = null;
+let CODE = "";
+let ACTION_TITLE = "";
+let SELECTED = [];
+let HISTORY_ROWS = [];
+
+async function loadFixtures() {
+  FIX = await (await fetch("/windows/scripts/frontend-stub/wire-fixtures.json")).json();
+  CODE = FIX.stateLoaded.data.load.summary.code;
+  ACTION_TITLE = FIX.treeWhole.data.action.button_title;
+  SELECTED = FIX.treeWhole.data.selected;
+  HISTORY_ROWS = FIX.historyGet.data.rows;
+  statePayload = FIX.stateLoaded;
+  historyPayload = FIX.historyGet;
+  // ⚠️ **许可载荷也在这里先取好**（不是等点开那一扇窗才取）：它的 `text` 是
+  //    三份真文件（18 KB + 4 KB + 1.5 KB，走 `fetch`）。放在 `invoke("license")` 里现取，
+  //    会让"点开那一扇窗"到"正文画出来"之间多一跳网络 —— 判据那边无所谓（等得起），
+  //    但**截图**那边会截到一个**空的正文块**（而那种图看起来"就是没加载出来"）。
+  licenseFixture = await licensePayload();
+}
+
+// ---- 许可那三条：**本夹具唯一的例外**（见文件头那段）-------------------------
+// ⚠️ 权威在 `windows/shell-win/src/licenses.rs` 的 `LICENSES` 表（那里有单测、
+//    构建脚本还按 sha256 核对内嵌的全文）。它**不在** `shell-core` 的
+//    example 够得着的范围里（`shell-win` 依赖 `shell-core`，反过来不行）——
+//    所以这三条字符串只能写在这里。**要收口**得把那张表搬进 `shell-core`
+//    （或让生成器也跑一遍 `shell-win`，而那会把 tauri 拉进 test.sh 的每一步）。
+// ⚠️ 这里写的是**逐字**抄自那张表的 `name` / `why`（连标点一起）——
+//    改那张表就要改这里，否则这一屏的断言在验一个已经不存在的形状。
+const LICENSE_NAMES = {
+  gpl: "GNU 通用公共许可协议 第 2 版（GPLv2）",
+  ofl: "SIL 开放字体许可 1.1（OFL-1.1）",
+  wv2: "WebView2 SDK 许可（3-Clause BSD）",
+  gplWhy: "本程序内嵌 aria2（GPLv2 许可）作为下载引擎，因此随附下列许可全文。",
+  oflWhy: "本程序内嵌 Noto Sans SC 的一个子集（SIL OFL 1.1 许可）作为界面字体，因此随附下列许可全文。",
+  wv2Why: "本程序随交付物再分发 Microsoft 的 WebView2Loader.dll（WebView2 SDK，3-Clause BSD 许可），因此随附下列许可全文。",
+};
+
+const encoder = new TextEncoder();
+async function sha256Hex(bytes) {
+  if (!globalThis.crypto || !crypto.subtle) return null;
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+/** 许可载荷：**全文与 sha256 取自真文件**（只有 name/why 是上面那三条）。 */
+async function licensePayload() {
+  const [gplBytes, oflBytes, wv2Bytes] = await Promise.all([
+    fetch("/core/assets/COPYING-GPLv2.txt").then((r) => r.arrayBuffer()),
+    fetch("/windows/assets/OFL-1.1.txt").then((r) => r.arrayBuffer()),
+    // ⚠️ 仓库里那份**就是**从官方 NuGet 包取出来的那一份（逐字节，有单测钉着）——
+    //    见 `licenses.rs` 文件头"第三条的来源"那一节。
+    fetch("/windows/assets/WebView2-SDK-LICENSE.txt").then((r) => r.arrayBuffer()),
+  ]);
+  const decoder = new TextDecoder();
+  const entries = [
+    { name: LICENSE_NAMES.gpl, why: LICENSE_NAMES.gplWhy, bytes: gplBytes },
+    { name: LICENSE_NAMES.ofl, why: LICENSE_NAMES.oflWhy, bytes: oflBytes },
+    { name: LICENSE_NAMES.wv2, why: LICENSE_NAMES.wv2Why, bytes: wv2Bytes },
+  ];
+  const licenses = [];
+  for (const entry of entries) {
+    licenses.push({
+      name: entry.name,
+      why: entry.why,
+      text: decoder.decode(entry.bytes),
+      sha256: (await sha256Hex(entry.bytes)) || "",
+    });
+  }
+  return { ok: true, data: { licenses } };
+}
+
+// ---- 受控 stub：前端以为自己在跟 Tauri 说话 ---------------------------------
+const invocations = [];
+/** `state()` 那一格的载荷。⚠️ **可变**：几条断言要它换一个批次/换一种加载态。 */
+// ⚠️ 这两格的初值是**占位**（`FIX` 要等 `loadFixtures()`，见文件上那一段）——
+//    `loadFixtures()` 落地的第一步就把它们接上，而那时第一拍还没开始。
+let statePayload = null;
+/** 让某一条命令回一个**失败信封**（`invoke.js` 会把它抛成原文）。 */
+let failures = {};
+let historyPayload = null;
+let licenseFixture = null;
+// 「选择…」那一次系统对话框的**返回值**（`null` = 用户取消，见 `commands::pick_directory`）。
+// 夹具里它由用例现设 —— 真机上它由 `SHBrowseForFolderW` 给。
+let pickedDir = null;
+
+async function invoke(cmd, args) {
+  invocations.push({ cmd, args: args || {} });
+  if (failures[cmd]) return { ok: false, error: { message: failures[cmd] } };
+  if (cmd === "state") return statePayload;
+  if (cmd === "tree") {
+    const path = args && typeof args.path === "string" ? args.path : null;
+    if (path === null) return FIX.treeWhole;
+    return FIX.treeLevelRoot;
+  }
+  if (cmd === "enqueue") return FIX.enqueuePartial;
+  if (cmd === "history_get") return historyPayload;
+  if (cmd === "history_put") {
+    // ⚠️ 回执**必须是写完之后那一份历史**（`api::history` 的契约）。这里就地把
+    //    那一条的备注换掉再发回来 —— 与真命令同形，前端只有一条渲染路径。
+    const entry = args.entry || {};
+    const rows = HISTORY_ROWS.map((row) =>
+      row.code === entry.code ? { ...row, note: entry.note, title: entry.note || row.code } : row
+    );
+    historyPayload = { ok: true, data: { rows } };
+    return historyPayload;
+  }
+  if (cmd === "settings_get") return FIX.settingsGet;
+  if (cmd === "settings_set") {
+    // 内核回的**是归一化之后那一份**：这里把用户发来的七个值原样回声（同形即可）。
+    return { ok: true, data: { ...FIX.settingsGet.data, settings: args.settings } };
+  }
+  if (cmd === "preferences_get") return FIX.preferencesGet;
+  // 取消 ⇒ 信封里的 `data` 是 `null`（**不是**空串、也不是失败信封 —— 见
+  // `commands::pick_directory` 与 `pickdir::pick_outcome` 那两段文档）。
+  if (cmd === "pick_directory") return { ok: true, data: pickedDir };
+  if (cmd === "preferences_check") {
+    return args.path === "/nope" ? FIX.preferencesCheckBad : FIX.preferencesCheckOk;
+  }
+  if (cmd === "preferences_set") {
+    return args.dir === "/Volumes/Data/交付" ? FIX.preferencesSetUnchanged : FIX.preferencesSetChanged;
+  }
+  if (cmd === "about") return FIX.about;
+  if (cmd === "license") return licenseFixture || (licenseFixture = await licensePayload());
+  return { ok: true, data: {} };
+}
+
+// ---- 结果与断言 -------------------------------------------------------------
+const lines = [];
+let ok = 0, fail = 0, reported = false;
+function check(name, cond, detail) {
+  if (cond) { ok++; lines.push("PASS " + name + (detail ? " — " + detail : "")); }
+  else { fail++; lines.push("FAIL " + name + (detail ? " — " + detail : "")); }
+  document.getElementById("out").textContent = lines.join("\n");
+}
+let aborted = 0;
+function abort(why, error) {
+  aborted += 1;
+  lines.push("ABORT " + why + "：" + (error && error.message ? error.message : error));
+  document.getElementById("out").textContent = lines.join("\n");
+}
+async function report() {
+  if (reported) return;
+  reported = true;
+  document.title = "DONE ok=" + ok + " fail=" + fail + " abort=" + aborted;
+  try {
+    await fetch("/__result", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ scenario: "panels", ok, fail, aborted, lines }),
+    });
+  } catch (error) {
+    console.error("POST /__result 失败：", error);
+  }
+}
+setTimeout(() => {
+  if (!reported) { abort("断言脚本 120s 内没跑完", "watchdog"); void report(); }
+}, 120000);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const doc = () => document.getElementById("f").contentDocument;
+const q = (sel) => doc().querySelector(sel);
+const txt = (sel) => { const el = q(sel); return el ? el.textContent : ""; };
+const shown = (sel) => { const el = q(sel); return !!el && !el.hidden; };
+const click = (el) => el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+const key = (el, k) => el.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true }));
+const input = (el, value) => { el.value = value; el.dispatchEvent(new Event("input", { bubbles: true })); };
+const esc = () => doc().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+const calls = (cmd) => invocations.filter((i) => i.cmd === cmd);
+/** 历史行**现查**：写盘成功之后那一块会整块重建（旧节点是废的）。 */
+const rowsNow = () => [...doc().querySelectorAll(".sc__row")];
+const notesNow = () => rowsNow().map((el) => el.querySelector(".sc__note"));
+/** 常驻提示行里**全部**正文（回执排在最末，所以这里读整排）。 */
+const notices = () => [...doc().querySelectorAll("#notices .notice__text")].map((n) => n.textContent).join(" | ");
+/** 深拷贝一份 state 载荷并改掉里面某几格（几条断言要"换一批 / 换一种加载态"）。 */
+const stateWith = (mutate) => {
+  const copy = JSON.parse(JSON.stringify(FIX.stateLoaded));
+  mutate(copy.data);
+  return copy;
+};
+
+// ---- 截图模式（`?s=switch|settings|license|about`）---------------------------
+// ⚠️ 它**不是一条判据**，只是"把某一扇窗停在这一帧"给人看用的（截图落在
+//    `.superpowers/…/task-13-shots/`，那些图是报告的证据，不是被守住的判据）。
+//    与判据那几条路共用**同一个**受控 stub（同一份夹具、同一套注入），
+//    所以图里画出来的东西与断言判的是同一件事。
+const SHOT = new URLSearchParams(location.search).get("s");
+
+/** 把界面停在某一帧（`switch` / `settings` / `about` / `license`）。 */
+async function runShot(name) {
+  await sleep(3200); // 与判据那条路同一个等待（等文件页挂上、工具栏同步过）
+  if (name === "switch") {
+    click(q("#tb-code"));
+    return;
+  }
+  click(q("#tb-settings"));
+  await sleep(900);
+  if (name === "about") click(q("#set-about"));
+  else if (name === "license") click(q("#set-license"));
+  // `settings`：就停在设置窗口上。
+}
+
+document.getElementById("f").addEventListener("load", (e) => {
+  e.target.contentWindow.__TAURI__ = { core: { invoke } };
+  if (SHOT) {
+    void loadFixtures().then(() => runShot(SHOT));
+    return;
+  }
+  void run();
+});
+
+async function run() {
+  try {
+    await loadFixtures();
+    await runAll();
+  }
+  catch (error) { abort("断言脚本中止（后面那些没跑）", error); }
+  finally { await report(); }
+}
+
+async function runAll() {
+  // ⚠️ **等够三拍**（`state` 的节拍是 1 s）：首帧那一拍前端还没有 `__TAURI__`（被拒），
+  //    第二拍才把文件页挂上 —— 而**工具栏那颗按钮的文案与启用态是下一拍（第三拍）
+  //    才拿得到的**（挂载那一刻 `tree()` 的载荷还没回来，屏只能答 `null`）。
+  //    等两拍的话这里会红，而红的原因是**夹具等得不够**，不是前端坏了 ——
+  //    本仓库最怕那种"红了但根因在夹具"的假红（它会把守卫训练成"红了就放宽"）。
+  await sleep(3200); // 首帧 + 文件页挂载 + 那两条 tree + 一拍 toolbar 同步
+
+  // =========================================================================
+  // ① 🔴 工具栏那颗下载按钮（这次任务的起因）
+  // =========================================================================
+  check("①a 文件页挂上了（工具栏那颗按钮有意义的先决条件）", !!q("#files-root"), txt("#files-bar-count"));
+  const dl = q("#tb-download");
+  check("①b 那颗按钮**不再是** disabled", dl && !dl.disabled);
+  check("①c 它的文案**逐字**是载荷里的 button_title",
+    txt("#tb-download-title") === ACTION_TITLE,
+    `实际「${txt("#tb-download-title")}」期望「${ACTION_TITLE}」`);
+  const enqBefore = calls("enqueue").length;
+  click(dl);
+  await sleep(600);
+  const firstEnqueue = calls("enqueue").pop();
+  check("①d 点它 ⇒ 对**当前勾选面**发 enqueue（不是空数组、不是别的）",
+    calls("enqueue").length === enqBefore + 1
+      && JSON.stringify(firstEnqueue.args.paths) === JSON.stringify(SELECTED),
+    JSON.stringify(firstEnqueue && firstEnqueue.args));
+
+  // =========================================================================
+  // ② 换码面板
+  // =========================================================================
+  click(q("#tb-code"));
+  await sleep(400);
+  check("②a 点「交付码」⇒ 面板打开（不是点了没反应）", shown("#sc-root"));
+  check("②b 输入框的初值 = 当前批次的码", q("#sc-code").value === CODE, q("#sc-code").value);
+  check("②c 历史那一块画出来了", shown("#sc-history"));
+  const rowEls = [...doc().querySelectorAll(".sc__row")];
+  check("②d 历史行数 = 夹具的行数", rowEls.length === HISTORY_ROWS.length, rowEls.length + " 行");
+  // ⚠️ 标题那一格的容器是 `.sc__switch`（里面是中间截断的两格）：读它的
+  //    `textContent` 拿到的就是**拼起来之后的原文**（两格之间没有空白文本节点）。
+  check("②e 行的**标题 / 码 / 时间**三格逐字来自夹具",
+    rowEls.every((el, i) =>
+      el.querySelector(".sc__switch").textContent === HISTORY_ROWS[i].title
+      && el.querySelector(".sc__code").textContent === HISTORY_ROWS[i].code
+      && el.querySelector(".sc__time").textContent === HISTORY_ROWS[i].time_text),
+    rowEls.map((el) => el.querySelector(".sc__switch").textContent).join(" / "));
+  // 🔴 **中间截断**（macOS `truncationMode(.middle)`）：两格都在、拼起来**逐字节**
+  //    等于原文 —— 也就是说 JS 只**切**、一个字符都没改（§3.2 / R-49 的界线）。
+  {
+    const codeSpan = rowEls[2].querySelector(".sc__code");
+    const parts = [...codeSpan.querySelectorAll(".mid__head, .mid__tail")].map((n) => n.textContent);
+    check("②e2 长码那一格是**两段**，拼起来**逐字**等于原文（JS 只切不改）",
+      parts.length === 2 && parts[0] + parts[1] === HISTORY_ROWS[2].code
+        && parts[0].length > 0 && parts[1].length > 0,
+      JSON.stringify(parts));
+  }
+  // 🔴 **中间截断的判据 ③：全文两处都在**（`dom.js:middleSplit` 的头注逐字）——
+  //    中间那一段屏幕上看不到，所以**必须有 `title` 这个出口**，否则那一段就没了。
+  //    ⚠️ **标题那一格曾经漏了这一句**（第 2 轮修复轮补的），而同批另外三处与
+  //    参照实现 `verify.js:pathRow` 都设了 —— 本条就是为"它不会再漏"钉的。
+  //    ⚠️ 断的是**两格都有**、且**逐字等于载荷里的原文**（不是"设了个 title 就行"）。
+  {
+    const missing = rowEls
+      .map((el, i) => {
+        const t = el.querySelector(".sc__switch").getAttribute("title");
+        const c = el.querySelector(".sc__code").getAttribute("title");
+        if (t !== HISTORY_ROWS[i].title || c !== HISTORY_ROWS[i].code) {
+          return `${HISTORY_ROWS[i].code}: title=${JSON.stringify(t)} code.title=${JSON.stringify(c)}`;
+        }
+        return null;
+      })
+      .filter(Boolean);
+    check("②e3 **两格**的悬停都是**全文原文**（中间截断的判据 ③：全文两处都在）",
+      missing.length === 0, missing.join("；"));
+  }
+  check("②f 每行的备注框预填了**存着的那一份**（不是空的）",
+    rowEls[0].querySelector(".sc__note").value === HISTORY_ROWS[0].note,
+    JSON.stringify(rowEls[0].querySelector(".sc__note").value));
+  check("②g 顺序照夹具（最近的在最前）",
+    rowEls[0].querySelector(".sc__code").textContent === CODE);
+
+  // ---- 备注就地编辑：三个提交点 ------------------------------------------
+  const customRowIndex = HISTORY_ROWS.findIndex((r) => r.base_url !== "");
+  const noteEls = rowEls.map((el) => el.querySelector(".sc__note"));
+  input(noteEls[0], "客户李四");
+  check("②h 敲字**不发命令**（只在三个提交点发）", calls("history_put").length === 0,
+    calls("history_put").length + " 次");
+  key(noteEls[0], "Enter");
+  await sleep(500);
+  const put = calls("history_put").pop();
+  check("②i 回车 ⇒ 发 history_put（kind=note / 码 / 用户敲的原文）",
+    !!put && put.args.entry && put.args.entry.kind === "note"
+      && put.args.entry.code === HISTORY_ROWS[0].code
+      && put.args.entry.note === "客户李四",
+    JSON.stringify(put && put.args));
+
+  const blurNote = notesNow()[1];
+  input(blurNote, "失焦那一句");
+  blurNote.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
+  await sleep(500);
+  const put2 = calls("history_put").pop();
+  check("②j 失焦 ⇒ 也交出去（不然用户敲完备注去点别处，那句就丢了）",
+    put2 !== put && put2.args.entry.note === "失焦那一句",
+    JSON.stringify(put2 && put2.args));
+
+  // ---- 换码：点一行直接切换（base_url 必须跟着发）--------------------------
+  const loadBefore = calls("load").length;
+  click(rowsNow()[customRowIndex].querySelector(".sc__switch"));
+  await sleep(500);
+  const byRow = calls("load").pop();
+  check("②k 点一行 ⇒ **直接发 load**（不是「填进输入框再点加载」）",
+    calls("load").length === loadBefore + 1, JSON.stringify(byRow && byRow.args));
+  check("②l 自定义服务器那一行 ⇒ base_url **跟着一起发**",
+    byRow && byRow.args.code === HISTORY_ROWS[customRowIndex].code
+      && byRow.args.baseUrl === HISTORY_ROWS[customRowIndex].base_url,
+    JSON.stringify(byRow && byRow.args));
+
+  // ---- 换码失败：原文留在面板里，面板**不关** ------------------------------
+  const KERNEL_SAID = "拉取交付清单失败：HTTP 404（来自夹具）";
+  statePayload = stateWith((data) => { data.load = { kind: "failed", message: KERNEL_SAID }; });
+  await sleep(1600);
+  check("②m 换码失败 ⇒ 面板**不关**，原文逐字显示在面板里",
+    shown("#sc-root") && shown("#sc-failure") && txt("#sc-failure-text") === KERNEL_SAID,
+    `面板=${shown("#sc-root")} 正文=「${txt("#sc-failure-text")}」`);
+
+  // ---- 换码成功：**换了一批**才关 ------------------------------------------
+  statePayload = stateWith((data) => { data.load.summary.code = "R.NEWBATCH00000000000"; });
+  await sleep(1600);
+  check("②n 换码成功（批次码真的变了）⇒ 面板自己关掉", !shown("#sc-root"));
+
+  // ---- 关掉之后**还能再打开**（`app.js` 那一格清干净了没有）-----------------
+  click(q("#tb-code"));
+  await sleep(400);
+  check("②o 关掉之后还能再打开（清了「现在开着的是谁」那一格）", shown("#sc-root"));
+  esc();
+  await sleep(300);
+  check("②p Esc ⇒ 面板收起", !shown("#sc-root"));
+  click(q("#tb-code"));
+  await sleep(400);
+  check("②q Esc 之后再打开（Esc 那条路也清了那一格）", shown("#sc-root"));
+
+  // ---- 历史写盘失败：**两个落点都在** --------------------------------------
+  const WRITE_FAILED = "历史没有记下来（写盘失败：磁盘空间不足）";
+  failures = { history_put: WRITE_FAILED };
+  const noteEl2 = notesNow()[2];
+  input(noteEl2, "写不进去的一句");
+  key(noteEl2, "Enter");
+  await sleep(600);
+  check("②r 历史写盘失败 ⇒ **面板里**说得出来（原文逐字）",
+    shown("#sc-history-failure") && txt("#sc-history-failure-text") === WRITE_FAILED,
+    `正文=「${txt("#sc-history-failure-text")}」`);
+  check("②s 同一个失败 ⇒ **主区常驻提示行**上也有一条（两个落点）",
+    notices().includes(WRITE_FAILED), notices());
+  failures = {};
+  click(q("#sc-cancel"));
+  await sleep(300);
+  check("②t 「取消」收起面板", !shown("#sc-root"));
+
+  // =========================================================================
+  // ③ 设置窗口
+  // =========================================================================
+  click(q("#tb-settings"));
+  await sleep(400);
+  check("③a 点「设置」⇒ 窗口打开（不是点了没反应）", shown("#set-root"));
+  // ⚠️ 再等一拍：那颗「保存」的可用性读的是**壳每拍灌进来的闸门**
+  //    （`state().allows_requests`），而它要等下一拍 `state` 才到（`SettingsView` 的
+  //    `.disabled` 同理）。等不够的话下面那条"改了才可按"会因为闸门还没到而红。
+  await sleep(1600);
+  check("③b 下载目录的显示值逐字来自载荷",
+    txt("#set-dir-display") === FIX.preferencesGet.data.display, txt("#set-dir-display"));
+  // 同一条中间截断判据 ③：这一格也要有悬停全文的出口（路径中段屏幕上看不到）。
+  check("③b2 它的悬停是**全文原文**（同一批四处的第三处）",
+    q("#set-dir-display").getAttribute("title") === FIX.preferencesGet.data.display,
+    JSON.stringify(q("#set-dir-display").getAttribute("title")));
+  check("③c 那一段脚注逐字来自载荷",
+    txt("#set-dir-note") === FIX.preferencesGet.data.section_note);
+  check("③d 目录输入框预填了偏好里那一份原文",
+    q("#set-dir-input").value === FIX.preferencesGet.data.dir, q("#set-dir-input").value);
+
+  const paramRows = [...doc().querySelectorAll("#set-params-rows .set__row")];
+  const parameters = FIX.settingsGet.data.parameters;
+  check("③e 七行参数一行不少", paramRows.length === 7, paramRows.length + " 行");
+  check("③f 七项的标签逐字来自载荷（含全角括号）",
+    paramRows.every((row, i) => row.querySelector(".set__label").textContent === parameters[i].label),
+    paramRows.map((r) => r.querySelector(".set__label").textContent).join(" / "));
+  check("③g 六项数值输入的上下界 = 载荷里的区间",
+    paramRows.every((row, i) => {
+      const control = row.querySelector("input");
+      if (!control) return parameters[i].min === null;
+      return control.getAttribute("min") === String(parameters[i].min)
+        && control.getAttribute("max") === String(parameters[i].max);
+    }));
+  const select = q("#set-params-rows select");
+  check("③h `-k` 那一项是**枚举**控件（不是数字框）", !!select);
+  const options = [...select.options].map((o) => o.value);
+  check("③i 候选项 = 内核给的集合 + **追加在末尾的当前值**",
+    JSON.stringify(options.slice(0, -1)) === JSON.stringify(FIX.settingsGet.data.min_split_size_options.slice(0, -1))
+      && options[options.length - 1] === "21M",
+    JSON.stringify(options));
+  check("③j 控件选中的是**当前值**（没有回落到第一项）", select.value === "21M", select.value);
+  check("③k 「不在集合里」那句说明在场（逐字来自载荷）",
+    doc().querySelector("#set-params-rows").textContent.includes(FIX.settingsGet.data.min_split_size_note));
+  check("③l 三句说明在表下面（限速 / 生效时机）",
+    txt("#set-params-notes").includes(FIX.settingsGet.data.notes.limit_mbps)
+      && txt("#set-params-notes").includes(FIX.settingsGet.data.notes.apply));
+  check("③m 横幅初始 = 「与内核当前参数一致」那一句（挑选，不是造句）",
+    txt("#set-banner") === FIX.settingsGet.data.banner.clean, txt("#set-banner"));
+  check("③n 没有改动 ⇒ 「保存」禁用且 help 是「一致」那一句",
+    q("#set-save").disabled
+      && q("#set-save").getAttribute("title") === FIX.settingsGet.data.save_help.clean,
+    q("#set-save").getAttribute("title"));
+
+  // ---- 改一项 ⇒ 横幅与按钮跟着变（**挑选**两句现成的）----------------------
+  const parallelInput = paramRows[0].querySelector("input");
+  input(parallelInput, "4");
+  await sleep(200);
+  check("③o 有改动 ⇒ 横幅换成「有未保存的改动」（载荷里那一句）",
+    txt("#set-banner") === FIX.settingsGet.data.banner.unsaved, txt("#set-banner"));
+  check("③p 有改动 ⇒ 「保存」可按，help 换成「下发」那一句",
+    !q("#set-save").disabled
+      && q("#set-save").getAttribute("title") === FIX.settingsGet.data.save_help.unsaved);
+  click(q("#set-save"));
+  await sleep(600);
+  const saved = calls("settings_set").pop();
+  const body = saved && saved.args.settings;
+  check("③q 保存发的是**七个键**（键名 = 线上契约），值取自表里那一份",
+    !!body && Object.keys(body).length === 7
+      && body.parallel === 4
+      && body.min_split_size === "21M"
+      && "retry_wait" in body && "limit_mbps" in body,
+    JSON.stringify(body));
+  await sleep(300);
+  check("③r 保存成功 ⇒ 用**回执那一份**重播种（横幅回到「一致」）",
+    txt("#set-banner") === FIX.settingsGet.data.banner.clean, txt("#set-banner"));
+
+  // ---- 改下载目录：**先检查、再确认** --------------------------------------
+  input(q("#set-dir-input"), "/nope");
+  click(q("#set-dir-apply"));
+  await sleep(600);
+  const checked = calls("preferences_check").pop();
+  check("③s 改目录 ⇒ 先发 preferences_check（拿「能不能用」与三条后果）",
+    !!checked && checked.args.path === "/nope", JSON.stringify(checked && checked.args));
+  check("③t 目录**不能用** ⇒ 弹的是「不能用」那一档，正文逐字是载荷里那句",
+    shown("#dlg-problem-message") && txt("#dlg-problem-message") === FIX.preferencesCheckBad.data.check,
+    txt("#dlg-problem-message"));
+  check("③u 🔴 不可用 ⇒ **确认框不出现**、也**没有**发 preferences_set（§2.3：确认之前就中止）",
+    !q("#dlg-confirm-message") && calls("preferences_set").length === 0,
+    calls("preferences_set").length + " 次");
+  click(q("#dlg-problem-ok"));
+  await sleep(300);
+  check("③v 提示框收起来了", !q("#dlg-problem-message"));
+
+  // ---- 能用的目录 ⇒ 三条后果的确认框 ---------------------------------------
+  const TARGET = "/Volumes/Data/交付_新盘";
+  input(q("#set-dir-input"), TARGET);
+  click(q("#set-dir-apply"));
+  await sleep(600);
+  check("③w 目录能用 ⇒ 弹出确认框，正文逐字是**三条后果**那段",
+    shown("#dlg-confirm-message") && txt("#dlg-confirm-message") === FIX.preferencesCheckOk.data.confirmation,
+    txt("#dlg-confirm-message").slice(0, 40));
+  click(q("#dlg-confirm-cancel"));
+  await sleep(300);
+  check("③x 确认框点「取消」⇒ **不发** preferences_set（用户没答应，内核不许动）",
+    calls("preferences_set").length === 0, calls("preferences_set").length + " 次");
+
+  click(q("#set-dir-apply"));
+  await sleep(600);
+  click(q("#dlg-confirm-accept"));
+  await sleep(800);
+  const setCall = calls("preferences_set").pop();
+  check("③y 确认之后才发 preferences_set（目标目录逐字）",
+    !!setCall && setCall.args.dir === TARGET, JSON.stringify(setCall && setCall.args));
+  check("③z 回执**两行**：标题 + 路径各一格，逐字来自载荷",
+    shown("#set-dir-receipt")
+      && txt("#set-dir-receipt-text").includes(FIX.preferencesSetChanged.data.headline)
+      && txt("#set-dir-receipt-text").includes(FIX.preferencesSetChanged.data.path_detail),
+    txt("#set-dir-receipt-text"));
+  check("③za 同一条回执**也挂在主区常驻提示行上**（窗口随手会关掉）",
+    notices().includes(FIX.preferencesSetChanged.data.headline), notices());
+  // ⚠️ 路径那一行是**中间截断**（`path_detail` 的文档："单行 + 中间截断 + 悬停看全文"）：
+  //    两段拼起来逐字等于载荷里那条路径，且**后一段（文件名）一个字都不少**。
+  {
+    const pathEl = q(".dlg__receipt-path");
+    const parts = pathEl
+      ? [...pathEl.querySelectorAll(".mid__head, .mid__tail")].map((n) => n.textContent)
+      : [];
+    const want = FIX.preferencesSetChanged.data.path_detail;
+    check("③zb2 路径那一行是两段、拼起来逐字等于载荷，且**尾段一个字不少**",
+      parts.length === 2 && parts[0] + parts[1] === want && parts[1] === want.split("/").pop(),
+      JSON.stringify(parts));
+    check("③zb3 它的悬停也是**全文原文**（四处里最后的一处）",
+      !!pathEl && pathEl.getAttribute("title") === want,
+      JSON.stringify(pathEl && pathEl.getAttribute("title")));
+  }
+  check("③zb3 改目录会**重启内核** ⇒ 补一拍 state（`pollNow`）",
+    calls("state").length > 1, calls("state").length + " 拍");
+
+  // ---- 「选择…」：系统对话框那一条路（对位 macOS 的 `choose()`）-----------------
+  //
+  // 真机来由（2026-09-20）：改下载目录原先只能把路径**粘**进那个输入框。
+  // 两条判据各自挡一种坏形态：
+  //   · **取消**（壳回 `data: null`）⇒ **什么都不许发生**：输入框一个字不动、
+  //     一条命令都不发。⚠️ 这条是承重的：`null` 若被读成空路径，就会走
+  //     `preferences_set("")` 的"恢复默认"语义 ⇒ **用户取消一次却弹出一个确认框**；
+  //   · **选了** ⇒ 路径落进输入框**并且直接进那条既有流程**（先 `preferences_check`、
+  //     再确认框）—— 与手工粘路径那条路**逐字同一条**，不另开一条捷径。
+  {
+    const beforeCheck = calls("preferences_check").length;
+    const beforeSet = calls("preferences_set").length;
+    input(q("#set-dir-input"), "/原来填着的");
+    pickedDir = null; // 用户按了取消
+    click(q("#set-dir-choose"));
+    await sleep(500);
+    check("③zc1 🔴 「选择…」**取消** ⇒ 输入框一个字不动、一条命令都不发",
+      q("#set-dir-input").value === "/原来填着的"
+        && calls("preferences_check").length === beforeCheck
+        && calls("preferences_set").length === beforeSet,
+      `值=${JSON.stringify(q("#set-dir-input").value)}，check +${calls("preferences_check").length - beforeCheck}`);
+
+    pickedDir = "/Volumes/Data/点着选的";
+    click(q("#set-dir-choose"));
+    await sleep(600);
+    const choseCheck = calls("preferences_check").pop();
+    check("③zc2 「选择…」选中了 ⇒ 路径落进输入框**并直接进那条流程**（先发 preferences_check）",
+      q("#set-dir-input").value === "/Volumes/Data/点着选的"
+        && !!choseCheck && choseCheck.args.path === "/Volumes/Data/点着选的",
+      JSON.stringify(q("#set-dir-input").value) + " / " + JSON.stringify(choseCheck && choseCheck.args));
+    check("③zc3 它与手工粘路径走的是同一条 ⇒ 确认框照样出现（不是「选完就改」）",
+      shown("#dlg-confirm-message"), txt("#dlg-confirm-message").slice(0, 30));
+    click(q("#dlg-confirm-cancel"));
+    await sleep(300);
+    check("③zc4 确认框取消 ⇒ **不发** preferences_set（选的这条路没有绕过那次确认）",
+      calls("preferences_set").length === beforeSet,
+      `+${calls("preferences_set").length - beforeSet} 次`);
+    pickedDir = null;
+  }
+
+  // ---- 🔴 改目录之后：**内核重启 + 重放当前批次**在界面上真的表现出来了 -------
+  // 判据是任务 8 那条裁决（`commands.rs:restart_kernel` 的四步）：目录只能经 argv 生效
+  // ⇒ 必须换一个内核进程；而**当前那一批会被自动重放**（用户回到文件页还是原来那批，
+  // 不是"换完目录批次没了"）。界面上它的全部表现就是下面这两拍。
+  statePayload = FIX.stateConnecting;
+  await sleep(1600);
+  check("③zc 重启期间：引擎徽标说「正在连接内核…」（那一句是 Rust 给的）",
+    txt("#engine-text") === FIX.stateConnecting.data.engine.text, txt("#engine-text"));
+  check("③zd 🔴 重启期间：主区**仍然是文件页**（批次还在，没被甩回空态页）",
+    !!q("#files-root"), doc().querySelector("#page").textContent.slice(0, 40));
+  check("③ze 🔴 重启期间：生效的批次码**不变**（重放的是原来那一批）",
+    txt("#summary-code") === CODE, txt("#summary-code"));
+  check("③zf 重启期间：闸门关着 ⇒ 「保存」禁用且 help 换成引擎不可用那一句",
+    q("#set-save").disabled
+      && q("#set-save").getAttribute("title") === FIX.settingsGet.data.save_help.engine_unavailable,
+    q("#set-save").getAttribute("title"));
+
+  statePayload = stateWith(() => {});
+  await sleep(1600);
+  check("③zg 重启落地（引擎回到运行中）：徽标换回 Rust 给的那一句",
+    txt("#engine-text") === FIX.stateLoaded.data.engine.text, txt("#engine-text"));
+  check("③zh 🔴 落地之后**仍然是同一批、仍然是文件页**（重放成功，不是空态页）",
+    txt("#summary-code") === CODE && !!q("#files-root"), txt("#summary-code"));
+
+  // =========================================================================
+  // ④ 关于 + 许可
+  // =========================================================================
+  click(q("#set-about"));
+  await sleep(600);
+  check("④a 关于窗口打开，版本号逐字来自载荷",
+    txt("#about-version") === FIX.about.data.version, txt("#about-version"));
+  esc();
+  await sleep(300);
+  check("④b Esc 收掉**最上面**那一扇（设置窗口还在）", !shown("#about-version") && shown("#set-root"));
+
+  click(q("#set-license"));
+  await sleep(900);
+  const tabs = [...doc().querySelectorAll("#license-list .dlg__tab")];
+  check("④c 许可全文窗口打开，**三份**条目（名字来自载荷）",
+    tabs.length === 3 && tabs[0].textContent === LICENSE_NAMES.gpl
+      && tabs[1].textContent === LICENSE_NAMES.ofl
+      && tabs[2].textContent === LICENSE_NAMES.wv2,
+    tabs.map((t) => t.textContent).join(" / "));
+  const firstText = txt("#license-body .dlg__license-text");
+  const full = await (await fetch("/windows/assets/OFL-1.1.txt")).text();
+  check("④d 第一份（GPLv2）的全文**逐字**且很长（不是一段 stub）",
+    firstText.length > 10000, firstText.length + " 字符");
+  check("④e 「这份许可是随哪个内嵌组件来的」那一句**跟着条目走**（不是一句全局的）",
+    txt("#license-why") === LICENSE_NAMES.gplWhy, txt("#license-why"));
+  check("④f sha256 显示出来了（64 位十六进制）", /^[0-9a-f]{64}$/.test(txt("#license-sha")),
+    txt("#license-sha"));
+  click(tabs[1]);
+  await sleep(300);
+  check("④g 点第二份 ⇒ 正文换成 OFL，且**逐字**等于那个文件",
+    txt("#license-why") === LICENSE_NAMES.oflWhy
+      && txt("#license-body .dlg__license-text") === full,
+    `${txt("#license-body .dlg__license-text").length} vs ${full.length} 字符`);
+  // ⚠️ 第三条（任务 15 加的）—— 它短得多（1.5 KB），所以**长度那一类的判据**
+  //    （"全文很长，不是 stub"）对它不成立 ⇒ 这里判的是**内容**：
+  //    逐字等于仓库里那份文件，且**真的包含触发我们再分发义务的那一条**。
+  click(tabs[2]);
+  await sleep(300);
+  const wv2Full = await (await fetch("/windows/assets/WebView2-SDK-LICENSE.txt")).text();
+  const wv2Shown = txt("#license-body .dlg__license-text");
+  check("④g2 点第三份 ⇒ 正文换成 WebView2 SDK 许可，且**逐字**等于那个文件",
+    txt("#license-why") === LICENSE_NAMES.wv2Why && wv2Shown === wv2Full,
+    `${wv2Shown.length} vs ${wv2Full.length} 字符`);
+  check("④g3 那一份里**确实有**触发我们再分发义务的那一条（二进制形式 + 随附材料）",
+    wv2Shown.includes("Redistributions in binary form must reproduce")
+      && wv2Shown.includes("in the documentation and/or other materials provided with the"),
+    wv2Shown.slice(0, 80));
+  esc();
+  await sleep(300);
+  check("④h Esc 收掉许可那一扇（设置窗口还在）", !doc().querySelector("#license-why") && shown("#set-root"));
+  esc();
+  await sleep(300);
+  check("④i 再按一次 Esc ⇒ 设置窗口收起（栈是**逐层**收的）", !shown("#set-root"));
+  click(q("#tb-settings"));
+  await sleep(400);
+  check("④j 设置窗口关掉之后还能再打开", shown("#set-root"));
+  esc();
+  await sleep(200);
+
+  // =========================================================================
+  // ⑤ 🔴 那颗按钮的**退化路径**：非文件页 ⇒ 禁用**且没有文字**
+  // =========================================================================
+  // ⚠️ 顺序是承重的：它必须跑在 ①b/①c **之后** —— 那两条已经证明过"这颗按钮在
+  //    文件页上真的被点亮过、真的有字"。没有那个前提，本组断言就分不出
+  //    "壳按屏的返回值把它关掉了"与"它一直是 HTML 里那个初始的 disabled"。
+  click(q("#nav-verify"));
+  await sleep(1800);
+  check("⑤a 校验页真的挂上了（不是没换成）", !!q("#verify-classes") && !!q("#verify-refresh"));
+  check("⑤b 校验页：那颗按钮 **disabled**", q("#tb-download").disabled === true);
+  check("⑤c 校验页：它的文字是**空的**（不是留着上一屏那一句）",
+    txt("#tb-download-title") === "", `「${txt("#tb-download-title")}」`);
+
+  statePayload = stateWith((data) => {
+    data.load = { kind: "idle" };
+  });
+  await sleep(1800);
+  check("⑤d 空态页真的挂上了（不是没换成）", !!q("#empty-code") && !!q("#empty-submit"));
+  check("⑤e 空态页：那颗按钮 **disabled**", q("#tb-download").disabled === true);
+  check("⑤f 空态页：它的文字是**空的**", txt("#tb-download-title") === "",
+    `「${txt("#tb-download-title")}」`);
+  // 负控制（同一组里）：换回**文件页** ⇒ 那颗按钮**必须自己亮回来**。
+  // 少了这一条，上面那三条在"壳干脆再也不碰这颗按钮了"的实现下**照样全绿**。
+  // ⚠️ **要点那一下侧栏**：路由是"按 `state()` 决定**有没有生效批次**" +
+  //    "按**壳记着的分区**决定挂哪一屏"（`applyRoute`），所以把 `load` 换回 `loaded`
+  //    并不会自己把主区从校验页切回文件页 —— 分区是**用户**选的。
+  statePayload = stateWith(() => {});
+  await sleep(600);
+  click(q("#nav-files"));
+  await sleep(3200);
+  check("⑤g0 （负控制的前置）文件页**真的回来了**", !!q("#files-root"));
+  check("⑤g 回到文件页 ⇒ 那颗按钮**亮回来**（负控制：上面那三条不是恒真）",
+    q("#tb-download").disabled === false && txt("#tb-download-title") === ACTION_TITLE,
+    `disabled=${q("#tb-download").disabled} 文案「${txt("#tb-download-title")}」`);
+
+  // =========================================================================
+  // ⑥ 失败条上那颗「收起」**真的可点**（审查重要 1）
+  // =========================================================================
+  // 🔴 第一版把监听器挂在模板里那个**空的 `<span>`** 上 —— 它没有内容、没有尺寸、
+  //    **点不动**。一条"点不动的关闭控件"比"根本没有"更坏（它看起来就是坏的）。
+  //    ⇒ 这一组判的不是"那个元素在"，而是**点下去那一行真的消失**。
+  click(q("#tb-settings"));
+  await sleep(1800);
+
+  const ABOUT_FAILED = "关于这一条取不出来（夹具：命令不存在）";
+  failures = { about: ABOUT_FAILED };
+  click(q("#set-about"));
+  await sleep(800);
+  check("⑥a 关于取失败 ⇒ 失败条出现，原文逐字",
+    shown("#about-failure") && txt("#about-failure-text") === ABOUT_FAILED,
+    `「${txt("#about-failure-text")}」`);
+  {
+    const btn = q("#about-failure-dismiss button");
+    check("⑥b 那颗「收起」是**一颗真的按钮**（不是空壳）",
+      !!btn && btn.tagName === "BUTTON" && btn.querySelector("svg") !== null,
+      btn ? btn.outerHTML.slice(0, 80) : "(没有 button)");
+    if (btn) click(btn);
+  }
+  await sleep(300);
+  check("⑥c 点它 ⇒ 关于那条失败**真的收起来了**", !shown("#about-failure"));
+  esc();
+  await sleep(300);
+
+  const LICENSE_FAILED = "许可全文取不出来（夹具：命令不存在）";
+  failures = { license: LICENSE_FAILED };
+  click(q("#set-license"));
+  await sleep(800);
+  check("⑥d 许可取失败 ⇒ 失败条出现，原文逐字",
+    shown("#license-failure") && txt("#license-failure-text") === LICENSE_FAILED,
+    `「${txt("#license-failure-text")}」`);
+  {
+    const btn = q("#license-failure-dismiss button");
+    check("⑥e 那颗「收起」也是**一颗真的按钮**", !!btn && btn.tagName === "BUTTON");
+    if (btn) click(btn);
+  }
+  await sleep(300);
+  check("⑥f 点它 ⇒ 许可那条失败**真的收起来了**", !shown("#license-failure"));
+  failures = {};
+  esc();
+  await sleep(200);
+
+  // =========================================================================
+  // ⑦ 🔴 R-5 对位差分：**判据在 Rust、行为在 JS** 的那几条，两边结论必须一致
+  // =========================================================================
+  // 为什么单列一组：本代最严重那个缺陷（"切一下分区回来，攒的选择就被抹掉"）的形状是
+  // **判据在 Rust 里、实现被抄进 JS**，而两边一分叉**谁都不会红**。
+  // `switchcode.js` 的文件头自己就写着"本文件抄了 `presentation::batch_history::NoteDrafts`
+  // 一份"，并如实记账"那四条规则**没有单测压着**"。这一组就是那件"东西"。
+  //
+  // ⚠️ 期望值**全部来自 `wire-fixtures.json` 的 `mirrorCases`**（由
+  //    `dump_wire_fixtures.rs` 从 Rust 现倒出来，`check_wire_fixtures.sh` 守着它不漂移）
+  //    —— 在这里手写一份期望值等于**又造一份抄件**，那正是本组要治的病。
+  await noteDraftsDifferential();
+  await settingsMatchesDifferential();
+}
+
+// ---------------------------------------------------------------------------
+// R-5 对位差分（两个回放器）—— 被上面 `runAll()` 的最后一步调用
+// ---------------------------------------------------------------------------
+
+/**
+ * **换码面板的备注草稿**：`presentation::batch_history::NoteDrafts` ↔ `js/switchcode.js`。
+ *
+ * 每一例都是"一扇新面板 + 一串用户动作"，判的是**发出去的那几条 `history_put`**：
+ * 要不要发、发的是哪个码、note 是什么、按什么顺序。
+ */
+async function noteDraftsDifferential() {
+  const required = [
+    "no-draft",
+    "unchanged",
+    "write",
+    "after-write",
+    "empty-is-a-draft",
+    "blur",
+    "close-order",
+    "close-partial",
+  ];
+  const spec = FIX.mirrorCases && FIX.mirrorCases.noteDrafts;
+  if (!spec || !Array.isArray(spec.cases) || spec.cases.length === 0) {
+    abort("⑦ 对位差分：夹具里没有 mirrorCases.noteDrafts",
+      "生成器没跑或这一格被删了 —— 这不是\"通过\"：少了它，两边的备注判决分叉就没人管");
+    return;
+  }
+  // ⚠️ **用例表自己也要被判一次**：少一条规则 ⇒ 那条规则**没人对**，而输出里看不出来
+  //    （"没验"与"验过了"长得一样）。同 `test.sh` 第 3 步"空跑绿灯判为失败"的纪律。
+  const rules = new Set(spec.cases.map((c) => c.rule));
+  const missed = required.filter((r) => !rules.has(r));
+  check("⑦a 用例表覆盖了八条规则（少一条 = 那条规则没人对）",
+    missed.length === 0, missed.join(" / "));
+
+  for (const c of spec.cases) {
+    // ⚠️ 每一例都从**一扇新面板 + 一份干净载荷**开始。
+    //    `HISTORY_ROWS` 也要一起换：stub 的 `history_put` 回执是**照它**拼的，
+    //    只换 `historyPayload` 的话，写成功那一刻这一例的行会被换回全局那一份。
+    esc();
+    await sleep(150);
+    HISTORY_ROWS = c.rows;
+    historyPayload = { ok: true, data: { rows: c.rows } };
+    click(q("#tb-code"));
+    await sleep(350);
+    if (!shown("#sc-root")) {
+      abort(`⑦ 对位差分：${c.rule} 那一例的面板没打开`, "面板打不开 ⇒ 这一例无从判起");
+      return;
+    }
+    /** 某一行的备注框**现查**（写成功之后那一块会整块重建，旧节点是废的）。 */
+    const noteEl = (code) => {
+      const i = c.rows.findIndex((r) => r.code === code);
+      const els = notesNow();
+      return i >= 0 && i < els.length ? els[i] : null;
+    };
+    const before = calls("history_put").length;
+    let broken = null;
+    for (const op of c.ops) {
+      const el = op.code ? noteEl(op.code) : null;
+      if (op.code && !el) {
+        broken = `${op.op} 那一行的输入框找不到（操作数的行不在面板上）`;
+        break;
+      }
+      if (op.op === "edit") input(el, op.text);
+      else if (op.op === "enter") key(el, "Enter");
+      else if (op.op === "blur") el.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
+      else if (op.op === "close") click(q("#sc-cancel"));
+      else { broken = `不认识的 op：${op.op}`; break; }
+      await sleep(250);
+    }
+    if (broken) {
+      abort(`⑦ 对位差分：${c.rule} 那一例没法跑完`, broken);
+      return;
+    }
+    await sleep(300);
+    const wrote = calls("history_put").slice(before).map((i) => ({
+      code: i.args && i.args.entry ? i.args.entry.code : null,
+      note: i.args && i.args.entry ? i.args.entry.note : null,
+    }));
+    check(`⑦ ${c.rule}：${c.name}`,
+      JSON.stringify(wrote) === JSON.stringify(c.writes),
+      `Rust 那一侧说 ${JSON.stringify(c.writes)}，前端实际发出去 ${JSON.stringify(wrote)}`);
+  }
+
+  // ---- 面板的**另外两条关闭路径**：Esc 与点背影 ------------------------------
+  //
+  // 🔴 为什么这两条也在这里：上面那张表判的是**判决**（要不要写、写哪些、什么顺序），
+  //    用的是"取消"那颗按钮那条路。而面板**还能被 Esc 与点背影关掉** —— 那两条路
+  //    在 `dialogs.js` 里走的是模态栈自己的 `handle.close()`，**不是**
+  //    `switchcode.js` 的 `close()`。
+  //
+  // ⚠️ **它曾经是红的（2026-09-20，本机 Edge 实测）**：那时第三个提交点只挂在
+  //    `switchcode.js` 的 `close()` 里，Esc 与点背影**绕过去**，全靠"关窗那一刻备注框
+  //    正好有焦点 ⇒ 浏览器补一次 `blur`"接住。实测两个方向：
+  //      · 备注框**有焦点**时关窗 ⇒ 写入**同步**发生（`history_put` 在关窗那一拍之内发出）；
+  //      · 关窗时那个框**没有焦点** ⇒ **一条都不发**、用户敲的字**无声丢掉**。
+  //    而第二种恰恰是常态：面板一打开焦点在**码输入框**上（`dialogs.js` 把焦点移给
+  //    第一个输入格），用户敲完备注去看别处再按 Esc 就是这一格。
+  //    ⇒ 修法是把第三个提交点搬到 `modal.close`（四条路径唯一的汇合点），
+  //      于是**焦点有没有**都不再是判据的前提。
+  //    ⚠️ **两种焦点状态都进判据**（下面那个双层循环）：只判"有焦点"那种 = 把
+  //      "浏览器会补一次事件"当成了机制 —— 而它正是 `switchcode.js` 模块头自己声明
+  //      "**不保证**会跑"的那一格。保住了一条、丢了另一条，就是这次修的形状。
+  //    ⇒ 它判的是"**那个字真的发出去了**"，不是"面板关掉了"；
+  //      而上面那张用例表**照样全绿**（它走的是另一条路）—— 两件事、两条判据。
+  //    关窗那一刻备注框**有没有焦点**，走的是**两条不同的路** ——
+  //      · 有焦点：节点被摘掉时 Chromium 补一次 `blur` ⇒ 失焦那个提交点接住；
+  //      · **没有焦点**（用户敲完去看别处 —— 面板一打开焦点本来就在码输入框上）：
+  //        `blur` **不会发生** ⇒ 只有**模态关闭路径上的那一次兜底**能接住。
+  //    只判前者 = 判据把"靠浏览器补一次事件"当成了机制；后者才是那段功能的验收项
+  //    （"重启应用后仍在"）真正会踩到的那一格。
+  for (const focused of [true, false]) {
+    for (const how of ["esc", "backdrop"]) {
+      esc();
+      await sleep(150);
+      HISTORY_ROWS = FIX.historyGet.data.rows;
+      historyPayload = FIX.historyGet;
+      click(q("#tb-code"));
+      await sleep(350);
+      const el = notesNow()[0];
+      const code = HISTORY_ROWS[0].code;
+      const probe = `关窗探针（${how}${focused ? "" : "-无焦点"}）`;
+      if (focused) el.focus();
+      input(el, probe);
+      const n0 = calls("history_put").length;
+      if (how === "esc") {
+        esc();
+      } else {
+        // 背影 = 那一下**正落在背影上**的 mousedown（见 `dialogs.js`）。
+        doc().querySelector(".modal").dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      }
+      await sleep(500);
+      const sent = calls("history_put").slice(n0).map((i) => i.args.entry);
+      check(`⑦ ${how}（关窗时备注框${focused ? "有" : "没有"}焦点）：敲了一半的备注在关窗时**交出去了**（不是无声丢掉）`,
+        sent.length === 1 && sent[0].code === code && sent[0].note === probe,
+        `面板还在=${shown("#sc-root")}；发出 ${JSON.stringify(sent)}`);
+    }
+  }
+
+  esc();
+  await sleep(150);
+  // 收尾：把两格恢复成夹具原本那一份（后面的用例与截图那条路读的是它）。
+  HISTORY_ROWS = FIX.historyGet.data.rows;
+  historyPayload = FIX.historyGet;
+}
+
+/**
+ * **参数面板的"有没有未保存的改动"**：
+ * `presentation::settings_form::SettingsForm::matches` ↔ `js/settings.js:hasUnsavedChanges`。
+ *
+ * ⚠️ 这一格与上面那一格**不同**：两句**文案**确实发出去了（`banner.{unsaved,clean}`），
+ *    没发出去的是那句**判决** —— "此刻算不算有未保存的改动"由前端自己比，
+ *    而 `matches` 的判据在 Rust 里、**没人调**。判据同样是"同一组输入、两边同一结论"。
+ */
+async function settingsMatchesDifferential() {
+  const spec = FIX.mirrorCases && FIX.mirrorCases.settingsMatches;
+  if (!spec || !Array.isArray(spec.cases) || spec.cases.length === 0) {
+    abort("⑦ 对位差分：夹具里没有 mirrorCases.settingsMatches",
+      "生成器没跑或这一格被删了 —— 这不是\"通过\"");
+    return;
+  }
+  const fields = Array.isArray(spec.fieldOrder) ? spec.fieldOrder : [];
+  // 两向都要有：只有"脏"或只有"干净"的话，一句恒 true / 恒 false 的实现也能全绿。
+  check("⑦s0 用例表两向都有（有改动的 / 没改动的）",
+    spec.cases.some((c) => c.dirty === true) && spec.cases.some((c) => c.dirty === false),
+    spec.cases.map((c) => `${c.rule}=${c.dirty}`).join(" "));
+
+  const baseSettings = JSON.parse(JSON.stringify(FIX.settingsGet.data.settings));
+  /** 枚举控件在**界面上**落在第几格（在**面板开着**的时候量，见下面的断言）。 */
+  let enumAt = -1;
+  for (const c of spec.cases) {
+    // 每一例都要**换掉载荷里那一份 `settings`**（"表里与内核那一份一不一样"是判决的
+    // 两个输入之一）—— 打开面板时它被重新读一次，`edited` 由它播种。
+    esc();
+    await sleep(150);
+    FIX.settingsGet.data.settings = c.current;
+    click(q("#tb-settings"));
+    await sleep(600);
+    if (!shown("#set-root")) {
+      abort(`⑦ 对位差分：${c.rule} 那一例的设置窗口没打开`, "窗口打不开 ⇒ 这一例无从判起");
+      return;
+    }
+    const rows = [...doc().querySelectorAll("#set-params-rows .set__row")];
+    if (rows.length !== fields.length) {
+      abort(`⑦ 对位差分：${c.rule} 那一例的格子数对不上`,
+        `界面上 ${rows.length} 格 / 夹具说 ${fields.length} 个字段`);
+      return;
+    }
+    // ⚠️ **就在面板开着的时候量**（量的是这一屏真的画出来的东西，不是夹具里那句话）：
+    //    收尾那一次 `esc()` 之后面板连同 `#set-params-rows` 一起被摘掉 ⇒ 那时量会得到 -1，
+    //    而那会让下面那条断言**以错误的理由**红。
+    if (enumAt < 0) {
+      enumAt = rows.findIndex((r) => r.querySelector("select"));
+    }
+    // 把每一格填成"表里那一份"（**不是**内核那一份）—— 然后看界面说它脏不脏。
+    for (let i = 0; i < fields.length; i += 1) {
+      const control = rows[i].querySelector("input, select");
+      const value = String(c.form[fields[i]]);
+      if (control.tagName === "SELECT") {
+        // 枚举那一格：值必须是候选之一（不在里面的话浏览器会把 `value` 落成空串，
+        // 那样这一例就变成在判别的东西了）。
+        control.value = value;
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+      } else {
+        input(control, value);
+      }
+    }
+    await sleep(250);
+    const banner = txt("#set-banner");
+    const want = c.dirty
+      ? FIX.settingsGet.data.banner.unsaved
+      : FIX.settingsGet.data.banner.clean;
+    check(`⑦ ${c.rule}：${c.name}`, banner === want,
+      `Rust 那一侧的判决是 dirty=${c.dirty} ⇒ 期望「${want}」，界面上是「${banner}」`);
+  }
+
+  // `fieldOrder` 那份顺序的前提：**枚举那一项在它说的那一格上**。
+  // ⚠️ 它判不到"顺序被整体重排"（重排之后多数用例的判决仍然相同）——那份残留
+  //    如实记在生成器里那一段（`fieldOrder` 的注释），别把这条读成顺序也被守住了。
+  check("⑦s1 `fieldOrder` 里枚举那一项的位置 = 界面上枚举控件的位置",
+    enumAt === fields.indexOf("min_split_size"),
+    `界面 ${enumAt} / 夹具 ${fields.indexOf("min_split_size")}`);
+
+  esc();
+  await sleep(150);
+  FIX.settingsGet.data.settings = baseSettings;
+}
+</script>
+</body>
+</html>

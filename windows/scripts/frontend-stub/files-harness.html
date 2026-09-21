@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<!--
+  windows/scripts/frontend-stub/files-harness.html —— **文件页的无头验收夹具**（常驻）。
+
+  跑法（**一条命令**）：bash windows/scripts/check_files_screen.sh
+  直接打开：/files-harness.html?s=sub|blocked|keep|root|fail|switch（要先起本地静态服务，见 runner）
+  ⚠️ `blocked` 是任务 17 加的第二档载荷场景（超预算的勾选面 ⇒ 那个动作按不下去）：
+     `sub` 那一档的 `blocked_reason` 是 `null`，所以"界面照那一格做了没有"在那里不可观测
+     —— 两档合起来才是一条判据的**正反两面**。
+  ⚠️ `keep` 是**换屏**那一档（**真机缺陷**：选一个文件 → 看一眼传输列表 → 切回来 →
+     点「下载选中」⇒ 下的是整批）。`sub` 那一场从头到尾**没换过屏** ⇒ 那条缺陷在那里
+     长得和"做对了"一模一样 —— 只有真的切走再切回来，它才可观测（理由写在场里）。
+
+  ===========================================================================
+  它验的是哪一件事
+  ===========================================================================
+  **"文件页在**真载荷**下渲染得对不对"** —— 三十几条断言，期望值**全部从
+  `windows/scripts/frontend-stub/wire-fixtures.json` 里读**（那份夹具由
+  `windows/scripts/make_wire_fixtures.sh` 从 `api::tree` / `api::enqueue` / `api::state`
+  现倒出来，**不是手抄的**）。
+
+  ⚠️ 为什么"期望值必须来自夹具"：这一代栽过一次 —— 手抄的 stub 载荷与前端代码
+  **犯同一个错**（两边都信了同一份简报里两个不存在的字段名），于是三十几条断言全绿、
+  而真载荷下**状态列整列空白**、**双击目录变成下载整个目录**。那份夹具就是那次事故的产物。
+
+  ===========================================================================
+  ⚠️ 它为什么住在这里，而不是 `windows/web/` 下
+  ===========================================================================
+  `shell-win/tauri.conf.json` 的 `build.frontendDist = "../web"` ⇒ **`windows/web/`
+  下的任何文件都会被编进 exe**。测试夹具放在那里 = **把测试代码发给客户**
+  （那条"别放错地方"由 `windows/scripts/check_frontend_copy.sh` 的文件清单判据守着）。
+  本目录**不在** frontendDist 里。
+
+  ===========================================================================
+  结果怎么从浏览器里出来（**这是本夹具唯一一处不显然的手法**）
+  ===========================================================================
+  `document.title` + `--dump-dom` **不行**：本仓库实测过 —— 这台机器上的
+  `Microsoft Edge 149` 在 `--headless=new --dump-dom` 下**会挂住**（跑不完也不退出）。
+  ⇒ 结果走 **HTTP POST**：本页把 `{scenario, ok, fail, lines}` POST 到 `/__result`，
+     而 runner 起的那个 python 服务把它**写进一个文件**；runner 轮询那个文件。
+  这样"跑完了没有""跑出来几条"都是**脚本读得到的数**，不靠人看截图
+  （空跑 ⇒ runner 红，同 `test.sh` 第 3 步那条"空跑绿灯判为失败"的纪律）。
+
+  ⚠️ 夹具里的中文**不归 §3.2 管**：它不是交付物（不进 exe）。判据只扫 `windows/web/**`。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light">
+<title>files screen harness</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; }
+  iframe { border: 0; display: block; width: 1120px; height: 720px; }
+  #out { margin: 0; padding: 8px 12px; font: 12px/1.5 ui-monospace, Menlo, monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<iframe id="f" src="/windows/web/index.html"></iframe>
+<pre id="out">loading fixtures…</pre>
+<script type="module">
+const SCENARIO = new URLSearchParams(location.search).get("s") || "sub";
+
+// ---- 夹具：**从 Rust 倒出来的那一份**（本页一个字段名都不手抄）-----------------
+const FIX = await (await fetch("/windows/scripts/frontend-stub/wire-fixtures.json")).json();
+const ROOT_ROWS = FIX.treeLevelRoot.data.rows;
+const SUB_ROWS = FIX.treeLevelSub.data.rows;
+const SELECTED = FIX.treeWhole.data.selected;
+const CODE = FIX.stateLoaded.data.load.summary.code;
+const SUB_PATH = FIX.treeLevelSub.data.breadcrumb.path;
+// `RowColor` 的五个成员 → 本屏的 CSS 类（**独立写死**，不从被测文件里 import：
+//  从被测对象算期望值等于恒真断言）。
+const COLOR_CLASS = { Secondary: "is-secondary", Blue: "is-blue", Green: "is-green", Red: "is-red", Orange: "is-orange" };
+
+const invocations = [];
+/**
+ * 🔴 **F-2 的观测窗**：只把**首挂那一条**「整棵树」读人工拖住一小段。
+ *
+ * 为什么非拖不可：夹具里的 `invoke` 是**立刻 resolve** 的，从 `mount` 到那一拍回来
+ * 只有几微秒宽 —— 而 F-2 要判的那一段（"载荷还没到、底栏那颗主按钮是什么状态"）
+ * 就在那个宽度里。不拖的话采样**永远采不到坏帧**，那条判据会退化成恒真
+ * （"看起来在守，其实什么都守不住" —— 本仓库最恨的形态）。
+ * ⚠️ **只在"首挂那一秒"里拖**（`TREE_SLOW_UNTIL` 那个时间窗）：这一屏的第一次读
+ *    一定发生在那一段里（注入 `__TAURI__` 之后几个微任务），而**用户交互都在 1600 ms
+ *    之后** ⇒ 既有那些断言的时间假设（`sleep(400/800)`）一个字都没动到。
+ * ⚠️ **`tree(path)`（导航/读某一层）不拖**，只拖**无 path 的那一支**（整棵树）——
+ *    要量的就是那一条。
+ */
+const FIRST_TREE_DELAY_MS = 200;
+// ⚠️ 窗口取 **2.5 s**（不是 1 s）：这一屏真正挂上是**第二拍 `state()`** 的事
+//（第一拍发生在注入 `__TAURI__` 之前 ⇒ 它必然失败、也必然不改路由），
+// 也就是注入之后约 1 s。窗口开小了会**刚好错开**那一次读 —— 而那正是要量的东西。
+const TREE_SLOW_UNTIL = Date.now() + 2500;
+
+async function invoke(cmd, args) {
+  invocations.push({ cmd, args: args || {} });
+  if (cmd === "state") return FIX.stateLoaded;
+  if (cmd === "tree" && (!args || args.path === undefined) && Date.now() < TREE_SLOW_UNTIL) {
+    await sleep(FIRST_TREE_DELAY_MS);
+  }
+  if (cmd === "tree") {
+    const path = args && typeof args.path === "string" ? args.path : null;
+    // 无 path：整棵树那一支。⚠️ **两档**（任务 17）：默认那一档 `blocked_reason` 是 `null`；
+    // `blocked` 场景给的是**超预算**那一档（`blocked_reason` 是个字符串）。
+    if (path === null) return SCENARIO === "blocked" ? FIX.treeWholeBlocked : FIX.treeWhole;
+    if (path === SUB_PATH) return SCENARIO === "fail" ? FIX.treeLevelFailure : FIX.treeLevelSub;
+    return FIX.treeLevelRoot;                                       // "" 与回退之后的根
+  }
+  if (cmd === "enqueue") {
+    return (args.paths || []).length === 0 ? FIX.enqueueNothing : FIX.enqueuePartial;
+  }
+  return { ok: true, data: {} };
+}
+
+const lines = [];
+let ok = 0, fail = 0;
+let reported = false;
+function check(name, cond, detail) {
+  if (cond) { ok++; lines.push("PASS " + name + (detail ? " — " + detail : "")); }
+  else { fail++; lines.push("FAIL " + name + (detail ? " — " + detail : "")); }
+  document.getElementById("out").textContent = lines.join("\n");
+}
+/**
+ * 断言脚本自己中止了（抛异常 / 卡住）。
+ *
+ * 🔴 **这一条是 A/B 逼出来的**：修前那一版在"双击目录"之后**根本没进得去目录**，
+ *    于是后面那些"读子目录里某一行的状态列"的断言会拿到 `undefined` ⇒ `.querySelector` 抛。
+ *    第一版夹具**没有接住它** ⇒ 结果送不出去 ⇒ runner 只看到"超时"，
+ *    而"超时"与"那 9 条红"是**两件事**（前者说不出是哪 9 条）。
+ *    ⚠️ 所以：**中止也要报**，而且**不计进 ok/fail**（它不是一条断言的结果，
+ *    它是"后面那些断言没能跑"这件事本身）。
+ */
+let aborted = 0;
+function abort(why, error) {
+  aborted += 1;
+  lines.push("ABORT " + why + "：" + (error && error.message ? error.message : error));
+  document.getElementById("out").textContent = lines.join("\n");
+}
+/** 把结果送出浏览器（见文件头那段：`--dump-dom` 在本机挂住，所以走 POST）。 */
+async function report() {
+  if (reported) return;
+  reported = true;
+  document.title = "DONE ok=" + ok + " fail=" + fail + " abort=" + aborted;
+  try {
+    await fetch("/__result", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ scenario: SCENARIO, ok, fail, aborted, lines }),
+    });
+  } catch (error) {
+    // 送不出去 = runner 收不到数 ⇒ 它会按"空跑"红（这正是要的：不许静默）。
+    console.error("POST /__result 失败：", error);
+  }
+}
+
+/**
+ * 每一轮都走这一条：**跑到哪儿算哪儿，然后一定回报**。
+ * ⚠️ 一个"卡住就不回报"的夹具，在 runner 眼里与"没跑"没有区别（两者都只是超时），
+ *    而那正是本仓库反复记账的"静默"形态。
+ */
+async function runScenario(runner) {
+  try {
+    await runner();
+  } catch (error) {
+    abort("断言脚本中止（后面那些没跑）", error);
+  } finally {
+    await report();
+  }
+}
+// 兜底：60 s 还没回报就报一次（页面卡住时至少能说出"卡在哪一条之后"）。
+setTimeout(() => {
+  if (!reported) {
+    abort("断言脚本 60s 内没跑完", "watchdog");
+    void report();
+  }
+}, 60000);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const doc = () => document.getElementById("f").contentDocument;
+const rowsOf = () => [...doc().querySelectorAll(".files__row")];
+const rowByPath = (p) => rowsOf().find((r) => r.dataset.path === p);
+const stateEl = (r) => r.querySelector(".files__state");
+const checked = () => rowsOf().filter((r) => r.querySelector(".files__cb").classList.contains("is-checked")).map((r) => r.dataset.path);
+const crumbText = () => [...doc().querySelectorAll(".files__crumb")].map((c) => c.textContent).join("|");
+const click = (el) => el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+// 🔴 **真浏览器的双击是 `click` → `click` → `dblclick` 三下**，不是只有最后一下。
+//    本夹具原来只发 `dblclick` ⇒ "单击处理器在双击里也跑了"这件事**在夹具里不存在**，
+//    于是一整类缺陷看不见（真机报的"进子目录后选单个文件却下了整个目录"就是这一类：
+//    那两次 `click` 把**刚点中的那个目录**选进了勾选面，而它进了目录之后就看不见了）。
+//    ⇒ 这里按真浏览器发全套，判据才落在真机上会发生的顺序上。
+const dbl = (el) => {
+  click(el);
+  click(el);
+  el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+};
+
+document.getElementById("f").addEventListener("load", (e) => {
+  e.target.contentWindow.__TAURI__ = { core: { invoke } };
+  if (SCENARIO === "sub") void runScenario(runInteractions);
+  else if (SCENARIO === "blocked") void runScenario(runBlocked);
+  else if (SCENARIO === "fail") void runScenario(runFailure);
+  else if (SCENARIO === "switch") void runScenario(runSwitch);
+  else if (SCENARIO === "keep") void runScenario(runKept);
+  else void runScenario(runStill);
+});
+
+// ---- 场景 root：只等它画完（给人看的截图用）----------------------------------
+async function runStill() {
+  await sleep(1600);
+  const hasState = ROOT_ROWS.some((r) => "state" in r);
+  check("夹具里没有 `state` 那一格（R-35：别发没人读的字段）", !hasState);
+  check("根那一层 7 行都画出来了", rowsOf().length === ROOT_ROWS.length, rowsOf().length + " 行");
+}
+
+// ---- 场景 blocked：勾选面大到一次发不出去 ⇒ 那个动作**真的按不下去**（任务 17）----
+//
+// 🔴 **这个场景为什么必须存在**（R-61：行为成立 ≠ 被守住）：`sub` 那一档的载荷里
+//    `blocked_reason` 是 `null`，于是"交不交勾选面 / 读不读那一格 / 有没有把它落到 DOM"
+//    这三件事**做没做长得一模一样** —— 只有一份 `blocked_reason` 非 `null` 的载荷
+//    才分得开。判据（什么时候算按不下去）在 Rust（`DownloadTargets::blocked_reason`，
+//    有单测）；本场景只验**界面照那一格做了没有**。
+async function runBlocked() {
+  await sleep(1600);
+  const act = FIX.treeWholeBlocked.data.action;
+  const bar = doc().querySelector("#files-bar-download");
+  const hint = doc().querySelector("#files-bar-hint");
+
+  // ⚠️ 先钉住处**夹具的前提**：这一档必须真的带着那句话（否则下面几条会退化成恒真）。
+  check("夹具给的是「按不下去」那一档（blocked_reason 是个非空字符串）",
+    typeof act.blocked_reason === "string" && act.blocked_reason !== "", String(act.blocked_reason));
+
+  check("底栏那颗下载按钮**真的禁用**（不是「点了没反应」）", bar.disabled === true, "disabled=" + bar.disabled);
+  // 🔴 **而且禁用要看得出来**（`files.css` 的 `:disabled` 那一段）：同一颗按钮，把 `disabled`
+  //    摘掉再读一次计算样式 —— 两次**必须不同**。⚠️ 只断言 `disabled === true` 是不够的：
+  //    `.is-primary` 的 accent 底色会盖住浏览器默认的禁用观感（那条 `:hover` 原本还会
+  //    把它点亮），于是"补了样式"与"没补"在 DOM 上一模一样 —— 那正是本任务修的那个形状。
+  const win = document.getElementById("f").contentWindow;
+  const bgDisabled = win.getComputedStyle(bar).backgroundColor;
+  bar.disabled = false;
+  const bgEnabled = win.getComputedStyle(bar).backgroundColor;
+  bar.disabled = true;
+  check("禁用态与可用态**看得出不一样**（同一颗按钮，背景色必须不同）",
+    bgDisabled !== bgEnabled, "禁用 " + bgDisabled + " / 可用 " + bgEnabled);
+  check("那句话显示出来了，且**逐字来自夹具**（Rust 给的，前端一个字都不造）",
+    !hint.hidden && hint.textContent === act.blocked_reason, "「" + hint.textContent + "」");
+  check("那句话旁边的分隔符也跟着出现（不然它会贴着项数）",
+    !doc().querySelector("#files-bar-hint-sep").hidden);
+  // ⚠️ 按钮文案**不受影响**：它仍然叫「下载选中」—— "此刻按不动"与"它叫什么"是两件事。
+  check("按钮文案仍然是夹具里的 button_title", bar.textContent === act.button_title, bar.textContent);
+
+  // ⚠️ 这一档的载荷**只改底栏那几格**：列表与面包屑一个字都不该受影响。
+  check("根那一层照旧画出来了（这一档的载荷不改列表）",
+    rowsOf().length === ROOT_ROWS.length, rowsOf().length + " 行");
+
+  // 右键菜单里那一项是**同一个入口**（同一处判据）⇒ 同样按不动。
+  const second = rowByPath(ROOT_ROWS[1].path);
+  if (!second) {
+    check("右键菜单那一项：行不在场（见上一条）", false,
+      "rowByPath 没找到 " + ROOT_ROWS[1].path + "；实际在场的是 " + rowsOf().map((r) => r.dataset.path).join(" / "));
+  } else {
+    second.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 700, clientY: 300 }));
+    await sleep(400);
+    check("右键菜单那一项也在场（右键点开了）", !doc().querySelector("#files-menu").hidden);
+    const item = doc().querySelector("#files-menu-download");
+    check("右键菜单里那一项也禁用了", item.disabled === true, "disabled=" + item.disabled);
+  }
+}
+
+// ---- 场景 fail：读某一层回 failure（回退 + 那条说明 + 上一层的内容还在）--------
+async function runFailure() {
+  await sleep(1600);
+  const dir = rowByPath(ROOT_ROWS[0].path);
+  check("列表先画出来了", !!dir, rowsOf().length + " 行");
+  if (dir) {
+    dbl(dir);
+    await sleep(1000);
+    const bar = doc().querySelector("#files-failure");
+    const f = FIX.treeLevelFailure.data.failure;
+    check("失败那条说明出现了", !!bar && !bar.hidden);
+    check("说了壳写的那句（逐字来自夹具）", bar.textContent.includes(f.notice), f.notice);
+    check("内核原文逐字在场", bar.textContent.includes(f.message), f.message);
+    check("面包屑退回失败那一层（夹具里的 breadcrumb.path）",
+      doc().querySelector(".files__crumb").textContent === CODE, doc().querySelector(".files__crumb").textContent);
+    check("上一层的内容仍然在（没被甩进错误页）", rowsOf().length === ROOT_ROWS.length, rowsOf().length + " 行");
+  }
+}
+
+// ---- 场景 switch：换批 ⇒ 复位 + 重播 ----------------------------------------
+async function runSwitch() {
+  await sleep(1600);
+  check("首屏在根上", rowsOf().length === ROOT_ROWS.length, rowsOf().length + " 行");
+  dbl(rowByPath(ROOT_ROWS[0].path));
+  await sleep(1200);
+  check("先进入了子目录", rowsOf().length === SUB_ROWS.length, rowsOf().length + " 行");
+  const before = invocations.filter((i) => i.cmd === "tree").length;
+  FIX.stateLoaded.data.load.summary.code = "R.ZZZZZZZZZZZZZZZZZZZZ";
+  await sleep(3200);
+  check("换批 ⇒ 浏览位置复位到根",
+    doc().querySelector(".files__crumb").textContent === "R.ZZZZZZZZZZZZZZZZZZZZ",
+    doc().querySelector(".files__crumb").textContent);
+  check("换批 ⇒ 确实重读了（多发了 tree）",
+    invocations.filter((i) => i.cmd === "tree").length > before,
+    before + " → " + invocations.filter((i) => i.cmd === "tree").length);
+  check("换批 ⇒ 重播了内核给的默认勾选面",
+    JSON.stringify(checked()) === JSON.stringify(SELECTED), JSON.stringify(checked()));
+}
+
+// ---- 场景 keep：**换屏不许把勾选面与位置打回默认面**（真机缺陷的永久判据）------
+//
+// 🔴 **这一场抓的是人类伙伴在真 Windows 上报的那一条**（原话）：
+//    > window客户端，**无法进行选中下载，只能下载全部**。具体是，我选择一个文件，
+//    > 点击下载选中，最终也是全部下载。其他的功能均正常。
+//
+// 根因（修之前）：**勾选面与当前层住在 `mount` 的闭包里**，而**换屏 = 重挂**
+//    （`app.js:applyRoute` 见到分区变了就 `unmount()` + `mount()`）。于是
+//    "选一个文件 → 去「传输列表」看一眼 → 切回来"的后果是勾选面被**重播**成内核给的
+//    `default_selected`（"所有还没下完的文件" —— 一批全新的交付里**就是整批**），
+//    位置退回根。而勾选面与整批**相等**时，`DownloadTargets::paths` 会收敛成
+//    `paths: []`（内核语义 = 下全部待下载）⇒ **只选了一个文件，下的是整批**。
+//
+// ⚠️ **它不是"我们的设计选择"，是漏了一次移植**：macOS 侧这三格由 `RootView` 持有
+//    （`FileBrowser.swift` 顶上那段注释逐字写着"留在视图的 `@State` 里的后果是：
+//    用户跨目录攒的选择与当前所在的目录被**无声地**打回 `default_selected` + 根目录"）
+//    —— 所以 macOS 上没这个毛病、Windows 上有。
+//
+// ⚠️ **判别力**：把 `files.js` 里 `kept` 那三格搬回 `mount` 的闭包（= 修之前那一版）
+//    ⇒ 本场的 ④ 与 ⑤ 立刻红（切回来时勾选面变成夹具的 `selected`、发出去的也是整批）。
+//
+// ⚠️ 两条路都测（人类伙伴说的"选择一个文件"是哪一种，他自己未必分得清）：
+//    ① 点**行体**；② 点**复选框**。两条都得活过换屏。
+/** 去「传输列表」看一眼再切回来。**这不是换批** —— 换屏不该动任何一格状态。 */
+async function switchAwayAndBack() {
+  click(doc().querySelector("#nav-transfers"));
+  await sleep(1200);
+  check("　切过去之后文件页确实被拆掉了（不是同一批 DOM ⇒ 这一场真的在测「重挂」）",
+    rowsOf().length === 0, rowsOf().length + " 行");
+  click(doc().querySelector("#nav-files"));
+  await sleep(1400);
+}
+
+async function runKept() {
+  await sleep(1600);
+  const sub = FIX.treeLevelSub.data.breadcrumb.segments[0].name;
+  const fileA = ROOT_ROWS[4].path;
+
+  // ---- ① 点**行体**选中一个，然后换屏再回来 ------------------------------------
+  click(rowByPath(fileA));
+  await sleep(900);
+  check("① 点一行 ⇒ 只选中它", JSON.stringify(checked()) === JSON.stringify([fileA]), JSON.stringify(checked()));
+  await switchAwayAndBack();
+
+  // ---- ② 回来之后：勾选面还是那一个（**不许被打回默认面**）----------------------
+  check("② 切回来 ⇒ 勾选面还是那一个（**不许被打回默认面**）",
+    JSON.stringify(checked()) === JSON.stringify([fileA]), JSON.stringify(checked()));
+  // ⚠️ 底栏那几格是 Rust 按"前端**报上去**的那个面"算的 ⇒ 也要一起核：
+  //    读的是**真的发出去的那条请求**的参数（`invocations` 记的），不是某个中间变量。
+  const whole = invocations.filter((i) => i.cmd === "tree" && i.args.path === undefined).pop();
+  check("② 切回来之后那一拍交上去的勾选面逐字还是它",
+    Array.isArray(whole.args.selection) && JSON.stringify(whole.args.selection) === JSON.stringify([fileA]),
+    JSON.stringify(whole.args));
+  // ⚠️ 同一处根因的另一半：底栏与工具栏那几格（"已选 N 项" / 按钮叫什么 / 此刻能不能按）
+  //    也是"当前勾选面"的函数，而它们是 `mount` 闭包里的 ⇒ 不重新问一次的话，
+  //    **切回来时底栏是空白的**：按钮没有文字、工具栏那颗 `toolbarDownload()` 返回 `null`
+  //    ⇒ **被禁用**。用户看到的是"那颗「下载选中」按不下去"—— 正是真机上
+  //    "无法进行选中下载"的直观形态。（判据是"有没有文字/能不能按"，具体文案由 Rust 给，
+  //    本夹具那两格读的是载荷里的值，不去拼它。）
+  check("② 切回来 ⇒ 底栏那颗有文字（不是空白的）",
+    doc().querySelector("#files-bar-download").textContent !== "",
+    "「" + doc().querySelector("#files-bar-download").textContent + "」");
+  check("② 切回来 ⇒ 工具栏那颗下载按钮**可用**（壳把它禁用 = 按不下去，正是「无法选中下载」）",
+    doc().querySelector("#tb-download").disabled === false
+      && doc().querySelector("#tb-download-title").textContent !== "",
+    "disabled=" + doc().querySelector("#tb-download").disabled
+      + " title=「" + doc().querySelector("#tb-download-title").textContent + "」");
+
+  // ---- ③ 点「下载选中」⇒ 发给内核的必须是**那一个**（不是整批）------------------
+  click(doc().querySelector("#files-bar-download"));
+  await sleep(900);
+  const enq = invocations.filter((i) => i.cmd === "enqueue").pop();
+  check("③ 点「下载选中」⇒ 发的是那一个路径（**不是整批**——整批会被壳收敛成空数组、内核下全部待下载）",
+    JSON.stringify(enq.args.paths) === JSON.stringify([fileA]), JSON.stringify(enq.args));
+
+  // ---- ④ 另一条路：**点复选框**选中的，也要活过换屏 ----------------------------
+  click(doc().querySelector("#files-bar-select-none"));
+  await sleep(800);
+  const fileB = ROOT_ROWS[5].path;
+  click(rowByPath(fileB).querySelector(".files__cb"));
+  await sleep(900);
+  check("④ 点复选框 ⇒ 只选中它", JSON.stringify(checked()) === JSON.stringify([fileB]), JSON.stringify(checked()));
+  await switchAwayAndBack();
+  check("④ 切回来 ⇒ 复选框选的那一个也还在（两条路的语义是同一条）",
+    JSON.stringify(checked()) === JSON.stringify([fileB]), JSON.stringify(checked()));
+  click(doc().querySelector("#files-bar-download"));
+  await sleep(900);
+  const enq2 = invocations.filter((i) => i.cmd === "enqueue").pop();
+  check("④ 它发出去的也是那一个路径", JSON.stringify(enq2.args.paths) === JSON.stringify([fileB]), JSON.stringify(enq2.args));
+
+  // ---- ⑤ 另一半：**当前所在的目录**也要活过换屏（同一处根因的第二格）-------------
+  dbl(rowByPath(ROOT_ROWS[0].path));
+  await sleep(1200);
+  check("⑤ 先进了子目录", crumbText() === CODE + "|" + sub, crumbText());
+  // ⚠️ **进目录会换掉勾选面**（真双击那两下 `click` ⇒ 本屏的
+  //    `kept.selection = new Set([path])`；macOS `List(selection:)` 同一条语义），
+  //    而"刚点中的那个目录"由 `navigate` 负责去掉（⑦ 钉着）。
+  //    ⇒ 别在这一格核"上一层攒的选择活下来"了：**它在真机上活不下来**，
+  //      而夹具原来那个 `dbl()` 只发 `dblclick`、两次 `click` 根本没跑，
+  //      于是这条断言一直绿的（钉的是夹具造出来的假象，不是真机行为）。
+  //    ⑤ 的本意是"换屏把勾选面打回默认面"那条真机缺陷 ⇒ 换成**子目录里**勾一个
+  //    再换屏，两半（哪一层 + 勾了什么）都核。
+  const subFile = SUB_ROWS[0].path;
+  click(rowByPath(subFile).querySelector(".files__cb"));
+  await sleep(900);
+  await switchAwayAndBack();
+  check("⑤ 切回来 ⇒ **还在原来那一层**（不许退回根）",
+    crumbText() === CODE + "|" + sub && rowsOf().length === SUB_ROWS.length, crumbText());
+  check("⑤ 切回来 ⇒ 子目录里勾的那一个还在（不许被打回默认面）",
+    JSON.stringify(checked()) === JSON.stringify([subFile]), JSON.stringify(checked()));
+  // ⚠️ 底栏那几格是 Rust 按"前端**报上去**的那个面"算的 ⇒ 也要一起核：
+  //    读的是**真的发出去的那条请求**的参数（`invocations` 记的），不是某个中间变量。
+  check("⑤ 切回来之后那一拍交上去的勾选面逐字还是它",
+    (() => {
+      const last = invocations.filter((i) => i.cmd === "tree" && i.args.path === undefined).pop();
+      return Array.isArray(last.args.selection) && JSON.stringify(last.args.selection) === JSON.stringify([subFile]);
+    })(),
+    JSON.stringify(invocations.filter((i) => i.cmd === "tree" && i.args.path === undefined).pop().args));
+
+  // ---- ⑥ 🔴 **在子目录里**选一个文件 ⇒ 发给内核的必须是**那一个** ---------------
+  //
+  // 真机缺陷（2026-09-20，人类伙伴报）：**进了子目录**、在里面选中一个文件、
+  // 点「下载选中」⇒ 下的是**整个子目录**，不是那一个文件。
+  //
+  // ⚠️ 这一格与 ③（根上选一个）**只差一个变量**：当前层不在根上。判据还是同一条
+  //    ——"交给内核的那一串**逐字**是哪一个"，不是"界面上高亮了几行"。
+  //    根的路径与子目录里的路径**形状不同**（前者没有 `/`），所以只判 ③ 会漏掉
+  //    "路径在子层被拼错/被截断"这整类：错了只会让内核**多下**（前缀命中），
+  //    而多下在界面上看起来就像"功能正常"。
+  click(rowByPath(SUB_ROWS[0].path));
+  await sleep(900);
+  check("⑥ 子目录里点一行 ⇒ 只选中它",
+    JSON.stringify(checked()) === JSON.stringify([SUB_ROWS[0].path]), JSON.stringify(checked()));
+  click(doc().querySelector("#files-bar-download"));
+  await sleep(900);
+  const enqSub = invocations.filter((i) => i.cmd === "enqueue").pop();
+  check("⑥ 子目录里点「下载选中」⇒ 发的是那**一个**路径（不是整个子目录、也不是整批）",
+    JSON.stringify(enqSub.args.paths) === JSON.stringify([SUB_ROWS[0].path]), JSON.stringify(enqSub.args));
+
+  // ---- ⑦ 🔴 **真双击**进目录 ⇒ 那个目录不许留在勾选面里（真机缺陷）---------------
+  //
+  // ⚠️ 夹具的 `dbl()` **只发 `dblclick`**，而真浏览器的双击会**先发两次 `click`**
+  //    （`click` → `click` → `dblclick`）。本屏的 `click` 处理器是
+  //    `kept.selection = new Set([path])` ⇒ 真机上"双击进目录"之后，
+  //    **刚进去的那个目录还留在勾选面里**。
+  //    而它在这一层**看不见**（没有行可勾、可取消）⇒ 用户无法从界面上发现或去掉它；
+  //    内核又把每个路径当**前缀**展开（`resolve_targets`：
+  //    `f.path == p || f.path.starts_with("{p}/")`）⇒ 在目录里勾一个文件、
+  //    点「下载选中」，下的是**整个目录**。
+  //
+  // 🔴 这正是真机报的那条（2026-09-20）："进了子目录，选单个文件，
+  //    点「下载选中」下的是整个目录"。判据两条：勾选面**不含**刚进来的那个目录、
+  //    发出去的**就是那一个文件**。
+  click(doc().querySelector(".files__crumb"));
+  await sleep(1200);
+  check("⑦ 先回到根", crumbText() === CODE, crumbText());
+  const dirRow = rowByPath(ROOT_ROWS[0].path);
+  click(dirRow); // 真双击的第 1 次 click
+  click(dirRow); // 真双击的第 2 次 click
+  dbl(dirRow); // 真双击的 dblclick
+  await sleep(1200);
+  check("⑦ 真双击进了子目录", crumbText() === CODE + "|" + sub, crumbText());
+  // ⚠️ 读**真的发出去的那条请求**的参数（勾选面在这一层看不见，DOM 上核不出来）：
+  const afterEnter = invocations.filter((i) => i.cmd === "tree" && i.args.path === undefined).pop();
+  check("⑦ 刚进来的那个目录**不在**勾选面里（留在里面 = 用户看不见、也去不掉的勾）",
+    Array.isArray(afterEnter.args.selection) && !afterEnter.args.selection.includes(ROOT_ROWS[0].path),
+    JSON.stringify(afterEnter.args));
+  click(rowByPath(SUB_ROWS[0].path).querySelector(".files__cb"));
+  await sleep(900);
+  click(doc().querySelector("#files-bar-download"));
+  await sleep(900);
+  const enqDir = invocations.filter((i) => i.cmd === "enqueue").pop();
+  check("⑦ 目录里勾一个文件 ⇒ 发给内核的是那**一个**（不是刚进来的那个目录、更不是整批）",
+    JSON.stringify(enqDir.args.paths) === JSON.stringify([SUB_ROWS[0].path]), JSON.stringify(enqDir.args));
+}
+
+// ---- 场景 sub：交互脚本（32 条；期望值全部读夹具）----------------------------
+async function runInteractions() {
+  // ---------------------------------------------------------------------------
+  // 🔴 F-2：首挂**只读一次**整棵树 + 那一段里那颗主按钮**不许"空文案还可点"**
+  // ---------------------------------------------------------------------------
+  // 两次读是**确定性**的（不是时序边界）：`poll.js:start` 的立即一拍是**微任务**，
+  // 而 `app.js:applyRoute` 在 `mount()` 返回后**同步**跑 `render` ⇒ `batchWatch` 的第一拍
+  // 必然认不出"这一批正在读"，于是它 `reseed()` —— 而 `mount` 的 IIFE 正在做**同一件事**。
+  // 实测（2026-09-20 的整分支审查）：挂上后 55 ms 内 `["state","tree","tree"]`，
+  // **两条 `tree` 都没有 `path`**。
+  // 而 `reseed` 把 `action` 置空的那一段里，底栏那颗主按钮是**空文案 + 可点**
+  // （工具栏上同功能的那颗此刻是**禁用**的）—— 实测点它 `invoke` **零调用**、
+  // 界面**一个字都没有**（约束 4 明禁的形态）。
+  //
+  // ⚠️ **采样必须在 mount 之前开始**：`runScenario` 是同步调进来的，而 mount 发生在
+  //    第一拍 `state()` 回来之后 ⇒ 这里（第一个 `await` 之前）仍然在那之前。
+  const barSamples = [];
+  const sampler = setInterval(() => {
+    const d = document.getElementById("f").contentDocument;
+    const bar = d && d.querySelector("#files-bar-download");
+    if (bar) barSamples.push({ text: bar.textContent, disabled: bar.disabled });
+  }, 5);
+
+  await sleep(1600);
+  clearInterval(sampler);
+
+  // ---- F-2 ①：首挂期间**只发一条**无 `path` 的 `tree`（此刻还没做任何交互）------
+  const firstWholeTrees = invocations.filter((i) => i.cmd === "tree" && i.args.path === undefined);
+  check("F-2① 首挂（尚未交互）只读**一次**整棵树：无 path 的 tree 恰好 1 条",
+    firstWholeTrees.length === 1,
+    "无 path 的 tree 共 " + firstWholeTrees.length + " 条（首挂后立刻数）："
+      + JSON.stringify(invocations.map((i) => i.cmd + (i.args.path === undefined ? "()" : "(" + i.args.path + ")"))));
+
+  // ---- F-2 ②：那一段里那颗主按钮**从来不是"空文案 + 可点"** -------------------
+  // ⚠️ 判据是"**空文案且可点**"这一对：禁用着（哪怕还没有文字）是允许的，
+  //    有文字且可点也是允许的 —— 不许的是"看着能按，按下去什么都不发生"。
+  const badFrames = barSamples.filter((s) => s.text === "" && s.disabled === false);
+  check("F-2② 底栏那颗主按钮在拿到标题之前**不可点**（采样里没有「空文案 + 可点」那一帧）",
+    badFrames.length === 0,
+    "采样 " + barSamples.length + " 帧，坏帧 " + badFrames.length + " 帧"
+      + (badFrames.length ? "：" + JSON.stringify(badFrames.slice(0, 3)) : ""));
+  // 🔴 **对照组**（少了它，把按钮改成"恒禁用"也能让上面那条绿）：
+  //    采样确实采到了东西，而且那颗按钮**真的会变成"可用 + 带上夹具给的标题"**。
+  const lastFrame = barSamples[barSamples.length - 1];
+  check("F-2② 对照组：采样非空，且末帧那颗按钮**可用、且标题逐字来自夹具**（不是恒禁用）",
+    barSamples.length > 0 && !!lastFrame
+      && lastFrame.disabled === false
+      && lastFrame.text === FIX.treeWhole.data.action.button_title,
+    "采样 " + barSamples.length + " 帧；末帧 text=「" + (lastFrame ? lastFrame.text : "?")
+      + "」disabled=" + (lastFrame ? String(lastFrame.disabled) : "?")
+      + "；夹具里的 button_title=「" + FIX.treeWhole.data.action.button_title + "」");
+
+  // ---- 四列：逐行对着夹具核 --------------------------------------------------
+  check("每一行的「名称」都是夹具里的 name（原文）",
+    rowsOf().every((r, i) => r.querySelector(".files__name").textContent === ROOT_ROWS[i].name));
+  check("每一行的「大小」都是夹具里的 detail_text",
+    rowsOf().every((r, i) => r.querySelector(".files__size").textContent === ROOT_ROWS[i].detail_text));
+  check("每一行的「时间」都是夹具里的 source_time_text",
+    rowsOf().every((r, i) => r.querySelector(".files__time").textContent === ROOT_ROWS[i].source_time_text));
+  const stateMismatch = rowsOf().map((r, i) =>
+    stateEl(r).textContent === ROOT_ROWS[i].state_label ? null
+      : `${ROOT_ROWS[i].name}: 期望「${ROOT_ROWS[i].state_label}」实际「${stateEl(r).textContent}」`).filter(Boolean);
+  check("每一行的「状态」都是夹具里的 state_label", stateMismatch.length === 0, stateMismatch.join("；"));
+  check("状态列没有一格是空的（曾经的缺陷：整列空白）",
+    rowsOf().every((r) => stateEl(r).textContent !== ""), rowsOf().map((r) => stateEl(r).textContent).join("/"));
+  const colorMismatch = rowsOf().map((r, i) =>
+    stateEl(r).className.includes(COLOR_CLASS[ROOT_ROWS[i].state_color]) ? null
+      : `${ROOT_ROWS[i].name}: 期望 ${COLOR_CLASS[ROOT_ROWS[i].state_color]} 实际「${stateEl(r).className}」`).filter(Boolean);
+  check("每一行的状态色都对上了 state_color（五个成员逐一映射）", colorMismatch.length === 0, colorMismatch.join("；"));
+  check("「已完成」那一行确实是绿的（抽一格实打实看一眼）",
+    stateEl(rowByPath("C24-8_×_25WS024_L01_R1.fastq.gz")).className.includes("is-green"),
+    stateEl(rowByPath("C24-8_×_25WS024_L01_R1.fastq.gz")).className);
+
+  // ---- 底栏 -------------------------------------------------------------------
+  const sel = FIX.treeWhole.data.selection;
+  const act = FIX.treeWhole.data.action;
+  check("底栏「已选」来自夹具", doc().querySelector("#files-bar-count").textContent === sel.count_text, sel.count_text);
+  check("底栏「合计」来自夹具", doc().querySelector("#files-bar-size").textContent === sel.size_text, sel.size_text);
+  check("底栏按钮文案来自夹具", doc().querySelector("#files-bar-download").textContent === act.button_title, act.button_title);
+  check("有勾选时那句「明说」不出现（夹具里是 null）",
+    act.empty_selection_hint === null && doc().querySelector("#files-bar-hint").textContent === "");
+  // ⚠️ **对照组**（任务 17）：同一颗按钮，`blocked_reason` 是 `null` 的正常载荷下**必须不禁用**
+  //    —— 少了这一条，`blocked` 场景那条"真的禁用了"就会被"把按钮写成恒禁用"蒙过去。
+  check("正常载荷（blocked_reason 是 null）⇒ 那颗按钮**不禁用**、也不显示理由",
+    act.blocked_reason === null
+      && doc().querySelector("#files-bar-download").disabled === false
+      && doc().querySelector("#files-bar-hint").hidden === true,
+    "blocked_reason=" + String(act.blocked_reason)
+      + " disabled=" + doc().querySelector("#files-bar-download").disabled);
+  check("默认勾选面 = 夹具的 selected",
+    JSON.stringify(checked()) === JSON.stringify(SELECTED), JSON.stringify(checked()));
+  check("根上不显示「下载本目录」", doc().querySelector("#files-download-dir").hidden);
+
+  // ---- 勾选 -------------------------------------------------------------------
+  const fileA = ROOT_ROWS[4].path;
+  click(rowByPath(fileA));
+  await sleep(800);
+  check("单击一行 ⇒ 只选中它", JSON.stringify(checked()) === JSON.stringify([fileA]), JSON.stringify(checked()));
+  // 🔴 **勾选面要跟着 `tree()`（无 path 那一支）一起交上去**（任务 17）：
+  //    那几格（已选几项 / 合计多大 / 按钮文案 / **此刻能不能按**）都是"**当前**这个勾选面"
+  //    的函数 —— 不交，壳只能拿内核的 `default_selected` 算，而用户早就把它改过了
+  //    （底栏会说一句**过期的话**）。⚠️ 断言的是**真的发出去的那条请求的参数**
+  //    （`invocations` 记的），不是某个中间变量。两条合起来才是那条判据的正反两面。
+  const wholeCalls = invocations.filter((i) => i.cmd === "tree" && i.args.path === undefined);
+  check("首帧那一拍**不带**勾选面（那一刻前端还没有自己的面 ⇒ 壳该用内核的默认面）",
+    wholeCalls.length > 0 && !("selection" in wholeCalls[0].args), JSON.stringify(wholeCalls[0].args));
+  const lastWhole = wholeCalls[wholeCalls.length - 1];
+  check("勾选面变了之后那一拍**带上了**（逐字是当前勾选面）",
+    Array.isArray(lastWhole.args.selection)
+      && JSON.stringify(lastWhole.args.selection) === JSON.stringify(checked()),
+    JSON.stringify(lastWhole.args));
+  const fileB = ROOT_ROWS[5].path;
+  click(rowByPath(fileB).querySelector(".files__cb"));
+  await sleep(400);
+  check("勾第二个 ⇒ 两项都在（复选是增删，不是替换）", checked().length === 2, JSON.stringify(checked()));
+  click(rowByPath(fileB).querySelector(".files__cb"));
+  await sleep(400);
+  check("再点一次 ⇒ 取消它", JSON.stringify(checked()) === JSON.stringify([fileA]));
+
+  // ---- 右键菜单 ---------------------------------------------------------------
+  const pdf = ROOT_ROWS[6].path;
+  rowByPath(pdf).dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 700, clientY: 300 }));
+  await sleep(400);
+  check("右键 ⇒ 菜单出现", !doc().querySelector("#files-menu").hidden);
+  check("右键落在没勾选的行上 ⇒ 勾选面换成那一行", JSON.stringify(checked()) === JSON.stringify([pdf]));
+  click(doc().querySelector("#files-menu-select-level"));
+  await sleep(400);
+  check("「全选本层」⇒ 这一层全勾上", checked().length === ROOT_ROWS.length, checked().length + " 项");
+  check("点完之后菜单收起来", doc().querySelector("#files-menu").hidden);
+  click(doc().querySelector("#files-bar-select-none"));
+  await sleep(400);
+  check("「全不选」⇒ 一个都不勾", checked().length === 0);
+
+  // ---- 双击目录（线上 kind 是 "Dir"）------------------------------------------
+  const dir = rowByPath(ROOT_ROWS[0].path);
+  const enqBefore = invocations.filter((i) => i.cmd === "enqueue").length;
+  dbl(dir);
+  await sleep(1200);
+  check("双击目录 ⇒ **进入**它（不是「下载整个目录」）", rowsOf().length === SUB_ROWS.length, rowsOf().length + " 行");
+  check("双击目录**没有**发出 enqueue",
+    invocations.filter((i) => i.cmd === "enqueue").length === enqBefore,
+    "enqueue 次数 " + invocations.filter((i) => i.cmd === "enqueue").length);
+  check("面包屑多了一段（名字与路径都来自夹具）",
+    crumbText() === CODE + "|" + FIX.treeLevelSub.data.breadcrumb.segments[0].name, crumbText());
+  check("不在根上 ⇒ 「下载本目录」出现", !doc().querySelector("#files-download-dir").hidden);
+  check("面包屑分隔符是内联 SVG（不是 › 字符）",
+    doc().querySelectorAll(".files__crumb-sep").length === 1
+      && doc().querySelector(".files__crumb-sep").tagName.toLowerCase() === "svg");
+  check("子目录那一层的状态列也对（失败那一格是红的）",
+    stateEl(rowByPath(SUB_ROWS[1].path)).textContent === SUB_ROWS[1].state_label
+      && stateEl(rowByPath(SUB_ROWS[1].path)).className.includes("is-red"),
+    stateEl(rowByPath(SUB_ROWS[1].path)).textContent + " " + stateEl(rowByPath(SUB_ROWS[1].path)).className);
+
+  // ---- enqueue 的回执 ---------------------------------------------------------
+  click(rowByPath(SUB_ROWS[1].path).querySelector(".files__cb"));
+  await sleep(400);
+  click(doc().querySelector("#files-bar-download"));
+  await sleep(800);
+  const enq = invocations.filter((i) => i.cmd === "enqueue").pop();
+  check("「下载选中」发的是勾选面的路径（原文）",
+    JSON.stringify(enq.args.paths) === JSON.stringify([SUB_ROWS[1].path]), JSON.stringify(enq.args));
+  const fb = FIX.enqueuePartial.data;
+  check("回执顶上一句来自夹具", doc().querySelector("#files-notice-text").textContent === fb.summary, fb.summary);
+  check("逐条拒绝理由来自夹具",
+    doc().querySelectorAll("#files-notice-list li").length === fb.rejections.length,
+    doc().querySelector("#files-notice-list").textContent);
+
+  // ---- 空勾选 ⇒ 空数组（= 全部待下载）-----------------------------------------
+  click(doc().querySelector("#files-bar-select-none"));
+  await sleep(400);
+  click(doc().querySelector("#files-bar-download"));
+  await sleep(800);
+  const enq2 = invocations.filter((i) => i.cmd === "enqueue").pop();
+  check("空勾选 ⇒ 发的是空数组", Array.isArray(enq2.args.paths) && enq2.args.paths.length === 0, JSON.stringify(enq2.args));
+  check("空勾选那条回执（没有需要下载的文件）来自夹具",
+    doc().querySelector("#files-notice-text").textContent === FIX.enqueueNothing.data.summary,
+    FIX.enqueueNothing.data.summary);
+
+}
+</script>
+</body>
+</html>

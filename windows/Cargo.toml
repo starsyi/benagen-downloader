@@ -1,0 +1,32 @@
+# Windows 壳的 cargo 工作区（规格 §4.3）。
+#
+# ⚠️ `members` 里从前**只有** `shell-core`：`shell-win`（egui 视图）是任务 9 才创建的，
+#    提前写进来 cargo 会立刻报 "failed to load manifest for workspace member"，
+#    连 `cargo test -p shell-core` 都跑不起来 —— 所以由任务 9 创建它时自己加进来（本次）。
+#
+# 拆两个 crate 的理由（规格 §4.3）：`shell-core` 是**跨平台纯逻辑**（协议镜像、
+# `Presentation/` 的移植、本地存储、所有把内核数据变成界面值的纯计算），
+# 不含 OS 调用，于是能在 macOS 上 `cargo test`；`shell-win` 是 egui 视图与系统集成，
+# 视图不单测。这条拆分是上游纪律在 Rust 里的同形落地：
+# **能写出断言的代码一律搬出视图目标**。
+[workspace]
+resolver = "2"
+members = ["shell-core", "shell-win"]
+
+# ---- WebView2Loader 补丁（规格 §4；完整根因见 docs/superpowers/2026-09-20-tauri2-windows-crosscompile.md §3）----
+#
+# 交付形态是**单个 exe**（W-4），而 `webview2-com-sys` 0.38.2 对非 MSVC 目标
+# （我们的 `x86_64-pc-windows-gnu`）发的是 `#[link(name = "WebView2Loader.dll")]`
+# ⇒ 链成动态导入 ⇒ exe 必须与那个 DLL 一起发，单文件交付当场不成立。
+#
+# ⇒ 把 crate vendor 进 `windows/vendor/`，改掉那一处 `#[link]`（详见那份 `src/lib.rs`
+#   的头部），再由 `shell-win/src/wv2.rs` 在运行期 `GetProcAddress` 转发那 5 个符号。
+#
+# ⚠️⚠️ **`version` 必须与 `tauri` 实际拉到的那个版本相容**（当前 `tauri 2.11.5` →
+#    `webview2-com-sys 0.38.2`）。patch 只对**版本相容**的依赖生效：写成一个不相容的
+#    版本号时它**静默不生效**（cargo 不会报错），补丁白打，而**在 macOS 上构建照样成功**
+#    —— 只有 `windows/scripts/build_windows.sh` 第 4 步那条"导入表里没有
+#    WebView2Loader.dll"的判据拦得住。升级 `tauri` 时先 `cargo tree -p webview2-com-sys`
+#    看清楚拉的是哪一版，再回头改这里与 `vendor/…/Cargo.toml`、重新 vendor。
+[patch.crates-io]
+webview2-com-sys = { path = "vendor/webview2-com-sys" }

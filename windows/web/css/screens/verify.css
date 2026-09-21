@@ -1,0 +1,332 @@
+/* verify.css —— 校验结果屏（总进度 + 一行总结 + 恒六类）。
+ *
+ * 结构与尺寸照 `macos/Sources/BenagenDownloader/Views/VerifyView.swift`：
+ *   · 顶部 20/10 内边距、三段之间 6；头下面是**一条分隔线**（macOS 的 `Divider()`）；
+ *   · 进度条固定 160 宽（`.frame(width: 160)`），三个数**等宽数字**（`.monospacedDigit()`）；
+ *   · 六类列表 20/12 内边距、一条一行（`LazyVStack(spacing: 0)` + 每块下面一条 `Divider()`）；
+ *   · 每类：标记 + 标签（callout 半粗）+ 计数（等宽数字）+ 说明（caption，可折行）；
+ *     路径缩进 24（`.padding(.leading, 24)`）、`caption.monospaced()`、一行一条。
+ *
+ * ⚠️ 这一屏**样张里没有**（`a0-proof.html` 画的是文件页）⇒ 本文件的尺寸不是从样张抄的，
+ *    是从 `VerifyView.swift` 的字面量抄的，两处出处的可信度不同（同 `empty.css` 的口径）：
+ *    令牌与样张同源（那是实测的），布局常量来自 SwiftUI 源码、**没有被样张实测过**。
+ *
+ * ⚠️ 一个色值都不在这里写死：颜色一律 `var(--c-*)`（值只有 `tokens.css` 一份），
+ *    而"哪一类该配哪个语义色"由 Rust 的 `RowColor` 决定，本文件只把那个档翻成类名
+ *    （翻法在 `js/screens/verify.js` 的 `COLOR_CLASS` 里，理由在那里）。
+ */
+
+.verify {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* ---- 顶部：总进度 + 一行总结 ---------------------------------------------- */
+.verify__header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+  padding: var(--pad-bar-y-tall) var(--pad-bar-x);
+  /* macOS 的 `Divider()`：头与内容之间那一条。 */
+  border-bottom: 1px solid var(--c-separator);
+}
+
+.verify__progress {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-8);
+}
+.verify__progress-title {
+  font-size: var(--text-callout);
+  color: var(--c-secondary);
+}
+
+/* 进度条：`.frame(width: 160)` + `ProgressView(.linear)`。
+   ⚠️ 不用原生 `<progress>`：各家 webview 给它的大脑门样式差别很大，而这里要的
+      只是一个 160×4 的条（与 `.empty__spinner` 里那条取舍同源，但方向相反 ——
+      那一条要的是"原生自带的 reduced-motion 尊重"，这一条要的是"与 macOS 逐像素像"）。 */
+.verify__bar {
+  flex: none;
+  align-self: center;
+  width: 160px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--c-separator);
+  overflow: hidden;
+}
+.verify__bar-fill {
+  height: 100%;
+  /* 🔴 长度 = **Rust 给的那个 0…1 的比例**，乘 100% 由 CSS 做
+     （`calc(var(--verify-fraction) * 100%)`）—— 与 `transfers.css` 的
+     `--transfers-fraction` **逐字同款**。`js/screens/verify.js` 里那一段曾经写的是
+     `Math.round(fraction * 100)`，那是"JS 自己算了一个显示值"（规格 §3.2 明禁），
+     而且与 Rust 的向零截断口径相反（见那个文件里 `paintProgress` 的注释）。
+     默认值 0：`--verify-fraction` 还没被写上去时那条是空的（`paintProgress` 的
+     "还没有总进度"那一支会把整根条 `hidden`）。 */
+  width: calc(var(--verify-fraction, 0) * 100%);
+  background: var(--c-accent);
+  /* macOS 的进度条本身是动画的；这里是**近似**（同 `empty.css` 对状态切换的处置：
+     令牌逐字搬、用法不是）。 */
+  transition: width var(--anim-dur) var(--anim-spring);
+}
+/* ⚠️ 尊重系统的"减少动态效果"（无障碍要求，同 `empty.css`）。 */
+@media (prefers-reduced-motion: reduce) {
+  .verify__bar-fill {
+    transition: none;
+  }
+}
+
+/* 等宽数字：三个数每秒都会变，不锁宽度的话整行会左右抖（macOS 的 `.monospacedDigit()`）。 */
+.verify__percent,
+.verify__meta,
+.verify__classified,
+.verify__class-count {
+  font-variant-numeric: tabular-nums;
+}
+.verify__percent {
+  font-size: var(--text-callout);
+  font-weight: 600;
+}
+.verify__meta {
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+}
+/* 「—」：树还没到、或不是这一批的时候说的那一句（**不编一个 0%**）。 */
+.verify__placeholder {
+  font-size: var(--text-callout);
+  color: var(--c-tertiary);
+}
+
+.verify__headline {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-8);
+}
+/* 图标那一格是个 `<span>`，里面那枚 `<svg>` 由 `dom.js` 的 `icon()` 造 ⇒
+   尺寸定在 `svg` 上（`svg` 有内在尺寸，光定外面那层 `span` 它不会缩）。 */
+.verify__headline-icon {
+  flex: none;
+  display: inline-flex;
+  align-self: center;
+}
+.verify__headline-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.verify__headline-text {
+  font-size: var(--text-title3);
+  font-weight: 600;
+}
+.verify__classified {
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+}
+/* 还没有第一份结果时的那一句（住在 `index.html`）。⚠️ **不是**错误态：
+   没有红色、没有惊叹号（"下一步做什么"不是"出事了"）。 */
+.verify__headline-empty {
+  font-size: var(--text-title3);
+  font-weight: 600;
+  color: var(--c-secondary);
+}
+
+/* 「刷新」**在进度那一行的右端**（macOS 的 `Spacer(minLength: 8)` + 那颗按钮：
+   `.verify__spacer` 把它推到最右，`min-width: var(--sp-8)` 是它那条 `minLength`）。 */
+.verify__spacer {
+  flex: 1;
+  min-width: var(--sp-8);
+}
+/* 按钮：`buttonStyle(.borderless)` 的对应物 —— 没有底色、没有边框，
+   只留"图形 + 文字"（`labelStyle(.titleAndIcon)`，与工具栏那几颗同一形态）。
+   ⚠️ **不许只留图形**：本仓库在 macOS 上为此栽过三次（`RootView.swift:155-158`）。 */
+.verify__refresh {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-4);
+  font: inherit;
+  font-size: var(--text-callout);
+  padding: var(--sp-2) var(--sp-6);
+  border: 0;
+  border-radius: var(--r-6);
+  background: transparent;
+  color: var(--c-label);
+  cursor: pointer;
+}
+.verify__refresh:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.05);
+}
+/* 禁用态：macOS 是 `.disabled(refreshing || !engineAllowsActions)` ⇒ 变灰。
+   ⚠️ 这里**不补一句"为什么按不动"**：它由闸门那一侧说（引擎不可用时顶部横幅正在说
+      同一件事）。约束 4 那条"按钮灰着、界面什么都不说"指的是**没有别的东西在说**。 */
+.verify__refresh:disabled {
+  color: var(--c-tertiary);
+  cursor: default;
+}
+.verify__refresh-ico {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+
+/* ---- 本屏自己的失败条（六类列表正上方）----------------------------------- */
+/* 形态与 `shell.css` 的常驻提示行同款（`.quaternary.opacity(0.4)` 那个底色 = `--bg-notice`）。
+   ⚠️ 正文**逐字**、**可选中**、**不截断**；这里**不加** `max-height` ——
+      "常驻提示行的高度不变量"管的是窗口内容**上方**、下面锚着别的东西的那些行，
+      而失败条在**主区**里、它下面就是六类列表，没有东西会被它顶出去。 */
+.verify__failure {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-6);
+  padding: var(--pad-bar-y) var(--pad-bar-x);
+  font-size: var(--text-caption);
+  background: var(--bg-notice);
+}
+.verify__failure-icon {
+  flex: none;
+  display: inline-flex;
+  align-self: center;
+}
+.verify__failure-icon svg {
+  width: 16px;
+  height: 16px;
+  /* 语义色在**这一层**给（图标本身一律 `currentColor`，见 `dom.js:icon`）。 */
+  color: var(--c-red);
+}
+.verify__failure-text {
+  /* ⚠️ `flex: 1` + `min-width: 0`：正文占满中间，那颗「收起」被推到右端
+     （macOS 的 `Spacer(minLength: 8)` 那个形态）。 */
+  flex: 1;
+  min-width: 0;
+  color: var(--c-label);
+}
+/* 「收起」那颗按钮**借用壳的模板**（`tpl-notice-dismiss`：它的无障碍名字住在
+   `index.html`）⇒ 按钮的排版跟着 `shell.css` 的 `.notice__dismiss`；
+   这里只把那枚 `<svg>` 的尺寸定下来（同 `.verify__headline-icon` 的理由）。 */
+.verify__dismiss {
+  flex: none;
+  display: inline-flex;
+}
+.verify__dismiss svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* ---- 六类分区 ------------------------------------------------------------- */
+/* 🔴 **恒六条**（含计数为 0 的那几类）：这一块**不隐藏任何一条**，
+   条数与顺序全由 Rust 的 `rows` 决定（`js/screens/verify.js` 里没有筛选）。 */
+.verify__classes {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-12) var(--pad-bar-x);
+}
+
+.verify__class {
+  padding-top: var(--sp-8);
+  padding-bottom: var(--sp-6);
+  /* macOS 的 `Divider().padding(.top, 6)`：每一类下面一条分隔线
+     （最后一条也有 —— 与 macOS 的 `ForEach` 逐字同形）。 */
+  border-bottom: 1px solid var(--c-separator);
+}
+.verify__class-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-8);
+}
+.verify__class-icon {
+  flex: none;
+  display: inline-flex;
+  align-self: center;
+}
+.verify__class-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.verify__class-label {
+  font-size: var(--text-callout);
+  font-weight: 600;
+}
+.verify__class-count {
+  font-size: var(--text-callout);
+  color: var(--c-secondary);
+}
+.verify__class-note {
+  padding-top: var(--sp-2);
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+}
+
+/* 路径：`caption.monospaced()`（规格 §6.2 的等宽一族）、缩进 24、一行一条。
+   🔴 **原文照登**（约束 3）：这里一个字符都不加工、不转义、不去重。
+
+   🔴 **中间省略**（macOS 的 `.truncationMode(.middle)`，`VerifyView.swift:181-182`）：
+      纯 CSS 做不到真正的中间省略（`text-overflow: ellipsis` 只画在**行尾**；
+       那个 `direction: rtl` 的经典手法截的是**开头**，两端只剩一端）；
+      ⇒ 由 `verify.js:pathRow` 把路径按**最后一个分隔符**切成两格**紧邻**的
+         `<span>`，**让 CSS 决定首段能放下多少** —— 放不下的部分由浏览器画成省略号。
+      理由与"这为什么不算 §3.2 的拼串"写在 `pathRow` 的注释里（一句话：
+        **一个字符都没被改写、切点是结构性的、全文在 title 与选中复制里都在**）。
+
+   ⚠️ 两条 flex 规则是**承重**的，而且它们的关系是**实测调出来的**（第一版写错了）：
+      · **首段**吃掉所有要缩的量（`flex: 0 1 auto` + `min-width: 0`）⇒ 省略号画在它末尾；
+        ⚠️ `flex-grow` 必须是 **0**：给它 1 的话首段会**撑满整行**、把尾段顶到最右端，
+        一条路径当场断成左右两半（**截图实测到了**，`truncation-check.js` 的
+        "两格相邻"那条断言现在钉着它）；
+      · **尾段**不参与收缩（`flex: 0 0 auto`，只留 `max-width: 100%` 兜住"文件名比整行
+        还长"那种极端）⇒ 末段**一个省略号都没有**。
+      ⚠️ 第一版写的是"首段 shrink 999、尾段 shrink 1"：那 1 份让尾段被压掉了 **0.02px**
+        —— 肉眼看不见，但**足以让浏览器在路径最末尾再画一个省略号**
+        （`scrollWidth` 与 `clientWidth` 差那 0.02px 就触发 `text-overflow`）。
+        客户看到的是"两个省略号"（中间一个、末尾一个），而末尾那个正好把**文件名**
+        的最后几个字符盖掉 —— 也就是这一处修改要解决的那个毛病换了个地方出现。 */
+.verify__path {
+  display: flex;
+  padding-left: 24px;
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  white-space: nowrap;
+}
+.verify__path-head,
+.verify__path-tail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.verify__path-head {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.verify__path-tail {
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+/* ⚠️ 两格之间**没有**任何空白（`verify.js` 里不 append 文本节点）—— 多一个空格，
+   路径中间就会多出一道缝，而那是"显示出来的东西与内核给的原文不一样"。 */
+
+/* ---- 语义色（`RowColor` 的五档 → 五条规则）--------------------------------
+   ⚠️ 颜色只上到**标记**上，不上到标签/计数/路径上：`RowColor` 描述的是"这一类的状态"，
+      把整块染色会让一屏六类变成六个色块，而路径（内核原文）不该被染。
+   ⚠️ `is-secondary` 就是 `--c-secondary`（中性）—— 它是「无法校验」的**专属标记**
+      （"不是失败"），别的类用上它就分不出来了（`presentation` 里有单测钉着这一条）。 */
+.verify__class.is-green .verify__class-svg,
+.verify__headline.is-green .verify__headline-svg {
+  color: var(--c-green);
+}
+.verify__class.is-red .verify__class-svg,
+.verify__headline.is-red .verify__headline-svg {
+  color: var(--c-red);
+}
+.verify__class.is-orange .verify__class-svg,
+.verify__headline.is-orange .verify__headline-svg {
+  color: var(--c-orange);
+}
+.verify__class.is-blue .verify__class-svg,
+.verify__headline.is-blue .verify__headline-svg {
+  color: var(--c-blue);
+}
+.verify__class.is-secondary .verify__class-svg,
+.verify__headline.is-secondary .verify__headline-svg {
+  color: var(--c-secondary);
+}

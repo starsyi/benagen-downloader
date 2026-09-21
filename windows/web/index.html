@@ -1,0 +1,1060 @@
+<!DOCTYPE html>
+<!--
+  windows/web/index.html —— 这一代客户端界面第一次立起来的地方（任务 9）。
+
+  ===========================================================================
+  这个文件是什么、不是什么
+  ===========================================================================
+  · 它是**结构**：骨架（`grid: 240px | 1fr`）、侧栏三项、工具栏四项、
+    常驻提示行的容器，以及两块 `<template>`（运行时才出现的那部分结构的家）。
+  · 它**不是**布局代码：所有尺寸/配色/字号都在 `app.css` 与 `css/` 下那几份里，
+    一个值都不在这里写。
+  · 它**不含任何逻辑**：没有内联 `<script>`、没有 `onclick` 属性、没有 `<style>`。
+    规格 §6.1 的"没有构建步骤"能成立，靠的正是"结构 / 样式 / 逻辑"三件东西
+    分住在 `.html` / `.css` / `.js` 三个文件里，各自能被单独读完。
+
+  ===========================================================================
+  🔴 这里的中文为什么不算"JS 拼界面文案"（规格 §3.2）
+  ===========================================================================
+  §3.2 管的是 **JS**：`js/` 下那些文件里不许出现任何面向用户的字面量。而本文件是
+  **结构**，它的中文是**结构文案** —— 与数据无关、在任何状态下都一样的那一类
+  （导航项名、按钮名、分组名、标题句）。它们住在 HTML 里、由浏览器直接渲染，
+  JS **一个字都不碰**。
+
+  为什么不由 Rust 给：`shell-core/src/presentation/` 里**没有**这些字的模块 ——
+  macOS 侧的它们同样住在视图文件里（`Sidebar.swift:20-26` 的 `SidebarSection.title`、
+  `EmptyState.swift` 的几句字面量、`RootView.swift` 的「设置」）。
+  把它们搬进 `presentation/` 是**另一件事**（它要先在 macOS 侧也搬，否则两份真相），
+  **不在任务 9 的范围里**。⇒ 本任务**记账，不越权**：
+  报告里逐条列出"哪些字还没有 Rust 的家"，以及它们各自的 macOS 出处。
+
+  ⚠️ 反过来说：**凡是与数据有关的一个字都不许写在这里** ——
+     交付码、文件数、大小、有效期、状态、错误原文、计数、按钮的动态标题，
+     全部从命令载荷来（`js/render.js` 是那些格子唯一的落点）。
+
+  ===========================================================================
+  ⚠️ 字体子集（W-5）：本文件里**会渲染的**非 ASCII 字，必须都在
+      `windows/assets/ui-subset.otf` 里。少了任何一个，界面上就是一块**豆腐块**，
+      而编译、测试、构建**全都过得去** —— `windows/scripts/test.sh` 第 0.6 步
+      是唯一会因此变红的东西（它扫的正是 `windows/web` 下所有页文件）。
+      ⚠️ 那一步**会把 HTML 注释整段剥掉**，所以上面这些中文散文不在判据里。
+      ⚠️⚠️ **本文件的注释里不许写出"注释起止符"那几个字符**（哪怕包在反引号里，
+         哪怕只是别的语言里的同形符号）：判据的剥法是"从起止符的开头找到下一个结尾"，
+         注释里再出现一对就会**提前收尾**，于是它后面的散文被当成"会渲染的字"
+         算进要求集 —— 那不是缺字，而是一次**误报**，
+         而误报的结局是判据被脱敏（本仓库最怕的形态）。
+         ⚠️ 同理不许出现"C 语言块注释的起止对"，那一种由判据的**第一步**剥。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- ⚠️ 必须显式声明浅色：Edge/Chrome 在**暗色系统**上会对没声明的页面**自动压暗**整页
+     （force dark），而我们的令牌是照 macOS 浅色外观实测的。少了这一行，
+     客户在暗色 Windows 上看到的是一张被算法改过的脸 —— 而那与设计无关，是事故。
+     ⚠️ 它必须是 `<meta>` 而不是 CSS 属性：`<meta name="color-scheme">` 在**首帧之前**
+     生效，CSS 要等样式表解析完，那一段窗口里页面已经是暗的了。 -->
+<meta name="color-scheme" content="light">
+<!-- ⚠️ 窗口标题的权威在 `shell-win/tauri.conf.json` 的 `app.windows[0].title`
+     （WebView 里这一行看不见）。它在这里只是为了"直接打开这一页时不至于没有标题"。 -->
+<title>Benagen 数据下载工具</title>
+<link rel="stylesheet" href="./app.css">
+<!-- 原生 ES 模块（规格 §6.1：没有构建步骤、没有打包器）。
+     `type="module"` 天然是 defer 的 ⇒ 脚本跑起来时下面这些挂载点都已经在了。 -->
+<script type="module" src="./app.js"></script>
+</head>
+<body>
+
+<div class="app">
+  <!-- ---- 侧边栏：三个分区 + 未完成徽标 + 底部批次摘要（规格 §7.1）------------- -->
+  <aside class="sidebar">
+    <!-- ⚠️ 用 `<button>` 而不是样张里的 `<a href="#">`：它是导航控件不是超链接
+         （`<a href="#">` 会往历史里塞一条、点击还会跳锚点）。因为换了元素，
+         `css/shell.css` 的 `.nav-item` 里那几条重置是**必需**的，不是风格。
+         ⚠️ `data-section` 是给 JS 认的；**分区的 id 与 `shell.js:SECTIONS` 逐字对应**。
+
+         🔴 **三个图标照 macOS 加，不照样张。**
+         样张的导航项是纯文字，而 macOS 的 `Sidebar.swift:52` 是
+         `Label(section.title, systemImage: section.systemImage)` —— 图标是这一行的一部分。
+         样张的 `README.md` 那 6 处"已知偏离"里**没有**这一条 ⇒ 样张少画了图标是**遗漏**，
+         不是有意的（旁证：样张的**工具栏**每项都是"内联 SVG + 文字"，作者没有去图标化）。
+         ⇒ 控制者裁决：**加**。下面三个图形的**语义**逐字取自
+         `SidebarSection.systemImage`（`Sidebar.swift:28-34`），**没有自己挑**：
+             文件 → `folder` ／ 传输列表 → `arrow.down.circle` ／ 校验结果 → `checkmark.seal`
+         ⚠️ 名字与图形是两件事（同 `engine_status.rs` 那条分工）：**名字**是 macOS 给的语义，
+            这一层只决定"那个名字画成什么样"。所以下面这三段路径是本文件的事，
+            而"该用哪个名字"不在这里判。
+         ⚠️ 手法与工具栏**完全一致**（内联 SVG、`currentColor`、16×16 viewBox）：
+            **不许**引入图标字体或任何外部资源（约束 3：零外链）。
+         ⚠️ `currentColor` 让选中态自动变白 —— 选中时 `.nav-item.is-selected` 的
+            `color: #FFF` 直接带下去，**不需要**为选中态另写一条图标颜色规则。 -->
+    <nav class="nav" id="nav">
+      <button class="nav-item is-selected" id="nav-files" type="button" aria-current="page">
+        <!-- `folder` -->
+        <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true">
+          <path d="M1.9 4.2h4.2l1.3 1.7h6.7v6.4H1.9z"/>
+        </svg>
+        <span class="nav-label">文件</span>
+        <span class="nav-badge" id="badge-files" hidden></span>
+      </button>
+      <button class="nav-item" id="nav-transfers" type="button" aria-current="false">
+        <!-- `arrow.down.circle`（与工具栏那颗下载按钮**同一个 SF Symbol**，
+             `RootView.swift:542` —— 但那两处的图形各自内联，不去共享一段路径：
+             共享会让"改侧栏图标"顺手改掉工具栏那颗按钮） -->
+        <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="8" cy="8" r="6"/><path d="M8 4.7v6M5.5 8.2 8 10.7l2.5-2.5"/>
+        </svg>
+        <span class="nav-label">传输列表</span>
+        <span class="nav-badge" id="badge-transfers" hidden></span>
+      </button>
+      <button class="nav-item" id="nav-verify" type="button" aria-current="false">
+        <!-- `checkmark.seal`：一枚**八瓣**的印章（八外八内、交替半径 6.4/4.9），
+             里面一个对勾。
+             ⚠️ 瓣数是**比出来**的，不是随手定的：把 6 / 8 / 10 瓣三版按 96px 与 16px
+                各渲一遍并排看，6 瓣读起来像一颗六角星、10 瓣像太阳/齿轮，
+                **8 瓣在两种尺寸下都最像"一枚印章"**（这正是 SF `checkmark.seal` 的语义）。
+                ⇒ 换瓣数时请重做这个对比，别只改数字。
+             ⚠️ `stroke-linejoin: round` 是**承重**的 —— 没有它，那些顶点全是尖角。 -->
+        <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M8 1.6 6.12 3.47 3.47 3.47 3.47 6.12 1.6 8 3.47 9.88 3.47 12.53 6.12 12.53 8 14.4 9.88 12.53 12.53 12.53 12.53 9.88 14.4 8 12.53 6.12 12.53 3.47 9.88 3.47z"/>
+          <path d="M5.8 8.05 7.2 9.5 10.1 6.5"/>
+        </svg>
+        <span class="nav-label">校验结果</span>
+        <span class="nav-badge" id="badge-verify" hidden></span>
+      </button>
+    </nav>
+
+    <!-- 底部常驻批次摘要。四格数据全部来自 `state().load.summary`（`DeliverySummary`）；
+         **没有生效批次时整块不渲染**（`hidden`，由 `shell.setBatchSummary(null)` 挂上）。 -->
+    <div class="batch-summary" id="batch-summary" hidden>
+      <div class="batch-summary__title">批次摘要</div>
+      <div class="batch-summary__head">
+        <span class="batch-summary__code" id="summary-code"></span>
+        <span class="batch-summary__expired" id="summary-expired" hidden></span>
+      </div>
+      <div class="batch-summary__meta">
+        <span id="summary-files"></span><span>·</span><span id="summary-size"></span>
+      </div>
+      <div class="batch-summary__validity" id="summary-validity"></div>
+    </div>
+  </aside>
+
+  <main class="detail">
+    <!-- ---- 工具栏（**四项、顺序固定**）------------------------------------
+         ⚠️ 每一项都是"图标 + 文字"（macOS 的 `.labelStyle(.titleAndIcon)`）。
+            **不许只留图标** —— 本仓库在 macOS 上为此栽过三次
+            （`RootView.swift:155-158`）。所以下面每颗按钮里的 `<span>` 不是可选的。 -->
+    <header class="toolbar">
+      <!-- ① 下载。⚠️ 标题**由 Rust 算**（`DownloadTargets::button_title(for:)`）：
+           空勾 ⇒ 「全部下载」、有勾 ⇒ 「下载选中」。它现在**空着**，
+           因为那个算式要选择集，而选择集来自 `tree()`（任务 10）。
+           空着**不是**"没写"：请见 `js/shell.js:setDownloadAction` 的注释 ——
+           在这里兜一句"下载"两个字，就是 JS 自己造了一个按钮标题（§3.2 明禁）。
+           ⚠️ 禁用条件是"**还没加载批次**"（`RootView.swift:554` 的 `.disabled(!hasLoadedManifest)`），
+           不是"没勾选"：空勾时它会**换一句话说**，不是变灰。 -->
+      <button class="tb-btn" id="tb-download" type="button" disabled>
+        <svg class="tb-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="8" cy="8" r="6"/><path d="M8 4.7v6M5.5 8.2 8 10.7l2.5-2.5"/>
+        </svg>
+        <span id="tb-download-title"></span>
+      </button>
+
+      <!-- ② 交付码（显示当前生效的那一个 + 点开换码面板，任务 13）。
+           ⚠️ 没加载批次时按钮上是**「交付码」这三个字**（`RootView.swift` 的
+           `loadedCode ?? "交付码"`）；有批次时换成**那个码本身**。
+           两格都在这里、由 `hidden` 切换 —— 见 `shell.setCodeLabel`：
+           JS **不构造**那句回退文案，它只是把 HTML 里这一格亮出来。 -->
+      <button class="tb-btn" id="tb-code" type="button">
+        <svg class="tb-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true">
+          <rect x="2.2" y="2.2" width="5" height="5" rx="1"/>
+          <rect x="8.8" y="2.2" width="5" height="5" rx="1"/>
+          <rect x="2.2" y="8.8" width="5" height="5" rx="1"/>
+          <path d="M9 9h2.2v2.2H9zM12.8 12.8h1v1h-1z"/>
+        </svg>
+        <span id="tb-code-static">交付码</span>
+        <span id="tb-code-value" hidden></span>
+      </button>
+
+      <!-- ③ 设置（任务 13 接上那扇窗）。菜单里那条「设置…」与它是**同一个**入口。 -->
+      <button class="tb-btn" id="tb-settings" type="button">
+        <svg class="tb-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+          <circle cx="8" cy="8" r="2.4"/>
+          <path d="M8 1.6v2.1M8 12.3v2.1M1.6 8h2.1M12.3 8h2.1M3.5 3.5l1.5 1.5M11 11l1.5 1.5M12.5 3.5 11 5M5 11l-1.5 1.5"/>
+        </svg>
+        <span>设置</span>
+      </button>
+
+      <span class="tb-spacer"></span>
+
+      <!-- ④ 引擎徽标。
+           🔴 **这里一个图形都不许写死**（规格 §3.2 把"图标名"点名列进了必须由 Rust
+           决定的显示值）。文字是 `EngineStatusPresentation::text`，
+           图形是 `EngineStatusPresentation::icon_name` —— **两个都从 `engine` 那一格来**：
+               文字 ← `engine.text`，图形 ← `engine.icon`，悬停 ← `engine.tooltip`
+           ⇒ 下面只留两个**空的**格子，由 `shell.setEngineBadge` 按载荷填。
+           ⚠️ 曾经这里写死过一颗闪电（`bolt.fill`）：那让前端自己挑了一个图标名，
+              而 Rust 换名字时**不会有任何东西变红**。已删（审查 I-2）。
+           ⚠️ 现在缺的是 wire：`api/state.rs` 的 `engine_wire` 只发 `{kind, reason}`，
+              那三格要任务 7 补。在补上之前这一整颗**不渲染**（不是显示一个空的徽标）。
+              缺口写在 `js/render.js:engineBadgeFromState` 的注释里。 -->
+      <span class="engine-badge" id="engine-badge" hidden>
+        <span class="engine-badge__icon" id="engine-icon"></span><span id="engine-text" class="engine-badge__text"></span>
+      </span>
+    </header>
+
+    <!-- ---- 常驻提示行（5 条槽位）-------------------------------------------
+         🔴 它们的位置是**承重的**：谁能救场（那颗「重试」）永远在"发生了什么"之上。
+            顺序由**载荷**决定，JS 整批替换（`shell.setNotices`）——
+            逐条增删会让顺序变成"哪条先到"的副作用。
+         今天只有 ①（引擎横幅）与 ②（W-2 退回内核的披露）有来源，两条都来自 `state()`；
+         ③④⑤（换码结果 / 历史写盘失败 / 改下载目录回执）的生产者在任务 13，
+         它们的值**现在根本不在载荷里** ⇒ 这里无从渲染，也**不许**编一句出来。 -->
+    <div class="notices" id="notices"></div>
+
+    <!-- 屏宿主：任务 10/11/12 的东西挂在这里面（接口契约见 `js/screens/registry.js`）。 -->
+    <section class="page" id="page"></section>
+  </main>
+</div>
+
+<!-- ===========================================================================
+     `<template>`：**运行时才出现的那部分结构的家**
+     ===========================================================================
+     里面是"结构 + 结构文案"，没有数据、没有逻辑。JS 只**克隆与摆放**它们
+     （`js/dom.js:template()`），所以那些字不算"JS 拼出来的界面文案"（§3.2）。
+
+     ⚠️ 为什么不做成"JS 里写 `h('button', {text: '重试'})`"：那一句就是一次
+        JS 生成界面字符串，而它**不会有任何东西变红**。这正是 §3.2 那条纪律
+        在原生 JS 里的执行方式 —— 靠结构，不靠自觉。
+     =========================================================================== -->
+
+<!-- 常驻提示行那颗「重试」。**它取代了 ×**：出错现场不给"关掉它"这个选项。 -->
+<template id="tpl-notice-retry">
+  <button class="notice__retry" type="button">重试</button>
+</template>
+
+<!-- 常驻提示行那颗「收起」（只有"你刚才那个动作的结果"那类回执才带它）。
+     ⚠️ 图标由 JS 补（`dom.js` 的 `ICONS` 是图形唯一的家），这里只留按钮与它的
+     无障碍名字 —— 一颗只有 × 的按钮对读屏来说是空的。 -->
+<template id="tpl-notice-dismiss">
+  <button class="notice__dismiss" type="button" aria-label="收起"></button>
+</template>
+
+<!-- 空态屏（`.idle` / `.loading` / `.failed` 三种加载态都落在这里）。
+     结构与文案逐句来自 `macos/Sources/BenagenDownloader/Views/EmptyState.swift`：
+     三段式（标题 + 输入卡片 + 状态），`maxWidth 460`、`spacing 16`、内容区 padding 20。
+     ⚠️ 顶上那颗**品牌图形标**对位 `EmptyState.swift` 的 `mark`：图是
+        `img/benagen-mark.png`（= `macos/Resources/benagen-mark.png` 的**交付副本**）。
+        **任务 18 补的**：这一处注释从写下起就写着"品牌资产是任务 14 的活"，而任务 14
+        的计划里没有它（R-6 把资产指给"前端 + 构建脚本"、任务 14 的文件面里却没有）
+        ⇒ 那活两头都没人接。整件事的账在 `check_frontend_copy.sh` 的 `TWIN_FILES`
+        与任务 18 的报告里。
+        ⚠️ 图片**没有字形**，所以它不进 `check_design_fonts` 的扫描面（那一份按扩展名
+        只取 `.html` / `.css` / `.js`）；它由两条判据守着：`check_frontend_copy.sh` 的
+        文件清单（`windows/web/` 下任何文件都会进 exe）与"逐字节副本"。
+        ⚠️ **与 macOS 的一处有意不同**：那边读不到资源时**整块不渲染**（装饰性资产
+        不值得打扰用户，判据放在打包脚本的存在性自查上）；这里做不到"不渲染"——
+        一个 `<img>` 取不到就只剩一颗**破图图标**（比不画更糟）。所以本代的处置是
+        **把判据放在测试期**（文件清单 + 逐字节副本 + 它真的在交付目录里），
+        而不是让运行时去兜——判据要放在它能生效的地方。
+     ⚠️ 「加载」那颗按钮的禁用条件只有一条：**码是空的**。
+        macOS 还有 `codeTooLong` / `baseURLTooLong` 两项，而它们各自的提示句是
+        `DeliveryCodeEntry.tooLongHint()` / `baseURLTooLongHint()` —— **Rust 算的**。
+        "按钮灰着、界面什么都不说"正是约束 4 要防的形态，所以本任务**不在这里
+        复刻那两条长度判据**：超长的串照发，由命令层（任务 7）按同一条判据拒掉，
+        再把它那句**原文**显示在下面那一格。这样"为什么按不动"永远说得出来，
+        而且说的正是 Rust 的那一句（`js/screens/empty.js` 里有完整推理）。
+-->
+<template id="tpl-screen-empty">
+  <section class="empty">
+    <div class="empty__header">
+      <!-- 品牌图形标。`alt=""` 是**刻意**的：macOS 那一边它也是纯装饰（`mark`
+           没有无障碍标签），给读屏念一遍"贝纳基因 logo"只是噪音。
+           `width`/`height` 属性是**给布局用的**（图没到位之前先占住 58×58，
+           否则标题会跳一下）—— 尺寸的权威仍是 `empty.css` 的 `.empty__mark`。 -->
+      <img class="empty__mark" src="./img/benagen-mark.png" alt="" width="58" height="58">
+      <h1 class="empty__title">输入交付码开始下载</h1>
+      <p class="empty__subtitle">交付码在交付邮件或交付页链接里（整条链接也可以直接粘进来）</p>
+    </div>
+
+    <div class="empty__card">
+      <input class="empty__field" id="empty-code" type="text" placeholder="交付码"
+             autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button class="empty__submit" id="empty-submit" type="button">加载</button>
+
+      <!-- 🔴 「高级：自定义下载地址」**默认收起**（简报明文）。用原生 `<details>` ——
+           它天生自带键盘可达与无障碍语义，而手写一个折叠要多写五行 JS，
+           那五行里多半会长出"已展开"/"已收起"这种 **JS 拼的文案**（§3.2 明禁）。
+           ⚠️ 下面那句「留空即用默认交付服务器」**在分组里面**，
+              而"自定义地址过长"的说明**不许**放在里面（macOS 的注释逐字记着这个坑：
+              它会禁用上面那颗「加载」，所以必须在**收起分组也看得见**的地方 ——
+              用户完全可能填完地址之后把「高级」收起来再点加载）。 -->
+      <details class="empty__advanced" id="empty-advanced">
+        <summary>高级：自定义下载地址</summary>
+        <div class="empty__advanced-body">
+          <input class="empty__field" id="empty-base-url" type="text"
+                 placeholder="http://download.benagen.com"
+                 autocomplete="off" autocapitalize="off" spellcheck="false">
+          <p class="empty__note">留空即用默认交付服务器</p>
+        </div>
+      </details>
+    </div>
+
+    <!-- 状态区（进行中 / 失败）。三块**都在这里**、由 `hidden` 切换，
+         而不是每次渲染重建一遍 —— 重建会让"输入框里正在敲的那半句话"、
+         以及焦点、滚动位置一起丢掉（那是只能在真机上用手感发现的缺陷）。
+         ⚠️ 里面**一个字的兜底文案都没有**：
+            · 「进行中」只有一颗转圈 —— macOS 那句 `busyReason`（"正在加载清单…"）
+              是**模型算的**，而它**不在 `state()` 的载荷里** ⇒ 这里编一句出来
+              就是 JS 生成界面文案（§3.2）。缺口记在报告里。
+            · 「失败」那句正文由 JS 填**内核原文逐字**（约束 3），不 trim、不折行、不截断。
+            · 「重试」那颗按钮的字是**结构文案** ⇒ 住在这里（理由同上面那两块 template）。 -->
+    <div class="empty__status" id="empty-status">
+      <div class="empty__busy" id="empty-busy" hidden>
+        <span class="empty__spinner" aria-hidden="true"></span>
+      </div>
+      <div class="empty__failure" id="empty-failure" hidden>
+        <span class="empty__failure-icon" id="empty-failure-icon"></span>
+        <span class="selectable" id="empty-failure-text"></span>
+      </div>
+      <button class="empty__retry" id="empty-retry" type="button" hidden>重试</button>
+    </div>
+  </section>
+</template>
+
+<!-- ===========================================================================
+     屏：文件页（任务 10）
+     ===========================================================================
+     本块由任务 10（文件页）添加，与任务 11/12 各自那一块**相邻但不相交**。
+
+     🔴 这里为什么有中文（规格 §3.2 的第一类例外：**结构文案**）：
+        下面这些字**与数据无关、任何状态下都一样**（列名、按钮名、状态句），
+        它们住在 HTML 里、由浏览器直接渲染，`js/screens/files.js` **一个字都不碰** ——
+        它只把这些节点克隆出来、按 `hidden` 亮一格（同 `tpl-screen-empty` 的做法）。
+        它们**不该由 Rust 给**：`shell-core/src/presentation/` 里没有这些字的模块，
+        而 macOS 侧它们同样住在视图文件里（`FileBrowser.swift:284-290` 的四列、
+        `:119` 的「下载本目录」、`:126-132` 的重读按钮、`:284` 与 `SelectionBar.swift:66,69`
+        的底栏按钮、`:249-250` 的右键菜单）。
+        ⇒ 把它们搬进 `presentation/` 是**另一件事**（要先在 macOS 侧也搬，
+          否则两份真相），不在任务 10 的范围里。
+
+     ⚠️ **凡是与数据有关的一个字都不许写在这里**：文件名、大小、时间、状态标签、
+        项数、合计、批次号、错误原文 —— 全部由 `BrowserRow` / `Breadcrumb` /
+        `SelectionSummary` / `DownloadAction` 从命令载荷下来。
+
+     ⚠️ 这四个列宽（`--col-size` / `--col-time` / `--col-state`）与 `files.css` 的
+        行网格**必须逐列同宽**（macOS `FileBrowser.swift:269-297` 记着这条：
+        "表头写着「时间」的那一列其实是大小"是只有看屏幕才能发现的错误）。
+        表头**有意不含**行首那两格（复选框与图标）—— 照搬 macOS 的既有形态，
+        所以「名称」比它下面的文件名偏左约一个复选框宽，**不要"修正"它**。
+     =========================================================================== -->
+<template id="tpl-screen-files">
+  <section class="files" id="files-root">
+    <div class="files__crumbs">
+      <nav class="files__crumbs-nav" id="files-crumbs"></nav>
+      <span class="files__spacer"></span>
+      <!-- 这两颗的图形**内联在这里**（不是 `dom.js` 的 `ICONS`）：它们是**静态结构**
+           —— 任何状态下都在，且只在下面这两个位置上。`dom.js` 那张表只管
+           "运行时才出现、名字由 Rust 给的"那类（见那份文件头的分工）。
+           图形逐字照 macOS 的 `systemImage`：`arrow.down.circle`（与工具栏那颗下载按钮
+           **同一个 SF Symbol**，但两处各自内联、不去共享一段路径 —— 共享会让
+           "改这一颗"顺手改掉工具栏那颗）与 `arrow.clockwise`。 -->
+      <button class="files__crumb-btn" id="files-download-dir" type="button" hidden>
+        <svg class="files__crumb-btn-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="8" cy="8" r="6"/><path d="M8 4.7v6M5.5 8.2 8 10.7l2.5-2.5"/>
+        </svg>
+        <span class="files__crumb-btn-label">下载本目录</span>
+      </button>
+      <button class="files__crumb-btn" id="files-reload" type="button"
+              title="重新读取这一层"
+              aria-label="重新读取这一层">
+        <svg class="files__crumb-btn-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.75"/><path d="M13.4 1.9v3.2h-3.2"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- 目录读失败那条说明（`DirLoadFailure`）：壳写的那句 + 内核原文逐字。 -->
+    <div class="files__failure" id="files-failure" hidden>
+      <svg class="files__failure-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+        <circle cx="8" cy="8" r="6.2"/><path d="M8 7.4v3.4M8 4.9v.01"/>
+      </svg>
+      <span class="files__failure-notice" id="files-failure-notice"></span>
+      <span class="files__failure-text selectable" id="files-failure-text"></span>
+      <span class="files__spacer"></span>
+      <button class="files__failure-dismiss" id="files-failure-dismiss" type="button"
+              title="收起这条提示"
+              aria-label="收起这条提示">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+          <path d="M4 4l8 8M12 4l-8 8"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="files__head" id="files-head">
+      <span class="files__col-name">名称</span>
+      <span class="files__col-size">大小</span>
+      <span class="files__col-time">时间</span>
+      <span class="files__col-state">状态</span>
+    </div>
+
+    <div class="files__rows" id="files-rows"></div>
+
+    <div class="files__status" id="files-status" hidden>
+      <span class="files__status-spinner" id="files-status-spinner" hidden></span>
+      <span class="files__status-text" id="files-status-loading" hidden>正在读取目录…</span>
+      <span class="files__status-text" id="files-status-failed" hidden>这一层没能读出来</span>
+      <span class="files__status-text" id="files-status-empty" hidden>这个目录是空的</span>
+      <button class="files__status-retry" id="files-status-retry" type="button" hidden>重试</button>
+    </div>
+
+    <div class="files__notice" id="files-notice" hidden>
+      <span class="files__notice-text selectable" id="files-notice-text"></span>
+      <ul class="files__notice-list" id="files-notice-list"></ul>
+    </div>
+
+    <div class="files__bar">
+      <span class="files__bar-hint" id="files-bar-hint"></span>
+      <span class="files__bar-sep" id="files-bar-hint-sep" hidden>·</span>
+      <span class="files__bar-count" id="files-bar-count"></span>
+      <span class="files__bar-sep">·</span>
+      <span class="files__bar-size" id="files-bar-size"></span>
+      <span class="files__spacer"></span>
+      <button class="files__bar-btn" id="files-bar-select-all" type="button">全选</button>
+      <button class="files__bar-btn" id="files-bar-select-none" type="button">全不选</button>
+      <button class="files__bar-btn is-primary" id="files-bar-download" type="button"></button>
+    </div>
+  </section>
+</template>
+
+<!-- 文件页的**右键菜单**（行上点右键时出现）。单独一块模板，理由同上面那块：
+     里面三句是结构文案，JS 只克隆与摆放。 -->
+<template id="tpl-screen-files-menu">
+  <div class="files__menu" id="files-menu" hidden>
+    <button class="files__menu-item" id="files-menu-download" type="button">下载选中项</button>
+    <span class="files__menu-sep"></span>
+    <button class="files__menu-item" id="files-menu-select-level" type="button">全选本层</button>
+    <button class="files__menu-item" id="files-menu-select-none" type="button">全不选</button>
+  </div>
+</template>
+<!-- ===========================================================================
+     屏：校验结果页（**任务 12**）
+     ===========================================================================
+     结构与文案逐句来自 `macos/Sources/BenagenDownloader/Views/VerifyView.swift`：
+     顶部（总进度 + 一行总结）/ 本屏自己的失败条 / 六类分区（`headers` 与列表都由 JS
+     按载荷生成，见下）。`maxWidth` 那一类的松紧照 macOS 的字面量。
+
+     ⚠️ **本块里的中文是"结构文案"**（与数据无关、任何状态下都一样、由浏览器直接渲染、
+        JS 只克隆与摆放）：它们是 `VerifyView.swift` 里的视图层字面量，
+        而 `shell-core/src/presentation/` 里**没有**它们的家（macOS 侧同样住在视图文件里）
+        ⇒ 按 `index.html` 头部那段论证，它们住在这里，不住进 JS。
+        ⚠️ **一句都不许多写**：六类的标签/计数/说明、总结那一句、已校验项数、路径原文
+        **全部**由 Rust 的 `VerifySummary` 给（规格 §3.2）——
+        本块里只允许出现"与数据无关、任何状态下都一样"的字。
+
+     ⚠️ 顶上那颗「刷新」就是 macOS 那颗（`VerifyView.swift:76-93`，**逐字同名**）：
+        它做的事与 macOS 逐字同款 —— **一次点 = 校验结果 + 总进度一起重取**，
+        禁用条件也是那两条（刷新在飞 / 引擎闸门关着）。它**没有**独立的命令：
+        点下去走的是这一屏自己的节拍器（`ctx.poller.pollNow()`），
+        而节拍器那条路自带重入保护与闸门（`js/screens/verify.js:refreshNow`）。
+        ⚠️ 字是**逐字**从上游抄来的「刷新」：**不许让字体决定文案**。它曾经被写成
+           「重新取一次」（那时 `刷` 不在子集里）—— 控制者裁定那是因果倒置，
+           已连同一次单独的资产刷新改回来（子集重生成 + `SUBSET_SHA256` 同步更新），
+           子集里现在**有** U+5237。
+        ⚠️ macOS 的 `.help(...)`（悬停说明）与空态页那句"下一步做什么"仍然省掉：
+           前者的第二支是 `EngineGate.unavailableHelp`（**不在任何载荷里**），
+           后者的两支都指向引擎状态 —— 两者都是**数据相关**的句子，
+           而 `presentation/` 里没有它们的家（写进这里就成了一份没有来源的文案）。
+  =========================================================================== -->
+<template id="tpl-screen-verify">
+  <section class="verify">
+    <!-- ---- 顶部：总进度 + 一行总结 ------------------------------------------
+         三格（进度条 / 百分比 / 字节 / 速度）由 JS 按 `ProgressSummary` 的四个字段填；
+         `total_bytes` 为 0 时**百分比那一格是 Rust 给的占位符**，JS 不编数字。 -->
+    <div class="verify__header">
+      <div class="verify__progress">
+        <span class="verify__progress-title">总进度</span>
+        <!-- 🔴 **值域是 0…1**（不是 0…100），与传输列表那一屏的进度条逐字同款
+             （`index.html` 的 `transfers-row` 模板）：`aria-valuenow` 直接是 Rust 给的
+             那个**原始比例**，`aria-valuetext` 是 Rust 的 `percent_text`
+             —— **JS 一个数都不换算**（规格 §3.2）。
+             ⚠️ 它曾经是 `0…100` 而 JS 自己 `Math.round(fraction * 100)`：那既是
+             §3.2 明禁的"JS 算出来的显示值"，又与 Rust 的向零截断口径**相反**
+             （199/200 ⇒ 屏幕 99%、读屏 100%）。理由与实测写在
+             `js/screens/verify.js:paintProgress` 那一段。 -->
+        <div class="verify__bar" id="verify-bar" role="progressbar"
+             aria-valuemin="0" aria-valuemax="1">
+          <div class="verify__bar-fill" id="verify-bar-fill"></div>
+        </div>
+        <span class="verify__percent" id="verify-percent"></span>
+        <span class="verify__meta" id="verify-bytes"></span>
+        <span class="verify__meta" id="verify-speed"></span>
+        <!-- 树还没到、或还不是这一批的：**说「—」**，不留空白、不编一个 0%
+             （口径同 `PercentFormat` 的占位符）。这四个字是 macOS 视图里的同一个字面量。 -->
+        <span class="verify__placeholder" id="verify-progress-empty" hidden>—</span>
+        <span class="verify__spacer"></span>
+        <!-- 刷新（`VerifyView.swift:76-93` 那颗按钮）。它做的事与 macOS 逐字同款：
+             **两条请求一起重取**（校验结果 + 总进度）—— 只刷一半会留下一个"看起来刷新了、
+             其中一格没动"的屏幕（`VerifyView.refresh()` 的注释）。
+             ⚠️ 禁用条件也是 macOS 的两条：**一次刷新在飞时不点第二下** + **引擎闸门关着**。
+             ⚠️ 文案是**逐字**从上游抄来的「刷新」（`VerifyView.swift:79`）。
+                它曾经被写成「重新取一次」：`刷`（U+5237）不在当时的
+                `windows/assets/ui-subset.otf` 里，而字体覆盖判据是 fail-closed 的
+                —— 也就是说**字体决定了文案**。控制者裁定那是**因果倒置**：
+                用户看得见的、从 macOS 抄来的文案不该因为子集缺一个字就换词。
+                ⇒ 已连同**一次单独的资产刷新**改回原文（子集重生成、`SUBSET_SHA256` 同步更新，
+                  两件事在同一个 commit 里）。**别再把文案迁就字体**。
+                （本仓库 egui 那一代在同一处留下过相反的处置，那是**上一代的债**、不是先例。）
+             图形（`arrow.clockwise`）内联在这里：它是**壳的静态图形**那一类（住 HTML、
+             由浏览器直接画），与 `dom.js` 的 `ICONS`（名字从 Rust 的载荷来）不是一回事。 -->
+        <button class="verify__refresh" id="verify-refresh" type="button">
+          <svg class="verify__refresh-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M13.3 8a5.3 5.3 0 1 1-1.55-3.75"/>
+            <path d="M13.3 2.7v2.7h-2.7"/>
+          </svg>
+          <span>刷新</span>
+        </button>
+      </div>
+
+      <div class="verify__headline" id="verify-headline">
+        <span class="verify__headline-icon" id="verify-headline-icon"></span>
+        <!-- 正文是 `VerifySummary::headline()`（Rust 算的四种 verdict），
+             颜色与图标是 `headline_color()` / `headline_icon()`。 -->
+        <span class="verify__headline-text selectable" id="verify-headline-text"></span>
+        <span class="verify__classified" id="verify-classified"></span>
+      </div>
+      <!-- 还没有拿到第一份校验结果（本屏刚挂上、第一拍还没回来）：说这一句，不画六个 0
+           （那会读成"全部通过"，而这句话谁都没说过）。 -->
+      <div class="verify__headline-empty" id="verify-headline-empty">还没有校验结果</div>
+    </div>
+
+    <!-- ---- 本屏自己的失败条 ------------------------------------------------
+         位置在六类列表**正上方**（macOS 同款）：它兜的是"取校验结果/取总进度"这两条
+         请求的失败，正文是**原文逐字**（约束 3）、可选中复制。
+         ⚠️ 那颗「收起」的按钮**不在这里**：它的无障碍名字已经有一份模板
+         （`tpl-notice-dismiss`，上面那块），JS 克隆它、不另写一个字。 -->
+    <div class="verify__failure" id="verify-failure" hidden>
+      <span class="verify__failure-icon" id="verify-failure-icon"></span>
+      <span class="verify__failure-text selectable" id="verify-failure-text"></span>
+      <span class="verify__dismiss" id="verify-dismiss"></span>
+    </div>
+
+    <!-- ---- 六类分区 ---------------------------------------------------------
+         🔴 **恒六条**（含计数为 0 的那几类，显示「0 项」）：整块由 JS 按 `rows` 生成，
+            顺序就是 Rust 给的顺序（`ALL_CLASSES`），JS **不排序、不筛选、不跳过 0**。
+            ⚠️ 所以这里**一个占位行都没有**：写一行"暂无校验结果"当兜底，
+            就等于 JS 替内核宣布了一句它没说过的话。 -->
+    <div class="verify__classes" id="verify-classes"></div>
+  </section>
+</template>
+
+<!-- ===========================================================================
+     屏：传输列表（**任务 11**）
+     ===========================================================================
+     ⚠️ **本块由任务 11 添加，与任务 10/12/13 各自那一块相邻但不相交**
+        （合并时按块拼；本块是文件的最后一块）。
+
+     结构与尺寸照 `macos/Sources/BenagenDownloader/Views/TransfersView.swift` +
+     `TransferRowView.swift`：
+       · 顶部一条（全局速度 + 活动数 + 「清空已完成」）—— `TransfersView.summaryBar`；
+       · 列表区每行：状态图标 · [标题(+「已暂停」角标) / 进度条 + 进度 + 百分比 / 错误原文]
+         · 速度 · 状态 · 行菜单（`TransferRowView.body` 的六段，逐段对位）；
+       · 空态（图标 + 一句话）—— `TransfersView.content` 的最后两支。
+
+     🔴 这里为什么有中文（规格 §3.2 的第一类例外：**结构文案**）：
+        下面这些字**与数据无关、任何状态下都一样**（按钮名 / 角标名 / 菜单项名），
+        它们住在 HTML 里、由浏览器直接渲染，`js/screens/transfers.js` **一个字都不碰**
+        —— 它只把这些节点克隆出来、按 `hidden` 亮一格（同 `tpl-screen-files` 的做法）。
+        它们**不该由 Rust 给**：`shell-core/src/presentation/` 里没有这些字的模块，
+        而 macOS 侧它们同样住在视图文件里（`TransfersView.swift` 的 `Label("清空已完成")`、
+        `TransferRowView.swift` 的 `Text("已暂停")` 与 `Button("暂停")` 那五项、
+        `Button("在访达中显示")`）。
+        ⇒ 把它们搬进 `presentation/` 是**另一件事**（要先在 macOS 侧也搬，
+          否则两份真相），不在任务 11 的范围里（报告里逐条记账）。
+
+     ⚠️ **凡是与数据有关的一个字都不许写在这里**：标题/路径、进度、百分比、速度、
+        状态标签、错误原文、全局速度与活动数、空态那句话 —— 全部由 `TransferRow` /
+        `TransferGlobalSummary` / `TransferListEmpty` 从 `transfers()` 的载荷下来。
+        ⚠️ 空态那句「没有正在传输的任务」**也不在这里**：它是 `TransferListEmpty::of`
+        给的两句之一（另一句是「下载引擎尚未启动（还没有添加过任务）」），
+        而"引擎不可用时它不说话"也是那条判据的一部分 —— 写死在 HTML 里就没有那三档了。
+
+     ⚠️ 行菜单那一块里，`data-action` 的五个值（`pause`/`unpause`/`retry`/`remove`）
+        是 **`TaskAction` 的线上字面量**（`protocol.rs` 的
+        `task_action_pins_the_five_wire_literals` 逐字钉着），JS 拿它去比对
+        `TransferRow.available_actions` 里那一格 —— **动作面由载荷决定，不由本块决定**。
+        ⚠️ `reveal` 那一项**不是**线上字面量（协议里没有它，规格 §5.2：那是壳的事），
+        它在这里只是一个**本地键**，用来把"这一项对应哪件壳侧的事"说清楚；
+        JS 判定它出不出现用的是 `manifest_path` 那一格（`can_reveal_in_finder` 的判据）。
+     =========================================================================== -->
+<template id="tpl-screen-transfers">
+  <section class="transfers" id="transfers-root">
+    <!-- ---- 顶部：全局速度 + 活动数 + 「刷新」 + 「清空已完成」-----------------
+         左边那颗图形（`arrow.down.circle`）与侧栏「传输列表」那一项、工具栏那颗下载
+         按钮是**同一个 SF Symbol**，但三处各自内联、不共享一段路径：共享会让"改这一颗"
+         顺手改掉另外两颗（`index.html` 里那条既有记账）。
+         两格数字由 JS 按 `TransferGlobalSummary` 填。
+         ⚠️ **没有快照（`global` 是 `null`）时只有那两格数据不渲染**（`api/transfers.rs`
+            的判据：不编一个"0 B/s / 活动 0"），**整条栏与两颗按钮仍然在**
+            —— macOS 的 `summaryBar` 也是常驻的（那两格的位置它放一句「读取中…」，
+            而那句是视图层的字面量、`presentation/` 里没有 ⇒ 本代**不编**，记账在报告里）。
+            少了这一条，引擎不可用/还没有快照时那颗「刷新」会连入口一起消失。 -->
+    <div class="transfers__header" id="transfers-header">
+      <span class="transfers__header-data" id="transfers-header-data" hidden>
+        <svg class="transfers__header-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="8" cy="8" r="6"/><path d="M8 4.7v6M5.5 8.2 8 10.7l2.5-2.5"/>
+        </svg>
+        <span class="transfers__speed" id="transfers-speed"></span>
+        <span class="transfers__activity" id="transfers-activity"></span>
+      </span>
+      <span class="transfers__spacer"></span>
+      <!-- 「刷新」就是 macOS 那颗（`TransfersView.swift:76-93` 的
+           `Label("刷新", systemImage: "arrow.clockwise")`，**逐字同名**）：一次点 =
+           立刻取一次传输列表快照（本代走 `ctx.poller.pollNow()`，那条路自带重入保护与闸门）。
+           ⚠️ 文案是**逐字**从上游抄来的「刷新」—— 任务 12 已经为它做过一次资产刷新
+              （`U+5237 刷` 现在在内嵌子集里），这里不再动资产。
+           ⚠️ 图标 + 文字**两个都在**（macOS 的 `.labelStyle(.titleAndIcon)`）：本仓库
+              在 macOS 上为"工具栏只留图标"栽过三次（`RootView.swift:155-158`）。
+           图形（`arrow.clockwise`）内联在这里：它是**壳的静态图形**（住 HTML、由浏览器
+           直接画），与 `dom.js` 的 `ICONS`（名字从 Rust 的载荷来）不是一回事。 -->
+      <button class="transfers__refresh" id="transfers-refresh" type="button">
+        <svg class="transfers__refresh-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M13.3 8a5.3 5.3 0 1 1-1.55-3.75"/>
+          <path d="M13.3 2.7v2.7h-2.7"/>
+        </svg>
+        <span>刷新</span>
+      </button>
+      <!-- 「清空已完成」是**列表级**动作（没有 gid）：行级菜单里没有它，
+           否则用户以为只清那一行、实际清掉一片（`TransferRow::actions` 的注释）。
+           可用性来自 `TransferGlobalSummary.can_clear_finished`（Rust 判的），
+           JS 不重算。 -->
+      <button class="transfers__clear" id="transfers-clear" type="button">清空已完成</button>
+    </div>
+
+    <!-- ---- 本屏自己的失败条 ------------------------------------------------
+         位置在列表**正上方**（macOS `TransfersView.failureBar` 同款）：它兜的是
+         `task_action` / `reveal` 这两条命令的失败，正文是**原文逐字**（约束 3）、
+         可选中复制。⚠️ 那颗「收起」的按钮**不在这里**：它的无障碍名字已经有一份模板
+         （`tpl-notice-dismiss`），JS 克隆它、不另写一个字。 -->
+    <div class="transfers__failure" id="transfers-failure" hidden>
+      <span class="transfers__failure-icon" id="transfers-failure-icon"></span>
+      <span class="transfers__failure-text selectable" id="transfers-failure-text"></span>
+      <span class="transfers__spacer"></span>
+      <span class="transfers__dismiss" id="transfers-dismiss"></span>
+    </div>
+
+    <!-- ---- 行 --------------------------------------------------------------
+         ⚠️ **一个占位行都没有**：行的条数与内容**只**由 `rows` 决定（Rust 给几条就是几条）。
+            写一行"加载中"当兜底，就等于 JS 替内核宣布了一句它没说过的话。 -->
+    <div class="transfers__rows" id="transfers-rows"></div>
+
+    <!-- ---- "还没有快照"那一档（转圈 + 一句话）-------------------------------
+         逐字照 `TransfersView.swift:113-121` 的那一支：
+             `else if model.transfers == nil && engineAllowsActions { ProgressView() … Text("正在读取传输列表…") }`
+         ⚠️ 它**排在空态之前**（macOS 的顺序就是 '有行 → 还没快照 → 空态 → 什么都不画'）：
+            "还没有快照"与"确实没有任务"是**两件事**，前者一帧都不该被后者顶掉。
+         ⚠️ 而**闸门关着时它不出现**（`engineAllowsActions == false`）——
+             macOS 那段注释逐字写着理由：一个**没有任何请求会返回**的转圈
+            正是约束 4 明禁的静默挂死；那时原因与出口都在主区顶部那条常驻横幅上。 -->
+    <div class="transfers__loading" id="transfers-loading" hidden>
+      <span class="transfers__spinner" aria-hidden="true"></span>
+      <span class="transfers__loading-text">正在读取传输列表…</span>
+    </div>
+
+    <!-- ---- 空态 ------------------------------------------------------------
+         整块只在"确实没有任务"时出现，那句话是 `TransferListEmpty::of` 给的原文；
+         ⚠️ 它**不是**"读不到数据"的兜底 —— 引擎不可用时 Rust 返回的是 `null`
+            （顶部那条常驻横幅已经在说同一句话），这时**这一块不出现**。 -->
+    <div class="transfers__empty" id="transfers-empty" hidden>
+      <svg class="transfers__empty-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="8" cy="8" r="6"/><path d="M8 4.7v6M5.5 8.2 8 10.7l2.5-2.5"/>
+      </svg>
+      <span class="transfers__empty-text" id="transfers-empty-text"></span>
+    </div>
+
+    <!-- 行菜单（右键 / 点行尾那颗「⋯」时出现）。⚠️ 它是 `position: absolute` 的，
+         要相对**这一屏**定位 ⇒ 它住在 `.transfers` 里面（同 `tpl-screen-files-menu`）。 -->
+    <div class="transfers__menu" id="transfers-menu" hidden></div>
+  </section>
+</template>
+
+<!-- 传输列表**一行**的结构。
+     ⚠️ 单独一块模板（不嵌在上面那块里）：嵌套 `<template>` 的 `content` 要两层克隆，
+     JS 那边会多一步"先取内层模板再克隆" —— 而 `dom.js:template()` 只认顶层 id。
+     六段与 macOS `TransferRowView.body` 逐段对位：
+       ① 状态图标（16pt，语义色）② [标题 + 「已暂停」角标] ③ [进度条 + 进度 + 百分比]
+       ④ 错误原文（**行下方全文展开**：不截断、不折行、可选中）⑤ 速度 ⑥ 状态
+       ⑦ 行菜单那颗「⋯」（macOS 的 `actionsMenu`，"同一份菜单挂两份"的可见入口）
+     ⚠️ 这些格子**一个 id 都没有**（一行一个，id 会重复）：JS 用类名在**行内**查
+     （`rowEl.querySelector(".transfers__title")`）。
+     ⚠️ 进度条用 `role="progressbar"` + `aria-valuemin/max`（0…1）：那条**值域**
+        就是 Rust 的 `progress_fraction` 的口径（恒在 0..=1），JS 只把那个数写进
+        `--transfers-fraction` 与 `aria-valuenow`，**不做任何换算**（规格 §3.2）。 -->
+<template id="tpl-screen-transfers-row">
+  <div class="transfers__row">
+    <span class="transfers__icon"></span>
+    <div class="transfers__main">
+      <div class="transfers__title-line">
+        <!-- ⚠️ **中间省略**：两格**紧邻**的 `<span>`（按最后一个分隔符切），由 CSS 决定
+             首段能放下多少、放不下的部分由**浏览器**画成省略号（`transfers.css` 那段）。
+             理由与"这为什么不算 §3.2 的拼串"与 `verify.js:pathRow` **逐条相同**
+             （**一个字符都没被改写**、切点是结构性的、全文在 `title` 与选中复制里都在）。 -->
+        <span class="transfers__title"><span class="transfers__title-head"></span><span class="transfers__title-tail"></span></span>
+        <span class="transfers__badge" hidden>已暂停</span>
+      </div>
+      <div class="transfers__progress-line">
+        <div class="transfers__bar" role="progressbar" aria-valuemin="0" aria-valuemax="1">
+          <div class="transfers__bar-fill"></div>
+        </div>
+        <span class="transfers__progress"></span>
+        <span class="transfers__percent"></span>
+      </div>
+      <div class="transfers__error selectable" hidden></div>
+    </div>
+    <span class="transfers__speed"></span>
+    <span class="transfers__state"></span>
+    <button class="transfers__menu-btn" type="button" aria-label="这一行的操作"></button>
+  </div>
+</template>
+
+<!-- 传输列表**行菜单**。⚠️ 这里列出的六项**不是**"这一行有哪些动作"的答案 ——
+     JS 只克隆其中**载荷允许的那几项**（`available_actions` 里有的内核动作 +
+     有路径时的「在资源管理器中显示」），**空集 = 一个都不克隆**（菜单都不弹）。
+     这一块只是"每个动作叫什么"的家（同 `tpl-screen-files-menu` 那三句）。
+     顺序照 macOS `TransferRowView.actionItems`：三个常规动作 → 分隔 → 显示 → 分隔 → 移除。
+     ⚠️ `data-kind` 区分两类：`kernel` 那五项要发 `task_action`（值是线上字面量），
+        `shell` 那一项走 `reveal`（**协议里没有这个名字**，见上面那段）。 -->
+<template id="tpl-screen-transfers-menu">
+  <button class="transfers__menu-item" type="button" data-kind="kernel" data-action="pause">暂停</button>
+  <button class="transfers__menu-item" type="button" data-kind="kernel" data-action="unpause">继续</button>
+  <button class="transfers__menu-item" type="button" data-kind="kernel" data-action="retry">重试</button>
+  <span class="transfers__menu-sep"></span>
+  <button class="transfers__menu-item" type="button" data-kind="shell" data-action="reveal">在资源管理器中显示</button>
+  <span class="transfers__menu-sep"></span>
+  <button class="transfers__menu-item is-destructive" type="button" data-kind="kernel" data-action="remove">移除</button>
+</template>
+
+<!-- ===========================================================================
+     任务 13：换码面板 / 设置窗口 / 关于 / 许可全文
+     ===========================================================================
+     本块由任务 13 添加，与任务 11 那一块**相邻但不相交**（合并时按块拼）。
+
+     这四扇与上面那几个"屏"**不是一回事**：屏挂在 `#page` 里、互斥（换屏 = 拆掉旧的），
+     而这四扇是**压在窗口上**的模态 —— 打开它们的时候底下的屏还在跑。
+     ⇒ 它们的宿主是 `document.body`（由 `js/dialogs.js` 那个模态层造），
+       而不是 `#page`；它们的结构住在下面这几块 `<template>` 里。
+
+     🔴 这里为什么有中文（规格 §3.2 的第一类例外：**结构文案**）：
+        下面这些字**与数据无关、任何状态下都一样**（标题、按钮名、分组名、
+        输入框占位符、那句后果说明），它们住在 HTML 里、由浏览器直接渲染，
+        `js/` 下那三个新文件**一个字都不碰** —— 只克隆与摆放。
+        它们**不该由 Rust 给**：`shell-core/src/presentation/` 里没有这些字的模块，
+        而 macOS 侧它们同样住在视图文件里（`SwitchDeliverySheet.swift` 的
+        「加载另一个交付码」与那句后果说明、`SettingsView.swift` 的按钮名与
+        `DownloadDirectory.swift` 之外的那几句、`AboutView.swift` / `LicenseView.swift`
+        的「关闭」、以及两个 `.alert` 的标题与按钮）。
+        ⇒ 搬进 `presentation/` 是**另一件事**，不在任务 13 的范围里。
+
+     ⚠️ **凡是与数据有关的一个字都不许写在这里**：交付码、备注、时间、批次号、
+        目录路径、七项参数的标签与说明、保存条那句横幅、许可名与许可全文、
+        sha256、错误原文 —— 全部由 `BatchHistoryRow` / `Parameter` /
+        `SettingsForm` / `DownloadDirectory` / `DownloadDirChange` / `License`
+        从命令载荷下来。
+
+     ⚠️ 本块的注释里**不许出现注释起止符**（见本文件头部那一段：出现一对就会让
+        字体覆盖判据提前收尾，把那之后的散文当成"会渲染的字"）。
+     =========================================================================== -->
+
+<!-- ---------------------------------------------------------------------------
+     换码面板（`js/switchcode.js`）
+     逐句来自 `SwitchDeliverySheet.swift`：标题 / 那句后果说明 / 输入框 / 历史那一段
+     / 两颗按钮。历史列表的**行**是运行时造的（条数与内容都由载荷决定），
+     所以它单独一块模板（下一块），由 JS 按行克隆。
+     ⚠️ 那句后果说明是**壳自己写的**（macOS 的注释逐字记着理由）：内核不会为一次
+     **还没发生**的操作主动说话，而它必须在用户点「加载」**之前**就摆在屏幕上。
+     --------------------------------------------------------------------------- -->
+<template id="tpl-panel-switchcode">
+  <div class="panel panel--switch" id="sc-root">
+    <p class="panel__title">加载另一个交付码</p>
+    <p class="panel__note">换码会把当前的下载任务从引擎里摘掉（含等待中的）；已经下载到磁盘的文件不会被删除。</p>
+
+    <input class="panel__input" id="sc-code" type="text" placeholder="交付码"
+           autocomplete="off" autocapitalize="off" spellcheck="false">
+
+    <!-- 失败原文**留在面板里**（约束 4：不得静默失效）。可选中复制（约束 3）：
+         客户要能把这句原话发给业务方。图形内联在这里（静态结构，同
+         `tpl-screen-files` 的失败条），不经过 `dom.js` 的图标表。 -->
+    <div class="panel__failure" id="sc-failure" hidden>
+      <svg class="panel__failure-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+        <path d="M8 1.9 14.6 13.4H1.4z"/><path d="M8 6.1v3.1M8 11.3v.01"/>
+      </svg>
+      <span class="panel__failure-text selectable" id="sc-failure-text"></span>
+    </div>
+
+    <!-- 历史批次。**空列表时整段不渲染**（`BatchHistoryRow::rows` 的判据：
+         列表为空时不显示这一段，不要给空盒子）—— 由 `sc-history` 的 hidden 切换。 -->
+    <div class="panel__history" id="sc-history" hidden>
+      <p class="panel__subtitle">历史批次</p>
+      <div class="panel__history-list" id="sc-history-rows"></div>
+      <!-- 历史写盘失败那行（主区另有一条常驻提示，两处读的是同一个字段 ——
+           macOS 的最终审查重要 1）。那句承诺是"重启应用后仍在"，而写盘失败时
+           **它是假的** ⇒ 不说的话用户敲完备注、关掉面板、重启，备注没了，无从归因。 -->
+      <div class="panel__history-failure" id="sc-history-failure" hidden>
+        <svg class="panel__failure-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+          <path d="M8 1.9 14.6 13.4H1.4z"/><path d="M8 6.1v3.1M8 11.3v.01"/>
+        </svg>
+        <span class="panel__failure-text selectable" id="sc-history-failure-text"></span>
+        <span class="panel__spacer"></span>
+        <!-- 那颗 × 由 JS 从 `tpl-notice-dismiss` 克隆进来（它的无障碍名字已经有一份
+             模板，本文件不另写一个字）。 -->
+        <span class="panel__dismiss" id="sc-history-failure-dismiss"></span>
+      </div>
+      <p class="panel__hint">点一行即可切换到那一批；备注写在这里，重启应用后仍在。</p>
+    </div>
+
+    <div class="panel__foot">
+      <span class="panel__spacer"></span>
+      <!-- ⚠️ 「取消」**有意不禁用**（macOS 同款）：面板关不关得掉，不该由一次网络请求
+           决定。代价是那次换码的结果会失去面板这个落点 —— 所以结果**同时**落在
+           `state().load` 上，由主区呈现（成功：文件页换成了新那一批；失败：原文）。 -->
+      <button class="panel__btn" id="sc-cancel" type="button">取消</button>
+      <button class="panel__btn is-primary" id="sc-load" type="button">加载</button>
+    </div>
+  </div>
+</template>
+
+<!-- 历史列表里的**一行**（由 `js/switchcode.js` 按载荷克隆，一行一份）。
+     ⚠️ 四格的值全部来自载荷（`BatchHistoryRow` 的 `title` / `code` / `time_text` /
+     `note`），这里只有那个输入框的占位符是结构文案。
+     ⚠️ 标题单独一颗按钮、码与时间在按钮**外面**：那两格要**可选中复制**，
+        而文字套进 `<button>` 之后在部分浏览器里选不动（详见 `switchcode.js:historyRow`）。 -->
+<template id="tpl-switchcode-row">
+  <div class="sc__row">
+    <div class="sc__head">
+      <button class="sc__switch" type="button"><span class="mid__head" data-part="title-head"></span><span class="mid__tail" data-part="title-tail"></span></button>
+      <span class="sc__code selectable"><span class="mid__head" data-part="code-head"></span><span class="mid__tail" data-part="code-tail"></span></span>
+      <span class="sc__time" data-part="time"></span>
+    </div>
+    <input class="sc__note" type="text" placeholder="备注" autocomplete="off" spellcheck="false">
+  </div>
+</template>
+
+<!-- ---------------------------------------------------------------------------
+     设置窗口（`js/settings.js`）
+     对位 `SettingsView.swift`：下载目录段 + 七项参数 + 底部那一行（关于 / 开源许可 /
+     横幅 / 保存）。七项参数的**行**是运行时造的（标签来自载荷），所以这里只给容器。
+     ⚠️ 下载目录那一段**在参数表之外**（macOS 的一个判断，逐字）：内核参数要等握过手
+     才画得出来，而"改下载目录"恰恰是**内核起不来时**最可能要去改的一件事
+     （内核的状态文件就在下载目录里）。两者写在一起，内核一挂它就跟着消失了。
+     --------------------------------------------------------------------------- -->
+<template id="tpl-window-settings">
+  <div class="win win--settings" id="set-root">
+    <div class="win__head">
+      <h2 class="win__title">设置</h2>
+      <button class="win__close" id="set-close" type="button" aria-label="关闭">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+          <path d="M4 4l8 8M12 4l-8 8"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="win__body">
+      <section class="set__section">
+        <div class="set__row">
+          <span class="set__label">下载到</span>
+          <!-- 只读显示值：未配置时是 Rust 给的那句"默认（…，由内核决定）"，
+               而**不是**一个空行（空行在界面上与"这一行坏了"分不开）。
+               ⚠️ 里面那两格是**中间截断**用的（路径可能很长，而这一行不许长高）：
+                  前一段（目录链）可压缩、后一段（文件名）一个字都不少 ——
+                  两格之间**不许有空白文本节点**，否则跨格选择会多出一个空格。 -->
+          <span class="set__value selectable" id="set-dir-display"><span class="mid__head" data-part="head"></span><span class="mid__tail" data-part="tail"></span></span>
+        </div>
+        <div class="set__row">
+          <input class="set__control" id="set-dir-input" type="text" placeholder="文件夹路径"
+                 autocomplete="off" autocapitalize="off" spellcheck="false">
+          <!-- 「选择…」= 弹一次**系统的**「选择文件夹」（`pick_directory`）。
+               对位 `SettingsView.swift:230` 那颗 `NSOpenPanel` 的入口。
+               ⚠️ 选完**直接进那条既有流程**（与 macOS 的 `choose()` → `ask()` 同一条：
+                  填进输入框 + 检查 → 确认 → 写偏好 → 重启内核），不是"只填一格、再让用户
+                  自己去点「应用」"—— 那会与 macOS 的行为分叉，而两处说的本来是同一件事。
+                  手工粘路径那条路一个字都没变。 -->
+          <button class="set__btn" id="set-dir-choose" type="button">选择…</button>
+          <button class="set__btn" id="set-dir-apply" type="button">应用</button>
+          <button class="set__btn" id="set-dir-reset" type="button">恢复默认</button>
+        </div>
+        <!-- 那一段脚注（"没有设置过时壳不指定下载目录……网络盘会让界面变慢"）：
+             逐字来自 `DownloadDirectory::SECTION_NOTE`。 -->
+        <p class="set__note" id="set-dir-note"></p>
+        <!-- 改目录的回执：**标题一行 + 路径一行**（两行都是载荷给的）。
+             ⚠️ 不许把完整路径铺进那一句话里：那是一次真实布局事故的根因
+             （长路径把常驻行撑高，锚在底边的两处一起被顶出窗口）。 -->
+        <div class="set__receipt" id="set-dir-receipt" hidden>
+          <span class="dlg__receipt-icon" id="set-dir-receipt-icon"></span>
+          <span class="set__receipt-text" id="set-dir-receipt-text"></span>
+          <span class="set__spacer"></span>
+          <span class="set__dismiss" id="set-dir-receipt-dismiss"></span>
+        </div>
+      </section>
+
+      <section class="set__section">
+        <div class="set__params" id="set-params-rows"></div>
+        <!-- 三句说明（限速那句 / 生效时机那句）集中在表下面：载荷里那七项只有
+             `{label,min,max}`，前端认不出"哪一行是限速"，按数字去猜就是拿一个
+             上界当标识符（Rust 改一次上界，这句话就会贴到别处而没有东西会变红）。 -->
+        <div class="set__notes" id="set-params-notes"></div>
+        <!-- 内核还没交出参数时的形态：**不画一张空表**（空表会让客户以为参数全没了，
+             而真实原因是"还没问到"）。下面那一格是**原文逐字**（内核还没起来那句）。 -->
+        <div class="set__unavailable" id="set-unavailable" hidden>
+          <p class="set__unavailable-title">内核还没交出参数</p>
+          <p class="set__unavailable-text selectable" id="set-unavailable-text"></p>
+        </div>
+      </section>
+
+      <!-- 保存失败的内核原文（约束 3：壳不加工、不重写），可选中复制、可收起。 -->
+      <div class="set__failure" id="set-failure" hidden>
+        <svg class="panel__failure-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+          <path d="M8 1.9 14.6 13.4H1.4z"/><path d="M8 6.1v3.1M8 11.3v.01"/>
+        </svg>
+        <span class="set__failure-text selectable" id="set-failure-text"></span>
+        <span class="set__spacer"></span>
+        <span class="set__dismiss" id="set-failure-dismiss"></span>
+      </div>
+    </div>
+
+    <div class="win__foot">
+      <!-- ⚠️ 这两颗**只画图标不画标题**是这个仓库栽过三次的形态（本仓库在 macOS 上
+           为此记过账）⇒ 它们是"图标 + 文字"，`<span>` 不是可选的。
+           ⚠️ 关于窗口的入口在这里，是因为 webview 里**没有应用菜单**：
+              macOS 那边它住在菜单栏的「关于 Benagen 数据下载工具」下，
+              而我们这一代**单窗口、无菜单栏**（规格 §2.2：多窗口与菜单那套不移植）。 -->
+      <button class="set__link" id="set-about" type="button">
+        <svg class="set__link-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+          <circle cx="8" cy="8" r="6"/><path d="M8 7.2v3.6M8 5.1v.01"/>
+        </svg>
+        <span>关于</span>
+      </button>
+      <button class="set__link" id="set-license" type="button">
+        <svg class="set__link-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3.4 1.9h6l3.2 3.2v9H3.4z"/><path d="M9.4 1.9v3.2h3.2"/>
+        </svg>
+        <span>开源许可…</span>
+      </button>
+      <span class="set__spacer"></span>
+      <!-- 横幅：**两格**（有改动 / 与内核一致）由 JS 按比较结果**挑选**，不造句。 -->
+      <span class="set__banner" id="set-banner"></span>
+      <button class="panel__btn is-primary" id="set-save" type="button">保存</button>
+    </div>
+  </div>
+</template>
+
+<!-- ---------------------------------------------------------------------------
+     两个提示框（都由 `js/settings.js` 打开）
+     ⚠️ 它们的标题与按钮名是**结构文案**；正文**必须**是载荷给的：
+      · `tpl-dialog-problem` 的正文是 `DownloadDirectory::check` 的那句话
+        （"这个位置不存在：…" / "这是一个文件，不是文件夹：…" /
+        "这个文件夹不可以写入（没有权限）：…"），逐字；
+      · `tpl-dialog-confirm` 的正文是 `DownloadDirectory::confirmation` 的**三条后果**。
+     ⚠️ 与 macOS 的一处形态差异：那边两个 `.alert` 挂在**同一个视图**上（"同一个视图上
+        挂两个 alert 是出了名的只有一个真的出得来"），所以它们共用一个 `Prompt` 枚举；
+        我们这边它们是两块模板、由 `openModal` 各自开一扇 —— 那个坑没有对应物。
+     --------------------------------------------------------------------------- -->
+<template id="tpl-dialog-problem">
+  <div class="dlg dlg--alert">
+    <p class="dlg__title">这个文件夹不能用</p>
+    <p class="dlg__body selectable" id="dlg-problem-message"></p>
+    <div class="dlg__foot">
+      <button class="panel__btn is-primary" id="dlg-problem-ok" type="button">知道了</button>
+    </div>
+  </div>
+</template>
+
+<template id="tpl-dialog-confirm">
+  <div class="dlg dlg--alert">
+    <p class="dlg__title">更改下载目录？</p>
+    <p class="dlg__body selectable" id="dlg-confirm-message"></p>
+    <div class="dlg__foot">
+      <button class="panel__btn" id="dlg-confirm-cancel" type="button">取消</button>
+      <!-- ⚠️ 这颗按钮的标题把**后果**再说一遍（「更改并重启内核」），不是一句空泛的
+           「确定」—— 用户点它之前要能看出自己答应的是什么（macOS 同款）。 -->
+      <button class="panel__btn is-primary" id="dlg-confirm-accept" type="button">更改并重启内核</button>
+    </div>
+  </div>
+</template>
+
+<!-- ---------------------------------------------------------------------------
+     关于（`js/dialogs.js:openAbout`），对位 `AboutView.swift`
+     ⚠️ macOS 那颗全称 logo 在这里**画**了（任务 18 补的），对位 `AboutView.swift` 的
+     `logoCard`：`img/benagen-full-logo.png`（= `macos/Resources/benagen-full-logo.png`
+     的交付副本）、宽 360（源图是 3451×934 的横版，**宽度必须显式约束**，不然它会把
+     窗口撑爆 —— macOS 那句 `.frame(width: 360)` 就是这件事）。
+     ⚠️ 这一处注释此前写的是"不画，因为品牌资产是任务 14 的活（R-6：`BrandAssets`
+     有意不移植）" —— **那句话把 R-6 读错了**：R-6 说的是"不建 `brand_assets.rs`
+     这个 Rust 模块"（资产是给 webview 的静态文件，归**前端 + 构建脚本**），
+     不是"不显示这颗 logo"。两处一叠加 ⇒ 这活当时无人认领（任务 18 ③）。
+     ⚠️ 版本号前面**不加**「版本」两个字：`AboutInfo` 的兜底文案本身就是一句完整的话
+     （"版本未知（…）"），加上去会变成"版本 版本未知（…）"。
+     --------------------------------------------------------------------------- -->
+<template id="tpl-dialog-about">
+  <div class="dlg dlg--about">
+    <div class="win__head">
+      <h2 class="win__title">关于</h2>
+      <button class="win__close" id="about-close" type="button" aria-label="关闭">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+          <path d="M4 4l8 8M12 4l-8 8"/>
+        </svg>
+      </button>
+    </div>
+    <!-- 全称 logo（`logoCard`）。`alt=""`：装饰性资产，macOS 那一边也不给读屏念它。 -->
+    <img class="dlg__logo" src="./img/benagen-full-logo.png" alt="">
+    <p class="dlg__app">Benagen 数据下载工具</p>
+    <!-- 版本号可选中复制：报障时被问到的第一个问题就是"你用的是哪个版本"。 -->
+    <p class="dlg__version selectable" id="about-version"></p>
+    <div class="dlg__failure" id="about-failure" hidden>
+      <svg class="panel__failure-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+        <path d="M8 1.9 14.6 13.4H1.4z"/><path d="M8 6.1v3.1M8 11.3v.01"/>
+      </svg>
+      <span class="selectable" id="about-failure-text"></span>
+      <span class="set__spacer"></span>
+      <span class="set__dismiss" id="about-failure-dismiss"></span>
+    </div>
+  </div>
+</template>
+
+<!-- ---------------------------------------------------------------------------
+     开源许可全文（`js/dialogs.js:openLicense`），对位 `LicenseView.swift`
+     🔴 这一扇不是装饰，是**法律义务**：应用内嵌 aria2（GPLv2）与 Noto Sans SC 的
+     子集（OFL-1.1），分发它们就要一并给出许可全文**与展示入口**（规格 §6.3 的 W-5：
+     "随附**并能看到**"）。两份全文由 Rust 在编译期编进 exe，构建脚本用 sha256 证明
+     编进去的是登记的那一份 —— 所以那个 sha256 也显示出来（可选中复制），
+     用户能拿它去跟官方发布件核对。
+     ⚠️ 上面那排条目的名字与下面那句"这份许可是随哪个内嵌组件来的"都来自载荷
+     （`License.name` / `License.why`）：两句话**跟着条目走**，所以 OFL 那一页
+     不会写着 aria2 的话（一句"看起来对、实际错"的说明）。
+     --------------------------------------------------------------------------- -->
+<template id="tpl-dialog-license">
+  <div class="dlg dlg--license">
+    <div class="win__head">
+      <h2 class="win__title">开源许可</h2>
+      <button class="win__close" id="license-close" type="button" aria-label="关闭">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+          <path d="M4 4l8 8M12 4l-8 8"/>
+        </svg>
+      </button>
+    </div>
+    <!-- 条目（两份）由 JS 按载荷生成 —— 条数由 Rust 的 LICENSES 表决定，不是这里的结构。 -->
+    <div class="dlg__tabs" id="license-list"></div>
+    <p class="dlg__why selectable" id="license-why"></p>
+    <p class="dlg__sha"><span class="dlg__sha-label">全文 sha256</span>
+      <span class="selectable" id="license-sha"></span></p>
+    <div class="dlg__license-body" id="license-body"></div>
+    <div class="dlg__failure" id="license-failure" hidden>
+      <svg class="panel__failure-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+        <path d="M8 1.9 14.6 13.4H1.4z"/><path d="M8 6.1v3.1M8 11.3v.01"/>
+      </svg>
+      <span class="selectable" id="license-failure-text"></span>
+      <span class="set__spacer"></span>
+      <span class="set__dismiss" id="license-failure-dismiss"></span>
+    </div>
+  </div>
+</template>
+
+</body>
+</html>

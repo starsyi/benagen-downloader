@@ -1,0 +1,78 @@
+/* base.css —— 全局元素样式（骨架之前的那一层）。照 `a0-proof.html` 逐条搬。 */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: var(--text-body);
+  color: var(--c-label);
+  background: var(--bg-window);
+  /* 样张逐字带着这一行，照搬：Windows 上它由 Edge/Chromium 解释，
+     观感与 macOS 侧的 `.antialiased` 对齐（这条**不是**可移植的保证，
+     只是"两边的字重看起来一样"的第一近似 —— 真机复核是任务 14 的事）。 */
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- `hidden` 属性必须真的藏得住（**这条是一个实测出来的坑，别删**）----------
+ *
+ * 🔴 现场：`.batch-summary` / `.engine-badge` / `.empty__busy` 这些元素都带
+ *    `hidden` 属性，而它们各自的类里写了 `display: flex` / `inline-flex`。
+ *    **类选择器的优先级高于 UA 样式表里那条 `[hidden] { display: none }`**
+ *    （UA 那条是"作者样式一律赢"的败方）⇒ 属性挂上了、东西照样显示。
+ *
+ * 实测证据：本任务第一次无头渲染时，侧栏底部那一块**空的**「批次摘要」和工具栏
+ * 右端那颗**没有文字的**闪电徽标都画了出来 —— 而它们的 `hidden` 都是真的。
+ * 这两处的观感后果完全不同（前者是一块空地、后者正是本仓库栽过三次的
+ * "工具栏只留图标"），但根因是同一个。
+ *
+ * ⇒ 这一条 `!important` 不是懒：`hidden` 是**语义**（"这一格现在没有值"），
+ * 任何布局意图都不该盖过它。没有它，每一处 `hidden` 都要靠"这个类的 display
+ * 恰好是默认值"来成立 —— 而那是**没人会记得检查**的条件。
+ */
+[hidden] {
+  display: none !important;
+}
+
+/* ---- 焦点态（规格 §7.3 点名要复刻的四件事之一）------------------------------
+   macOS 用系统焦点环。Web 上**不要**删掉默认焦点环（那是无障碍的地板），
+   只把它统一成 accent 色。⚠️ 只在键盘导航时显示（`:focus-visible`）——
+   鼠标点击也画一圈的话，观感会很脏。 */
+:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 1px;
+}
+button:focus:not(:focus-visible),
+a:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ---- 可选中复制的原文（约束 3 / C-7）--------------------------------------
+   "客户要能把这段原文原样发给业务方"——内核的错误原文、路径、交付码、引擎正文都要能选。
+
+   🔴 **这里曾经写着"全局默认不可选（那会让拖拽选中整块界面），需要的地方逐个打开"，
+      而那件事**从来没有被实现过**：全仓 CSS 里**没有任何一处 `user-select: none`**，
+      所以浏览器默认（`auto`，即"可选"）一直生效。一句不成立的注释比没有注释更坏 ——
+      它让人以为"这一格没写 `.selectable` 所以选不中"，于是**没有去查那个真正的
+      原因**（每拍重写 `textContent`，见 `shell.js:writeText`）。实测：那两格
+      （`#summary-code` / `#engine-text`）的 `user-select` 是 `auto`、**选得中**，
+      只是选区**每秒被清一次**。
+
+   ⚠️ **今天 `.selectable` 的真实作用是"这一格该被当成可复制的原文"这个标记**
+      （外加一个 `cursor: text` 的光标暗示）—— 它**不是**"打开开关"：不写它那几格
+      一样选得中。要在真机上验证"能不能复制"，看的是**选区活不活得过一拍**，
+      而不是这一格有没有这个类名。
+   ⚠️ **不要**为了"让这句话成真"去补一条全局 `user-select: none`：那会把交付码、
+      引擎原文、内核错误原文一起变成选不中的格子 —— 而"客户能把原文原样发给业务方"
+      正是约束 3 / C-7 要保的东西（漏掉的每一处都要逐个补回来，漏一处就是一次静默失效）。 */
+.selectable {
+  user-select: text;
+  cursor: text;
+}

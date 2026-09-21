@@ -1,0 +1,549 @@
+/* files.css —— 文件页（平铺列表 + 双击进入 + 面包屑导航）。
+ *
+ * 结构照 `macos/Sources/BenagenDownloader/Views/FileBrowser.swift` 与
+ * `SelectionBar.swift`，尺寸/配色/字号**全部取 `tokens.css` 的令牌** ——
+ * 本文件里不出现任何字面色值，也不出现任何字面尺寸（见 `tokens.css` 的三条纪律）。
+ *
+ * ⚠️ 本文件**一个中文都没有、也一个字面文案都没有**：这一屏会显示的字
+ *    （列名、按钮名、状态句）住在 `index.html` 的 `tpl-screen-files` 里，
+ *    其余每一个字都从命令载荷来（`BrowserRow` / `Breadcrumb` / `SelectionSummary` /
+ *    `DownloadAction`）。样式表里出现一句文案，就是"文案有了第二个家"。
+ *
+ * ⚠️ 类名前缀一律 `files__`（BEM），不与壳（`.nav` / `.toolbar` / `.notice`）撞名 ——
+ *    三屏并行时"某一屏的样式顺手改了壳"是本仓库最怕的那种分叉。
+ */
+
+/* 这一屏的根。`.screen`（壳给的宿主）已经是 `flex:1` 的一列，这里照它继续往下分。 */
+.files {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* 右键菜单要相对**这一屏**定位（它在 `.files` 里面、绝对定位）。 */
+  position: relative;
+}
+
+/* 一句"把剩下的推开"的空格。用独立的 `<span>` 而不是 `margin-left:auto`：
+   后者会让"这一行里谁在左、谁在右"这件事散在四五个类的 margin 里。 */
+.files__spacer {
+  flex: 1;
+  min-width: var(--sp-8);
+}
+
+/* ---- 面包屑 ---------------------------------------------------------------
+   每一段都是 `<button>`（点了就跳到那一段），所以下面那几条重置是**必需**的
+   （`<button>` 的默认外观不等于 macOS 的 `.buttonStyle(.plain)`）：少一条都会让
+   这一行与样张长得不一样，而那是"看着不对但说不出哪里不对"的偏差。 */
+.files__crumbs {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--pad-bar-y) var(--pad-bar-x);
+  font-size: var(--text-callout);
+}
+.files__crumbs-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  min-width: 0;
+}
+.files__crumb {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  font-size: var(--text-callout);
+  color: var(--c-secondary);
+  cursor: pointer;
+  /* 长路径在面包屑里**中间截断**（macOS 的 `.truncationMode(.middle)`）——
+     头尾都是"这是哪一批 / 这是哪一层"，中间那一段才是可以省掉的。 */
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* 方向写成 ltr 才让 `text-overflow` 落在末尾；中间截断由 JS 侧的
+     `direction: rtl` 那一招做不了（会打乱中英混排），所以这里退一步用末尾截断，
+     并**如实记账**：与 macOS 的 `.middle` 不是同一种截断。 */
+}
+.files__crumb:hover {
+  color: var(--c-label);
+}
+/* 当前这一层：加重、用正文色（macOS 的 `.fontWeight(path == currentPath ? .semibold : .regular)`）。 */
+.files__crumb.is-current {
+  color: var(--c-label);
+  font-weight: 600;
+}
+/* 分隔符是**内联 SVG**（见 `files.js` 的 `crumbSeparator`），所以定尺寸而不是定字号 ——
+   它取的是 `currentColor`，颜色由这一条给。 */
+.files__crumb-sep {
+  flex: none;
+  width: 7px;
+  height: 11px;
+  color: var(--c-tertiary);
+}
+/* 「下载本目录」/「重新读取这一层」两颗。
+   ⚠️ 前者是"图标 + 文字"（macOS 的 `.labelStyle(.titleAndIcon)`）——**不许只留图标**
+      （`RootView.swift:155-158` 记着本仓库为此栽过三次）。后者是纯图标按钮，
+      它的名字在 `title`（`aria-label` 同源，见 `index.html` 那一块）。 */
+.files__crumb-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-6);
+  flex: none;
+  border: 0;
+  background: transparent;
+  border-radius: var(--r-6);
+  padding: var(--sp-2) var(--sp-6);
+  font: inherit;
+  font-size: var(--text-callout);
+  color: var(--c-label);
+  cursor: pointer;
+}
+.files__crumb-btn:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+/* 图标是内联在这个按钮里的 `<svg>`（见 `index.html` 那一块），所以尺寸定在
+   它自己身上 —— `currentColor` 让它跟着按钮的文字色走（禁用/悬停都自动对）。 */
+.files__crumb-btn-icon {
+  flex: none;
+  width: var(--row-icon-w);
+  height: var(--row-icon-w);
+}
+
+/* ---- 目录读失败那条说明（`path_not_found` 回退后就在地说明，不停在错误页）----
+   背景取 `--bg-notice`（与常驻提示行同一块材质）。 */
+.files__failure {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-8);
+  padding: var(--pad-bar-y) var(--pad-bar-x);
+  background: var(--bg-notice);
+}
+.files__failure-icon {
+  flex: none;
+  align-self: center;
+  width: var(--row-icon-w);
+  height: var(--row-icon-w);
+  color: var(--c-secondary);
+}
+/* 「已返回上一层」那一句是**壳写的**（`DirLoadFailure.notice`），加重一点把它与
+   下面那句内核原文分开。 */
+.files__failure-notice {
+  flex: none;
+  font-size: var(--text-callout);
+  font-weight: 600;
+}
+/* 🔴 内核原文**逐字**（约束 3）：可选中复制（`.selectable`）、不截断、不折成一行。
+   这里**不许**加 `max-height` —— 那条高度不变量管的是窗口内容**上方**、
+   下面锚着别的东西的常驻提示行；这一段在主区里，它下面没有别的东西可顶。 */
+.files__failure-text {
+  min-width: 0;
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+}
+.files__failure-dismiss {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  border: 0;
+  background: transparent;
+  border-radius: var(--r-6);
+  padding: var(--sp-2);
+  color: var(--c-secondary);
+  cursor: pointer;
+}
+.files__failure-dismiss:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+.files__failure-dismiss svg {
+  width: var(--row-icon-w);
+  height: var(--row-icon-w);
+}
+
+/* ---- 表头与行：**同一张网格**，逐列同宽 -------------------------------
+   ⚠️ 这两条必须一起改：表头与行对不上时列会错位，而"表头写着「时间」的那一列
+      其实是大小"是**只有看屏幕才能发现**的错误（macOS `FileBrowser.swift:269-297`
+      记着同一条）。表头**有意不含**行首那两格（复选框与图标的宽度不是常量），
+      所以「名称」比它下面的文件名偏左约一个复选框宽 —— **照搬，不要"修正"它**。 */
+.files__head,
+.files__row {
+  display: grid;
+  grid-template-columns: 1fr var(--col-size) var(--col-time) var(--col-state);
+  gap: var(--sp-8);
+  align-items: center;
+}
+.files__head {
+  padding: var(--sp-6) var(--pad-bar-x);
+  font-size: var(--text-caption);
+  font-weight: 600;
+  color: var(--c-secondary);
+}
+/* 「大小」右对齐、「时间」左对齐（逐字照 macOS 的 `alignment:`）。 */
+.files__col-size,
+.files__size {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.files__col-time,
+.files__time {
+  text-align: left;
+  font-variant-numeric: tabular-nums;
+}
+.files__col-state,
+.files__state {
+  text-align: left;
+}
+
+.files__rows {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+/* 行：**没有内边距**（上下都不留），行高由 `min-height` 给出。
+   ⚠️ 这个数（28px）是**样张估的首轮值**（macOS 侧是 `List` 的系统默认值，源码里没有这个数
+      —— `windows/design/README.md` 第 ③ 条已知偏离）。它是**待真机复核**的一档。
+   ⚠️ 任务 14 起取令牌 `--row-h`（此前这里写的是字面量 28px，而 `tokens.css` 的
+      第 ③ 条偏离注释**声称**这个值留在令牌里供本屏取用 —— 那句话当时是空头的。
+      值一个字没改，只是把两处写成一处）。 */
+.files__row {
+  padding: 0 var(--pad-bar-x);
+  min-height: var(--row-h);
+  cursor: default;
+}
+.files__row:hover {
+  background: rgba(0, 0, 0, 0.02);
+}
+/* 选中行 = 勾选面里那一行（两者在 macOS 侧是**同一个集合**：
+   `FileBrowser.swift:229` 的 `List(rows, id: \.path, selection: $selection)`
+   同时驱动行高亮与勾选框）—— 所以它们必须同进同退，不许分到两行上。 */
+.files__row.is-selected {
+  background: var(--bg-selected);
+  color: #fff;
+}
+/* 🔴 **裁决 12：选中行保留状态列的语义色**（规格 §6.2）。
+   ⚠️ 样张里那三条把 `.col-size` / `.col-time` / `.col-state` 一起压成
+      `rgba(255,255,255,.75)` 的覆盖规则**故意没搬**：`RowStateStyle::color()` 是
+      `presentation` 的既有判据，压成白色等于**让前端推翻了它**
+      （`tokens.css` 的 `--bg-selected` 那一段做着这笔账）。
+   ⇒ 代价如实记账：选中行里「大小」与「时间」两列在蓝底上是对比度偏低的次级灰。
+      那是**照 macOS 的取舍**，不是漏改；真机上若读不出来，改的是 macOS 侧那一处。 */
+/* 「名称」格里没有工具的那两样：复选框与文件图标。
+   它们在选中行里**必须换色**，否则 accent 蓝的目录图标压在蓝底上等于没画
+   （约束 4：不得静默失效）—— 这是**控件与图形**的颜色，不是上面那条语义色，
+   两回事，别混。 */
+.files__row.is-selected .files__cb {
+  border-color: rgba(255, 255, 255, 0.6);
+}
+.files__row.is-selected .files__cb.is-checked {
+  background: #fff;
+  border-color: #fff;
+}
+/* ⚠️ 白底上的那个勾**必须换成 accent**：不换的话它是"白勾画在白底上"= 什么都看不见
+   （勾的颜色在上面那条 `::after` 里定死了 `#fff`）。而"勾了却看不见勾"正是约束 4
+   说的那种静默失效 —— 客户会以为没点上，于是再点一次（把它取消掉）。
+   ⚠️ 样张里那一格是一个**纯白的方块**（它的勾选框是个空的 `<i>`，根本没有勾），
+      所以这一处我们比样张**多**画了一个勾：照搬那张图反而会做出一个坏控件。 */
+.files__row.is-selected .files__cb.is-checked::after {
+  border-color: var(--c-accent);
+}
+.files__row.is-selected .files__icon {
+  color: #fff;
+}
+
+.files__col-name {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  min-width: 0;
+}
+/* 文件名：**末尾**截断（`×` 与空格原样显示，约束 3）。 */
+.files__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.files__size,
+.files__time {
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+}
+.files__state {
+  font-size: var(--text-caption);
+}
+/* 语义色 → 具体值：**与 `shell-core` 的 `RowColor` 一一对应**。
+   ⚠️ 五个成员一个都不能少（`RowColor` 是 five-case 枚举，`presentation/mod.rs` 记着
+      "不是 6 个"那笔账）。少写一个的后果是那一档**没有颜色**，而它看起来
+      "就是个普通的灰字"，不像缺陷 —— 所以这五条要一起看。
+   ⚠️ 类名由 `files.js` 从载荷里的 `state.color` 映射而来（名字是 Rust 给的）。 */
+.files__state.is-secondary {
+  color: var(--c-secondary);
+}
+.files__state.is-blue {
+  color: var(--c-blue);
+}
+.files__state.is-green {
+  color: var(--c-green);
+}
+.files__state.is-red {
+  color: var(--c-red);
+}
+.files__state.is-orange {
+  color: var(--c-orange);
+}
+
+/* 复选框。⚠️ 它不是 `<input type="checkbox">` 而是**自绘的 `<button>`**，
+   照 macOS 的 `.buttonStyle(.borderless)` + `checkmark.square.fill` / `square`
+   那一对：原生 checkbox 的外观在各家 webview 里差异很大，而这一格是
+   "勾选面"唯一看得见的表示（约束 4）。 */
+.files__cb {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  padding: 0;
+  border: 1px solid var(--c-secondary);
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+}
+.files__cb.is-checked {
+  background: var(--c-accent);
+  border-color: var(--c-accent);
+}
+/* 那个勾**用 CSS 画**（一段旋转 45° 的两边描边），不走 `dom.js` 的图标表：
+   `ICONS` 收的是"名字由 Rust 给"的语义图形（`icon_name` / `engine.icon`），
+   而这一颗勾是**这一屏自己的控件形状**、没有任何语义名字可给 ——
+   塞进那张表等于让"图标名"这件事多出一个没有来源的键。 */
+.files__cb.is-checked::after {
+  content: "";
+  width: 3px;
+  height: 6px;
+  border: solid #fff;
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg) translate(-1px, -1px);
+}
+.files__icon {
+  flex: none;
+  display: inline-flex;
+  width: var(--row-icon-w);
+  height: var(--row-icon-w);
+}
+.files__icon svg {
+  width: var(--row-icon-w);
+  height: var(--row-icon-w);
+}
+/* 目录用 accent、文件用次级色（macOS `.foregroundStyle(row.kind == .dir ? … : …)`）。
+   ⚠️ 这里的判据是**载荷里的 `state.color` 之外的另一个字段**：目录行恒是
+   `RowStateStyle::None` ⇒ `RowColor::Secondary`，而 macOS 的目录图标是 accent
+   —— 所以这一条走 `icon_name`（Rust 给的语义名），不是走颜色。 */
+.files__icon.is-folder {
+  color: var(--c-accent);
+}
+
+/* ---- 列表那一块的四态（读取中 / 读失败 / 空目录 / 有内容）------------------
+   三块状态文案**常驻在 DOM 里**、由 `hidden` 切换（照 `empty.js` 的理由：
+   重建会让"用户正拖着选区准备复制的原文"每秒被清一次）。 */
+.files__status {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-8);
+  padding: var(--sp-20);
+  min-height: 0;
+}
+.files__status-text {
+  font-size: var(--text-callout);
+  color: var(--c-secondary);
+}
+/* 转圈：一个圆环 + 一个透明缺口 + 一条 CSS 动画（与 `empty.css` 的那一颗同一个做法）。
+   ⚠️ 不用 `<progress>`：它在各家 webview 里的默认外观差异很大，
+      而这里要的只是一个"有东西在动"的最小信号。 */
+.files__status-spinner {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--c-tertiary);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: files-spin 800ms linear infinite;
+}
+@keyframes files-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* ⚠️ 尊重系统的"减少动态效果"（无障碍要求，不是体贴）。 */
+@media (prefers-reduced-motion: reduce) {
+  .files__status-spinner {
+    animation-duration: 2400ms;
+  }
+}
+.files__status-retry {
+  font: inherit;
+  font-size: var(--text-callout);
+  padding: var(--sp-2) var(--sp-8);
+  border: 1px solid var(--c-separator);
+  border-radius: var(--r-6);
+  background: transparent;
+  color: var(--c-label);
+  cursor: pointer;
+}
+.files__status-retry:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+/* ---- `enqueue` 的回执（顶上一句 + 逐条拒绝理由）---------------------------
+   ⚠️ 它**不是**常驻提示行（那一条的家在壳里、且归 `app.js` 的路由管）：
+   这是**本屏自己发起的那一次动作**的结果，摆在列表下方、底栏上方。
+   约束 4：`added` 与 `rejected` 两边都要有落点 —— 所以拒绝理由是**逐条**的。 */
+.files__notice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--pad-bar-y) var(--pad-bar-x);
+  background: var(--bg-notice);
+}
+.files__notice-text {
+  font-size: var(--text-callout);
+  font-weight: 600;
+}
+.files__notice-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: var(--notice-list-max-h);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+.files__notice-list li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-8);
+  font-size: var(--text-caption);
+}
+/* 路径可截断、理由换行也要能看全（理由里常带内核原文的引号与括号）。 */
+.files__notice-path {
+  flex: none;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.files__notice-reason {
+  min-width: 0;
+  color: var(--c-secondary);
+}
+
+/* ---- 底栏（规格 §7.1：「已选 N 项 · 合计大小 · 操作按钮」）---------------- */
+.files__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  padding: var(--pad-bar-y-tall) var(--pad-bar-x);
+  font-size: var(--text-callout);
+  white-space: nowrap;
+  border-top: 1px solid var(--c-separator);
+}
+/* 提示在**最左边、项数之前**（它解释的是"接下来会发生什么"，
+   用户从左往右读到的第一句就该是它 —— macOS `SelectionBar.swift:46-53` 逐字）。 */
+.files__bar-hint {
+  color: var(--c-secondary);
+}
+.files__bar-sep {
+  color: var(--c-tertiary);
+}
+.files__bar-count {
+  color: var(--c-secondary);
+}
+.files__bar-size {
+  color: var(--c-secondary);
+  font-variant-numeric: tabular-nums;
+}
+/* 「全选 / 全不选」是辅助动作、不是这一栏的主角（macOS 的 `.borderless`）——
+   所以它们是无底色的普通按钮，只有主按钮铺 accent。 */
+.files__bar-btn {
+  font: inherit;
+  font-size: var(--text-callout);
+  border: 0;
+  border-radius: var(--r-6);
+  padding: var(--sp-2) var(--sp-6);
+  background: transparent;
+  color: var(--c-label);
+  cursor: pointer;
+}
+.files__bar-btn:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.05);
+}
+.files__bar-btn.is-primary {
+  background: var(--c-accent);
+  color: #fff;
+  padding: var(--sp-4) var(--sp-12);
+}
+.files__bar-btn.is-primary:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+/* ---- 禁用态（任务 17）：勾选面大到一次发不出去时，这两颗**真的禁用** -------------
+   ⚠️ 为什么必须补这一段：`.is-primary` 自带的 accent 底色会**盖住**浏览器默认的禁用观感，
+   而上面那两条 `:hover` 原来没有 `:not(:disabled)` —— 禁用了反而看不出禁用、悬停还更亮，
+   那就是"看起来能用、点下去没反应"（本项目最恨的静默失效的形态）。
+   ✅ **判据（什么时候禁用）不在这里**：它在 Rust（`DownloadAction.blocked_reason`，
+   由 `api::tree::whole` 发下来），而"为什么按不动"那句话也由载荷给（`files.js` 只摆位置）。
+   这里**只管让它看得出来**。写法照 `panels.css` 里 `.panel__btn.is-primary:disabled`（同一套 token）。 */
+.files__bar-btn:disabled {
+  color: var(--c-tertiary);
+  cursor: default;
+}
+.files__bar-btn.is-primary:disabled {
+  background: var(--c-separator);
+  color: var(--c-tertiary);
+}
+
+/* ---- 右键菜单 -------------------------------------------------------------
+   照 macOS 的 `.contextMenu(forSelectionType:)` 那三项（`FileBrowser.swift:244-250`）。
+   ⚠️ 位置由 `files.js` 按点击坐标给（`left` / `top`），这里只管外观。 */
+.files__menu {
+  position: absolute;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  min-width: 160px;
+  padding: var(--sp-4);
+  border: 1px solid var(--c-separator);
+  border-radius: var(--r-10);
+  background: var(--bg-window);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+}
+.files__menu-item {
+  font: inherit;
+  font-size: var(--text-body);
+  text-align: left;
+  border: 0;
+  border-radius: var(--r-6);
+  padding: var(--sp-4) var(--sp-8);
+  background: transparent;
+  color: var(--c-label);
+  cursor: default;
+}
+.files__menu-item:hover:not(:disabled) {
+  background: var(--bg-selected);
+  color: #fff;
+}
+/* 禁用态（任务 17）：与底栏那颗同一件事 —— 菜单里那一项也是"加入下载"的入口，
+   超预算时同样按不动（判据同上，在 Rust 里）。没有这一段的话，它悬停照样高亮。 */
+.files__menu-item:disabled {
+  color: var(--c-tertiary);
+  cursor: default;
+}
+.files__menu-sep {
+  height: 1px;
+  margin: var(--sp-4) 0;
+  background: var(--c-separator);
+}

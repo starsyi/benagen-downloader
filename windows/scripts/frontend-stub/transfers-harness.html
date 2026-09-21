@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<!--
+  windows/scripts/frontend-stub/transfers-harness.html —— **传输列表屏的无头验收夹具**（常驻）。
+
+  跑法（**一条命令**）：bash windows/scripts/check_transfers_screen.sh
+  直接打开：/transfers-harness.html?s=still|tick|empty|down|gate|loading
+                （要先起本地静态服务，见 runner）
+
+  ===========================================================================
+  它验的是哪一件事
+  ===========================================================================
+  **"传输列表屏在**真载荷**下渲染得对不对、以及 200 ms 那一拍有没有把 DOM 重建"**
+  ——期望值**全部从 `windows/scripts/frontend-stub/wire-fixtures.json` 里读**
+  （那份夹具由 `windows/scripts/make_wire_fixtures.sh` 调 shell-core 的
+  `examples/dump_wire_fixtures.rs` 从 `api::transfers::transfers` 现倒出来，
+  **不是手抄的** —— 手抄的夹具与前端会犯同一个错，那是任务 10 第 2 轮的事故）。
+
+  ===========================================================================
+  六个场景（顺序与 `check_transfers_screen.sh --all` 一致）
+  ===========================================================================
+  · `still`（默认）—— 13 个字段逐一对照夹具 + 行标题的**中间省略**（含压窄 20px 的几何
+    断言与受控 `copy` 事件）+ 行菜单**完全由 `available_actions` 驱动**（含"空集 = 一个
+    动作都不给"那一行）+ 三个动作真的发出去了（`task_action` / `reveal` / `clear_finished`）
+    + 「刷新」的形态、禁用态与"点一下立刻补一拍" + 动作失败的原文逐字、**且不被 200 ms
+    那一拍清掉**；
+  · `tick`  —— 🔴 **200 ms 一拍只改文本与宽度、不建节点**：行容器的 `childList` 变更数
+    必须是 **0**、行元素与错误原文的文本节点**还是同一个**、**选区还活着**；
+    **并有一组对照**（切到"少一行"的载荷）⇒ 变更数立刻起来，证明那个 0 不是"观察器没装上"。
+  · `empty` —— 空态（`rows: []` + `global: null` + `TransferListEmpty` 那句话）；
+  · `down`  —— 载荷说不用说话那一档：`empty_text` 是 `null` ⇒ **这一屏什么都不说**
+    （横幅在壳上），而且**不许编一句出来**；
+  · `gate`  —— 闸门关着（`allows_requests == false`）⇒ **一拍都不发**、
+    「刷新」在场但禁用、**转圈不出现**（一个永远没有回音的转圈 = 静默挂死）；
+  · `loading` —— **还没有快照**（`model.transfers == nil`）而引擎能发请求 ⇒
+    转圈 + 「正在读取传输列表…」，且**排在空态之前**（`TransfersView.swift:113-121`）。
+
+  ===========================================================================
+  ⚠️ 它为什么住在这里，而不是 `windows/web/` 下
+  ===========================================================================
+  `shell-win/tauri.conf.json` 的 `build.frontendDist = "../web"` ⇒ **`windows/web/`
+  下的任何文件都会被编进 exe**（那件事由 `check_frontend_copy.sh` 的文件清单判据守着）。
+  本目录**不在** frontendDist 里。
+
+  ===========================================================================
+  结果怎么从浏览器里出来（同 `files-harness.html`，那里有完整论证）
+  ===========================================================================
+  本机实测 `Microsoft Edge 149` 在 `--headless=new --dump-dom` 下会挂住 ⇒ 结果走
+  **HTTP POST**（`/__result`），runner 起的那个 python 服务把它写进一个文件，runner 轮询。
+  这样"跑完了没有""过了几条、红的是哪几条"都是脚本读得到的数。
+
+  ⚠️ 夹具里的中文**不归 §3.2 管**：它不是交付物（不进 exe）。判据只扫 `windows/web/**`。
+  ⚠️ 本页**一个字段名都不手抄**：所有期望值都从 `wire-fixtures.json` 里取。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light">
+<title>transfers screen harness</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; }
+  iframe { border: 0; display: block; width: 1120px; height: 720px; }
+  #out { margin: 0; padding: 8px 12px; font: 12px/1.5 ui-monospace, Menlo, monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<iframe id="f" src="/windows/web/index.html"></iframe>
+<pre id="out">loading fixtures…</pre>
+<script>
+// 🔴 **这一段是 classic 脚本**（不是 module），它只做一件事：把**模块脚本自己坏掉**
+//    那一路也报出去。
+//
+// 为什么必须有它（**这是实测换来的**）：下面那个 module 一旦有**语法错误**，
+// 整个模块**一行都不执行** ⇒ `runScenario` 的兜底、`report()`、那个 90 s 看门狗
+// 全都不存在 ⇒ runner 只能等满 `WAIT_SECONDS`（180 s）**每一轮**，
+// 而它打出来的是"TIMEOUT"——那句话**说不出是哪一行错了**（本夹具的开发过程中
+// 就这么浪费掉了一整轮 400 s）。`window.onerror` 在这里把那条错误直接 POST 出去，
+// 于是"语法错误"变成一条**立刻**出现的 `ABORT …SyntaxError: …`。
+// ⚠️ 它**不替代**模块里那个 `report()`（正常路径一条都不用它）：两者都往
+//    `/__result` 写，谁先到算谁（真出错时只有这一条会到）。
+window.addEventListener("error", function (event) {
+  var text = (event && event.message ? event.message : String(event))
+    + (event && event.lineno ? "（第 " + event.lineno + " 行）" : "");
+  try {
+    fetch("/__result", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        scenario: new URLSearchParams(location.search).get("s") || "still",
+        ok: 0, fail: 0, aborted: 1,
+        lines: ["ABORT 夹具页自己坏了（多半是语法错误）：" + text],
+      }),
+    });
+  } catch (error) {
+    // 连这条都送不出去 ⇒ runner 仍会按"空跑"红（这正是要的：不许静默）。
+  }
+});
+</script>
+<script type="module">
+const SCENARIO = new URLSearchParams(location.search).get("s") || "still";
+
+// ---- 夹具：**从 Rust 倒出来的那一份**（本页一个字段名都不手抄）-----------------
+const FIX = await (await fetch("/windows/scripts/frontend-stub/wire-fixtures.json")).json();
+const SNAP = FIX.transfersSnapshot.data;
+const TICK = FIX.transfersTick.data;
+const AFTER = FIX.transfersAfterRemove.data;
+const EMPTY = FIX.transfersEmpty.data;
+const DOWN = FIX.transfersEngineDown.data;
+const ROWS = SNAP.rows;
+const BY_GID = new Map(ROWS.map((r) => [r.gid, r]));
+
+// `RowColor` 的五个成员 → 本屏的 CSS 类（**独立写死**，不从被测文件里 import：
+//  从被测对象算期望值等于恒真断言）。
+const COLOR_CLASS = { Secondary: "is-secondary", Blue: "is-blue", Green: "is-green", Red: "is-red", Orange: "is-orange" };
+
+const invocations = [];
+/** 传输列表那一支返回哪一份载荷（`tick` 场景里每拍交替，见 `invoke`）。 */
+let mode = "snapshot";
+/** 下一次 `task_action` 要不要回失败信封（给"动作失败要留在屏幕上"那条断言用）。 */
+let failNextAction = false;
+let tickToggle = false;
+
+async function invoke(cmd, args) {
+  invocations.push({ cmd, args: args || {} });
+  // `gate` 那一档：`state()` 报引擎不可用 ⇒ `allows_requests: false` ⇒ 闸门关着。
+  if (cmd === "state") return mode === "gate" ? FIX.stateEngineDown : FIX.stateLoaded;
+  if (cmd === "tree") {
+    const path = args && typeof args.path === "string" ? args.path : null;
+    if (path === null) return FIX.treeWhole;
+    return FIX.treeLevelRoot;
+  }
+  if (cmd === "transfers") {
+    // `loading` 那一档：**第一拍永不返回** ⇒ `snapshotSeen` 一直是 false ⇒ "还没有快照"。
+    // ⚠️ 这是**真的在飞**（不是"没发请求"）：`poll.js` 的重入保护会把后面每一拍都跳过
+    //    —— 那正是"转圈该转的时候"的现场。
+    if (mode === "loading") return new Promise(() => {});
+    if (mode === "empty") return FIX.transfersEmpty;
+    if (mode === "down") return FIX.transfersEngineDown;
+    if (mode === "afterRemove") return FIX.transfersAfterRemove;
+    if (mode === "tick") {
+      tickToggle = !tickToggle;
+      return tickToggle ? FIX.transfersTick : FIX.transfersSnapshot;
+    }
+    return FIX.transfersSnapshot;
+  }
+  if (cmd === "task_action") {
+    if (failNextAction) {
+      failNextAction = false;
+      // 内核原文（多行、带换行）——屏幕上必须**逐字**出现，且**不被 200 ms 那一拍清掉**。
+      return { ok: false, error: { message: ACTION_FAILURE_TEXT } };
+    }
+    return { ok: true, data: { status: "done" } };
+  }
+  if (cmd === "reveal") return { ok: true, data: { status: "revealed" } };
+  return { ok: true, data: {} };
+}
+const ACTION_FAILURE_TEXT = "GID g-active 没有路径映射（可能已被移除）\n（内核原文，逐字）";
+
+const lines = [];
+let ok = 0, fail = 0;
+let reported = false;
+function check(name, cond, detail) {
+  if (cond) { ok++; lines.push("PASS " + name + (detail ? " — " + detail : "")); }
+  else { fail++; lines.push("FAIL " + name + (detail ? " — " + detail : "")); }
+  document.getElementById("out").textContent = lines.join("\n");
+}
+/** 断言脚本自己中止了（抛异常 / 卡住）—— 中止也要报，且**不计进 ok/fail**（见 files-harness 那段）。 */
+let aborted = 0;
+function abort(why, error) {
+  aborted += 1;
+  lines.push("ABORT " + why + "：" + (error && error.message ? error.message : error));
+  document.getElementById("out").textContent = lines.join("\n");
+}
+async function report() {
+  if (reported) return;
+  reported = true;
+  document.title = "DONE ok=" + ok + " fail=" + fail + " abort=" + aborted;
+  try {
+    await fetch("/__result", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ scenario: SCENARIO, ok, fail, aborted, lines }),
+    });
+  } catch (error) {
+    console.error("POST /__result 失败：", error);
+  }
+}
+async function runScenario(runner) {
+  try {
+    await runner();
+  } catch (error) {
+    abort("断言脚本中止（后面那些没跑）", error);
+  } finally {
+    await report();
+  }
+}
+setTimeout(() => {
+  if (!reported) {
+    abort("断言脚本 90s 内没跑完", "watchdog");
+    void report();
+  }
+}, 90000);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = () => document.getElementById("f");
+const doc = () => frame().contentDocument;
+const win = () => frame().contentWindow;
+const rowsOf = () => [...doc().querySelectorAll("#transfers-rows .transfers__row")];
+const rowByGid = (g) => rowsOf().find((r) => r.dataset.gid === g);
+const textOf = (root, sel) => { const el = root.querySelector(sel); return el ? el.textContent : null; };
+const click = (el) => el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+/**
+ * 菜单**此刻列出来**的那几项。
+ *
+ * ⚠️ 必须先看菜单是不是开着的：收起来（`hidden`）的菜单**节点还留在 DOM 里**
+ *    （这是刻意的 —— 每次打开都重建 DOM 才是那一屏要避免的事），少判这一句，
+ *    上一个菜单残留的那几项会被读成"这一行的菜单"（本夹具第一版就是这么假绿的）。
+ */
+const menuItems = () => {
+  const menu = doc().getElementById("transfers-menu");
+  if (!menu || menu.hidden) return [];
+  return [...menu.querySelectorAll(".transfers__menu-item")];
+};
+const menuActions = () => menuItems().map((i) => i.dataset.action);
+/** 模板里"某个动作叫什么"（本页**不抄**那几个字：它们住在被测的 `index.html` 里）。 */
+function templateLabel(action) {
+  const tpl = doc().getElementById("tpl-screen-transfers-menu");
+  const item = tpl.content.querySelector(`.transfers__menu-item[data-action="${action}"]`);
+  return item ? item.textContent : null;
+}
+
+// ---- 切到「传输列表」那一屏（**用户做的事**：点侧栏那一项）--------------------
+//
+// ⚠️ 时间线（`app.js` 的节拍是 1 s）：iframe 的 `load` 之前 `app.js` 已经跑过一轮，
+//    而那时 `window.__TAURI__` 还没注入 ⇒ 第一拍失败、**1 s 后**那一拍才成功并做首次
+//    路由（此时分区是默认的 `files`）。⇒ 这里等足一拍再点侧栏，点了之后**再等一拍**
+//    让路由重算（`applyRoute` 只在 `state()` 的节拍上跑）。
+async function enterTransfers() {
+  await sleep(1400);
+  const nav = doc().getElementById("nav-transfers");
+  check("侧栏有「传输列表」那一项", !!nav);
+  if (nav) click(nav);
+  await sleep(1400);
+  check("切过去之后这一屏挂起来了", !!doc().querySelector("#transfers-root"));
+}
+
+/**
+ * 注入 `window.__TAURI__` 并起场景。
+ *
+ * ⚠️ **两条路都要走**（`load` 事件 + "已经加载完了"的兜底）：`<iframe src>` 在解析
+ *    HTML 时就开始了，而本页是一个 **deferred 的模块脚本** —— 它跑起来时 iframe
+ *    完全可能**已经 loaded**（那时 `load` 事件已经过去了，监听器永远等不到）。
+ *    `files-harness.html` 只有 `load` 那条路（它一直没红是运气：本机够快、或者够慢），
+ *    这里两条都留 —— 一个"监听器挂晚了就静默超时"的夹具与没有夹具是一样的。
+ * ⚠️ 注入晚了**不是问题**：`app.js` 的第一拍一定失败（那时还没有 `__TAURI__`），
+ *    1 s 后的第二拍才成功 —— 场景里的等待时间就是照这条算的。
+ */
+function start() {
+  if (started) return;
+  started = true;
+  win().__TAURI__ = { core: { invoke } };
+  if (SCENARIO === "tick") void runScenario(runPaintCheck);
+  else if (SCENARIO === "empty") void runScenario(runEmpty);
+  else if (SCENARIO === "down") void runScenario(runEngineDown);
+  else if (SCENARIO === "gate") void runScenario(runGate);
+  else if (SCENARIO === "loading") void runScenario(runLoading);
+  else void runScenario(runLayoutAndMenu);
+}
+let started = false;
+frame().addEventListener("load", start);
+if (frame().contentDocument && frame().contentDocument.readyState === "complete") start();
+
+// ===========================================================================
+// 场景 still：13 个字段 + 行菜单（**动作面完全由载荷驱动**）+ 动作 + 失败原文
+// ===========================================================================
+async function runLayoutAndMenu() {
+  await enterTransfers();
+
+  // ---- ① 行的条数：**载荷给几条就是几条**（不许有占位行、不许筛选）-------------
+  check("行数与载荷一样（不多不少）", rowsOf().length === ROWS.length,
+    rowsOf().length + " vs " + ROWS.length);
+
+  // ---- ② gid：行元素按 gid 认（也是 task_action 的实参）----------------------
+  check("每一行的 data-gid 就是载荷里的 gid（顺序也一致）",
+    rowsOf().every((r, i) => r.dataset.gid === ROWS[i].gid),
+    rowsOf().map((r) => r.dataset.gid).join(","));
+
+  // ---- ③ 13 个字段逐一对照 ---------------------------------------------------
+  const mismatches = [];
+  for (const row of ROWS) {
+    const el = rowByGid(row.gid);
+    if (!el) { mismatches.push(row.gid + ": 行不在"); continue; }
+    const got = {
+      title: textOf(el, ".transfers__title"),
+      progress_text: textOf(el, ".transfers__progress"),
+      percent_text: textOf(el, ".transfers__percent"),
+      speed_text: textOf(el, ".transfers__speed"),
+      state_label: textOf(el, ".transfers__state"),
+      error_text: el.querySelector(".transfers__error").hidden
+        ? null : textOf(el, ".transfers__error"),
+    };
+    for (const key of Object.keys(got)) {
+      if (got[key] !== row[key]) mismatches.push(`${row.gid}.${key}: 「${got[key]}」≠「${row[key]}」`);
+    }
+    // `progress_fraction`：**原样**写进自定义属性（JS 不做任何换算）
+    const prop = el.querySelector(".transfers__bar-fill").style.getPropertyValue("--transfers-fraction");
+    if (prop !== String(row.progress_fraction)) {
+      mismatches.push(`${row.gid}.progress_fraction: 「${prop}」≠「${row.progress_fraction}」`);
+    }
+    // `state_color` → 类名
+    if (!el.querySelector(".transfers__state").className.includes(COLOR_CLASS[row.state_color])) {
+      mismatches.push(`${row.gid}.state_color: 「${el.querySelector(".transfers__state").className}」`);
+    }
+    // `shows_paused_badge` → 角标那一格的 `hidden`
+    const badgeHidden = el.querySelector(".transfers__badge").hidden;
+    if (badgeHidden === row.shows_paused_badge) {
+      mismatches.push(`${row.gid}.shows_paused_badge: hidden=${badgeHidden}`);
+    }
+    // `state_icon_name`：那一格里的 `<svg>` 路径必须与"那个名字画成什么"对得上 ——
+    // 这里只断言"有图形"，而"名字变了才换图形"由下面的 tick 场景钉。
+    if (!el.querySelector(".transfers__icon svg")) mismatches.push(`${row.gid}.state_icon_name: 没有图形`);
+  }
+  check("13 格里那 9 个直接显示的值逐字来自载荷", mismatches.length === 0, mismatches.join("；"));
+
+  // ---- ④ 进度条的**宽度**真的等于那个分数（不是"看起来差不多"）----------------
+  {
+    const el = rowByGid(ROWS[0].gid);
+    const fill = el.querySelector(".transfers__bar-fill");
+    const bar = el.querySelector(".transfers__bar");
+    const want = Number(fill.style.getPropertyValue("--transfers-fraction")) * bar.getBoundingClientRect().width;
+    const got = fill.getBoundingClientRect().width;
+    check("进度条宽度 = progress_fraction × 条宽（CSS 算的，JS 不换算）",
+      Math.abs(got - want) < 1.5, `${got.toFixed(1)}px vs ${want.toFixed(1)}px`);
+  }
+
+  // ---- ⑤ 错误原文：**行下方全文展开、不截断** ---------------------------------
+  {
+    const errEl = errorBlock().el.querySelector(".transfers__error");
+    const cs = doc().defaultView.getComputedStyle(errEl);
+    check("有错误的那一行，原文**逐字**在场（含换行）",
+      errEl.textContent === errorBlock().row.error_text, JSON.stringify(errEl.textContent));
+    check("错误原文没有被截断（pre-wrap + 没有裁切）",
+      cs.whiteSpace === "pre-wrap" && cs.overflow !== "hidden"
+        && errEl.scrollHeight <= errEl.clientHeight + 1,
+      `white-space=${cs.whiteSpace} overflow=${cs.overflow} ${errEl.scrollHeight}/${errEl.clientHeight}`);
+    check("没有错误的那些行，那一格是 hidden（不是空行）",
+      ROWS.filter((r) => r.error_text === null)
+        .every((r) => rowByGid(r.gid).querySelector(".transfers__error").hidden));
+    check("错误原文那一格是可选中的（约束 3：客户要能复制）",
+      errEl.classList.contains("selectable"));
+  }
+
+  // ---- ⑤b 标题：**中间省略**（macOS `.truncationMode(.middle)`）-----------------
+  // 判据（与 `verify.js:pathRow` 那一套逐条同源）：
+  //   · 切点是**最后一个分隔符**、两格**紧邻**（中间没有空白文本节点）；
+  //   · 两格拼起来**逐字节**等于载荷里的 title（一个字符都没被改写）；
+  //   · 真缩一下：**首段被切、尾段一个字符都不少**（省略号由浏览器画在首段末尾）；
+  //   · 复制：把浏览器序列化出来的那份（含块边界的 `\n`）喂给处理器 ⇒ 还原成逐字原文；
+  //     不命中时**一个字符都不碰**、也不 `preventDefault`（照 `verify.js` 那条的保守口径）。
+  {
+    const row = ROWS.find((r) => r.title.includes("/"));
+    const titleEl = rowByGid(row.gid).querySelector(".transfers__title");
+    const head = titleEl.querySelector(".transfers__title-head");
+    const tail = titleEl.querySelector(".transfers__title-tail");
+    const cut = row.title.lastIndexOf("/");
+    check("标题是两格（首段 + 尾段）—— 中间省略的形状", !!head && !!tail);
+    check("两格拼起来**逐字**等于载荷里的 title（一个字符都没被改写）",
+      head.textContent + tail.textContent === row.title,
+      JSON.stringify(head.textContent + "|" + tail.textContent));
+    check("切点是**最后一个分隔符**（首段含它、尾段是文件名）",
+      head.textContent === row.title.slice(0, cut + 1)
+        && tail.textContent === row.title.slice(cut + 1),
+      JSON.stringify(head.textContent) + " / " + JSON.stringify(tail.textContent));
+    check("两格之间**没有任何空白节点**（多一个空格 = 显示的东西与原文不一样）",
+      head.nextElementSibling === tail && head.nextSibling === tail);
+    check("省略号的画法在 CSS 上：首段收缩（flex-grow=0）、尾段不收缩（flex-shrink=0）",
+      doc().defaultView.getComputedStyle(head).flexGrow === "0"
+        && doc().defaultView.getComputedStyle(tail).flexShrink === "0");
+    // 真缩一下（把容器压到"两格之和 - 20px"）⇒ 首段必须被切、尾段必须完整。
+    const full = head.getBoundingClientRect().width + tail.getBoundingClientRect().width;
+    titleEl.style.width = Math.max(40, full - 20) + "px";
+    await sleep(60);
+    check("缩 20px 之后：**首段被切**（省略号由浏览器画）、**尾段一个字符都不少**",
+      head.scrollWidth > head.clientWidth + 0.5 && tail.scrollWidth <= tail.clientWidth + 0.5,
+      `head ${head.scrollWidth}/${head.clientWidth}，tail ${tail.scrollWidth}/${tail.clientWidth}`);
+    titleEl.style.width = "";
+    await sleep(60);
+    check("界面上的标题文本里**没有**我们自己写进去的省略号（`…` 不在载荷里也不在两格里）",
+      !row.title.includes("…") && titleEl.textContent === row.title);
+    check("完整原文挂在 `title` 属性上（悬停可见；macOS 的 `.help`）",
+      titleEl.title === row.title);
+
+    // 复制：受控的 copy 事件（自造 DataTransfer）——与 `task-12-harness/copy-check.js` 同一手法。
+    const sel = doc().getSelection();
+    const range = doc().createRange();
+    range.selectNodeContents(titleEl);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    const serialized = String(sel);
+    check("（前提）浏览器序列化跨块边界的选区时会插一个换行 —— 这正是要还原的东西",
+      serialized.includes("\n"), JSON.stringify(serialized));
+    const dt = new (win().DataTransfer)();
+    dt.setData("text/plain", serialized);
+    const ev = new (win().ClipboardEvent)("copy", { clipboardData: dt, bubbles: true, cancelable: true });
+    doc().getElementById("transfers-rows").dispatchEvent(ev);
+    check("复制：处理器把那个换行还原掉 ⇒ 剪贴板里是**逐字原文**",
+      dt.getData("text/plain") === row.title, JSON.stringify(dt.getData("text/plain")));
+    check("复制：接管了这一次（preventDefault）", ev.defaultPrevented);
+    // ⚠️ 判"没命中"必须**同时把选区换成不含那个边界的东西** —— 处理器读的是
+    //    **活动选区**（照 `verify.js` 那条），只换剪贴板里的文本而选区还整段罩着标题的话，
+    //    它照样会命中、照样改写（本夹具第一版就是这么假红的）：
+    //    ⇒ 这里照 `task-12-harness/copy-check.js` 的手法，选区改成**只有尾段**。
+    const tailRange = doc().createRange();
+    tailRange.selectNodeContents(tail);
+    sel.removeAllRanges();
+    sel.addRange(tailRange);
+    const dt2 = new (win().DataTransfer)();
+    const untouched = "用户自己选的一段文字\n第二行";
+    dt2.setData("text/plain", untouched);
+    const ev2 = new (win().ClipboardEvent)("copy", { clipboardData: dt2, bubbles: true, cancelable: true });
+    doc().getElementById("transfers-rows").dispatchEvent(ev2);
+    check("复制：**没命中**时一个字符都不碰、也不 preventDefault（保守口径）",
+      dt2.getData("text/plain") === untouched && !ev2.defaultPrevented,
+      JSON.stringify(dt2.getData("text/plain")));
+    sel.removeAllRanges();
+  }
+
+  // ---- ⑥ 行菜单：**完全由 `available_actions` 驱动** --------------------------
+  // 期望值 = 载荷里的 available_actions（顺序也按它）+ 有路径时的「在资源管理器中显示」
+  //（macOS `TransferRowView` 同款：`canAct(_:)` 与 `canRevealInFinder` 两个判据）。
+  const menuMismatch = [];
+  for (const row of ROWS) {
+    const el = rowByGid(row.gid);
+    const btn = el.querySelector(".transfers__menu-btn");
+    // 「一个动作都不给」的那一行：那颗「⋯」**禁用**、点开也**不弹菜单**。
+    const expected = [...row.available_actions];
+    if (typeof row.manifest_path === "string") expected.push("reveal");
+    if (expected.length === 0) {
+      if (!btn.disabled) menuMismatch.push(`${row.gid}: 没有动作，但「⋯」不是禁用的`);
+      click(btn);
+      if (menuItems().length !== 0) {
+        menuMismatch.push(`${row.gid}: 空集却弹出了 ${menuItems().length} 项`);
+        doc().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      }
+      continue;
+    }
+    click(btn);
+    const got = menuActions().filter((a) => a !== undefined);
+    // 顺序：载荷里的 available_actions 原序（`BTreeSet` 的序），reveal 插在中间
+    //（模板的顺序）—— 这里比对**集合 + 逐项在场**，不比顺序（顺序由模板定，见下一条）。
+    if (got.length !== expected.length || !expected.every((a) => got.includes(a))) {
+      menuMismatch.push(`${row.gid}: [${got}] ≠ [${expected}]`);
+    }
+    // 每一项的字必须与**模板里那一项**的字一样（防"克隆错了项"）。
+    for (const item of menuItems()) {
+      if (item.textContent !== templateLabel(item.dataset.action)) {
+        menuMismatch.push(`${row.gid}/${item.dataset.action}: 文案「${item.textContent}」`);
+      }
+      if (item.textContent === "") menuMismatch.push(`${row.gid}/${item.dataset.action}: 空文案`);
+    }
+    doc().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  }
+  check("行菜单的项 = 载荷的 available_actions（+ 有路径时的「显示」），一个不多一个不少",
+    menuMismatch.length === 0, menuMismatch.join("；"));
+
+  // ---- ⑦ 动作真的发出去了 -----------------------------------------------------
+  click(rowByGid("g-active").querySelector(".transfers__menu-btn"));
+  const pauseItem = menuItems().find((i) => i.dataset.action === "pause");
+  check("「下载中」那一行有「暂停」", !!pauseItem);
+  if (pauseItem) click(pauseItem);
+  await sleep(400);
+  const sent = invocations.filter((i) => i.cmd === "task_action").pop();
+  check("点「暂停」⇒ 发 task_action{action:'pause', gid:那一行的 gid}",
+    !!sent && sent.args.action === "pause" && sent.args.gid === "g-active",
+    JSON.stringify(sent && sent.args));
+  const transfersBefore = invocations.filter((i) => i.cmd === "transfers").length;
+  await sleep(400);
+  check("动作之后**补了一拍**（行/状态立刻跟着变，不用等满一拍）",
+    invocations.filter((i) => i.cmd === "transfers").length > transfersBefore,
+    invocations.filter((i) => i.cmd === "transfers").length + " 次");
+
+  // 「在资源管理器中显示」发的是**清单相对路径**（不是磁盘路径）。
+  click(rowByGid("g-error").querySelector(".transfers__menu-btn"));
+  const revealItem = menuItems().find((i) => i.dataset.action === "reveal");
+  if (revealItem) click(revealItem);
+  await sleep(400);
+  const revealed = invocations.filter((i) => i.cmd === "reveal").pop();
+  check("点「在资源管理器中显示」⇒ 发 reveal{path:那一行的 manifest_path}",
+    !!revealed && revealed.args.path === BY_GID.get("g-error").manifest_path,
+    JSON.stringify(revealed && revealed.args));
+
+  // ---- ⑦b 「刷新」（macOS `TransfersView.swift:76-93` 那颗）--------------------
+  {
+    const btn = doc().getElementById("transfers-refresh");
+    check("「刷新」在顶部那条栏上", !!btn && doc().getElementById("transfers-header").contains(btn));
+    // ⚠️ 判的是**那个 `<span>` 里的字**，不是 `btn.textContent`：模板里为了让 SVG 好读
+    //    留了缩进，`textContent` 会带上那些空白（它们不渲染 —— flex 容器里纯空白的
+    //    文本节点不生成 flex 项 —— 但拿它去比字符串会假红。本夹具第一版就是这么红的）。
+    check("形态是「图标 + 文字」（**不许只留图标** —— macOS 那颗是 `.labelStyle(.titleAndIcon)`）",
+      !!btn.querySelector("svg") && btn.querySelector("span").textContent === "刷新",
+      JSON.stringify(btn.querySelector("span").textContent));
+    check("闸门开着 ⇒ 「刷新」可按（macOS 的禁用条件只有 `!engineAllowsActions` 这一条）",
+      btn.disabled === false);
+
+    // 🔴 **"点一下真的立刻取一次"**：`pollNow` 会把**所有**任务都补一拍 ——
+    //    包括壳那条 1 s 的 `state`。⇒ 用 1 s 的节拍来判它**是确定性的**：
+    //    等到"刚刚跑过一拍 state"之后 300 ms 再点，此时下一拍自然节拍还有 ~700 ms，
+    //    于是 80 ms 窗口里出现的任何一次 `state` 都只可能来自这一次点击。
+    //    ⚠️ 不拿 `transfers`（200 ms）来判这一条：那个窗口与节拍同量级，会假绿也会假红。
+    const stateBefore = invocations.filter((i) => i.cmd === "state").length;
+    for (let i = 0; i < 40; i += 1) {
+      await sleep(60);
+      if (invocations.filter((i) => i.cmd === "state").length > stateBefore) break;
+    }
+    await sleep(300); // 离上一拍 state 约 300 ms —— 下一拍自然节拍还在 ~700 ms 之外
+    const s0 = invocations.filter((i) => i.cmd === "state").length;
+    const t0 = invocations.filter((i) => i.cmd === "transfers").length;
+    click(btn);
+    await sleep(80);
+    check("🔴 点「刷新」⇒ **立刻**补一拍（不等节拍）：80 ms 窗口内壳那条 `state` 也补了一拍",
+      invocations.filter((i) => i.cmd === "state").length > s0,
+      `state ${s0} → ${invocations.filter((i) => i.cmd === "state").length}`);
+    check("（同一次点击）`transfers` 也跟着多取了一次",
+      invocations.filter((i) => i.cmd === "transfers").length > t0,
+      `transfers ${t0} → ${invocations.filter((i) => i.cmd === "transfers").length}`);
+  }
+
+  // ---- ⑧ 「清空已完成」：列表级动作（没有 gid）--------------------------------
+  const clearBtn = doc().getElementById("transfers-clear");
+  check("「清空已完成」可用性 = can_clear_finished（夹具里是 true）", clearBtn.disabled === false);
+  click(clearBtn);
+  await sleep(400);
+  const cleared = invocations.filter((i) => i.cmd === "task_action").pop();
+  check("点「清空已完成」⇒ 发 task_action{action:'clear_finished', gid:null}（**没有 gid**）",
+    !!cleared && cleared.args.action === "clear_finished" && cleared.args.gid === null,
+    JSON.stringify(cleared && cleared.args));
+
+  // ---- ⑨ 动作失败：原文逐字、**而且不被 200 ms 那一拍清掉** --------------------
+  failNextAction = true;
+  click(rowByGid("g-error").querySelector(".transfers__menu-btn"));
+  const retryItem = menuItems().find((i) => i.dataset.action === "retry");
+  if (retryItem) click(retryItem);
+  await sleep(600); // ≥3 拍（200 ms）—— 够把"会被下一拍清掉"那个实现抓出来
+  const bar = doc().getElementById("transfers-failure");
+  check("动作失败 ⇒ 那条失败条出现", !bar.hidden);
+  check("失败正文 = 内核原文**逐字**（含换行、不加前缀）",
+    doc().getElementById("transfers-failure-text").textContent === ACTION_FAILURE_TEXT,
+    JSON.stringify(doc().getElementById("transfers-failure-text").textContent));
+  check("🔴 失败正文**扛过了 200 ms 的节拍**（没被下一拍清掉）", !bar.hidden);
+  click(bar.querySelector(".notice__dismiss"));
+  await sleep(100);
+  check("「收起」之后那条失败条消失", bar.hidden);
+
+  // ---- ⑩ 顶部摘要（三格）------------------------------------------------------
+  check("顶部速度 = 载荷的 global.speed_text", textOf(doc(), "#transfers-speed") === SNAP.global.speed_text,
+    textOf(doc(), "#transfers-speed"));
+  check("顶部活动数 = 载荷的 global.activity_text",
+    textOf(doc(), "#transfers-activity") === SNAP.global.activity_text,
+    textOf(doc(), "#transfers-activity"));
+  check("有行时**不显示**空态那一块（`empty_text` 在场也不显示）",
+    doc().getElementById("transfers-empty").hidden);
+
+  // ---- ⑪ 换到"移除了一行"的载荷 ⇒ 那一行真的消失（结构真的会变）---------------
+  const survivorNode = rowByGid("g-active");
+  const survivorErrorNode = errorBlock().el.querySelector(".transfers__error").firstChild;
+  mode = "afterRemove";
+  await sleep(600);
+  check("载荷少一行 ⇒ 那一行从界面上消失（不是留在那里）",
+    rowsOf().length === AFTER.rows.length && !rowByGid("g-done"),
+    rowsOf().length + " 行");
+  check("那一行没了之后，**剩下的行还是原来的节点**（按 gid 复用，不是整块重建）",
+    rowByGid("g-active") === survivorNode
+      && errorBlock().el.querySelector(".transfers__error").firstChild === survivorErrorNode);
+}
+
+/** 夹具里那一条带错误原文的行（**从载荷找**，不写死 gid —— 写死就等于把夹具抄了一遍）。 */
+function errorBlock() {
+  const row = ROWS.find((r) => typeof r.error_text === "string");
+  return { row, el: rowByGid(row.gid) };
+}
+
+// ===========================================================================
+// 场景 tick：🔴 200 ms 一拍**只改文本与宽度、不建节点**（含对照组）
+// ===========================================================================
+async function runPaintCheck() {
+  mode = "tick"; // 每拍交替两份由 Rust 倒出来的载荷（结构完全相同、只有数字在走）
+  await enterTransfers();
+  await sleep(400);
+
+  const rowsBox = doc().getElementById("transfers-rows");
+  const firstRow = rowByGid(ROWS[0].gid);
+  const errEl = rowByGid(ROWS.find((r) => typeof r.error_text === "string").gid)
+    .querySelector(".transfers__error");
+  const percentEl = firstRow.querySelector(".transfers__percent");
+  const barFill = firstRow.querySelector(".transfers__bar-fill");
+
+  // ② 节点身份：行元素与那段错误原文的**文本节点**都记下来
+  const rowNode0 = firstRow;
+  const errNode0 = errEl.firstChild;
+  const errText0 = errEl.textContent;
+
+  // ③ 选区：整段错误原文（**客户要复制的那段**）
+  const sel = doc().getSelection();
+  const range = doc().createRange();
+  range.selectNodeContents(errEl);
+  sel.removeAllRanges();
+  sel.addRange(range);
+
+  // ④ 焦点：那颗「清空已完成」
+  const clearBtn = doc().getElementById("transfers-clear");
+  clearBtn.focus();
+
+  const seenPercent = new Set([percentEl.textContent]);
+  let childList = 0;
+  let other = 0;
+  // ⚠️ 必须走 `win()`（Iframe 自己的 `MutationObserver` 构造器）：宿主页那个也能用，
+  //    但 `new doc().defaultView.X(...)` 这个写法**是错的**（`new` 会把 `doc()` 当构造器，
+  //    报 "doc is not a constructor" —— 本夹具第一版就栽在这一行上）。
+  const mo = new (win().MutationObserver)((recs) => {
+    for (const r of recs) (r.type === "childList" ? (childList += 1) : (other += 1));
+  });
+  mo.observe(rowsBox, { childList: true, subtree: true, characterData: true, attributes: true });
+  // 文本真的在变吗（每 50 ms 采一次；交替载荷的奇偶不可预期，所以**采样**而不是比首尾）
+  const sampler = setInterval(() => seenPercent.add(percentEl.textContent), 50);
+
+  await sleep(1600); // ≥8 拍（200 ms）
+  clearInterval(sampler);
+
+  check("① 8 拍之后，行容器的 childList 变更数 = 0（一个节点都没动过）", childList === 0,
+    childList + " 次");
+  check("① 期间确实有其它变更（characterData/attributes）—— 证明这一屏真的在刷",
+    other > 0, other + " 次");
+  check("② 那一行还是同一个 DOM 节点", rowByGid(ROWS[0].gid) === rowNode0);
+  check("② 错误原文那一格的文本节点还是同一个", errEl.firstChild === errNode0);
+  check("③ 选区还活着（没被清掉）", !sel.isCollapsed);
+  check("③ 选区里的原文**逐字**就是内核那句话（可整段复制）", String(sel) === errText0,
+    JSON.stringify(String(sel)));
+  check("④ 焦点还在那颗「清空已完成」上", doc().activeElement === clearBtn);
+  check("⑤ 进度文本真的在变（采样到不止一个值）", seenPercent.size >= 2,
+    [...seenPercent].join(" → "));
+  {
+    const prop = Number(barFill.style.getPropertyValue("--transfers-fraction"));
+    const bar = firstRow.querySelector(".transfers__bar");
+    const width = barFill.getBoundingClientRect().width;
+    const want = prop * bar.getBoundingClientRect().width;
+    check("⑤ 进度条宽度仍然 = 自定义属性里那个分数 × 条宽（宽度这一格也没被重建搞坏）",
+      Math.abs(width - want) < 1.5, `${width.toFixed(1)}px vs ${want.toFixed(1)}px`);
+  }
+
+  // ⑥ **对照组**：把载荷换成"少一行"（结构真的变了一次）⇒ childList 变更数必须起来
+  const before = childList;
+  const errNodeBefore = errEl.firstChild;
+  mode = "afterRemove";
+  await sleep(600); // ≥3 拍
+  check("⑥ 对照组：载荷结构真变了之后 childList 变更数立刻起来（观察器真的装上了）",
+    childList - before > 0, (childList - before) + " 次");
+  check("⑥ 对照组之后，剩下那些行**仍然是原来的节点**（按 gid 复用）",
+    rowByGid(ROWS[0].gid) === rowNode0 && errEl.firstChild === errNodeBefore);
+  mo.disconnect();
+}
+
+// ===========================================================================
+// 场景 empty：空态（`rows: []` + `global: null` + 一句话）
+// ===========================================================================
+async function runEmpty() {
+  mode = "empty";
+  await enterTransfers();
+  await sleep(400);
+  check("没有行", rowsOf().length === 0);
+  check("空态那一块出现了", !doc().getElementById("transfers-empty").hidden);
+  check("空态那句话**逐字**来自载荷（TransferListEmpty）",
+    textOf(doc(), "#transfers-empty-text") === EMPTY.empty_text,
+    textOf(doc(), "#transfers-empty-text"));
+  check("`global: null` ⇒ 顶部那**两格数据**不渲染（不编 0 B/s）",
+    doc().getElementById("transfers-header-data").hidden);
+  check("`global: null` ⇒ 那两格是**空的**（不是 0）",
+    textOf(doc(), "#transfers-speed") === "" && textOf(doc(), "#transfers-activity") === "");
+  // ⚠️ 而**整条栏与两颗按钮仍然在**：藏掉整条的话，那颗「刷新」会连入口一起消失
+  //    （macOS 的 `summaryBar` 也是常驻的）。见 `transfers.js:paintGlobal`。
+  check("但整条栏与「刷新」**仍然在**（那颗按钮是用户唯一能自救的地方）",
+    !doc().getElementById("transfers-header").hidden
+      && !!doc().getElementById("transfers-refresh")
+      && doc().getElementById("transfers-refresh").disabled === false);
+}
+
+// ===========================================================================
+// 场景 down：引擎不可用（`empty_text` 是 `null`）⇒ **这一屏什么都不说**
+// ===========================================================================
+async function runEngineDown() {
+  mode = "down";
+  await enterTransfers();
+  await sleep(400);
+  check("没有行", rowsOf().length === 0);
+  check("🔴 `empty_text` 是 null ⇒ 空态那一块**不出现**（横幅在壳上，这一屏不重复）",
+    doc().getElementById("transfers-empty").hidden);
+  check("空态那一格也没有被写进任何字",
+    textOf(doc(), "#transfers-empty-text") === "");
+  check("顶部那两格数据同样不渲染", doc().getElementById("transfers-header-data").hidden);
+  // ⚠️ 这一档里**闸门是开着的**（`state()` 报的是引擎在跑）—— 载荷里的 `empty_text: null`
+  //    是**另一件事**（内核那条回执说"这一屏不用说话"）。两件事合起来才是这一档。
+  //    闸门关着那一档（`transfers` 一发都不发）见下面的 `runGate`。
+  check("但整条栏与「刷新」仍然在（`empty_text: null` 不是「把整条栏藏掉」的理由）",
+    !doc().getElementById("transfers-header").hidden
+      && !!doc().getElementById("transfers-refresh"));
+}
+
+// ===========================================================================
+// 场景 gate：**闸门关着**（`state().allows_requests == false`）⇒ 一拍都不发
+// ===========================================================================
+// 这是 `EngineGate` 那条既有语义在本屏的落点，也是"引擎不可用时那颗「刷新」在场但禁用"
+// 的现场（macOS `.disabled(!engineAllowsActions)`）。⚠️ 它与 `down` 那一档**不是同一件事**：
+// 那一档判的是"载荷说不用说话"，这一档判的是"连问都不问"。
+async function runGate() {
+  mode = "gate";
+  await enterTransfers();
+  await sleep(600);
+  check("闸门关着 ⇒ `transfers` **一次都没发过**（`poll.js` 的闸门，屏里不重算）",
+    invocations.filter((i) => i.cmd === "transfers").length === 0,
+    invocations.filter((i) => i.cmd === "transfers").length + " 次");
+  check("没有行、空态那一块也不出现（这一屏此刻什么都不说）",
+    rowsOf().length === 0 && doc().getElementById("transfers-empty").hidden);
+  check("🔴 那颗「刷新」**在场但禁用**（不是藏起来 —— 藏掉就没有出口了）",
+    !doc().getElementById("transfers-header").hidden
+      && doc().getElementById("transfers-refresh").disabled === true);
+  check("「清空已完成」同样禁用（`can_clear_finished` 取不到 + 闸门关着，两道都是 fail-closed）",
+    doc().getElementById("transfers-clear").disabled === true);
+  check("`state` 仍然在按 1 s 的节拍跑（它是壳的、不受闸门管 —— 否则闸门永远解不开）",
+    invocations.filter((i) => i.cmd === "state").length >= 2,
+    invocations.filter((i) => i.cmd === "state").length + " 次");
+  // 🔴 闸门关着 ⇒ **"正在读取传输列表…"那一档绝不出现**：一个没有任何请求会返回的
+  //    转圈正是约束 4 明禁的静默挂死（macOS 那一支写着 `&& engineAllowsActions`）。
+  check("🔴 闸门关着时**转圈不出现**（一个永远不会有回音的转圈 = 静默挂死）",
+    doc().getElementById("transfers-loading").hidden);
+}
+
+// ===========================================================================
+// 场景 loading：**还没有快照**（`model.transfers == nil`）且引擎能发请求
+// ===========================================================================
+// macOS `TransfersView.swift:113-121` 那一支：转圈 + 「正在读取传输列表…」，
+// 而它**排在空态之前**。这一档在这里的现场是"第一拍发出去了、还没回来"。
+async function runLoading() {
+  mode = "loading"; // 第一拍永不返回 ⇒ snapshotSeen 一直是 false
+  await enterTransfers();
+  await sleep(400);
+
+  const box = doc().getElementById("transfers-loading");
+  // 期望的那句话**从模板里读**（本页不抄那几个字：它们住在被测的 `index.html` 里，
+  // 而"这句话是什么"由 `check_frontend_copy.sh` 的白名单逐条登记钉着）。
+  const tpl = doc().getElementById("tpl-screen-transfers");
+  const wantText = tpl.content.querySelector(".transfers__loading-text").textContent;
+
+  check("`transfers` **真的发出去了**（不是「没请求」—— 那一档是「还没回来」）",
+    invocations.filter((i) => i.cmd === "transfers").length >= 1,
+    invocations.filter((i) => i.cmd === "transfers").length + " 次");
+  check("🔴 还没有快照 ⇒ 「正在读取传输列表…」那一档出现", !box.hidden);
+  check("那句话**逐字**是模板里那一句（与数据无关的结构文案）",
+    box.querySelector(".transfers__loading-text").textContent === wantText
+      && wantText.length > 0,
+    JSON.stringify(box.querySelector(".transfers__loading-text").textContent));
+  check("它带一颗转圈（`ProgressView()` 的对位物）",
+    !!box.querySelector(".transfers__spinner"));
+  check("🔴 它**排在空态之前**：此刻空态那一块**不出现**（「还没有快照」不是「没有任务」）",
+    doc().getElementById("transfers-empty").hidden);
+  check("也没有行", rowsOf().length === 0);
+  check("顶部那两格数据同样不渲染，但整条栏与「刷新」在（闸门开着 ⇒ 可按）",
+    doc().getElementById("transfers-header-data").hidden
+      && !doc().getElementById("transfers-header").hidden
+      && doc().getElementById("transfers-refresh").disabled === false);
+}
+
+// ⚠️ **本夹具没有 `shot`（截图）那一档 —— 这是量出来的结论，不是没试过。**
+//
+//   试过三条路，都被同一堵墙挡住：
+//     ① `--virtual-time-budget` + `--screenshot`：本机**挂住**（顶层 `await fetch`
+//        ＋ 这一屏 200 ms 的重复定时器凑在一起，虚拟时间推进不去）；
+//     ② 不带虚拟时间、只靠 `--screenshot`（它在 load 之后拍）：因为①那个原因，
+//        这一页的 load 会被模块的顶层 await 挡很久 ⇒ 浏览器**一直不退出**；
+//     ③ 再把 load 放行的时刻挪到"这一屏画好了"之后 —— 截图**拍到了**，但拍到的是
+//        **默认的文件页**（`shell.js:SECTIONS[0]`）。于是往页面里插了一个探针量快门时刻：
+//
+//          t=502ms  传输列表屏=不在
+//
+//        ⇒ `--screenshot` 在**约 500 ms** 按快门，而"切到非默认分区"这件事只在
+//          `state()` 的 **1 s** 节拍上发生（`app.js:applyRoute`）⇒
+//          **传输列表这一屏在结构上不可能出现在那 500 ms 里**（点了侧栏也要等下一拍）。
+//   ⚠️ 所以这里**不留**一条"看起来能拍、拍出来是别的屏"的通道：一张拍错屏的图
+//      比没有图更坏。要图的话在**宿主上**（或真浏览器里）打开下面这个地址自己看：
+//        http://127.0.0.1:${PORT}/transfers-harness.html?s=still
+//      本轮验收的可视证据是那 **78 条读 DOM 几何的断言**（进度条实测宽度、错误原文的
+//      scrollHeight/clientHeight、标题两格的 scrollWidth/clientWidth、菜单项数、hidden 态）。
+</script>
+</body>
+</html>

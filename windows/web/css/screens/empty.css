@@ -1,0 +1,228 @@
+/* empty.css —— 空态屏（交付码入口）。
+ *
+ * 结构照 `macos/Sources/BenagenDownloader/Views/EmptyState.swift`：
+ * 三段式（标题 + 输入卡片 + 状态），`maxWidth 460`、`spacing 16`、内容区内边距 20。
+ *
+ * ⚠️ 这一屏**样张里没有**（`a0-proof.html` 画的是文件页）。所以本文件的尺寸不是从样张
+ *    抄的，是从 `EmptyState.swift` 的字面量抄的 —— 两处出处的可信度不同：
+ *      · 令牌（颜色/字号/圆角/间距档）**与样张同源**（那是实测的）；
+ *      · 布局常量（460 / 16 / 20 / 16）来自 SwiftUI 源码，**没有被样张实测过**。
+ *    报告里按这个口径记（"长得对"与"接得通"之外，还有一层"没被实测过"）。
+ */
+
+.empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-16);
+  /* 规格 §7.2：内容区 20–24px 内边距。 */
+  padding: var(--sp-20);
+}
+
+/* 三段各自不超过 460（`EmptyState.swift` 的 `.frame(maxWidth: 460)`），
+   ⚠️ 是 `width:100%` + `max-width` 而不是固定 460：窗口拖宽时三段仍然居中、不拉散。 */
+.empty__header,
+.empty__card,
+.empty__status {
+  width: 100%;
+  max-width: 460px;
+}
+
+.empty__header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-6);
+  text-align: center;
+}
+
+/* 品牌图形标（任务 18 接上的；对位 `EmptyState.swift` 的 `mark`）：
+   图形 58×58，四周再留 19px —— 这两个数都是 macOS 视图层的字面量
+   （`.frame(width: 58, height: 58)` + `.padding(19)`），照搬。
+   ⚠️ 19px **不走间距档**（档里没有 19）：与 `verify.css` 的 `padding-left: 24px`、
+   `transfers.css` 的 `padding: 0 5px` 同一性质 —— 出处是 macOS 的源码行，
+   不是"我挑的间距"。
+   ⚠️ `box-sizing: content-box` 是**承重**的：`base.css` 是全局 `border-box`，
+   少了这一行 19px 内边距会从 58px 里扣 ⇒ 图形被压到 20px（"图变小了"很难被
+   当成缺陷报上来）。
+   ⚠️ macOS 那一边还有一层**白底圆角卡片**（`RoundedRectangle(cornerRadius: 10)
+   .fill(.white)`）—— 这里**有意不搬**：本代界面固定浅色（`<meta name="color-scheme"
+   content="light">`），窗口底色就是 `--bg-window`（#FFF）⇒ 那块白底**看不出任何
+   效果**，贴上去只会让人以为它被验过了（样张 README 第 ⑤ 条对 `backdrop-filter`
+   是同一条口径）。**真要做深色外观时，这块白底（含 radius 10）必须跟着回来** ——
+   那时它是承重的。⇒ 这也解释了这里为什么没有 `background` 与 `border-radius`：
+   两个都只对那块白底有意义。 */
+.empty__mark {
+  box-sizing: content-box;
+  width: 58px;
+  height: 58px;
+  padding: 19px;
+}
+.empty__title {
+  font-size: var(--text-title2);
+  font-weight: 600;
+}
+/* 副标题 —— `.callout` + `.secondary`。 */
+.empty__subtitle {
+  font-size: var(--text-callout);
+  color: var(--c-secondary);
+}
+
+/* 输入卡片：`.quaternary.opacity(0.5)` 的对应物就是 `--bg-card`（样张里那个令牌
+   本来就是为它准备的），圆角 10（规格 §7.2：8–12px）。 */
+.empty__card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-12);
+  padding: var(--sp-16);
+  border-radius: var(--r-10);
+  background: var(--bg-card);
+}
+
+.empty__field {
+  font: inherit;
+  font-size: var(--text-body);
+  color: var(--c-label);
+  background: var(--bg-window);
+  border: 1px solid var(--c-separator);
+  border-radius: var(--r-6);
+  padding: var(--sp-4) var(--sp-8);
+}
+.empty__field:disabled {
+  color: var(--c-tertiary);
+}
+
+/* 主按钮：`.borderedProminent` 的近似 —— accent 底、白字。
+   ⚠️ 禁用态**不由颜色独自承担**：`opacity` 之外还留 `cursor:default`，
+   而"为什么按不动"由旁边那句提示说（约束 4：不许"按钮灰着、界面什么都不说"）。 */
+.empty__submit {
+  font: inherit;
+  font-size: var(--text-body);
+  align-self: flex-start;
+  padding: var(--sp-4) var(--sp-16);
+  border: 0;
+  border-radius: var(--r-6);
+  background: var(--c-accent);
+  color: #fff;
+  cursor: pointer;
+}
+.empty__submit:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+.empty__submit:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* 「高级：自定义下载地址」—— 用原生 `<details>`，**不自己写展开逻辑**：
+   它天生自带键盘可达与无障碍语义，而手写一个 `<div>` 折叠要多写五行 JS
+   （而那五行 JS 里多半会长出"已展开"/"已收起"这种**JS 拼的文案** —— §3.2 明禁）。 */
+.empty__advanced {
+  font-size: var(--text-callout);
+}
+.empty__advanced > summary {
+  cursor: default;
+  color: var(--c-label);
+}
+.empty__advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding-top: var(--sp-4);
+}
+/* 收起分组也看得见的说明 —— 它解释的是"留空会怎样"，不是"这一格里是什么"。 */
+.empty__note {
+  font-size: var(--text-caption);
+  color: var(--c-tertiary);
+}
+
+/* 状态区（进行中 / 失败）---------------------------------------------------
+   三块**常驻在 DOM 里**、由 `hidden` 切换（`empty.js` 的理由：重建会丢掉
+   输入框里正在敲的半句话）。全隐藏时这一格自然塌成零高（`hidden` = `display:none`），
+   所以不需要 `:empty` 那条规则 —— 那种规则在"孩子恒在"的写法下永远不会命中。
+   ⚠️ 状态切换的动效：macOS 是 `.spring(response:0.3, dampingFraction:0.7)`，
+      这里用同一份令牌（`--anim-spring` / `--anim-dur`）做一次淡入。
+      这是**近似**，不是复刻：CSS 没有"弹簧"这条时间函数，
+      令牌本身是逐字搬的，用法不是。 */
+.empty__status {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-8);
+  transition: opacity var(--anim-dur) var(--anim-spring);
+}
+.empty__busy {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  font-size: var(--text-callout);
+  color: var(--c-secondary);
+}
+/* 转圈：一个圆环 + 一个透明缺口 + 一条 CSS 动画。
+   ⚠️ 不用 `<progress>`：它在各家 webview 里的默认外观差异很大，
+      而这里要的只是一个"有东西在动"的最小信号。 */
+.empty__spinner {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--c-tertiary);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: empty-spin 800ms linear infinite;
+}
+@keyframes empty-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* ⚠️ 尊重系统的"减少动态效果"：这不是体贴，是无障碍要求
+   （前庭功能障碍的用户会因此不适），而 CSS 里它只需要一条媒体查询。 */
+@media (prefers-reduced-motion: reduce) {
+  .empty__spinner {
+    animation-duration: 2400ms;
+  }
+  .empty__status {
+    transition: none;
+  }
+}
+/* 🔴 失败原文**逐字**显示（约束 3），**可选中复制**、**不截断**、**不折成一行**。
+   ⚠️ 这里**不许**加 `max-height`：常驻提示行那条"高度不变量"管的是
+      窗口内容**上方**、下面锚着别的东西的那些行；失败原文在**主区**里，
+      它下面没有别的东西可顶 —— 见 `ResidentNotice.swift` 的管辖范围那段。 */
+.empty__failure {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-6);
+  font-size: var(--text-callout);
+  color: var(--c-red);
+}
+/* 图标那一格是个 `<span>`，里面那枚 `<svg>` 由 `dom.js` 的 `icon()` 造 ⇒
+   尺寸定在 `svg` 上（`svg` 有内在尺寸，光定外面那层 `span` 它不会缩）。 */
+.empty__failure-icon {
+  flex: none;
+  display: inline-flex;
+  align-self: center;
+}
+.empty__failure-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.empty__retry {
+  font: inherit;
+  font-size: var(--text-callout);
+  align-self: flex-start;
+  padding: var(--sp-2) var(--sp-8);
+  border: 1px solid var(--c-separator);
+  border-radius: var(--r-6);
+  background: transparent;
+  color: var(--c-label);
+  cursor: pointer;
+}
+.empty__retry:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.05);
+}
+.empty__retry:disabled {
+  color: var(--c-tertiary);
+  cursor: default;
+}
