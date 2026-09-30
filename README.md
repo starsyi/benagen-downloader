@@ -24,8 +24,12 @@
 | Linux | x86_64，**静态链接**（不依赖系统库）。目前只提供命令行工具 |
 | Windows | Windows 10/11，需 **WebView2 运行时**（Windows 11 自带） |
 
-> macOS 与 Windows 的分发包**未做代码签名/公证**。macOS 上首次打开需要手动放行
-> （右键 →「打开」，或解除 quarantine 属性），详见命令行工具说明里的同一节。
+> macOS 与 Windows 的分发包**未做代码签名/公证**。macOS 上首次打开需要手动放行，
+> 详见 [`macos/README.md`](macos/README.md) 的「分发注意」与
+> [`benagen_dl_usage_guide.md`](benagen_dl_usage_guide.md) 第二节。
+> ⚠️ macOS **DMG 盘里带了一件 `已损坏修复.command`**，双击它即可，不必手输命令。
+> 手动放行时注意：那句流传很广的「右键 →『打开』」**从 macOS 15 起已失效**
+> （Apple 移除了那条路），15 及以上要走「系统设置 → 隐私与安全性 → 仍要打开」。
 
 ## 构建
 

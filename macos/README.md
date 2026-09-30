@@ -41,8 +41,21 @@ bash scripts/verify_app_launch_macos.sh    # 启动取证：确认是前台应�
 
 ## 分发注意
 
-- **没有做代码签名，也没有做公证。** 客户首次打开需要手动放行
-  （右键 →「打开」；或在终端执行 `xattr -d com.apple.quarantine <应用路径>`）。
+- **没有做代码签名，也没有做公证。** 客户首次打开需要手动放行。
   Intel 与 Apple Silicon 两份都是这个情况：arm64 那份由链接器加了 ad-hoc 签名，
   x86_64 那份完全没有签名 —— 两者都不满足 Gatekeeper 的要求。
+- **盘里带了一件 `Resources/已损坏修复.command`**（`build_dmg_macos.sh` 装盘时拷进去）。
+  客户双击应用提示「已损坏，无法打开」时，双击它即可：装进 `/Applications`、
+  清掉 `com.apple.quarantine`、启动。这是**首选**的放行方式。
+  ⚠️ 它**不动**系统 Gatekeeper（`spctl --master-disable` 会把整台机器的安全闸门永久关掉，
+  而且实测并不能替代清属性），也不重新签名。
+- **手动放行按系统版本分**（⚠️ 那句流传很广的「右键 →『打开』」**从 macOS 15 起已失效**，
+  Apple 移除了那条路）：
+  - **macOS 15 及以上**：先双击一次（会被拦下）→ 系统设置 →「隐私与安全性」→
+    在「安全性」里找到那条拦截记录 → 点「仍要打开」。该按钮**只在尝试打开后的约 1 小时内可用**。
+  - **macOS 14 及以下**：右键（或按住 Control 点击）→「打开」→ 再确认一次。
+  - 或直接在终端执行（`-r` 是递归：应用是目录，属性落在里面每个文件上）：
+    `xattr -dr com.apple.quarantine /Applications/BenagenDownloader.app`
+- `scripts/verify_fix_script_macos.sh` 是修复脚本的取证：三条路径 + 变异自验，
+  不碰真的 `/Applications`（用 `BENAGEN_APP_DEST` 指到临时目录）。
 - `dist/` 是**可再生产物，不入库**：源码与脚本才是唯一真相。

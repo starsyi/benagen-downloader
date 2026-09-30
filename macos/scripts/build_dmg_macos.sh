@@ -21,8 +21,15 @@
 #    `BenagenDownloader.dmg`，脚本**不碰它**（只在自己的产物名上 `rm -f`）。
 #    那个含糊名字的处置留给验收者。
 #
-# ⚠️ **安装布局**：卷里放 `.app` **和一条指向 `/Applications` 的符号链接** ——
-#    这是 macOS 用户认得的"拖进去"形态。没有那条链接，用户得自己想"拖到哪儿"。
+# ⚠️ **安装布局**：卷里放**三样**：
+#    1. `.app` 本身；
+#    2. 一条指向 `/Applications` 的符号链接 —— 这是 macOS 用户认得的"拖进去"形态。
+#       没有那条链接，用户得自己想"拖到哪儿"；
+#    3. `已损坏修复.command` —— 客户双击应用被 Gatekeeper 拦下（「已损坏，无法打开」）
+#       时跑的修复脚本。它与上面的放行流程是**两条并行的路**：客户愿意照文档点几步，
+#       走放行流程也行；不想点就直接双击这个脚本。
+#       ⚠️ 脚本**不碰系统 Gatekeeper**（`spctl --master-disable` 会永久关掉整机的安全闸门），
+#          也不重签名，只清该应用自己的 `com.apple.quarantine`。理由写在脚本文件头。
 #
 # ⚠️ **不做签名、不做公证**（与 `build_app_macos.sh` 同一决定：本阶段交付给自己人测）。
 #    后果要说清楚，别让人以为"双击就能装到任何人机器上"：
@@ -56,6 +63,11 @@ DIST="$REPO/macos/dist"
 APP="$DIST/BenagenDownloader.app"
 BIN_NAME="BenagenDownloader"
 
+# 修复脚本：**入库的静态资产**（与 `macos/Resources/` 那三个品牌图标同一性质），
+# 本脚本不生成它、只把它装盘。源码在 Resources 下，产物在卷根。
+FIXER_NAME="已损坏修复.command"
+FIXER_SRC="$REPO/macos/Resources/$FIXER_NAME"
+
 if [ ! -d "$APP" ]; then
   echo "错误：找不到 $APP" >&2
   echo "先跑：bash macos/scripts/build_app_macos.sh（或 ... build_app_macos.sh x86_64）" >&2
@@ -67,6 +79,22 @@ fi
 MAIN="$APP/Contents/MacOS/$BIN_NAME"
 if [ ! -x "$MAIN" ]; then
   echo "错误：$MAIN 不存在或不可执行 —— 这个 .app 是坏的，先重建。" >&2
+  exit 2
+fi
+
+# 修复脚本也在这里预检，理由与上面那条一样：**装盘之前失败**。
+# 盘已经做出来才发现卷里少了这一件，等于白白走完整个 hdiutil + 挂载自验。
+# 可执行位单列一条：少了它文件**照样在盘里**，客户双击却毫无反应 ——
+# 那是比"文件缺失"更难看出来的一种坏（本脚本末尾的盘内自验还会再判一次，
+# 判的是**真装进 DMG 的字节**，这里判的是源）。
+if [ ! -f "$FIXER_SRC" ]; then
+  echo "错误：找不到 $FIXER_SRC —— 修复脚本是入库资产，不该缺失。" >&2
+  echo "      它是客户遇到「已损坏」时盘里唯一的现成办法，缺了就等于没这个功能。" >&2
+  exit 2
+fi
+if [ ! -x "$FIXER_SRC" ]; then
+  echo "错误：$FIXER_SRC 没有可执行位 —— 装进盘里客户双击也不会有任何反应。" >&2
+  echo "      修：chmod +x \"$FIXER_SRC\"" >&2
   exit 2
 fi
 
@@ -161,6 +189,11 @@ trap 'rm -rf "$STAGE"' EXIT
 echo "==> 摆放安装布局"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
+# ⚠️ 显式 `chmod +x`，不把"可执行位传过去了没有"交给 `cp` 的默认行为去决定
+#    （`cp` 对新文件的模式在不同平台/umask 下并不完全一致）。少了这一位，
+#    客户双击它毫无反应 —— 而文件本身明明在盘里。
+cp "$FIXER_SRC" "$STAGE/$FIXER_NAME"
+chmod +x "$STAGE/$FIXER_NAME"
 
 echo "==> 压缩为 DMG（UDZO）"
 rm -f "$OUT"
@@ -188,6 +221,20 @@ if [ ! -x "$MOUNT_POINT/$BIN_NAME.app/Contents/MacOS/$BIN_NAME" ]; then
 fi
 if [ ! -L "$MOUNT_POINT/Applications" ]; then
   echo "错误：卷里没有指向 /Applications 的符号链接（用户会不知道该拖到哪儿）。" >&2
+  exit 1
+fi
+
+# 第三件：修复脚本。这里判的是**从盘里读回来的**那一份，与前面判 .app 的架构、
+# 后面判最低系统版本是同一条纪律 —— `hdiutil create` 退出码为 0 只说明"写文件成功"。
+# 「在不在」与「可不可执行」分成两条：前者是装盘漏了，后者是复制过程中位丢了，
+# 两种坏法的补救动作不同，报错就不该混成一句。
+if [ ! -f "$MOUNT_POINT/$FIXER_NAME" ]; then
+  echo "错误：卷里没有 $FIXER_NAME —— 修复脚本没能装进盘。" >&2
+  exit 1
+fi
+if [ ! -x "$MOUNT_POINT/$FIXER_NAME" ]; then
+  echo "错误：卷里的 $FIXER_NAME 没有可执行位 —— 客户双击它不会有任何反应。" >&2
+  echo "      这张盘不能交付：文件明明在盘里，客户却双击不出任何东西。" >&2
   exit 1
 fi
 
