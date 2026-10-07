@@ -167,6 +167,22 @@ public final class AppModel: ObservableObject {
     ///    直接改这个字段（如果将来有人把它变成 `var`）只会造成"界面显示新目录、
     ///    内核还在往旧的写"的分裂。
     @Published public private(set) var downloadDir: String = ""
+    /// 「详细日志」开关（规格 §2.4）。**`false` = 关**（缺省，也是老客户那份偏好文件
+    /// 里没有这一格时读出来的值）。
+    ///
+    /// ⚠️ 与 [`downloadDir`] 逐条同款：它是**"此刻生效的是什么"的唯一来源**，而它生效的
+    ///    通道也是**内核的 argv**（`--log-level verbose`）⇒ 改它的唯一合法路径是
+    ///    [`changeVerboseLogging(to:)`]（它会**重启内核**）。
+    /// ⚠️ **壳自己那一份日志的档位不在这个字段里**：它在 `DiagnosticsLog` 的进程级静态上，
+    ///    由 `changeVerboseLogging` **就地再落一次**（壳这个进程不重启 —— 少了那一步的表现是
+    ///    "内核那份变详细了、壳那份一行不变"，而没有任何东西会变红）。
+    @Published public private(set) var verboseLogging: Bool = false
+    /// 最近一次**改详细日志**的结果（`nil` = 还没改过，或用户已经收起了那一行）。
+    ///
+    /// ⚠️ **它存在的唯一理由与 `downloadDirChange` 逐字相同：那句话必须活过那扇窗**
+    ///    （设置窗口是随手就会被关掉的东西，而这里有一格恰恰是"**没改成**"——
+    ///    `restartKernel()` 被一次在飞的重启挡住时，盘上已经是新档位、内核还在旧档上跑）。
+    @Published public private(set) var verboseLoggingChange: VerboseLoggingChange?
     /// 最近一次**改下载目录**的结果（`nil` = 还没改过，或用户已经收起了那一行）。
     ///
     /// ⚠️ **它存在的唯一理由与 `lastSwitchOutcome` 逐字相同：那句话必须活过那扇窗**
@@ -186,6 +202,19 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var downloadDirChange: DownloadDirChange?
     /// `-k` 的枚举面。**来自 `hello`**，不是壳里的硬编码（契约 §2.3）。
     @Published public private(set) var minSplitSizeChoices: [String] = []
+    /// **内核自报的协议版本**（握手的 `hello` 回执上那一格，任务 6）。
+    ///
+    /// ⚠️ 它存在的**唯一**理由是导出说明文件里 `protocol_version:` 那一格（规格 §2.6）。
+    ///    Windows 那一侧的同位物是会话状态里的 `handshake_reply`（整条回执的**原文**，
+    ///    `commands::diagnostics_export` 从它里面解出这一格）；本壳此前把
+    ///    `hello.protocolVersion` **解完就丢**，于是那一格只能编一个 —— 而
+    ///    `protocol_version: 未连上` 那条判据**明禁**回落成壳自己的 `kProtocolVersion`
+    ///    （那一格回答的是"**内核**自报的是哪一套协议"，填我们自己的常量就把它从
+    ///    "内核说的"变成了"我们以为的"）。
+    /// ⚠️ `nil` = **还没握上手 / 这次握手没成** —— 说明文件如实写"未连上"。
+    ///    每次 `start()` 开头都会把它清回 `nil`：那是**这一个会话**的事实，
+    ///    一次失败的握手不许继承上一个内核的答复（那正是"编一个版本号"的另一种长相）。
+    @Published public private(set) var kernelProtocolVersion: UInt32?
     /// 内核回的协议级错误（`id == 0`）。它们是**当前连接**的产物：内核崩溃重启后
     /// 从新的空列表重新累积（旧内核那几条早就显示过了）。
     @Published public private(set) var protocolAlerts: [ErrorBody] = []
@@ -261,14 +290,16 @@ public final class AppModel: ObservableObject {
     private var client: (any CoreCalling)?
     /// 重启内核的唯一入口。生产 = `CoreClient.live(settingsPath:downloadDir:)`；测试 = 再造一个替身。
     ///
-    /// ⚠️ **参数是 `--download-dir` 的值**（`nil` = **不传那个 flag**，E-5），不是"下载目录"
-    ///    这个业务概念：内核要的就是 argv 上那一格，壳把"该不该传"的判断留给
-    ///    `DownloadDirectory.argument(for:)` 一处（有单测）。
+    /// ⚠️ **两个参数都是"内核 argv 上的那一格"**，不是业务概念：
+    ///    ① `--download-dir` 的值（`nil` = **不传那个 flag**，E-5）—— 内核要的就是 argv
+    ///       上那一格，壳把"该不该传"的判断留给 `DownloadDirectory.argument(for:)` 一处；
+    ///    ② `--log-level verbose` 那**一对参数拼不拼**（`true` = 拼）。
+    ///       与 ① 同一条纪律：**关着就什么都不拼**（内核的缺省就是 normal）。
     ///
     /// ⚠️ **它是重启与首启共用的同一个闭包**（`spawnClient()` 与 `live()` 各调一次），
-    ///    所以"改目录"只要让这个闭包在**下一次**被调用时拿到新值就够了 ——
+    ///    所以"改目录 / 改详细日志"只要让这个闭包在**下一次**被调用时拿到新值就够了 ——
     ///    两个调用点各改一次的实现方式迟早会分叉。
-    private let makeClient: @Sendable (String?) throws -> any CoreCalling
+    private let makeClient: @Sendable (String?, Bool) throws -> any CoreCalling
 
     /// 握手的**有界**等待（秒）。生产 = [`defaultHandshakeTimeout`]（5 秒）；
     /// 测试注入一个小值，否则要么真等 5 秒、要么根本测不了。
@@ -332,48 +363,57 @@ public final class AppModel: ObservableObject {
                 handshakeTimeout: Double = AppModel.defaultHandshakeTimeout,
                 historyStore: BatchHistoryStore? = nil,
                 preferencesStore: AppPreferencesStore? = nil,
-                downloadDir: String = "") {
+                downloadDir: String = "",
+                verboseLogging: Bool = false) {
         self.client = client
         self.historyStore = historyStore
         self.preferencesStore = preferencesStore
-        self.makeClient = { _ in
+        self.makeClient = { _, _ in
             throw CoreError.transport("测试接缝没有提供重启工厂（要用 init(client:makeClient:) 注入）")
         }
         self.handshakeTimeout = handshakeTimeout
         // 与传给第一个内核的那份**同一个来源**（生产里由 `live()` 从盘上读一次、两处都用它）
         // —— 所以"内存里的值"与"第一个内核拿到的 argv"不可能分叉。
-        self.downloadDir = AppPreferences(downloadDir: downloadDir).downloadDir
+        let preferences = AppPreferences(downloadDir: downloadDir, verboseLogging: verboseLogging)
+        self.downloadDir = preferences.downloadDir
+        self.verboseLogging = preferences.verboseLogging
     }
 
     /// 测试接缝（带重启工厂）。
     public init(client: CoreCalling,
-                makeClient: @escaping @Sendable (String?) throws -> CoreCalling,
+                makeClient: @escaping @Sendable (String?, Bool) throws -> CoreCalling,
                 handshakeTimeout: Double = AppModel.defaultHandshakeTimeout,
                 historyStore: BatchHistoryStore? = nil,
                 preferencesStore: AppPreferencesStore? = nil,
-                downloadDir: String = "") {
+                downloadDir: String = "",
+                verboseLogging: Bool = false) {
         self.client = client
         self.historyStore = historyStore
         self.preferencesStore = preferencesStore
         self.makeClient = makeClient
         self.handshakeTimeout = handshakeTimeout
-        self.downloadDir = AppPreferences(downloadDir: downloadDir).downloadDir
+        let preferences = AppPreferences(downloadDir: downloadDir, verboseLogging: verboseLogging)
+        self.downloadDir = preferences.downloadDir
+        self.verboseLogging = preferences.verboseLogging
     }
 
     /// 「内核压根没起来」的形态（`live()` 找不到二进制时用它）：没有客户端，
     /// 但原因已经装在 `engine` 里 —— 约束 4 要求它出现在界面上。
     init(engine: EngineState,
-         makeClient: @escaping @Sendable (String?) throws -> any CoreCalling,
+         makeClient: @escaping @Sendable (String?, Bool) throws -> any CoreCalling,
          handshakeTimeout: Double = AppModel.defaultHandshakeTimeout,
          historyStore: BatchHistoryStore? = nil,
          preferencesStore: AppPreferencesStore? = nil,
-         downloadDir: String = "") {
+         downloadDir: String = "",
+         verboseLogging: Bool = false) {
         self.client = nil
         self.historyStore = historyStore
         self.preferencesStore = preferencesStore
         self.makeClient = makeClient
         self.handshakeTimeout = handshakeTimeout
-        self.downloadDir = AppPreferences(downloadDir: downloadDir).downloadDir
+        let preferences = AppPreferences(downloadDir: downloadDir, verboseLogging: verboseLogging)
+        self.downloadDir = preferences.downloadDir
+        self.verboseLogging = preferences.verboseLogging
         self.engine = engine
     }
 
@@ -385,7 +425,7 @@ public final class AppModel: ObservableObject {
     ///    偏好（下载目录）落在同目录的 `preferences.json`。
     ///    两个分支都带同一个 store —— 内核起不来时历史与新目录也该是同一份。
     ///
-    /// ⚠️ **下载目录的偏好在这里读一次**，而且**两处用的是同一个值**：一给 `make(...)`
+    /// ⚠️ **偏好只在这里读一次**，而且**两处用的是同一个值**：一给 `make(...)`
     ///    （第一个内核的 argv），一给模型（界面显示与下一次重启的依据）。
     ///    读一次是硬要求 —— 读两次（比如让模型自己再读一遍）就有了两个来源，
     ///    而"界面显示的目录"与"内核实际用的目录"一旦分叉，症状是**文件下到别处去**，
@@ -393,25 +433,52 @@ public final class AppModel: ObservableObject {
     /// ⚠️ 坏文件（`preferences.json` 是一段乱码）⇒ `load()` 回 `.empty` ⇒ `argument(for:)`
     ///    返回 `nil` ⇒ 内核走自己的默认值，**应用照常启动**（E-1 + E-5）。
     public static func live() -> AppModel {
-        let make: @Sendable (String?) throws -> any CoreCalling = { dir in
-            try CoreClient.live(settingsPath: nil, downloadDir: dir)
+        let make: @Sendable (String?, Bool) throws -> any CoreCalling = { dir, verboseLogging in
+            try CoreClient.live(settingsPath: nil, downloadDir: dir,
+                                verboseLogging: verboseLogging)
         }
         let historyStore = BatchHistoryStore()
         let preferencesStore = AppPreferencesStore()
         let preferences = preferencesStore.load()
+
+        // ---- 🔴 **壳自己这一格日志档位的两处调用点之一：启动时**（规格 §2.4）----
+        //
+        // ⚠️ **少了这一步，`diag-shell.log` 一行都不会出现**：那一格是个**进程级静态**
+        //    （`DiagnosticsLog`），不落它就永远是 `.normal` —— 客户把开关打开、重启应用、
+        //    复现了故障，回传给我们的仍然只有内核那一份，而**没有任何东西会变红**
+        //    （文件根本不会被创建）。
+        // ⚠️ **时机是承重的**：要**早于任何一次 `log`**（`start()` 一跑起来就会记东西），
+        //    也要早于 `make(...)` 起的那个内核进程（它一出生就会往自己的日志里写）。
+        //    ⇒ 就落在这里：偏好刚读出来，什么都还没开始跑。
+        // ⚠️ **另一处是 `changeVerboseLogging(to:)`**（改内核的级别要重启内核，
+        //    但**壳自己这个进程不重启** —— 少了那一处的表现是"内核那份变详细了、
+        //    壳那份一行不变"，同样没有任何东西会变红）。两处共用下面这一个映射。
+        // ⚠️ **本机没有判据**（`configure` 写的是进程级静态，为它造用例会让同进程里
+        //    别的用例随机红 / 随机往真日志里写）—— 这两处只由**真机验收**两条守着。
+        DiagnosticsLog.configure(Self.logLevel(for: preferences))
+
         do {
-            return AppModel(client: try make(DownloadDirectory.argument(for: preferences)),
+            return AppModel(client: try make(DownloadDirectory.argument(for: preferences),
+                                             preferences.verboseLogging),
                             makeClient: make,
                             historyStore: historyStore,
                             preferencesStore: preferencesStore,
-                            downloadDir: preferences.downloadDir)
+                            downloadDir: preferences.downloadDir,
+                            verboseLogging: preferences.verboseLogging)
         } catch {
             return AppModel(engine: .unavailable(Self.message(of: error)),
                             makeClient: make,
                             historyStore: historyStore,
                             preferencesStore: preferencesStore,
-                            downloadDir: preferences.downloadDir)
+                            downloadDir: preferences.downloadDir,
+                            verboseLogging: preferences.verboseLogging)
         }
+    }
+
+    /// 偏好里那一格 ⇒ 壳自己日志的档位。**两处调用点共用**（启动时 / 开关被改时）：
+    /// 各写一份 `if verboseLogging { … } else { … }` 的结局是两处哪天漂成不一样的映射。
+    nonisolated static func logLevel(for preferences: AppPreferences) -> DiagnosticsLog.Level {
+        preferences.verboseLogging ? .verbose : .normal
     }
 
     // MARK: - 请求通道
@@ -519,6 +586,10 @@ public final class AppModel: ObservableObject {
     ///    而自动重启会把用户正在看的授权框底下的进程换掉，反而更乱。
     public func start() async {
         guard client != nil else { return }   // 连内核都没有（live() 失败）：engine 里已有原因
+        // ⚠️ 手还没握 ⇒ 上一轮那个内核自报的协议版本**不许留着**（它是"当前连接"的事实，
+        //    不是壳的常量）：清掉之后，一次失败的握手会让说明文件如实写"未连上"，
+        //    而不是拿上一个内核的答复冒充这一个。见 `kernelProtocolVersion` 的文档。
+        kernelProtocolVersion = nil
 
         do {
             let handshake = try await withTimeout(handshakeTimeout) { try await self.performHandshake() }
@@ -528,6 +599,7 @@ public final class AppModel: ObservableObject {
             minSplitSizeChoices = handshake.choices
             settings = handshake.settings
             lastCode = handshake.lastCode
+            kernelProtocolVersion = handshake.protocolVersion
             // 内核只在 `enqueue` 里起引擎（`op_enqueue` 的 `ensure_engine`），而这个内核进程
             // 是壳刚起的 —— 所以握手完成后「引擎未启动」是**事实**，不是猜测。
             engine = .notStarted
@@ -587,6 +659,8 @@ public final class AppModel: ObservableObject {
         let choices: [String]
         let settings: Settings
         let lastCode: String
+        /// 内核**自报**的协议版本（`hello` 回执那一格）—— 见 `kernelProtocolVersion`。
+        let protocolVersion: UInt32
     }
 
     /// 真正发请求的那一段。**在后台的竞速任务里跑**，所以它是 `@Sendable` 的调用目标。
@@ -597,7 +671,8 @@ public final class AppModel: ObservableObject {
         let current = try await call("get_settings", .null).decoded(SettingsResult.self)
         return Handshake(choices: hello.minSplitSizeChoices,
                          settings: current.settings,
-                         lastCode: current.lastCode)
+                         lastCode: current.lastCode,
+                         protocolVersion: hello.protocolVersion)
     }
 
     /// 有界等待：把 `operation` 与一个计时器赛跑，**谁先完成用谁**。
@@ -914,55 +989,153 @@ public final class AppModel: ObservableObject {
     }
 
     /// 改下载目录的**实际动作**（唯一的出口在 `changeDownloadDir`，回执在那里落定）。
+    ///
+    /// ⚠️ 主体在 [`performPreferenceChange`]（与 [`changeVerboseLogging`] **共用一份**）：
+    ///    抄第二份的结局是"下次改其中一处规矩时只改了一半"。
     private func performDownloadDirChange(to path: String) async -> DownloadDirChange {
-        let updated = AppPreferences(downloadDir: path)
-        guard updated.downloadDir != downloadDir else {
-            return .unchanged(dir: downloadDir)
+        let updated = AppPreferences(downloadDir: path, verboseLogging: verboseLogging)
+        let result = await performPreferenceChange(
+            to: updated,
+            unchanged: updated.downloadDir == downloadDir,
+            // 🔴 这句话是**壳自己写的**（约束 3 的例外，理由写明）：内核**还不知道**
+            //    这件事（我们还没动它），没有原文可登 —— 而写盘失败必须有落点，
+            //    否则就是一次"以为存上了"的静默失败（E-2 的注释里那句）。
+            saveFailure: { "下载目录没有改成（偏好写入失败：\($0)）" },
+            restartBlocked: "内核还在重启中，这一次没有改成。下载目录已经记下来了，下次启动会按它生效。",
+            apply: { updated in
+                downloadDir = updated.downloadDir
+                // ⚠️ **校验快照跟着作废**（同 `performLoadDelivery` 里那条"换批即作废"的纪律，
+                //    理由换了一个：这次**批次没换，但下载根换了**）。那份快照说的是
+                //    "**上一个目录里**这些文件的校验结果"，而新目录里它们一个都还没校验过 ——
+                //    留着它，侧边栏那颗徽标与整个校验屏会显示一组**看起来属于这一批**的旧数字，
+                //    与阶段 D 修掉的"已完成假象"是同一类缺陷（用户照着它做决定）。
+                //    ⚠️ 置 nil 的语义是"**还不知道**"（不是"校验没过"）：校验屏照常显示它的空态，
+                //       用户点一次「刷新」就会从新内核手里拿一份真的。
+                //    ⚠️ 这一行必须在**确认改动已经成立之后**（写盘成功之后）：写盘失败那条早退
+                //       什么都不该动。
+                verify = nil
+            })
+        switch result {
+        case .unchanged: return .unchanged(dir: downloadDir)
+        case .changed: return .changed(dir: updated.downloadDir)
+        case .failed(let message): return .failed(message: message)
         }
+    }
+
+    // MARK: - 详细日志（规格 §2.4）
+
+    /// 改「详细日志」那一格。**唯一**能让新档位生效的入口（与 [`changeDownloadDir(to:)`] 同形）。
+    ///
+    /// 顺序（与改目录逐字相同：写盘 → 落内存 → 重启内核）：
+    ///   ① **偏好先落盘**（失败 ⇒ 中止，一个内核都不许动）；
+    ///   ② 落内存（`verboseLogging`）**并就地再落一次壳自己的日志档位**；
+    ///   ③ **重启内核**（新进程带 `--log-level verbose`）。
+    ///
+    /// 🔴 **② 里那次 `configure` 是承重的**（规格 §2.4，2026-10-06 由 Windows 那一侧的任务审查
+    ///    点出的缺口）：改内核的级别要重启内核，但**壳自己这个进程不重启** ——
+    ///    少了这一步的表现是"打开开关之后内核的日志变详细了、**壳那一份一行都不变**"，
+    ///    而**没有任何东西会变红**（两个文件都还在，只是其中一个没跟着走）。
+    ///    顺序也与 Windows 那一侧一致：**先落壳自己这一格，再重启内核** ——
+    ///    反过来的话，内核重启那几十毫秒到几秒里壳的级别还是旧的那一档，
+    ///    而那一刻正是最该记全的时候（内核正在被换掉）。它与重启成不成功**无关**：
+    ///    内核起不来也不该让壳的日志继续停在旧档上（回执会把"没改成"如实说出来）。
+    ///
+    /// ⚠️ 同值 ⇒ 什么都不做（`.unchanged`）但仍给回执；回执落在
+    ///    `verboseLoggingChange` 上，好让它活过设置窗口（同 `changeDownloadDir`）。
+    @discardableResult
+    public func changeVerboseLogging(to on: Bool) async -> VerboseLoggingChange {
+        verboseLoggingChange = nil
+        let outcome = await performVerboseLoggingChange(to: on)
+        verboseLoggingChange = outcome
+        return outcome
+    }
+
+    /// 收起那行"详细日志"提示（与 [`dismissDownloadDirChange()`] 同一条：
+    /// **用户主动**收起不算静默失效，下一次改动会重新写上它）。
+    public func dismissVerboseLoggingChange() {
+        verboseLoggingChange = nil
+    }
+
+    private func performVerboseLoggingChange(to on: Bool) async -> VerboseLoggingChange {
+        let updated = AppPreferences(downloadDir: downloadDir, verboseLogging: on)
+        let result = await performPreferenceChange(
+            to: updated,
+            unchanged: updated.verboseLogging == verboseLogging,
+            saveFailure: { "详细日志没有改成（偏好写入失败：\($0)）" },
+            // ⚠️ 与 Windows 那份（`api::preferences::verbose_restart_timed_out`）**逐字同源**：
+            //    内核那半句与"下次启动会按它生效"那半句**与改的是哪一格无关**，两处必须一样；
+            //    只有点名哪一格的那半句不同（那是 Windows 那一侧的同一条判据钉住的）。
+            restartBlocked: "内核还在重启中，这一次没有改成。详细日志开关已经记下来了，"
+                + "下次启动会按它生效。",
+            apply: { updated in
+                verboseLogging = updated.verboseLogging
+                // 🔴 **两处 `configure` 调用点之二：开关被改时**（另一处在 `live()`，
+                //    理由与时机逐条写在那边）。两处共用同一个映射函数。
+                DiagnosticsLog.configure(Self.logLevel(for: updated))
+            })
+        switch result {
+        case .unchanged: return .unchanged(on: on)
+        case .changed: return .changed(on: updated.verboseLogging)
+        case .failed(let message): return .failed(message: message)
+        }
+    }
+
+    /// 一次改偏好的结论。两个入口各自把它映射成**自己那个**回执类型
+    /// （`DownloadDirChange` / `VerboseLoggingChange` —— 主词不同的两句话，
+    /// 理由见 `VerboseLoggingChange` 的类型文档）。
+    private enum PreferenceChangeResult {
+        case changed
+        case unchanged
+        case failed(String)
+    }
+
+    /// 改**一格**偏好的公共部分：写盘 → 落内存 → 等一次在飞的重启 → 重启 → 判失败。
+    ///
+    /// ⚠️ **两个入口（下载目录 / 详细日志）的唯一实现**。它们的差异只有三处：
+    ///    ① 改的是哪一格（`apply`）；
+    ///    ② 写盘失败那句话里点名的是哪一格（`saveFailure`）；
+    ///    ③ 被在飞的重启挡住时那句回执（`restartBlocked`）。
+    ///    抄第二份那五十行的结局是"下次改其中一处规矩时只改了一半" ——
+    ///    而这一段的每一步（顺序、早退、作废）都是踩出来的。
+    ///
+    /// ⚠️ **必须确保"这一次重启真的发生了"**：`restartKernel()` 里有一道 `restarting`
+    ///    闸（同时只跑一次重启），而内核刚崩时的自动重启会占着它最长约十秒
+    ///    （收尾 ≤8s + 握手 ≤5s）。用户在这个窗口里确认一次改动是**完全可能的**
+    ///    ——他刚看到横幅变红，就去设置里改——而那一刻在飞的那次重启
+    ///    **已经拿着旧参数**在起新内核了。若就此放过，结果是"内核按旧参数在跑、
+    ///    壳记的是新值"，症状是文件下到了用户以为已经换掉的地方、或者日志没变详细。
+    ///    所以：先等它落地，再重启一次（那一次一定拿得到新值）。
+    ///
+    ///    ⚠️ 等**一次**就够：自动重启用完预算后 `restartAttempted` 为真，
+    ///    在用户动作复位它之前不会有第二次自动重启插进来（`restartIfAllowed`）；
+    ///    而用户动作与我们同在主 actor 上，插不进来。
+    private func performPreferenceChange(
+        to updated: AppPreferences,
+        unchanged: Bool,
+        saveFailure: (Error) -> String,
+        restartBlocked: String,
+        apply: (AppPreferences) -> Void
+    ) async -> PreferenceChangeResult {
+        if unchanged { return .unchanged }
 
         if let preferencesStore {
             do {
                 try preferencesStore.save(updated)
             } catch {
-                // 🔴 这句话是**壳自己写的**（约束 3 的例外，理由写明）：内核**还不知道**
-                //    这件事（我们还没动它），没有原文可登 —— 而写盘失败必须有落点，
-                //    否则就是一次"以为存上了"的静默失败（E-2 的注释里那句）。
-                return .failed(message: "下载目录没有改成（偏好写入失败：\(error)）")
+                return .failed(saveFailure(error))
             }
         }
 
-        downloadDir = updated.downloadDir
-        // ⚠️ **校验快照跟着作废**（同 `performLoadDelivery` 里那条"换批即作废"的纪律，
-        //    理由换了一个：这次**批次没换，但下载根换了**）。那份快照说的是
-        //    "**上一个目录里**这些文件的校验结果"，而新目录里它们一个都还没校验过 ——
-        //    留着它，侧边栏那颗徽标与整个校验屏会显示一组**看起来属于这一批**的旧数字，
-        //    与阶段 D 修掉的"已完成假象"是同一类缺陷（用户照着它做决定）。
-        //    ⚠️ 置 nil 的语义是"**还不知道**"（不是"校验没过"）：校验屏照常显示它的空态，
-        //       用户点一次「刷新」就会从新内核手里拿一份真的。
-        //    ⚠️ 这一行必须在**确认改动已经成立之后**（写盘成功之后）：写盘失败那条早退
-        //       什么都不该动。
-        verify = nil
+        apply(updated)
         restartAttempted = false
 
-        // ⚠️ **必须确保"这一次重启真的发生了"**：`restartKernel()` 里有一道 `restarting`
-        //    闸（同时只跑一次重启），而内核刚崩时的自动重启会占着它最长约十秒
-        //    （收尾 ≤8s + 握手 ≤5s）。用户在这个窗口里确认一个新目录是**完全可能的**
-        //    ——他刚看到横幅变红，就去设置里改目录——而那一刻在飞的那次重启
-        //    **已经拿着旧目录**在起新内核了。若就此放过，结果是"内核用旧目录在跑、
-        //    壳记的是新目录"，症状是文件下到了用户以为已经换掉的地方。
-        //    所以：先等它落地，再重启一次（那一次一定拿得到新值）。
-        //
-        //    ⚠️ 等**一次**就够：自动重启用完预算后 `restartAttempted` 为真，
-        //    在用户动作复位它之前不会有第二次自动重启插进来（`restartIfAllowed`）；
-        //    而用户动作与我们同在主 actor 上，插不进来。
         await waitForTheRestartInFlightToFinish()
         guard await restartKernel() else {
-            return .failed(message: "内核还在重启中，这一次没有改成。"
-                           + "下载目录已经记下来了，下次启动会按它生效。")
+            return .failed(restartBlocked)
         }
         // 内核没起来 ⇒ 如实说（那句话同时也是顶部引擎横幅的内容）。
-        if case .unavailable(let why) = engine { return .failed(message: why) }
-        return .changed(dir: updated.downloadDir)
+        if case .unavailable(let why) = engine { return .failed(why) }
+        return .changed
     }
 
     /// 等一次**在飞的重启**落地（`restartKernel` 的 `restarting` 闸）。**有界。**
@@ -1086,6 +1259,11 @@ public final class AppModel: ObservableObject {
         if mode == .initial { loadState = .loading }
         busyReason = "正在加载交付清单…"
         defer { busyReason = nil }
+
+        // 🔴 **在这个码被发出去之前**就告诉这条连接该抹什么（规格 §2.3 B）。
+        //    ⚠️ **时机是承重的**：晚一步 —— 比如挪到失败之后 —— 的表现是**那一次失败的
+        //    日志里仍然带着码**，而那一次恰恰是最可能失败（码打错）、也最需要那份日志的一次。
+        rememberRedactions(code: code)
 
         var params: [String: JSONValue] = ["code": .string(code)]
         if let baseURL, !baseURL.isEmpty { params["base_url"] = .string(baseURL) }
@@ -1585,6 +1763,20 @@ public final class AppModel: ObservableObject {
 
         do {
             client = try await spawnClient()
+            // 🔴 **新连接 = 空的可抹清单**（`setRedactions` 挂在连接上，不是进程全局）
+            //    ⇒ 这里必须**立刻**重推一遍，否则"改了下载目录 ⇒ 重启内核"之后，
+            //    新连接上再没有东西挡着客户目录名了（见 `rememberRedactions` 的文档）。
+            //
+            // ⚠️ **这一句和上面那句 `client = …` 之间没有 `await`**（修复轮 2 与 Windows
+            //    对照记的账）：`AppModel` 是 `@MainActor`，而 `client = try await spawnClient()`
+            //    返回之后到 `rememberRedactions` 为止**一路同步** ⇒ 没有任何别的 main-actor
+            //    代码能在这中间读到那个新客户端，**窗口在本侧不存在**。
+            //    （Windows 那一侧不是这个形状：`install_client` 是把连接**公布给别的线程**
+            //    的那一下，所以那两句的先后承重，判据是 `shell-win/src/session.rs` 的
+            //    `the_redaction_list_goes_out_before_the_client_is_published`。）
+            //    ⚠️ **别**往这两句中间插 `await`（或把 `rememberRedactions` 挪到下面那个
+            //    `await start()` 之后）—— 一插，Windows 那个窗口在这一侧也就有了。
+            rememberRedactions(code: loadedCode)
             // 上一个内核的传输列表属于上一个内核：不自动恢复（规格 §8.3）。
             transfers = nil
             await start()
@@ -1621,10 +1813,44 @@ public final class AppModel: ObservableObject {
     ///    `DownloadDirectory.argument(for:)`），而且它读的是**此刻**的 `downloadDir`
     ///    —— 这正是"改目录之后重启出来的内核拿到的是**新**目录"的实现方式：
     ///    只有一处闭包、两个调用点，没有第二个"当前目录"的副本。
+    /// ⚠️ `--log-level` 那一格同理：它读的是**此刻**的 `verboseLogging`，
+    ///    由 `AppPreferences(downloadDir:verboseLogging:)` 与目录一起打包
+    ///    —— **两格只有一个来源**（模型里那两个字段），不会一个改了另一个没改。
     private func spawnClient() async throws -> any CoreCalling {
         let make = makeClient
-        let dir = DownloadDirectory.argument(for: AppPreferences(downloadDir: downloadDir))
-        return try await Task.detached { try make(dir) }.value
+        let preferences = AppPreferences(downloadDir: downloadDir, verboseLogging: verboseLogging)
+        let dir = DownloadDirectory.argument(for: preferences)
+        return try await Task.detached { try make(dir, preferences.verboseLogging) }.value
+    }
+
+    /// 告诉**当前这条连接**：写进 `diag-shell.log` 之前，哪几个字面串必须抹掉（规格 §2.3 B）。
+    ///
+    /// 🔴 **它为什么是"按构造"而不是"事后过滤"**：`kernel_call` 那一行的 `why` 是**内核原文**，
+    ///    而交付码是**我们自己**拼进内核文案里的（`core/src/delivery.rs` 那条 404 把
+    ///    `…/{交付码}/manifest.json` 整条 URL 送了进来；`core/src/main.rs` 的 `preflight`
+    ///    带着客户的目录名）。这两个串**壳都知道** —— 码在它刚发出去的请求里，目录在它
+    ///    自己存的偏好里 ⇒ 不必去猜任意第三方文案里像不像码。
+    ///
+    /// ⚠️ **推的是"此刻该抹的整份清单"，不是追加**：换批次要换码、改设置要换目录
+    ///    （`CoreClient.setRedactions` 的文档记着"追加式接口会留下看不出来的残留"）。
+    ///
+    /// ⚠️ **两处调用点**（与 `DiagnosticsLog.configure` 那两处同款，缺一个就有一个方向不工作）：
+    ///    · **每次发 `load_delivery` 之前**（`performLoadDelivery`）—— 那个码**马上**就要
+    ///      出现在内核的文案里，而"码打错"正是最常见的那次失败；
+    ///    · **换了一条新连接之后**（`restartKernel` 里 `spawnClient()` 那一步）—— 新连接的
+    ///      可抹清单是**空的**（清单挂在连接上，不在进程全局），不重推的话"改了下载目录
+    ///      ⇒ 重启内核"之后，新连接上就再没有东西挡着客户目录名了。
+    ///
+    /// ⚠️ **诚实的记账**：`setRedactions` 那一格本机有判据（`CoreClientTests` 里那条
+    ///    把码与目录一起驱过去、断言落盘那一行里两样都没有的用例），但**本函数这两个
+    ///    调用点没有** —— 与 `DiagnosticsLog.configure` 那两处同一条账：要判它们得让
+    ///    测试去读真的偏好、或者翻进程全局。⇒ "调用点有没有被走到"只有真机验收能回答。
+    private func rememberRedactions(code: String?) {
+        // 空串（`downloadDir` 未配置 = 不传 `--download-dir`）由 `DiagnosticsLog.redact`
+        // 跳过 —— 那不是"抹掉整行"，也不是错误。
+        var secrets = [downloadDir]
+        if let code, !code.isEmpty { secrets.append(code) }
+        client?.setRedactions(secrets)
     }
 
     // MARK: - 错误映射

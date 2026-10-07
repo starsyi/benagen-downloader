@@ -24,9 +24,11 @@
      关面板三个提交点都发 `history_put`）、历史写盘失败**两个落点都在**、
      换码失败**留在面板里显示原文**、成功**换了一批才关**、关掉之后**还能再打开**。
   ③ **设置窗口**：下载目录段（显示值 / 脚注 / **先检查再确认** / 三条后果 / 回执）、
+     **详细日志那个勾选框**（任务 3：标签与说明来自载荷、勾选态跟着偏好、点了发
+     `verbose_logging_set`、回执走**同一条**渲染路径但话是详细日志那句）、
      七项参数（标签与区间来自载荷、`-k` 是枚举且当前值被追加在末尾）、保存。
   ④ **关于**与**许可全文**（三份、可切换、全文逐字）。
-  ⑦ 🔴 **R-5 的对位差分**（19 条）：`presentation/` 里那几条"判据在 Rust、行为在前端"的
+  ⑦ 🔴 **R-5 的对位差分**（21 条）：`presentation/` 里那几条"判据在 Rust、行为在前端"的
      东西（`NoteDrafts` / `SettingsForm::matches` / 开关面板的两条关闭路径），
      把**从 Rust 倒出来的用例表**回放一遍，两边的结论必须一致。
      ⚠️ 它与 ①～⑥ **不同**：那些判的是"这一屏画得对不对"，⑦ 判的是
@@ -157,6 +159,20 @@ let licenseFixture = null;
 // 「选择…」那一次系统对话框的**返回值**（`null` = 用户取消，见 `commands::pick_directory`）。
 // 夹具里它由用例现设 —— 真机上它由 `SHBrowseForFolderW` 给。
 let pickedDir = null;
+// 「详细日志」那一格**已经写进盘**的那一份偏好（`null` = 还没动过，用夹具原样那-份）。
+// ⚠️ 它模拟的是"`verbose_logging_set` 落盘成功"这件事：真命令写完之后，
+//    紧接着那一次 `preferences_get` 读回来的就是新的那一份（见 `invoke` 里那一支）。
+let verbosePayload = null;
+// 「导出诊断日志…」那一次动作的回执（`null` = 用夹具里**成功**那一档）。
+// ⚠️ 它是**可变**的：三条用例要分别看成功 / 取消 / 失败三档（三份都取自夹具，
+//    由 Rust 现倒 —— 与 `verbose_logging_set` 同一条口径，不在夹具里编话）。
+let exportPayload = null;
+// 「下载目录」那一段的**另一份**载荷（`null` = 用夹具原样那一份 POSIX 形状的）。
+// ⚠️ 它是修复轮 2 加的：真机是 Windows，路径里**一个 `/` 都没有** —— 显示行与改目录
+//    的回执都要按最后一个分隔符切，而只认 `/` 的实现在 POSIX 夹具上**看不出差别**。
+let prefPayload = null;
+// 那一条链路的 Windows 目标目录（`preferences_set` 的受控 stub 认它）。
+const WIN_TARGET = "D:\\交付\\交付_新盘";
 
 async function invoke(cmd, args) {
   invocations.push({ cmd, args: args || {} });
@@ -184,7 +200,9 @@ async function invoke(cmd, args) {
     // 内核回的**是归一化之后那一份**：这里把用户发来的七个值原样回声（同形即可）。
     return { ok: true, data: { ...FIX.settingsGet.data, settings: args.settings } };
   }
-  if (cmd === "preferences_get") return FIX.preferencesGet;
+  // ⚠️ `verbosePayload` 非 null 时用它（那是本夹具"记住"了详细日志开关之后的那一份，
+  //    `null` 一切照旧 —— 见 `verbose_logging_set` 那一支）。
+  if (cmd === "preferences_get") return prefPayload || verbosePayload || FIX.preferencesGet;
   // 取消 ⇒ 信封里的 `data` 是 `null`（**不是**空串、也不是失败信封 —— 见
   // `commands::pick_directory` 与 `pickdir::pick_outcome` 那两段文档）。
   if (cmd === "pick_directory") return { ok: true, data: pickedDir };
@@ -192,8 +210,27 @@ async function invoke(cmd, args) {
     return args.path === "/nope" ? FIX.preferencesCheckBad : FIX.preferencesCheckOk;
   }
   if (cmd === "preferences_set") {
+    // ⚠️ 第二条分支是修复轮 2 加的：**Windows 形状**的回执（那条链路的另一半判据）。
+    if (args.dir === WIN_TARGET) return FIX.preferencesSetWindowsChanged;
     return args.dir === "/Volumes/Data/交付" ? FIX.preferencesSetUnchanged : FIX.preferencesSetChanged;
   }
+  // `verbose_logging_set`（任务 3）：回执**取自夹具**（由 Rust 现倒，同
+  // `preferences_set` 那三条）—— 这里不编一句话，否则夹具与真载荷各说各话。
+  // ⚠️ 同时模拟"**偏好已经落盘**"：真命令写盘之后，紧接着那一次 `preferences_get`
+  //    读回来的就是新的那一份（`settings.js:setVerboseLogging` 会重读一次去定勾选态）。
+  //    不模拟的话，勾会在重读之后**弹回旧值** —— 而那是夹具不记忆造成的假象，
+  //    与被测代码无关（真机上盘里那一份确实变了）。
+  if (cmd === "verbose_logging_set") {
+    verbosePayload = {
+      ok: true,
+      data: { ...FIX.preferencesGet.data, verbose_logging: args.on === true },
+    };
+    return FIX.verboseLoggingSetChanged;
+  }
+  // `diagnostics_export`（任务 4）：三档回执都**取自夹具**（成功 / 取消 / 失败，
+  // 由 Rust 现倒）—— 与 `verbose_logging_set` 那一条逐字同款的理由：夹具与真载荷
+  // 只许有一个来源，这里不编一句话。
+  if (cmd === "diagnostics_export") return exportPayload || FIX.diagnosticsExportDone;
   if (cmd === "about") return FIX.about;
   if (cmd === "license") return licenseFixture || (licenseFixture = await licensePayload());
   return { ok: true, data: {} };
@@ -469,6 +506,197 @@ async function runAll() {
   check("③d 目录输入框预填了偏好里那一份原文",
     q("#set-dir-input").value === FIX.preferencesGet.data.dir, q("#set-dir-input").value);
 
+  // ---- 「详细日志」那一个勾选框（任务 3，规格 §2.4）-------------------------
+  //
+  // 🔴 **每条断言挡哪一种坏形态**（**逐条对号**；2026-10-06 修复轮 1 订正过一版：
+  //    前一版把三个变异各自会红哪一条标错了三个位置，而这是本屏唯一的测试 ——
+  //    注释把人引到错的那条断言上，比没有注释更糟）：
+  //
+  //   | 把实现改坏成 | 变红的（**实测**，见任务报告「修复轮 1」与任务 4 的复测） |
+  //   |---|---|
+  //   | 标签/说明改由前端自己写（不读载荷，§3.2 明禁） | **本组一条都不红** —— 抓住它的是 `windows/scripts/check_frontend_copy.sh`（**EXIT=3**，点名 `windows/web/js/settings.js`）。⚠️ ③d1 **不是**这条的判据：手写的那句恰好等于载荷给的那句时，它是绿的（实测 **fail=0** —— 那一轮 123 条，本任务又加了 13 条导出的断言 ⇒ 136 条） |
+  //   | `paintPreferences` 里不读 `verbose_logging`（永远不勾） | **只有 ③d9** |
+  //   | 那个 `change` 监听不发命令 / 发错名字 | **③d3**，且 ③d4 / ③d5 / ③d9 **一起**红（它们都排在"命令成功"之后） |
+  //   | 那个监听**把方向发反**（`setVerboseLogging(!verboseEl.checked)`） | **③d3 / ③d7 / ③d9**（✅ 复测过）。⚠️ ③d4 与 ③d5 **不红**：它们只看回执有没有落在两处，与发出去的方向无关 |
+  //   | 回执不落在那两处 | **③d4** / **③d5** |
+  //
+  //   ⚠️ **③d2 不在上面任何一格**：它断的是"**首帧**的勾选态与载荷一致"，
+  //      而首帧那一份是 `false`、新克隆出来的 `<input type="checkbox">` **默认也是
+  //      `false`** ⇒ "读了载荷"与"没读"在那一拍**分不开**（实测：把
+  //      `verboseEl.checked = …` 整行删掉，③d2 **不红**）。它留着是为了钉住**初始态**
+  //      ——而能钉住它的那个变异是"**不读载荷、直接写死** `verboseEl.checked = true`"
+  //      （实测：**只有 ③d2 红**；③d9 那一拍盘上那份也是 `true`，照样绿）。
+  //      **别把它当成"读了载荷"的证据** —— 那件事的证据是 ③d9
+  //      （它跑在"盘上那一份是 `true`"的那一拍）。
+  //      ⚠️ 而"模板里写成 `<input checked>`"**不会**让它红（实测 **fail=0**，同上）：
+  //      组件克隆之后 `paintPreferences` 每次都会把 `checked` 重写一遍，
+  //      模板里那个初值活不到第一帧之后 —— 这一条断的是**首帧那一笔的方向**，
+  //      不是模板写了什么。
+  //
+  //   ⚠️ **③d6 不是前端断言**：它断的是**夹具里那条登记**的内容（"详细日志那一支回执
+  //      说的是详细日志、不是下载目录"）。它的失败模式要**两个 Rust 文件同时改**
+  //      （`dump_wire_fixtures.rs` 把那个键接到 `change(&DownloadDirChange…)` 上，
+  //      `check_wire_fixtures.sh` 只比"夹具与生成器一致"、照旧绿）—— 留着它是因为
+  //      那条缝**只有它看得见**，但它**不**属于"关于这个控件的断言"。
+  //   ⚠️ **③d8 是 ③d9 的前置条件**（"设置窗口真的关掉了"），不是关于勾选框的断言：
+  //      少了它，③d9 可能因为"窗口根本没关、读的还是旧那一扇"而以错误的理由绿。
+  check("③d1 勾选框的标签与说明**逐字来自载荷**（前端一个字都不造）",
+    txt("#set-verbose-label") === FIX.preferencesGet.data.verbose_label
+      && txt("#set-verbose-note") === FIX.preferencesGet.data.verbose_note,
+    JSON.stringify([txt("#set-verbose-label"), txt("#set-verbose-note")]));
+  check("③d2 首帧：未配置那一档（`verbose_logging: false`）⇒ 勾选框**不勾**",
+    q("#set-verbose").checked === FIX.preferencesGet.data.verbose_logging,
+    `checked=${q("#set-verbose").checked} / 载荷=${FIX.preferencesGet.data.verbose_logging}`);
+  {
+    const before = calls("verbose_logging_set").length;
+    const box = q("#set-verbose");
+    box.checked = true;
+    box.dispatchEvent(new Event("change", { bubbles: true }));
+    await sleep(700);
+    const sent = calls("verbose_logging_set").pop();
+    check("③d3 勾上 ⇒ 发 `verbose_logging_set`（方向逐字：`on: true`）",
+      !!sent && sent.args.on === true && calls("verbose_logging_set").length === before + 1,
+      JSON.stringify(sent && sent.args));
+    check("③d4 回执出现在那一行上、正文逐字是载荷给的那句（这一格没有路径行）",
+      shown("#set-dir-receipt")
+        && txt("#set-dir-receipt-text").includes(FIX.verboseLoggingSetChanged.data.headline)
+        && !doc().querySelector("#set-dir-receipt .dlg__receipt-path"),
+      txt("#set-dir-receipt-text"));
+    check("③d5 同一条回执**也挂在主区常驻提示行上**（窗口随手会关掉）",
+      notices().includes(FIX.verboseLoggingSetChanged.data.headline), notices());
+    // ⚠️ **这一条是"夹具自检"，不是关于勾选框的断言**（详见本组开头那张表）：
+    //    它断的是 `wire-fixtures.json` 里 `verboseLoggingSetChanged` 那条登记的内容。
+    //    留着它的理由：`dump_wire_fixtures.rs` 若把那个键接到 `change(&DownloadDirChange…)`
+    //    上，`check_wire_fixtures.sh`（只比"夹具与生成器一致"）**照旧是绿的** ——
+    //    那条缝只有这一条看得见。两件事长得像（都要重启内核），而说错对象是一句
+    //    用户读得出来的假话。
+    check("③d6（夹具自检）那一支回执一个字都不提下载目录",
+      FIX.verboseLoggingSetChanged.data.headline.includes("详细日志")
+        && !FIX.verboseLoggingSetChanged.data.headline.includes("下载目录"),
+      FIX.verboseLoggingSetChanged.data.headline);
+    // 落盘之后重读一次 ⇒ 勾**跟着盘上那一份**（失败时要能回弹，见 `setVerboseLogging`）。
+    check("③d7 命令成功之后重读偏好 ⇒ 勾选框仍与**盘上那一份**一致",
+      q("#set-verbose").checked === true,
+      `checked=${q("#set-verbose").checked}`);
+  }
+
+  // 🔴 **关掉再打开：勾选态必须从偏好读**（不是"记住上一扇窗画的样子"）。
+  //
+  // ⚠️ 这一条才是"`paintPreferences` 真的读了 `verbose_logging`"的**判别力所在**：
+  //    新开的那一扇是从模板克隆出来的，`<input type="checkbox">` 起手就是**没勾** ——
+  //    于是"读了"与"没读"在**盘上那一份是 `true`** 的时候才会分开
+  //    （盘上是 `false` 时两边都画成没勾，那种断言恒真）。
+  //    刚才那一下把盘上那一份改成了 `true`（`verbosePayload`），所以现在开的这一扇
+  //    必须是**勾着**的。把 `settings.js` 里那句 `verboseEl.checked = …` 删掉 ⇒ 这一条红。
+  click(q("#set-close"));
+  await sleep(300);
+  check("③d8 关掉设置窗口", !shown("#set-root"));
+  click(q("#tb-settings"));
+  await sleep(1400);
+  check("③d9 🔴 重新打开 ⇒ 勾选框**从偏好读**（盘上那份是 true ⇒ 勾上）",
+    shown("#set-root") && q("#set-verbose").checked === true,
+    `窗口=${shown("#set-root")} checked=${q("#set-verbose").checked}`);
+  // 收尾：夹具那"一份已经落盘"的记忆清掉（后面几组读的还是夹具原样那一份）。
+  verbosePayload = null;
+
+  // ---- 「导出诊断日志…」（任务 4，规格 §2.5 / §2.7）--------------------------
+  //
+  // 🔴 **本组的第一条是"回执画在哪一节"**：上一轮那个开关的教训 —— 勾选框在自己的
+  //    那一节、回执却画在**头顶那一节**（下载目录那一段里），用户勾一下、确认出现在
+  //    别处。那件事**不是假话，是误导**，而它当时**一条判据都没有**（是审查看出来的）。
+  //    ⇒ 这一组把它钉成一条**结构判据**（同一个 `<section>` 里），不是"看着对"。
+  //    ⚠️ ③导出1b 是它的**对照**：改设置那两条回执今天仍然画在下载目录那一节
+  //    （本任务**没有**去动它 —— 那是任务 3 的落点，动它要连 ③d4 / ③z 一起改）。
+  //    留着这一条是为了让"两处不一样"这件事**在判据里看得见**，而不是被忘掉。
+  const diagSection = q("#set-verbose-check").closest("section");
+  const dirSection = q("#set-dir-display").closest("section");
+  check("③导出1 🔴 导出按钮与它的回执**都在诊断那一节里**（不是画到上面那一节去）",
+    !!diagSection && diagSection !== dirSection
+      && diagSection.contains(q("#set-export"))
+      && diagSection.contains(q("#set-export-receipt")),
+    `诊断节里的按钮=${!!diagSection && diagSection.contains(q("#set-export"))} `
+      + `回执=${!!diagSection && diagSection.contains(q("#set-export-receipt"))}`);
+  check("③导出1b 对照组：改设置那两条回执画在**下载目录那一节**（上一轮那处误导，本任务未动它）",
+    !!dirSection && dirSection !== diagSection && dirSection.contains(q("#set-dir-receipt")),
+    `目录节=${!!dirSection}`);
+  check("③导出2 按钮的文案是**结构文案**（逐字来自 index.html，不随数据变）",
+    txt("#set-export") === "导出诊断日志…", JSON.stringify(txt("#set-export")));
+  check("③导出3 还没点过 ⇒ 回执那一行不显示（不是一开窗就挂着一条空的）",
+    !shown("#set-export-receipt"));
+
+  const exportCallsBefore = calls("diagnostics_export").length;
+  click(q("#set-export"));
+  await sleep(500);
+  check("③导出4 点它 ⇒ 发一次 `diagnostics_export`",
+    calls("diagnostics_export").length === exportCallsBefore + 1,
+    calls("diagnostics_export").length + " 次");
+  check("③导出5 成功那一档：回执在本节里显示，标题逐字是载荷给的那句",
+    shown("#set-export-receipt")
+      && txt("#set-export-receipt-text").includes(FIX.diagnosticsExportDone.data.headline),
+    txt("#set-export-receipt-text"));
+  {
+    const pathEl = q("#set-export-receipt .dlg__receipt-path");
+    const parts = pathEl
+      ? [...pathEl.querySelectorAll(".mid__head, .mid__tail")].map((n) => n.textContent)
+      : [];
+    const want = FIX.diagnosticsExportDone.data.path_detail;
+    // 🔴 **尾段必须是那个文件夹名**（修复轮 1 加的那半条）：夹具里这条路径是
+    //    **Windows 形状**的（`D:\…`）——真机上路径里一个 `/` 都没有 ⇒
+    //    只认 `/` 的中间截断会把**整条路径**放进"会被压缩的前一段"、
+    //    尾段空着，而**用户最需要看的就是那个文件夹名**。
+    //    判别力：把 `settings.js` 里 `middleSplit(detail, "/\\")` 改回 `"/"` ⇒ 这一条红。
+    //    ⚠️ 切法与实现分开写（`/[\\/]/` 与 `"/\\"` 不是同一处代码）：两边都用
+    //    "两个分隔符"是对的，但这不是同一条判据 —— 见上面那条。
+    const tail = want.split(/[\\/]/).pop();
+    check("③导出6 路径是**单独一行、两段**：拼起来逐字等于载荷，且尾段就是那个文件夹名",
+      parts.length === 2 && parts[0] + parts[1] === want && parts[1] === tail
+        && tail.startsWith("诊断日志-"),
+      JSON.stringify(parts));
+    check("③导出7 它的悬停是**全文原文**",
+      !!pathEl && pathEl.getAttribute("title") === want,
+      JSON.stringify(pathEl && pathEl.getAttribute("title")));
+  }
+  check("③导出8 🔴 那句隐私提醒在场、逐字来自载荷（规格 §2.7 的**第二处明说**）",
+    txt("#set-export-receipt-text").includes(FIX.diagnosticsExportDone.data.privacy_note),
+    txt("#set-export-receipt-text"));
+  check("③导出9 成功 ⇒ 图标不是失败那一档（`is_failure: false`）",
+    !q("#set-export-receipt-icon").classList.contains("is-failure"),
+    q("#set-export-receipt-icon").className);
+
+  // ---- 取消与失败两档：**都要说得出话**，而且都不是错误样式 -------------------
+  exportPayload = FIX.diagnosticsExportCancelled;
+  click(q("#set-export"));
+  await sleep(500);
+  check("③导出10 取消那一档：说「没有导出」，不是失败样式，也没有路径行与隐私提醒",
+    shown("#set-export-receipt")
+      && txt("#set-export-receipt-text").includes(FIX.diagnosticsExportCancelled.data.headline)
+      && !q("#set-export-receipt-icon").classList.contains("is-failure")
+      && !q("#set-export-receipt .dlg__receipt-path"),
+    txt("#set-export-receipt-text"));
+
+  exportPayload = FIX.diagnosticsExportFailed;
+  click(q("#set-export"));
+  await sleep(500);
+  check("③导出11 失败那一档：正文逐字是载荷那句（**不加工**），图标翻成失败",
+    shown("#set-export-receipt")
+      && txt("#set-export-receipt-text").includes(FIX.diagnosticsExportFailed.data.headline)
+      && q("#set-export-receipt-icon").classList.contains("is-failure"),
+    txt("#set-export-receipt-text"));
+  exportPayload = null;
+
+  // ---- 命令本身发不出去（宿主里没有这条命令）：走**既有**的那条失败行 ----------
+  failures = { diagnostics_export: "宿主里没有这条命令" };
+  click(q("#set-export"));
+  await sleep(500);
+  check("③导出12 命令发不出去 ⇒ 走既有的失败行、原文逐字（约束 3/4）",
+    shown("#set-failure") && txt("#set-failure-text") === "宿主里没有这条命令",
+    txt("#set-failure-text"));
+  failures = {};
+  // ⚠️ 收起来的是那一格里那颗**按钮**（`dialogs.js:dismissButton` 把监听挂在按钮上，
+  //    点外层那个 `<span>` 只会穿过它）—— 与关于 / 许可那两处同一个写法。
+  click(q("#set-failure-dismiss button"));
+  await sleep(200);
+
   const paramRows = [...doc().querySelectorAll("#set-params-rows .set__row")];
   const parameters = FIX.settingsGet.data.parameters;
   check("③e 七行参数一行不少", paramRows.length === 7, paramRows.length + " 行");
@@ -586,6 +814,71 @@ async function runAll() {
   }
   check("③zb3 改目录会**重启内核** ⇒ 补一拍 state（`pollNow`）",
     calls("state").length > 1, calls("state").length + " 拍");
+
+  // ---- 🔴 **Windows 形状的下载目录**：显示行与回执都要按最后一个 `\` 切 ---------
+  //
+  // 为什么必须有这一组（修复轮 2，审查量的）：上面那两条（③b2 / ③zb2）吃的是
+  // **POSIX 形状**的夹具（`/Volumes/Data/…`），而**真机是 Windows** —— 那边的路径里
+  // **一个 `/` 都没有**。只认 `/` 的实现（`middleSplit(detail, "/")`）会回
+  // `[整条, ""]`（`dom.js:107` 的兜底）⇒ **尾段空着**；而缩的是 `.mid__head`
+  // （`.mid__tail` 是 `flex: none`）⇒ **"这一格一个字都不许少"的那个名字恰好落进
+  // 会被省略号吃掉的那一段**。审查实测：把 `preferencesGet.display` 换成 Windows 形状，
+  // **整屏 136/0，一条都不红** —— 这一组就是那个缺口。
+  //
+  // ⚠️ 用的是**独立的一份载荷**（`preferencesGetWindows`），上面那一组**一个字没动**：
+  //    两种形状各有一条判据（谁也替不了谁）。
+  //    ⚠️ **但"POSIX 那一档仍有人钉着"只对回执成立**（2026-10-06，第三轮重审测量后订正）：
+  //       **回执**的 POSIX 分支有判据（③zb2，实测把 `settings.js:558` 改成只认 `\` 会红）；
+  //       **显示行**的 POSIX 分支**没有**（把 `settings.js:378-379` 改成只认 `\`，
+  //       整屏 140/0 —— 因为 ③b2 只断 `title`、③b 只断 `textContent`，
+  //       两者对"这条串从哪儿切开"都不敏感）。**这是既有缺口，不是本组引入的。**
+  prefPayload = FIX.preferencesGetWindows;
+  click(q("#set-close"));
+  await sleep(300);
+  click(q("#tb-settings"));
+  await sleep(1400);
+  {
+    const el = q("#set-dir-display");
+    const parts = el
+      ? [...el.querySelectorAll(".mid__head, .mid__tail")].map((n) => n.textContent)
+      : [];
+    const want = FIX.preferencesGetWindows.data.display;
+    check("③目录w1 🔴 显示行按**最后一个分隔符**切：两段拼起来逐字等于载荷，尾段就是那个名字",
+      parts.length === 2
+        && parts[0] + parts[1] === want
+        && parts[1] === want.split(/[\\/]/).pop()
+        && parts[1] === "Benagen",
+      JSON.stringify(parts));
+    check("③目录w2 它的悬停是**全文原文**（这一格截断之后还看得到全部）",
+      !!el && el.getAttribute("title") === want,
+      JSON.stringify(el && el.getAttribute("title")));
+  }
+  // 回执那一行同理（另一处 `middleSplit` —— 两处各是一条判据）。
+  input(q("#set-dir-input"), WIN_TARGET);
+  click(q("#set-dir-apply"));
+  await sleep(600);
+  click(q("#dlg-confirm-accept"));
+  await sleep(800);
+  {
+    // ⚠️ 明确取**这一条**回执里的那一格（导出那条回执也有 `.dlg__receipt-path`，
+    //    它排在文档更后面，按类名取第一条会取到别人身上）。
+    const pathEl = q("#set-dir-receipt .dlg__receipt-path");
+    const parts = pathEl
+      ? [...pathEl.querySelectorAll(".mid__head, .mid__tail")].map((n) => n.textContent)
+      : [];
+    const want = FIX.preferencesSetWindowsChanged.data.path_detail;
+    check("③目录w3 🔴 回执那一行按**最后一个分隔符**切：拼起来逐字等于载荷，尾段就是那个名字",
+      parts.length === 2
+        && parts[0] + parts[1] === want
+        && parts[1] === want.split(/[\\/]/).pop()
+        && parts[1] === "交付_新盘",
+      JSON.stringify(parts));
+    check("③目录w4 它的悬停也是全文原文",
+      !!pathEl && pathEl.getAttribute("title") === want,
+      JSON.stringify(pathEl && pathEl.getAttribute("title")));
+  }
+  // 收尾：后面的用例读的还是夹具原样那一份（POSIX 形状）。
+  prefPayload = null;
 
   // ---- 「选择…」：系统对话框那一条路（对位 macOS 的 `choose()`）-----------------
   //

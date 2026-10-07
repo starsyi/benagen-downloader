@@ -514,14 +514,39 @@ private func makeFakeBundle(withCore: Bool) throws -> (bundle: Bundle, core: URL
 }
 
 @Test func coreArgumentsArePassedAsArgvNotThroughAShell() {
-    #expect(CoreClient.coreArguments(settingsPath: nil, downloadDir: nil) == [])
-    #expect(CoreClient.coreArguments(settingsPath: "/s.json", downloadDir: nil) == ["--settings", "/s.json"])
-    #expect(CoreClient.coreArguments(settingsPath: nil, downloadDir: "/d") == ["--download-dir", "/d"])
-    #expect(CoreClient.coreArguments(settingsPath: "/s.json", downloadDir: "/d")
+    #expect(CoreClient.coreArguments(settingsPath: nil, downloadDir: nil, verboseLogging: false) == [])
+    #expect(CoreClient.coreArguments(settingsPath: "/s.json", downloadDir: nil, verboseLogging: false)
+            == ["--settings", "/s.json"])
+    #expect(CoreClient.coreArguments(settingsPath: nil, downloadDir: "/d", verboseLogging: false)
+            == ["--download-dir", "/d"])
+    #expect(CoreClient.coreArguments(settingsPath: "/s.json", downloadDir: "/d",
+                                     verboseLogging: false)
             == ["--download-dir", "/d", "--settings", "/s.json"])
     // 带空格的路径必须原样进 argv（不许过 shell）
-    #expect(CoreClient.coreArguments(settingsPath: nil, downloadDir: "/有 空格/目录")
+    #expect(CoreClient.coreArguments(settingsPath: nil, downloadDir: "/有 空格/目录",
+                                     verboseLogging: false)
             == ["--download-dir", "/有 空格/目录"])
+}
+
+/// 🔴 **开了才拼那一对；关了什么都不拼**（规格 §2.1 / §5.1 的 argv 行）。
+///
+/// ⚠️ **关掉时拼 `--log-level normal` 是错的**：内核的缺省就是 normal
+///    （`parse_args` 的 `log_level.unwrap_or(Level::Normal)`），多拼一对只是多一处
+///    会漂的东西 —— 而且它漂起来的方式是静默的（两种写法在真机上行为一样，
+///    只有并排读两份 argv 时才看得出来）。
+@Test func theVerboseFlagIsOnlySpelledOutWhenItIsOn() {
+    #expect(CoreClient.coreArguments(settingsPath: nil, downloadDir: nil, verboseLogging: false) == [])
+    #expect(!CoreClient.coreArguments(settingsPath: nil, downloadDir: "/d", verboseLogging: false)
+        .contains("--log-level"),
+        "关着的时候一个 `--log-level` 都不许出现（缺省即 normal，多拼一处就是多一处会漂的）")
+
+    #expect(CoreClient.coreArguments(settingsPath: nil, downloadDir: "/d", verboseLogging: true)
+            == ["--download-dir", "/d", "--log-level", "verbose"])
+    // ⚠️ 拼接次序与 Windows 那份（`windows/shell-core/src/client.rs` 的 `core_arguments`）
+    //    **逐个一致**：`--log-level` 排在最后。内核的 `parse_args` 认顺序无关，
+    //    但两边"什么时候有哪几格"要对得上 —— 不然并排读两份 argv 时像是壳少拼了一个。
+    #expect(CoreClient.coreArguments(settingsPath: "/s.json", downloadDir: "/d", verboseLogging: true)
+            == ["--download-dir", "/d", "--settings", "/s.json", "--log-level", "verbose"])
 }
 
 // ---------------------------------------------------------------------------
@@ -639,5 +664,221 @@ final class Box<T>: @unchecked Sendable {
 
     let drained = await waitFor("stdout 那一行之后 stderr 继续被排空", within: 20) { sink.snapshot.count > 100 }
     #expect(drained, "stderr 只收到 \(sink.snapshot.count) 行——排水线程没在跑")
+}
+
+// ---------------------------------------------------------------------------
+// 详细档"每一次壳→内核的调用"那一行（规格 §2.3 的内核侧 C）
+//
+// 为什么必须有这一条：`performCall` 里那一句记账是**整档新增行为在壳侧的收口**，
+// 而同一个缺口在内核那侧已经撞过一次（任务 1 的任务审查：`aria2_call` 那一行 ——
+// 那个功能的主角 —— 一条判据都没有，**删掉记账 / 把 `why` 改成无条件 / 把闸门反过来，
+// 全套判据仍然全绿**）。Windows 壳那侧的同位缺口由任务 2 补上，这里是第三份。
+//
+// 🔴 **两条硬约束**（下面那条用例逐条绕开，机制见 `CoreClient.verboseSink`）：
+//   ① **不许往真的用户日志目录里写**：`DiagnosticsLog.logVerbose` 走
+//      `ShellStorage.directory`（= `~/Library/Application Support/BenagenDownloader/`，
+//      **这台机器上就是人类伙伴自己那一份**）—— 用例往那里写 = "跑一次测试"变成
+//      "往他的日志里灌测试数据"。
+//   ② **不许翻进程级静态**：`DiagnosticsLog.configure(.verbose)` 写的是全局，而同一进程里
+//      假设普通档的用例（含 `DiagnosticsLogTests` 的轮转用例、以及**所有**用默认出口的
+//      `CoreClient` 用例）会**随调度随机红 / 随机往真日志里写** —— 那种 flaky 比没有判据更坏。
+//
+// 注入 sink 把两条**同时**绕开：用例既不取那条路径（不碰 ①），也不读不写级别
+// （不碰 ②）。残余：`logVerbose` 里那道**闸门本身**（普通档不记）仍然没有判据 ——
+// 要判它就得动上面两样中的一样；它与 Windows 那侧的同位缺口是同一个，如实记账。
+//
+// ⚠️ 顺带说明**生产那一行的接线**（把 `verboseSink` 的初值换成空闭包，
+//    本文件全绿）：它没有本机判据，只由**真机验收**那条
+//    "打开详细日志 + 跑一次下载 ⇒ `diag-shell.log` 里 `event=kernel_call` 的条数 > 0" 守着。
+// ---------------------------------------------------------------------------
+
+/// 一个**记账替身**：把每一行收进内存，**不碰文件系统、不碰全局**。
+private final class VerboseRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [(String, [(String, String)])] = []
+
+    /// 注入用的那个出口。
+    var sink: @Sendable (String, [(String, String)]) -> Void {
+        { event, fields in
+            self.lock.lock()
+            self.lines.append((event, fields))
+            self.lock.unlock()
+        }
+    }
+
+    /// 读记录用的句柄。
+    var recorded: [(String, [(String, String)])] {
+        lock.lock(); defer { lock.unlock() }
+        return lines
+    }
+}
+
+/// 取一条记录里某个字段的值（没有这个字段 ⇒ `nil`）。
+private func fieldOf(_ line: (String, [(String, String)]), _ key: String) -> String? {
+    line.1.first { $0.0 == key }?.1
+}
+
+/// 🔴 **每一次壳→内核的调用都落一行；失败那一行带着壳自己给用户看的那句话**。
+///
+/// 三拍成功 + 一拍失败 ⇒ **四行**，且：
+///   · 成功那三条**不带 `why`**（补一个空字段会让"这一行有几个字段"随结果变）；
+///   · 失败那一条的 `why` **就是 `AppModel.message(of:)` 给的那句话**（与界面上同一份）。
+///
+/// 判别力（两条都实测过，读数见任务 5 的报告）：
+///   · 把 `performCall` 里那句 `recordKernelCall(…)` 删掉 ⇒ 记录 **0 行**，第一条断言红；
+///   · 把 `why` 改成**无条件**追加 ⇒ 成功那三条多出 `why=`，最后那道"不许带 why"红。
+@Test func everyKernelCallIsLoggedWithTheShellsOwnWordsOnFailure() throws {
+    let ch = FakeChannel()
+    ch.toSend = [
+        #"{"id":1,"ok":true,"result":{"protocol":1}}"#,
+        #"{"id":2,"ok":true,"result":{}}"#,
+        #"{"id":3,"ok":true,"result":{}}"#,
+        #"{"id":4,"ok":false,"error":{"code":"no_delivery","message":"这一批不存在或已过期"}}"#,
+    ]
+    let recorder = VerboseRecorder()
+    let client = CoreClient(channel: ch)
+    // ⚠️ 只换出口：**不给 setter**（那会多出一条只在测试里用的公开面，
+    //    还会给非测试构建带出一条 `dead_code` 之类的告警）。
+    //    这里能直接赋，是因为 `verboseSink` 是 internal 而本文件是 `@testable import`。
+    client.verboseSink = recorder.sink
+
+    _ = try client.callSync("hello", .object(["protocol": .integer(1)]))
+    _ = try client.callSync("get_state", .null)
+    _ = try client.callSync("get_state", .null)
+    let failure = #expect(throws: CoreError.self) { _ = try client.callSync("verify", .null) }
+
+    let lines = recorder.recorded
+    #expect(lines.count == 4,
+            "每一次调用都要落一行（3 拍成功 + 1 拍失败 = 4 行），实际 \(lines.map(\.0))")
+    guard lines.count == 4 else { return }
+
+    for line in lines {
+        #expect(line.0 == "kernel_call", "事件名必须是 kernel_call：\(line)")
+        #expect(fieldOf(line, "ms") != nil, "每一行都要带耗时：\(line)")
+        #expect(fieldOf(line, "ok") != nil, "每一行都要带成败：\(line)")
+    }
+    #expect(lines.compactMap { fieldOf($0, "method") } == ["hello", "get_state", "get_state", "verify"],
+            """
+            记的是方法名（参数里可能有交付码之类，一律不许进来）；顺序也要对得上 —— \
+            一行一次的对应关系本身是判据
+            """)
+
+    // 成功那三条：`ok=true`，且**没有 `why`**
+    for line in lines.prefix(3) {
+        #expect(fieldOf(line, "ok") == "true", "\(line)")
+        #expect(fieldOf(line, "why") == nil,
+                """
+                成功时**不许**带 `why` —— 补一个空字段会让这一行的字段数随结果变，\
+                而按空格切字段读它的下一个人会读到空值：\(line)
+                """)
+    }
+    // 失败那一条：`ok=false`，且 `why` 是壳给用户看的那句话（内核原文，逐字）
+    let last = lines[3]
+    #expect(fieldOf(last, "ok") == "false", "\(last)")
+    #expect(fieldOf(last, "why") == "这一批不存在或已过期",
+            """
+            失败时 `why` 必须是壳既有那句人话（`AppModel.message(of:)`），\
+            不是这里另写的、也不是 `\(String(describing: CoreError.self))` 那种调试形态：\(last)
+            """)
+    if let failure {
+        #expect(fieldOf(last, "why") == AppModel.message(of: failure),
+                "`why` 与界面上给用户看的那句必须是**同一份**")
+    }
+}
+
+/// 造一条**内核回错**的信封（键是 snake_case，与线上逐字相同）。
+///
+/// ⚠️ 正文必须交给 `CoreJSON.encoder` 去转义：夹具里那个目录名带着 `/` 与中文，
+///    手写字符串拼出来的那一行**不是合法 JSON**，`decodeEnvelope` 会先把它拒掉 ——
+///    于是用例会以"内核发来的一行不是合法 JSON"红，而它想测的东西一个字节都没走到。
+private func errorEnvelopeJSON(id: Int, code: String, message: String) -> String {
+    let value = JSONValue.object([
+        "id": .integer(Int64(id)),
+        "ok": .bool(false),
+        "error": .object(["code": .string(code), "message": .string(message)]),
+    ])
+    let data = (try? CoreJSON.encoder.encode(value)) ?? Data()
+    return String(decoding: data, as: UTF8.self)
+}
+
+/// 🔴 **交付码与下载目录**绝不许出现在**写下去的那一行**里（隐私，规格 §2.3 B）。
+///
+/// 为什么必须有它：这一批把**内核**那条拉交付页的路收窄成了"只记分类"
+/// （`core/src/delivery.rs` 的 `outcomeCategory`），正是**因为 URL 里含交付码** ——
+/// 而同一个码从**另一条**路回来了：内核 404 那句文案是**我们自己**拼的
+/// （`清单不存在（404）——请确认交付码是否正确：{url}`），它经 RPC 错误体流进 `why`，
+/// 而 `why` 是**逐字**落的。`core/src/main.rs` 的 `preflight` 同样把客户目录名带进来。
+/// ⇒ 壳在**它自己知道的那一刻**把这两个串推下来（`AppModel.rememberRedactions`），
+/// 由 `CoreClient.setRedactions` 在落盘前抹掉。
+///
+/// 判别力（两条都实测过，读数见终审修复报告）：
+///   · 把 `recordKernelCall` 里那句 `redact(…)` 换回 `AppModel.message(of: error)`（即不抹）⇒
+///     本用例两条断言都红 —— 而真机上的表现是**交付码与客户目录名被回传给我们**；
+///   · 把 `setRedactions` 的调用点从**发请求之前**挪到**失败之后**（`AppModel`）⇒
+///     那一次失败的日志里仍然带着码（`setRedactions` 的文档记着这条）。
+///
+/// ⚠️ **它钉住的是"抹掉"这一步本身**，不是"壳有没有把那两个串推下来"：
+///    推的那一处（`rememberRedactions`）的两个调用点判据不在本文件 —— 如实记账。
+@Test func theDeliveryCodeAndDownloadDirectoryNeverReachTheWrittenLine() throws {
+    // 形状按真的来：码是 20 位随机码里的那种、目录是客户机上那种带用户名的绝对路径。
+    let code = "C24-8ZQ7K3M9P1W5X7T2"
+    let dir = "/Users/zhangming/Downloads/Benagen"
+    // 内核 404 那句（`core/src/delivery.rs`）—— 码**是 URL 的一个路径段**。
+    let notFound = "清单不存在（404）——请确认交付码是否正确："
+        + "http://download.benagen.com/\(code)/manifest.json"
+    // 内核 preflight 那句（`core/src/main.rs`）—— 客户目录名在里面。
+    let preflight = "目标目录不可写（\(dir)）：拒绝访问"
+
+    let ch = FakeChannel()
+    ch.toSend = [
+        errorEnvelopeJSON(id: 1, code: "delivery_fetch_failed", message: notFound),
+        errorEnvelopeJSON(id: 2, code: "preflight_failed", message: preflight),
+    ]
+    let recorder = VerboseRecorder()
+    let client = CoreClient(channel: ch)
+    client.verboseSink = recorder.sink
+    client.setRedactions([dir, code])
+
+    _ = try? client.callSync("load_delivery", .object(["code": .string(code)]))
+    _ = try? client.callSync("enqueue", .null)
+
+    let lines = recorder.recorded
+    #expect(lines.count == 2, "两次失败两次记账：\(lines.map(\.0))")
+    guard lines.count == 2 else { return }
+
+    let first = fieldOf(lines[0], "why") ?? ""
+    #expect(!first.contains(code), "交付码进了日志：\(first)")
+    // **诊断价值要留住**：抹掉的是那两个串，不是整句话 —— URL 那个**路径段**
+    // 只剩 `[已隐去]`，而主机名、文件名、那句人话都还在（看日志的人仍然看得出
+    // "问题出在拉清单这一路上"）。
+    #expect(first.contains("清单不存在（404）"), "只抹那两个串，别把话抹没了：\(first)")
+    #expect(first.contains("download.benagen.com"), "别把整条 URL 抹掉：\(first)")
+    #expect(first.contains("manifest.json"), "别把整条 URL 抹掉：\(first)")
+    #expect(first.contains(DiagnosticsLog.redacted), "要看得出来这里被抹过：\(first)")
+
+    let second = fieldOf(lines[1], "why") ?? ""
+    #expect(!second.contains(dir), "客户目录名进了日志：\(second)")
+    #expect(!second.contains("zhangming"), "目录名的任一段都不该在：\(second)")
+    #expect(second.contains("目标目录不可写"), "只抹那两个串，别把话抹没了：\(second)")
+    #expect(second.contains("拒绝访问"), "内核原文的其余部分必须逐字留着：\(second)")
+}
+
+/// ⚠️ **没被告知要抹什么时，`why` 逐字透传**（这道防线不是"顺手改文案"的地方）。
+///
+/// 判别力：把 `redact` 改成"无条件把整段 `why` 抹成 `DiagnosticsLog.redacted`" ⇒ 本用例红
+/// —— 而真机上那是**最需要的那半句诊断信息没了**（`why` 存在的全部意义就是
+/// "引擎为什么没回话"）。它同时钉住"新连接的可抹清单是空的"这件事。
+@Test func withoutSecretsTheWhyIsVerbatim() throws {
+    let ch = FakeChannel()
+    ch.toSend = [#"{"id":1,"ok":false,"error":{"code":"no_delivery","message":"这一批不存在或已过期"}}"#]
+    let recorder = VerboseRecorder()
+    let client = CoreClient(channel: ch)
+    client.verboseSink = recorder.sink
+
+    _ = try? client.callSync("load_delivery", .null)
+
+    let lines = recorder.recorded
+    #expect(fieldOf(lines[0], "why") == "这一批不存在或已过期",
+            "没有要抹的串时一个字都不许动：\(lines)")
 }
 

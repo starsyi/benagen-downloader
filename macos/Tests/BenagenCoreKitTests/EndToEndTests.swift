@@ -406,7 +406,8 @@ private func percentEncodedPath(_ path: String) -> String {
 
     // ── 3) 起真内核（**两个目录都指到临时目录**）──────────────────────────────
     let client = try CoreClient.live(settingsPath: root.appendingPathComponent("settings.json").path,
-                                     downloadDir: downloadDir.path)
+                                     downloadDir: downloadDir.path,
+                                     verboseLogging: false)
     defer { client.shutdown() }
 
     // ── 3a) hello 握手 ──────────────────────────────────────────────────────

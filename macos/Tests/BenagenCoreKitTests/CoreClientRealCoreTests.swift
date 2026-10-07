@@ -21,7 +21,8 @@ private func liveClient() throws -> CoreClient {
         .appendingPathComponent("benagen-core-smoke-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     return try CoreClient.live(settingsPath: root.appendingPathComponent("settings.json").path,
-                               downloadDir: root.appendingPathComponent("downloads").path)
+                               downloadDir: root.appendingPathComponent("downloads").path,
+                               verboseLogging: false)
 }
 
 @Test(.enabled(if: CoreClient.devCoreBinaryExists()))

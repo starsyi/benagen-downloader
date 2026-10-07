@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # 为 Linux（x86_64-musl）构建 `benagen-dl` 的**单文件静态**分发产物。
 #
-# 构建机：root@<构建机>（<构建机主机名>，Oracle Linux 9.5，x86_64）
+# 构建机：root@172.20.204.11（downloader-01.benagen.local，Oracle Linux 9.5，x86_64）
 # **在那一台机器上**以 root 运行本脚本。
 #
 #   ① 在 Mac 上把源码送过去（**只碰 ${BUILD_ROOT}，绝不碰生产目录**）：
 #        rsync -a --delete --exclude 'target/' --exclude '.git/' --exclude 'dist_cli/' \
 #              --exclude 'macos/.build/' --exclude 'downloader/dist/' \
 #              --exclude '.superpowers/' --exclude '.claude/' --exclude '__pycache__/' \
-#              ./ root@<构建机>:/root/benagen-cli-build/src/repo/
+#              ./ root@172.20.204.11:/root/benagen-cli-build/src/repo/
 #      （实测：这几条排除**不是可选的**。带上 .git / target / .claude 是 15 GB 量级，
 #        排除之后源头总共 159 MB —— 这条链路只有 ~400 KB/s。）
 #   ② 在那台机器上跑本脚本：
-#        scp core/scripts/build_cli_linux.sh root@<构建机>:/tmp/
-#        ssh root@<构建机> 'bash /tmp/build_cli_linux.sh'
+#        scp core/scripts/build_cli_linux.sh root@172.20.204.11:/tmp/
+#        ssh root@172.20.204.11 'bash /tmp/build_cli_linux.sh'
 #
 # 产物：$BUILD_ROOT/out/benagen-dl-linux-x86_64（静态、能跑，末尾打印 file/readelf/sha256）
-#       取回：scp root@<构建机>:/root/benagen-cli-build/out/benagen-dl-linux-x86_64 \
+#       取回：scp root@172.20.204.11:/root/benagen-cli-build/out/benagen-dl-linux-x86_64 \
 #                 dist_cli/benagen-dl-linux-x86_64
 #
 # ---------------------------------------------------------------------------
@@ -223,7 +223,7 @@ ok "$TARGET 的 std 已装"
      从 Mac 上先跑（只碰 ${BUILD_ROOT}）：
        rsync -a --delete --exclude target --exclude .git --exclude dist_cli \\
              --exclude macos/.build --exclude downloader/dist \\
-             ./ root@<构建机>:$REPO_DIR/" 2
+             ./ root@172.20.204.11:$REPO_DIR/" 2
 
 ARIA2C_SRC="$REPO_DIR/core/assets/$ARIA2C_ASSET"
 [ -s "$ARIA2C_SRC" ] \

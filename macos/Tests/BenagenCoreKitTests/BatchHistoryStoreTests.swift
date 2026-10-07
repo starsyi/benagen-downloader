@@ -41,7 +41,8 @@ private func withTempDir(_ body: (URL) throws -> Void) throws {
     #expect(url.deletingLastPathComponent().lastPathComponent == "BenagenDownloader")
     #expect(url.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent
             == "Application Support")
-    // 内核的 `settings::default_path()`（`core/src/settings.rs:198-207`）用的是 `$HOME`；
+    // 内核的 `settings::default_path()`（函数定义在 `core/src/settings.rs:208`——原写
+    // `:198-207` 是**陈旧指针**，那几行现在只是它的文档注释）用的是 `$HOME`；
     // 这里钉的是"两边指同一个目录"这条契约的另一半。
     #expect(url.path.hasSuffix("/Library/Application Support/BenagenDownloader/history.json"),
             "实际 \(url.path)")

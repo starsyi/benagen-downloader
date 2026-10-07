@@ -127,7 +127,8 @@ public struct JsonFileStoreError: Error, Equatable, CustomStringConvertible {
 ///    由各自负责（内核改 `settings.json` 的形状不该让壳的历史跟着陪葬）。
 ///
 /// ⚠️ 先取 `$HOME`、再回退 `homeDirectoryForCurrentUser`：内核的
-///    `settings::default_path()`（`core/src/settings.rs:198-207`）用的是 `$HOME`
+///    `settings::default_path()`（函数定义在 `core/src/settings.rs:208`——原写
+///    `:198-207` 是**陈旧指针**，那几行现在只是它的文档注释）用的是 `$HOME`
 ///    （Go 的 `os.UserHomeDir()` 在 Unix 上就是它），而"同目录"这条契约要两边
 ///    算出**同一个**目录才算数。`$HOME` 在 GUI 应用里通常就是用户主目录，
 ///    但它是**环境变量**、可以被改；这里跟着内核取同一个来源，避免"壳写在 A、

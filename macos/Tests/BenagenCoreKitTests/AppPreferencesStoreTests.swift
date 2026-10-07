@@ -85,8 +85,8 @@ private struct TempDir {
     let temp = try TempDir()
     defer { temp.cleanUp() }
 
-    try temp.store.save(AppPreferences(downloadDir: "/Volumes/Data/交付/有 空格的目录"))
-    #expect(temp.store.load() == AppPreferences(downloadDir: "/Volumes/Data/交付/有 空格的目录"))
+    try temp.store.save(AppPreferences(downloadDir: "/Volumes/Data/交付/有 空格的目录", verboseLogging: false))
+    #expect(temp.store.load() == AppPreferences(downloadDir: "/Volumes/Data/交付/有 空格的目录", verboseLogging: false))
 }
 
 @Test func saveCreatesTheMissingDirectoryOnFirstRun() throws {
@@ -95,7 +95,7 @@ private struct TempDir {
     let nested = AppPreferencesStore(url: temp.url
         .appendingPathComponent("深一层/再深一层/preferences.json"))
 
-    try nested.save(AppPreferences(downloadDir: "/Volumes/Data"))
+    try nested.save(AppPreferences(downloadDir: "/Volumes/Data", verboseLogging: false))
 
     #expect(FileManager.default.fileExists(atPath: nested.url.path))
 }
@@ -106,15 +106,15 @@ private struct TempDir {
     //（一次"以为存上了"的静默失败，用户要等到重启之后才发现 —— 而那时已经无从归因）。
     let temp = try TempDir()
     defer { temp.cleanUp() }
-    try temp.store.save(AppPreferences(downloadDir: "/Volumes/旧"))
+    try temp.store.save(AppPreferences(downloadDir: "/Volumes/旧", verboseLogging: false))
 
     // 把临时文件名占成一个**目录** ⇒ 这次写必失败（同 `JsonFileStoreTests` 的手法）。
     let blocker = temp.url.appendingPathComponent(JsonFileStore.temporaryName(for: temp.store.url))
     try FileManager.default.createDirectory(at: blocker, withIntermediateDirectories: true)
 
     #expect(throws: (any Error).self) {
-        try temp.store.save(AppPreferences(downloadDir: "/Volumes/新"))
+        try temp.store.save(AppPreferences(downloadDir: "/Volumes/新", verboseLogging: false))
     }
-    #expect(temp.store.load() == AppPreferences(downloadDir: "/Volumes/旧"),
+    #expect(temp.store.load() == AppPreferences(downloadDir: "/Volumes/旧", verboseLogging: false),
             "写失败之后盘上那份必须**逐字还是旧的**")
 }

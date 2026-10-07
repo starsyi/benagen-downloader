@@ -11,6 +11,36 @@
     },
     "ok": true
   },
+  "diagnosticsExportCancelled": {
+    "data": {
+      "headline": "没有导出（你取消了选择文件夹）",
+      "is_failure": false,
+      "notice_text": "没有导出（你取消了选择文件夹）",
+      "path_detail": null,
+      "privacy_note": null
+    },
+    "ok": true
+  },
+  "diagnosticsExportDone": {
+    "data": {
+      "headline": "诊断日志已导出",
+      "is_failure": false,
+      "notice_text": "诊断日志已导出到 D:\\导出\\诊断日志-20260101-000000",
+      "path_detail": "D:\\导出\\诊断日志-20260101-000000",
+      "privacy_note": "这份日志可能包含下载地址片段，发送前你可以自己打开看一眼。"
+    },
+    "ok": true
+  },
+  "diagnosticsExportFailed": {
+    "data": {
+      "headline": "诊断日志没有导出：建不了文件夹 /Volumes/Data/只读/诊断日志-20260101-000000（系统原话：Permission denied (os error 13)）。补救：换一个能写的文件夹再试一次（比如桌面），或检查那个位置是不是一个文件、磁盘是不是满了。",
+      "is_failure": true,
+      "notice_text": "诊断日志没有导出：建不了文件夹 /Volumes/Data/只读/诊断日志-20260101-000000（系统原话：Permission denied (os error 13)）。补救：换一个能写的文件夹再试一次（比如桌面），或检查那个位置是不是一个文件、磁盘是不是满了。",
+      "path_detail": null,
+      "privacy_note": null
+    },
+    "ok": true
+  },
   "enqueueNothing": {
     "data": {
       "rejections": [],
@@ -511,7 +541,10 @@
     "data": {
       "dir": "/Volumes/Data/交付",
       "display": "/Volumes/Data/交付",
-      "section_note": "没有设置过时，壳**不指定**下载目录，由内核用它自己的默认值。改变目录会立刻重启内核（正在跑的任务会停）。请尽量选**本机磁盘**上的目录：网络盘（NFS / SMB）会让界面明显变慢。"
+      "section_note": "没有设置过时，壳**不指定**下载目录，由内核用它自己的默认值。改变目录会立刻重启内核（正在跑的任务会停）。请尽量选**本机磁盘**上的目录：网络盘（NFS / SMB）会让界面明显变慢。",
+      "verbose_label": "详细日志",
+      "verbose_logging": false,
+      "verbose_note": "打开后日志会详细很多（用于排查问题），排查完请关掉。改动会立刻重启内核（正在跑的任务会停）。"
     },
     "ok": true
   },
@@ -519,7 +552,21 @@
     "data": {
       "dir": "",
       "display": "默认（~/Downloads/Benagen，由内核决定）",
-      "section_note": "没有设置过时，壳**不指定**下载目录，由内核用它自己的默认值。改变目录会立刻重启内核（正在跑的任务会停）。请尽量选**本机磁盘**上的目录：网络盘（NFS / SMB）会让界面明显变慢。"
+      "section_note": "没有设置过时，壳**不指定**下载目录，由内核用它自己的默认值。改变目录会立刻重启内核（正在跑的任务会停）。请尽量选**本机磁盘**上的目录：网络盘（NFS / SMB）会让界面明显变慢。",
+      "verbose_label": "详细日志",
+      "verbose_logging": false,
+      "verbose_note": "打开后日志会详细很多（用于排查问题），排查完请关掉。改动会立刻重启内核（正在跑的任务会停）。"
+    },
+    "ok": true
+  },
+  "preferencesGetWindows": {
+    "data": {
+      "dir": "D:\\交付\\Benagen",
+      "display": "D:\\交付\\Benagen",
+      "section_note": "没有设置过时，壳**不指定**下载目录，由内核用它自己的默认值。改变目录会立刻重启内核（正在跑的任务会停）。请尽量选**本机磁盘**上的目录：网络盘（NFS / SMB）会让界面明显变慢。",
+      "verbose_label": "详细日志",
+      "verbose_logging": false,
+      "verbose_note": "打开后日志会详细很多（用于排查问题），排查完请关掉。改动会立刻重启内核（正在跑的任务会停）。"
     },
     "ok": true
   },
@@ -547,6 +594,15 @@
       "is_failure": false,
       "notice_text": "下载目录没有变化，没有重启内核",
       "path_detail": null
+    },
+    "ok": true
+  },
+  "preferencesSetWindowsChanged": {
+    "data": {
+      "headline": "下载目录已改（内核已按新目录重启）",
+      "is_failure": false,
+      "notice_text": "下载目录已改为 D:\\交付\\交付_新盘（内核已按新目录重启）",
+      "path_detail": "D:\\交付\\交付_新盘"
     },
     "ok": true
   },
@@ -1301,6 +1357,24 @@
         "count_text": "已选 200000 项",
         "size_text": "合计 195.3 GB"
       }
+    },
+    "ok": true
+  },
+  "verboseLoggingSetChanged": {
+    "data": {
+      "headline": "详细日志已打开（内核已按详细档重启）",
+      "is_failure": false,
+      "notice_text": "详细日志已打开（内核已按详细档重启）",
+      "path_detail": null
+    },
+    "ok": true
+  },
+  "verboseLoggingSetFailed": {
+    "data": {
+      "headline": "内核还在重启中，这一次没有改成。详细日志开关已经记下来了，下次启动会按它生效。",
+      "is_failure": true,
+      "notice_text": "内核还在重启中，这一次没有改成。详细日志开关已经记下来了，下次启动会按它生效。",
+      "path_detail": null
     },
     "ok": true
   }

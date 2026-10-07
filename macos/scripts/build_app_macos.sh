@@ -72,7 +72,7 @@
 set -euo pipefail
 
 ARCH="${1:-${BENAGEN_ARCH:-arm64}}"
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-0.2.0}"
 MIN_MACOS="${MIN_MACOS:-13.0}"
 BUNDLE_ID="com.benagen.downloader"
 BIN_NAME="BenagenDownloader"

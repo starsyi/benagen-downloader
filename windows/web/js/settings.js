@@ -110,6 +110,14 @@ export function openSettings(ctx, hooks) {
   const dirReceiptIconEl = byIdIn(root, "set-dir-receipt-icon");
   const dirReceiptTextEl = byIdIn(root, "set-dir-receipt-text");
   const dirReceiptDismissEl = byIdIn(root, "set-dir-receipt-dismiss");
+  const verboseEl = byIdIn(root, "set-verbose");
+  const verboseLabelEl = byIdIn(root, "set-verbose-label");
+  const verboseNoteEl = byIdIn(root, "set-verbose-note");
+  const exportEl = byIdIn(root, "set-export");
+  const exportReceiptEl = byIdIn(root, "set-export-receipt");
+  const exportReceiptIconEl = byIdIn(root, "set-export-receipt-icon");
+  const exportReceiptTextEl = byIdIn(root, "set-export-receipt-text");
+  const exportReceiptDismissEl = byIdIn(root, "set-export-receipt-dismiss");
   const paramsRowsEl = byIdIn(root, "set-params-rows");
   const paramsNotesEl = byIdIn(root, "set-params-notes");
   const unavailableEl = byIdIn(root, "set-unavailable");
@@ -126,7 +134,7 @@ export function openSettings(ctx, hooks) {
   // 「收起」那颗 ×：走 `dialogs.js:dismissButton`（克隆模板 + **补上那个 ×**）。
   // ⚠️ 只克隆、不补图形的话，那是一颗**没有内容的小方块** —— 看得见（悬停才有一点底色）、
   //    但在客户眼里与"这里坏了"分不开。这一条是审查抓出来的（五个地方同一个错）。
-  for (const host of [dirReceiptDismissEl, failureDismissEl]) {
+  for (const host of [dirReceiptDismissEl, exportReceiptDismissEl, failureDismissEl]) {
     host.append(dismissButton(() => host.__dismiss()));
   }
 
@@ -150,6 +158,14 @@ export function openSettings(ctx, hooks) {
    *    ⇒ 合成一个的话，`chooseDirectory` 拿到结果再调 `askDirectory` 时会被自己挡住。
    */
   let picking = false;
+  /**
+   * 一次「导出诊断日志…」在飞（**只挡开第二个系统对话框**，理由同 [`picking`]）。
+   *
+   * ⚠️ 它与 `picking` 是**两件事**（两个按钮、两条命令），各自挡自己那一颗：
+   *    真机上两个对话框都是**模态**的，同时点不出两个来；分成两格只是为了让
+   *    "哪一颗正在等系统"这件事在代码里读得出来。
+   */
+  let exporting = false;
   /** 引擎闸门（`state().allows_requests`，壳每一拍灌进来）。 */
   let gateOpen = false;
   /**
@@ -172,6 +188,9 @@ export function openSettings(ctx, hooks) {
   };
   failureDismissEl.__dismiss = () => {
     failureEl.hidden = true;
+  };
+  exportReceiptDismissEl.__dismiss = () => {
+    exportReceiptEl.hidden = true;
   };
 
   // ---------------------------------------------------------------------------
@@ -349,14 +368,40 @@ export function openSettings(ctx, hooks) {
     if (!preferences) return;
     // ⚠️ **中间截断**（macOS `SettingsView` 那一格是 `.lineLimit(1).truncationMode(.middle)`）：
     //    切成两段交给 CSS（规则与理由见 `dom.js:middleSplit` —— 一个字符都不改，
-    //    省略号由浏览器画）。分隔符是 `/`：**文件名那一格一个字都不许少**
-    //    （用户要看的正是"下到哪个目录的哪个名字"）。
-    setText(dirDisplayHeadEl, middleSplit(preferences.display, "/")[0]);
-    setText(dirDisplayTailEl, middleSplit(preferences.display, "/")[1]);
+    //    省略号由浏览器画）。
+    // 🔴 **两个分隔符都要认**（`/` 与 `\`）：真机是 Windows，那边的路径里**一个 `/`
+    //    都没有** ⇒ 只传 `"/"` 的话 `middleSplit` 回 `[整条, ""]`（`dom.js:107` 的兜底）
+    //    ⇒ **尾段空着**，而缩的是 `.mid__head`、`.mid__tail` 是 `flex: none` ⇒
+    //    "这一格一个字都不许少"的那个名字**恰好落进会被省略号吃掉的那一段**。
+    //    （覆盖：`panels-harness.html` 的 ③目录w1 / ③目录w3 用一份 Windows 形状的
+    //      载荷各钉一处。
+    //    ⚠️ **POSIX 形状那一档的账要分开算**（2026-10-06，Task 4 第三轮重审测量后订正）：
+    //       **回执**那一档真的有判据（③zb2 —— 把 `:558` 改成只认 `\` 会让它红）；
+    //       而**显示行**那一档**没有**（把这两行改成只认 `\`，整屏 **140/0、一条都不红**）。
+    //       原因是 ③b2 只断 `title`、③b 只断 `textContent`，**两者对"这条串从哪儿切开"
+    //       都不敏感**。⇒ 别拿 ③b2 的绿当作这两行 POSIX 分支的判据；那是本批之前就有的
+    //       缺口（这一行原先两种形状都没有判据），不是本批引入的。）
+    setText(dirDisplayHeadEl, middleSplit(preferences.display, "/\\")[0]);
+    setText(dirDisplayTailEl, middleSplit(preferences.display, "/\\")[1]);
     // 悬停给**全文**（原文那一份，不是切过的）—— 这是"截断之后还看得到全部"的出口。
     dirDisplayEl.setAttribute("title", preferences.display);
     dirInputEl.value = typeof preferences.dir === "string" ? preferences.dir : "";
     setText(dirNoteEl, preferences.section_note);
+
+    // ⚠️ **勾选框那一格（规格 §2.4）**：标签与说明**跟着载荷下来**（`verbose_label` /
+    //    `verbose_note`）—— 本文件一个字都不造（§3.2）。判"是不是开着"的是
+    //    `verbose_logging` 这一格，而它是**盘上那一份**：这条命令每次落盘之后都会
+    //    重读一次（见 `setVerboseLogging`），于是"存失败了"时勾会**跟着回去**，
+    //    不会出现"勾着、而盘上没记住"那种下次启动才发现的分叉。
+    setText(
+      verboseLabelEl,
+      typeof preferences.verbose_label === "string" ? preferences.verbose_label : ""
+    );
+    setText(
+      verboseNoteEl,
+      typeof preferences.verbose_note === "string" ? preferences.verbose_note : ""
+    );
+    verboseEl.checked = preferences.verbose_logging === true;
   }
 
   /**
@@ -454,6 +499,43 @@ export function openSettings(ctx, hooks) {
     await loadPreferences();
   }
 
+  /**
+   * 打开 / 关掉**详细诊断日志**（`verbose_logging_set`）。**改了会重启内核**。
+   *
+   * ⚠️ **没有确认框**（与改下载目录那条不同）：这一格不选路径、不会把文件导到别处去，
+   *    macOS 那一侧也是一个直接的 `Toggle`。代价（正在跑的任务会停）已经写在
+   *    那句说明里（`verbose_note` 的最后半句）—— 用户**按之前**就看得见。
+   *
+   * ⚠️ **它抢的是同一条 `busy`**（与改目录共用）：两条命令都会重启内核，
+   *    同时来一发等于把刚起来的内核再换掉一次。
+   *
+   * ⚠️ **无论成败都重读一次偏好**：回执那一份可能被归一化过，而**失败时那一格更关键** ——
+   *    写盘失败 / 内核起不来的话，界面上的勾必须回到**盘上那一份**，
+   *    否则用户看到"勾上了"而根本没记下来（E-2 明禁的那种"以为存上了"）。
+   */
+  async function setVerboseLogging(on) {
+    if (busy) return;
+    busy = true;
+    try {
+      let change;
+      try {
+        change = await ctx.call(ctx.CMD.verboseLoggingSet, { on });
+      } catch (error) {
+        showFailure(failureText(error));
+        await loadPreferences();
+        return;
+      }
+      // 回执与改目录那条**同一片区域、同一条常驻行**（两件事都是"改了一项要重启内核
+      // 的设置"，回执的形状也逐格相同 —— 见 `api::preferences::verbose_change`）。
+      paintChangeReceipt(change);
+      // 内核按新档位重启了 ⇒ 补一拍，让引擎徽标当场跟着动（同 `applyDirectory`）。
+      ctx.poller.pollNow();
+      await loadPreferences();
+    } finally {
+      busy = false;
+    }
+  }
+
   /** 把一条改目录的回执落到窗口里那一行上（图标是**绘制**，文字全部来自载荷）。 */
   function paintChangeReceipt(change) {
     dirReceiptEl.hidden = false;
@@ -476,9 +558,10 @@ export function openSettings(ctx, hooks) {
     if (detail) {
       // 路径单独一行、可悬停看全文（`headline` 里**不含**路径 —— 那正是两格分开的理由）。
       // ⚠️ **中间截断**（`app_preferences` 的 `path_detail` 逐字："单行 + 中间截断 +
-      //    悬停看全文"）：切在最后一个 `/` 之后 ⇒ **文件名那一格一个字都不少**。
+      //    悬停看全文"）：切在**最后一个分隔符**之后 ⇒ **文件名那一格一个字都不少**。
+      //    🔴 两个分隔符都认（理由与显示行那条逐字相同：真机是 Windows，路径里没有 `/`）。
       //    两格之间不许有空白文本节点（否则跨格复制会多一个空格）。
-      const [pathHead, pathTail] = middleSplit(detail, "/");
+      const [pathHead, pathTail] = middleSplit(detail, "/\\");
       const pathEl = h("span", { class: "dlg__receipt-path selectable", title: detail });
       pathEl.append(h("span", { class: "mid__head", text: pathHead }));
       pathEl.append(h("span", { class: "mid__tail", text: pathTail }));
@@ -495,6 +578,80 @@ export function openSettings(ctx, hooks) {
         hint: detail || null,
         dismiss: true,
       });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 导出诊断日志（规格 §2.5）
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 「导出诊断日志…」：**一次系统对话框 + 一次拷贝**，回执就落在**本节里**（按钮下面）。
+   *
+   * ⚠️ **回执画在本节**（不是下载目录那一节的那一行）：用户点的是这一节里的按钮，
+   *    确认就该出现在**同一节**里（上一轮那个开关的教训：勾选框在自己那一节、
+   *    回执却画在头顶那一节 —— 不是假话，是误导）。
+   *
+   * ⚠️ **三档都不是错误**（命令层的那条口径）：成功 / 取消 / 失败都走**成功信封**，
+   *    由 `is_failure` 决定图标与颜色。取消那一档也**必须说一句** ——
+   *    用户点了「导出」而界面一动不动，与"卡住了"分不开（约束 4）。
+   *    只有**命令本身发不出去**（宿主里没有这条命令）才走 `showFailure` 那条既有路径。
+   */
+  async function exportDiagnostics() {
+    if (exporting) return;
+    exporting = true;
+    try {
+      const change = await ctx.call(ctx.CMD.diagnosticsExport);
+      paintExportReceipt(change);
+    } catch (error) {
+      showFailure(failureText(error));
+    } finally {
+      exporting = false;
+    }
+  }
+
+  /**
+   * 把一次导出的回执落到本节那一行上（图标是**绘制**，文字全部来自载荷）。
+   *
+   * ⚠️ 四格与改设置那两条**同形**（`headline` / `path_detail` / `is_failure`：前端只有
+   *    一条渲染路径的写法在这里照抄了一遍结构），多出来的第五格 `privacy_note` 是
+   *    规格 §2.7 要求的**第二处明说** —— 它**只在成功那一档有值**（没导出东西的时候
+   *    没有什么可提醒的），所以是"有才画"。
+   */
+  function paintExportReceipt(change) {
+    exportReceiptEl.hidden = false;
+    clear(exportReceiptIconEl);
+    const failure = change && change.is_failure === true;
+    exportReceiptIconEl.className = failure ? "dlg__receipt-icon is-failure" : "dlg__receipt-icon";
+    exportReceiptIconEl.append(
+      icon(failure ? "exclamationmark.triangle.fill" : "checkmark.circle.fill", "dlg__receipt-svg")
+    );
+    const headline = change && typeof change.headline === "string" ? change.headline : "";
+    const detail = change && typeof change.path_detail === "string" ? change.path_detail : "";
+    clear(exportReceiptTextEl);
+    exportReceiptTextEl.append(
+      h("span", { class: "dlg__receipt-headline selectable", text: headline })
+    );
+    if (detail) {
+      // 路径单独一行、中间截断 + 悬停看全文（与改目录那条**同一套**：
+      // `path_detail` 的契约就是"单行 + 中间截断 + 悬停"）。
+      // ⚠️ **两个分隔符都要认**（`/` 与 `\`）：真机是 Windows，那边的路径里**一个 `/`
+      //    都没有** ⇒ 只传 `"/"` 的话 `middleSplit` 会回 `[整条, ""]`
+      //    （`dom.js:107` 的兜底）⇒ **用户最需要看到的那一格（目标文件夹的名字）
+      //    恰好落进会被压缩的前一段**。这一屏存在的唯一目的就是告诉用户"东西在哪"，
+      //    所以这里按真机形状写。
+      //    ✅ **本机看得见**：夹具里那一条（`diagnosticsExportDone`）**就是 Windows 形状的**
+      //    （`D:\导出\诊断日志-…`，故意的）⇒ `panels-harness.html` 的 ③导出6 会
+      //    在有人把这里退回 `"/"` 时红（实测：`["D:\\导出\\诊断日志-…",""]`）。
+      const [pathHead, pathTail] = middleSplit(detail, "/\\");
+      const pathEl = h("span", { class: "dlg__receipt-path selectable", title: detail });
+      pathEl.append(h("span", { class: "mid__head", text: pathHead }));
+      pathEl.append(h("span", { class: "mid__tail", text: pathTail }));
+      exportReceiptTextEl.append(pathEl);
+    }
+    const note = change && typeof change.privacy_note === "string" ? change.privacy_note : "";
+    if (note) {
+      exportReceiptTextEl.append(h("span", { class: "set__note selectable", text: note }));
     }
   }
 
@@ -587,6 +744,17 @@ export function openSettings(ctx, hooks) {
   });
   saveEl.addEventListener("click", () => {
     void save();
+  });
+  // 详细日志那个勾选框：**只有真的变了才发命令**（`change` 事件本身就是这个语义，
+  // 而命令那一侧还有一道"同值 ⇒ 什么都不做"的兜底 —— 一条迟到的重复不许把
+  // 用户正在跑的任务重启掉）。
+  verboseEl.addEventListener("change", () => {
+    void setVerboseLogging(verboseEl.checked);
+  });
+  // 「导出诊断日志…」：**一次系统对话框 + 一次拷贝**，回执落在本节里那颗按钮下面
+  // （与上面那个勾选框同一节 —— 见 `exportDiagnostics` 的文档）。
+  exportEl.addEventListener("click", () => {
+    void exportDiagnostics();
   });
 
   /**

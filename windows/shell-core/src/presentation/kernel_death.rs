@@ -29,6 +29,11 @@
 //!    「下载引擎已断开」，套上去成了「下载引擎已断开：下载引擎已断开」。
 //!    约束 3（壳不加工内核的话）在这里就是判据：**内核亲口说的，原样登。**
 //!
+//! ⚠️ **还有第三支，它不在上游**（本代新加的，规格 §3 A5）：[`ClientError::CallTimedOut`]
+//!    —— 壳自己等超时了（看门狗把通道判死）。规格的原话是「把这条通道判死
+//!    （**等同于 `KernelGone`**），走既有的「内核没了」路径（横幅 + 「重试」）」，
+//!    所以它走**第一列**（壳加前缀）：它也是**壳探测到的**状况，没有内核原文可登。
+//!
 //! ## ⚠️ 两个**内核报的**码**并列**（照上游；控制者 2026-09-19 裁定）
 //!
 //! 上游那一支是 `case .engineDisconnected?, .engineStartFailed?` —— 两个码都翻 `Unavailable`。
@@ -70,6 +75,20 @@ impl KernelDeath {
         match error {
             // ① 传输层：管道结束 ⇒ 内核进程没了（`client.rs`：这是"内核已死"的唯一可靠信号）。
             ClientError::KernelGone => Some(format!("{}{}", Self::PREFIX, error_text(error))),
+            // ①′ 传输层：**壳自己等超时了**（A5）—— 看门狗已经把这条通道关掉、子进程也收了
+            //     ⇒ 规格 §3 A5 的原话是「把这条通道**判死**（**等同于 `KernelGone`**），
+            //     走既有的「内核没了」路径（横幅 + 「重试」）」。
+            //    ⚠️ 为什么必须在这一处接上（而不是"报个错就行"）：`CallTimedOut` 那句原文
+            //       里写着"请点「重试」"，而那颗「重试」**只挂在引擎不可用那条横幅上**
+            //       （`EngineBanner::of`：`shows_retry` 只有 `Unavailable` 那一档是 true）。
+            //       不接上，客户会看到一句**指向不存在的按钮**的补救 —— 本仓对这条有前科
+            //       （`ClientError::RequestTooLong` 那句"分批发"就是这么改掉的）。
+            //    ⚠️ 与 ① 用**同一条**格式（带壳写的前缀）：界面上要做的动作是同一个。
+            //       `client.rs` 那一侧记着两件事的**不同**（内核可能还活着，所以不许报成
+            //       `KernelGone`）；这里取的是两者的**相同**之处。
+            ClientError::CallTimedOut { .. } => {
+                Some(format!("{}{}", Self::PREFIX, error_text(error)))
+            }
             // ② 内核**自己**报的那两个码（上游 `case .engineDisconnected?, .engineStartFailed?`）：
             //    "引擎已被判定断开、这次重连也没成功"（设计规格 §9）与"引擎起不来"
             //    （端口被占之类）。**两个并列**，因为上游就是并列的、两边的可见结果相同。
@@ -234,6 +253,47 @@ mod tests {
 
     use super::{is_engine_not_started, is_no_delivery, CallFailure, KernelDeath};
     use crate::client::ClientError;
+    use std::time::Duration;
+
+    /// 🔴 **壳自己等超时了，也是「内核没了」那一档**（规格 §3 A5 的原话：
+    /// 「把这条通道判死（**等同于 `KernelGone`**），走既有的「内核没了」路径（横幅 +
+    /// 「重试」）」）。
+    ///
+    /// 判别力：把 `reason_of` 里 `CallTimedOut` 那一支删掉 ⇒ 本条红。而真机上的表现是
+    /// **客户看到一句"请点「重试」"，屏幕上一颗「重试」都找不到** —— 那颗按钮只挂在引擎
+    /// 不可用那条横幅上（`EngineBanner::of`：`shows_retry` 只有 `Unavailable` 那一档是真）。
+    /// 本仓对"补救指向一个不存在的动作"有前科：`ClientError::RequestTooLong` 那句
+    /// "把 enqueue 分批发"就是因为界面里没有那个动作而改掉的。
+    #[test]
+    fn a_shell_side_call_timeout_is_a_kernel_death_too() {
+        let error = ClientError::CallTimedOut {
+            method: "get_state".to_string(),
+            waited: Duration::from_secs(150),
+        };
+        let reason = KernelDeath::reason_of(&error).expect("超时判死就是「内核没了」那一档");
+        assert_eq!(
+            reason, "下载引擎已断开：内核在 150s 内没有回应 get_state——这条通道已判死，请点「重试」",
+            "与 `KernelGone` 同一列（壳加前缀）；正文是 `client.rs` 那句人话，一字不改"
+        );
+        assert!(
+            reason.contains("重试"),
+            "这句话必须给出路 —— 而「重试」那颗按钮真的会出现（本条守的就是这件事）：{reason}"
+        );
+
+        // 完整的落点：调用方拿到的必须是 `KernelGone` 那一格（翻引擎 + 就地显示两句话），
+        // 不是 `Text`（那一格**不翻引擎** ⇒ 横幅与「重试」都不会出现）。
+        match CallFailure::of(&error) {
+            CallFailure::KernelGone { reason: r, text } => {
+                assert_eq!(r, reason, "翻引擎那句与 `reason_of` 是同一句");
+                assert!(
+                    !text.contains(KernelDeath::PREFIX),
+                    "就地显示的那句**不带**壳写的前缀（免得与横幅逐字重复）：{text}"
+                );
+                assert_ne!(text, r, "两句话是两件事，不许退化成同一句");
+            }
+            other => panic!("超时判死必须走「内核没了」那一格，实际是 {}", other.text()),
+        }
+    }
 
     /// 传输层那一支：**壳加前缀**，而且前缀是逐字的那一个。
     ///

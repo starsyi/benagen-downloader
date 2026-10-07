@@ -173,7 +173,7 @@ FONT_RELEASE_API="https://api.github.com/repos/notofonts/noto-cjk/releases/tags/
 #    同样覆盖这些字形**的子集"就能**全绿**过去 —— 而"不许打包不可再分发字体"（W-5）
 #    就**没有任何自动化在守**。第 8/9 步在生成模式里做同样的闭环（对不上就退出 3 并打印
 #    该抄的那一行，与 `fetch_windows_aria2c.sh` 第 9 步同一手法）。
-SUBSET_SHA256="8b2c504a2eda0674ed27d8d70d729325fddda48893107b3a552e437a02f70f80"
+SUBSET_SHA256="b9d9eeee92cc5efe3996a1980f28b1918459d1883dbc3d1cf390df862427c765"
 
 # 那条硬线：**超过 1 MB 就停下来重新权衡**（口径出自 2026-09-18 规格 §14.1，那份文件
 # 已随那一代方案删除；数字没变，见文件头"登记闭环"与规格 §6.3 末尾的遗留记账）。

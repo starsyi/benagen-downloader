@@ -894,6 +894,42 @@
         </div>
       </section>
 
+      <!-- 「详细日志」那一个勾选框（规格 §2.4）。**改了要重启内核**
+           （与下载目录那一段同一条后果：档位只在 argv 上）。
+           ⚠️ 标签与那句说明都**来自载荷**（`preferences_get` 的 `verbose_label` /
+              `verbose_note`）—— 本文件里因此一个新界面词都没有，JS 也不许造
+              （§3.2；这个控件是运行时画的，要按偏好的当前值设 `checked`）。
+           ⚠️ 控件用的是**原生** `<input type="checkbox">`（`accent-color` 取本应用的
+              accent）：文件页那一颗自绘的 `.files__cb` 是**那一屏的**控件形状
+              （它要跟 macOS 行首那对 `checkmark.square.fill` / `square` 对位，
+              而且是行里唯一看得见的勾选表示）；这一格的勾选框旁边**永远跟着一句
+              label**，再造一份自绘实现只会让同一个控件有两处实现。 -->
+      <section class="set__section">
+        <label class="set__check" id="set-verbose-check">
+          <input type="checkbox" id="set-verbose">
+          <span class="set__check-label" id="set-verbose-label"></span>
+        </label>
+        <p class="set__note" id="set-verbose-note"></p>
+        <!-- 「导出诊断日志…」那颗按钮（规格 §2.5）。它与上面那个开关是**同一节**的
+             两半：开关把日志打开、导出把它取出来交给分析的人。
+             ⚠️ **按钮与它的回执都住在本节里**（紧挨着按钮）—— 上一轮那个开关的教训：
+                 「勾选框在自己那一节、回执却画在上面那一节」，用户勾一下、确认出现在
+                 头顶那一段，指错了地方（不是假话，是误导）。
+             动作本身：弹一次系统的「选择文件夹」（复用 `pick_directory` 那一个对话框），
+             在里面建一个带时间戳的子目录，把日志与一份说明文件拷进去。
+             ⚠️ 回执那几格（标题 / 路径 / 隐私提醒）**全部来自载荷**（`api::diagnostics`）
+                 —— 本文件里没有一个字是这次动作的文案，JS 也不许造（§3.2）。 -->
+        <div class="set__row">
+          <button class="set__btn" id="set-export" type="button">导出诊断日志…</button>
+        </div>
+        <div class="set__receipt" id="set-export-receipt" hidden>
+          <span class="dlg__receipt-icon" id="set-export-receipt-icon"></span>
+          <span class="set__receipt-text" id="set-export-receipt-text"></span>
+          <span class="set__spacer"></span>
+          <span class="set__dismiss" id="set-export-receipt-dismiss"></span>
+        </div>
+      </section>
+
       <section class="set__section">
         <div class="set__params" id="set-params-rows"></div>
         <!-- 三句说明（限速那句 / 生效时机那句）集中在表下面：载荷里那七项只有

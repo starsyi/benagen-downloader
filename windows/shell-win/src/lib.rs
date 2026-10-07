@@ -37,6 +37,12 @@ pub mod commands;
 ///    ⚠️ 它进 lib 而不是留在 bin 里，正是下面 D1 那条理由的正面用法：
 ///    **bin 暂时不用不算死代码**，而任务能自底向上做。
 pub mod embed;
+/// **导出诊断日志**里"真的去拷文件"的那一半（规格 §2.5）。
+///
+/// ⚠️ 判据与文字在 `shell_core::export`（时间戳目录名、要拷哪些、说明文件的全文、
+///    失败那句话），本模块只做那两次系统调用（`create_dir_all` / `fs::copy`）
+///    与"逐份文件量事实"。拆法与 `pickdir` / `reveal` 逐字同款。
+pub mod export;
 pub mod kernel;
 // ⚠️ **它进 lib 是因为那两份许可全文必须内嵌进交付形态**（W-5 / 裁定 RR）：本模块用
 //    `include_str!` 把 GPLv2 与 OFL-1.1 两份**全文**编进二进制，而"编进二进制"这件事

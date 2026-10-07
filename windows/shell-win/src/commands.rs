@@ -15,8 +15,10 @@
 //! ## ⚠️⚠️ 锁的纪律：**绝不在持锁时调 `kernel::*`**
 //!
 //! `session.rs` 的文件头写着这条，而**本文件是新的调用点，同一条纪律照旧**。
-//! `kernel::*` 那些函数是**阻塞**的（`CoreClient::call` 没有每请求超时，
-//! `load_delivery` 最坏约 91.5 秒），而 `Session` 的锁是所有命令共用的
+//! `kernel::*` 那些函数是**阻塞**的（`CoreClient::call` 的上界按方法名分两档：普通
+//! **150 秒**、长调用家族 **600 秒** —— 两档都刻意取长。⚠️ `load_delivery` 的最坏值
+//! **不是** 91.5 秒：那只是内核三段记账里的第一段，见 `client.rs` 的 `LONG_CALL_TIMEOUT`），
+//! 而 `Session` 的锁是所有命令共用的
 //! （`state()` 一秒一问，规格 §3.5）—— 持着锁等内核，等于让**整个前端的轮询**跟着停摆。
 //!
 //! 本文件的写法只有两种，两种都把锁放掉了：
@@ -48,8 +50,11 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use shell_core::api;
+use shell_core::export::Header;
 use shell_core::presentation::about_info::AboutInfo;
-use shell_core::presentation::app_preferences::{DownloadDirChange, DownloadDirectory};
+use shell_core::presentation::app_preferences::{
+    DownloadDirChange, DownloadDirectory, VerboseLoggingChange,
+};
 use shell_core::presentation::breadcrumb::Breadcrumb;
 use shell_core::presentation::browser_row::{BrowserRow, BrowserSelection, SelectionSummary};
 use shell_core::presentation::delivery_summary::DeliveryCodeEntry;
@@ -123,10 +128,18 @@ pub fn invoke_handler<R: tauri::Runtime>(
         preferences_get,
         preferences_check,
         preferences_set,
+        // ⚠️ 规格 §3.4 那张表里也没有这一条（同 `preferences_check` / `pick_directory`）：
+        //    它是**详细诊断日志那个开关**（规格 §2.4），与 `preferences_set` 是同一件事的
+        //    另一半（"改一项要重启内核的设置"）。理由写在它自己的文档上。
+        verbose_logging_set,
         // ⚠️ 规格 §3.4 那张表里没有这一条（同 `preferences_check`）：它是**系统对话框**
         //    那一路，第二代与 macOS 都没有对应的"端点"（macOS 那边是视图里直接调
         //    `NSOpenPanel`，没有命令行）。理由写在它自己的文档上。
         pick_directory,
+        // ⚠️ 规格 §3.4 那张表里也没有这一条（同 `pick_directory`）：它是**导出诊断日志**
+        //    那一次动作（规格 §2.5），与 `verbose_logging_set` 是一件事的两半
+        //    （开关把日志打开、导出把它取出来）。理由写在它自己的文档上。
+        diagnostics_export,
         history_get,
         history_put,
         license,
@@ -149,7 +162,8 @@ pub fn state(app: tauri::State<'_, Shell>) -> Value {
 /// 起一次 `load_delivery`（规格 §3.4 第二行，对齐第二代 `POST /api/load`）。
 ///
 /// **异步**：结果落在 `session.load` 上，前端靠轮询 `state()` 取（D6）——
-/// `load_delivery` 最坏约 91.5 秒，同步会把这条 `invoke` 按住那么久。
+/// `load_delivery` 走的是长调用那一档（上界 600 秒，见 `client.rs` 的 `LONG_CALL_TIMEOUT`），
+/// 同步会把这条 `invoke` 按住那么久。
 ///
 /// ⚠️ **长度闸在发之前**（第二代那两条判据一字未搬，只是换了调用点）：
 ///    超限的请求内核**不报错**，它只把客户端**静默堵死**（`core/src/main.rs` 的行长上限
@@ -170,7 +184,7 @@ pub fn load(app: tauri::State<'_, Shell>, code: String, base_url: Option<String>
             .set_load(LoadState::Failed(DeliveryCodeEntry::base_url_too_long_hint()));
         return api::envelope::ok(serde_json::json!({ "status": "rejected" }));
     }
-    // ⚠️ 锁的纪律：`client()` 克隆出来就放锁，`spawn_load` 起后台线程跑那 91.5 秒。
+    // ⚠️ 锁的纪律：`client()` 克隆出来就放锁，`spawn_load` 起后台线程跑那条长调用。
     match app.session.client() {
         Some(client) => {
             app.session.set_load(LoadState::Loading);
@@ -354,8 +368,11 @@ fn whole_tree(
 ///    8 MiB（`core/src/main.rs`），而 `CoreClient::call` 在**写出去之前**就按同一个数字
 ///    拒绝（`client.rs` 的 `MAX_REQUEST_LINE_BYTES`）⇒ 那一次下载**报错**（不是静默挂死）。
 ///    ⚠️ **"内核回 `id == 0` ⇒ 那条 `invoke` 永远不 resolve"是另一件事**（闸的**另一侧**：
-///    内核按 `take(8 MiB)` 读不到整行、于是回一条对不上任何请求 id 的协议告警），
-///    今天仍然敞着、归真机验收清单 —— 那件事的**出处是 `client.rs` 的
+///    内核按 `take(8 MiB)` 读不到整行、于是回一条对不上任何请求 id 的协议告警）——
+///    ✅ **那条账已由 A5 关闭**（`client.rs` 的看门狗：一次调用超过它那一档的上界 ⇒ 判死 ⇒
+///    走「内核没了」路径，横幅 + 「重试」）。⚠️ 口径与 `commands.rs` 里那条同题用例
+///    （`a_huge_batch_does_not_blow_up_the_request` 的文档）**必须一致**，两处都写着这件事。
+///    那件事的**出处是 `client.rs` 的
 ///    `MAX_REQUEST_LINE_BYTES` 文档与 `a_huge_batch_does_not_blow_up_the_request` 那条用例的文档**，
 ///    不是本函数下面那个 `kernel_paths`（它的文档只说"勾选面怎么变成发出去的那一串"）。
 ///    判据本身**只有一处实现**（`shell-core` 的 `DownloadTargets::paths`，有单测），
@@ -804,6 +821,106 @@ pub fn pick_directory<R: tauri::Runtime>(window: tauri::WebviewWindow<R>) -> Val
     })
 }
 
+/// **导出诊断日志**（规格 §2.5）。选一个**目标文件夹**，在里面建一个带时间戳的子目录。
+///
+/// **对齐 macOS**：`SettingsView` 那一节「诊断」里的导出按钮（`NSOpenPanel` + 拷贝 +
+/// 说明文件；字段表见规格 §2.6）。
+///
+/// ## 四步（规格 §2.5 逐字）
+///
+///   ① 选一个**目标文件夹**（复用 `pick_directory` 那条既有能力：同一个
+///      `pickdir::pick_folder`，**同一个**系统对话框）；
+///   ② 在里面建一个**带时间戳的子目录**（名字由 `shell_core::export::subdirectory_name`
+///      算 —— 多次导出不互相覆盖）；
+///   ③ 拷进去那几份日志（**存在的才拷**，不存在的不算失败）+ 一份 `说明.txt`；
+///   ④ 回执 = 那个子目录的路径 + 规格 §2.7 那句提醒（**都在 `api::diagnostics` 里**）。
+///
+/// ## ⚠️ 取消选择**不是失败**（`pick_folder` 回 `None` ⇒ 回执说"没有导出"）
+///
+/// 与 `pick_directory` 那条**同一条口径**（取消一个对话框什么都不该发生，
+/// 把它报成错误会让常驻提示行无缘无故亮一条）。差别只有一处：这里**要说一句**
+/// ——用户点的是「导出」，界面一动不动会与"卡住了"分不开（约束 4）。
+///
+/// ## ⚠️ 它**不碰会话状态**（不清 `last_error`、不翻引擎）
+///
+/// 与 `reveal` 同一条：这一次动作**没有经过内核**（规格 §5.2 的那一类）——
+/// 它既不改变引擎的状态，也不该让"上一次失败"过去。失败**只走回执那一格**
+/// （`is_failure: true`，界面据此换图标与颜色）。
+///
+/// ## ⚠️ 它照样会**阻塞这一拍**（与 `pick_directory` 同一条）
+///
+/// `SHBrowseForFolderW` 是模态的，而紧接着的拷贝与逐文件哈希也是同步的
+/// （日志上界 12 MiB ⇒ 最多几十毫秒）。前端必须在那颗按钮自己身上等它。
+///
+/// ⚠️ 它对**运行期 `R` 是泛型的**（同 `pick_directory`：`invoke_handler::<R>` 把 `R`
+///    传进来，写死 `tauri::Wry` 的话宿主上的单测直接编不过）。
+///
+/// ⚠️ **它比 `pick_directory` 多收一个 `State<'_, Shell>`**（计划里那行签名只有一个
+///    `window`）：说明文件里"内核自报的协议版本"那一格住在**握手的回执**上
+///    （`SessionView.handshake_reply`），而那是会话状态 —— 不收它就取不到，只能编一个
+///    壳自己的常量，而那正是 `protocol_version: 未连上` 那条判据明禁的事。
+///    ⚠️ 锁的纪律照旧：`view()` 是"读一次就放锁"，之后的系统对话框与拷贝都在锁外。
+#[tauri::command]
+pub fn diagnostics_export<R: tauri::Runtime>(
+    app: tauri::State<'_, Shell>,
+    window: tauri::WebviewWindow<R>,
+) -> Value {
+    // ① 选目标文件夹。取消 ⇒ 一句"没有导出"（**不是**错误信封，见函数文档）。
+    let Some(target) = pickdir::pick_folder(owner_hwnd(&window)) else {
+        return api::diagnostics::export_cancelled();
+    };
+    // ②③④ 的**事实**在这一段里取齐：说明文件要写的那七格（规格 §2.6 那张表）。
+    //    ⚠️ 这些是**取数据**（规格 §5.3 的第一步），成句与摆位置在 `shell_core` 里。
+    //
+    // 🔴 **读时钟的只有下面这一句**（2026-10-06 终审）：这个时刻有**两个**落点 ——
+    //    说明文件那格 `exported_at`，以及文件夹名 `诊断日志-YYYYMMDD-HHMMSS`。
+    //    两处各读一次时钟的话，跨过秒边界时**同一个导出里那两个时刻会差一秒**，
+    //    而它看起来完全正常（两个都是"合理的时间"，谁也看不出它们对不上）。
+    //    ⇒ 取一次，两处都用它（`export_from` 的 `at` 参数就是为这条存在的）。
+    let at = std::time::SystemTime::now();
+    let header = Header {
+        // 与 `about()` 同一个来源（`option_env!` 是编译那一刻的环境，`build.rs` 的
+        // `rerun-if-env-changed` 盯的是同一个名字 —— 两处同源）。
+        app_version: AboutInfo::version(
+            option_env!("BENAGEN_VERSION"),
+            Some(env!("CARGO_PKG_VERSION")),
+        ),
+        // 内嵌内核的**身份**（编译期常量，任何时候都拿得到 —— 不需要连上内核）。
+        core_sha256: crate::export::embedded_core_sha256(),
+        // 内核**自报**的协议版本。⚠️ 从握手的 `hello` 回执里取：连不上 ⇒ `None`
+        // ⇒ 说明文件如实写"未连上"（**不许**回落到壳自己那个 `PROTOCOL_VERSION`）。
+        protocol_version: shell_core::export::protocol_version_from_handshake(
+            app.session.view().handshake_reply.as_deref(),
+        ),
+        // **这一格是灵魂**：没有它，看日志的人无法判断"这份日志为什么只有这么几行"
+        // （是没问题，还是级别没开）。取值与内核的 `--log-level` **逐字同两个**
+        // （`diagnostics::parse_level` 认的就是这两个串）。
+        // ⚠️ 读不到偏好 ⇒ `normal`：壳自己那一档在那种情况下**确实**是 Normal
+        //    （`apply_shell_log_level` 对空偏好就是这么落的），不是编的。
+        log_level: match load_preferences() {
+            Ok(preferences) if preferences.verbose_logging => "verbose".to_string(),
+            _ => "normal".to_string(),
+        },
+        // 系统与版本（`GetVersionExW`；宿主那一支只回平台名）—— 见 `crate::export::os_version`。
+        os: crate::export::os_version(),
+        arch: std::env::consts::ARCH.to_string(),
+        // 导出时刻（UTC，与目录名用的是**同一个**时刻 —— 见上面 `at` 那一段）。
+        exported_at: shell_core::export::utc_stamp(at),
+        // 每份文件的字节数 / sha256 / 覆盖范围由导出那一侧**量出来**（见
+        // `shell-win/src/export.rs`），这里一个字都不编。
+        files: Vec::new(),
+    };
+    match crate::export::export_to(&target, &header, at) {
+        Ok(folder) => api::diagnostics::export_done(&folder),
+        // 那句话是 `shell_core::export` 里**按失败的那一步**拼好的
+        // （`folder_failure_text` / `copy_failure_text` / `header_failure_text` 三档，
+        // 各自点名自己的那个位置、带上系统原话与下一步 —— 修复轮 1 拆的，
+        // 见 `each_failure_names_the_step_that_actually_failed`），
+        // 本层**一个字都不加工**（同 `preferences_set` 失败那一支的"照登"）。
+        Err(why) => api::diagnostics::export_failed(&why),
+    }
+}
+
 /// 主窗口的 `HWND`（**没有就退回空指针**），宿主上恒空。
 ///
 /// ⚠️ `h.0` 那个字段访问是**跨 crate 的一个稳定面**：Tauri 用的是 `windows` crate 的
@@ -864,13 +981,73 @@ pub fn preferences_set(app: tauri::State<'_, Shell>, dir: String) -> Value {
             message: api::preferences::save_failed(&cause.to_string()),
         });
     }
-    match restart_kernel(&app.session) {
+    match restart_kernel(&app.session, ChangedSetting::DownloadDir.restart_timeout_message()) {
         Ok(()) => api::preferences::change(&DownloadDirChange::Changed {
             dir: updated.download_dir,
         }),
         // 内核起不来的**原因原文**照登（可能是"没找到内核…"，也可能是握手超时那句，
         // 也可能是"没在期限内落地"）—— 三种都是**完整的一句话**，壳不再加工。
         Err(why) => api::preferences::change(&DownloadDirChange::Failed { message: why }),
+    }
+}
+
+/// **详细日志开关**（规格 §2.4）。**改了要重启内核**（它与 `--download-dir` 同一条
+/// argv 通路 —— 内核的 `set_settings` 里没有这一格）。
+///
+/// ## 四步与 [`preferences_set`] 逐条同形
+///
+///   ① **同值 ⇒ 什么都不做**（`Unchanged`）：勾选框正常来说只在真的变了的时候发这一条，
+///      但界面是异步的 —— 一条迟到的"和当前一样"不许把用户正在跑的任务停掉；
+///   ② **偏好先落盘**（失败 ⇒ 中止，内核一个都不许动；那句话说明了根因，而盘上那一份
+///      一个字都没被动过）；
+///   ③ **重启内核**（下载目录那段同理：档位只在 argv 上）；
+///   ④ 回执由 `api::preferences` 成句，本层一个字都不自己写。
+///
+/// ## 🔴 中间那一步是**本命令独有**的：壳自己这一格必须**当场**跟着变
+///
+/// 改内核的级别要重启内核，但**壳这个进程不重启** —— 它自己那份 `diag-shell.log`
+/// 的档位是一个**进程级静态**（`shell_core::diagnostics::init`），只在启动时落过一次。
+/// ⇒ 少了 [`apply_shell_log_level`] 这一步，用户会看到"内核的日志变详细了、
+/// **壳那一份一行都不变**"，而**没有任何东西会变红**（两个文件都还在，
+/// 只是其中一个没跟着走）—— 这正是这个开关最要紧的那一半：
+/// 客户报"下载引擎已断开"时，壳当时在做什么**只有这一份里才有**。
+///
+/// ## ⚠️ 回执用的是 [`VerboseLoggingChange`]，不是 `DownloadDirChange`
+///
+/// 简报让这条复用 `preferences_set` 那一套**回执形状**（"对用户来说这是同一件事：
+/// 改了一项要重启内核的设置"）—— 形状确实复用了（`api::preferences` 装的是
+/// **同一组四格**，前端只有一条渲染路径）。但**那三句话没有复用**：
+/// `DownloadDirChange` 的三句把主词写死成"下载目录"，拿它来报一次勾选框的改动
+/// 会让用户在常驻回执上读到一句**假话**。理由写在那个类型的文档里。
+#[tauri::command]
+pub fn verbose_logging_set(app: tauri::State<'_, Shell>, on: bool) -> Value {
+    let path = match preferences_path() {
+        Ok(path) => path,
+        Err(why) => return api::envelope::err(&why),
+    };
+    let current = Preferences::load(&path);
+    let updated = current.setting_verbose_logging(on);
+
+    if updated.verbose_logging == current.verbose_logging {
+        return api::preferences::verbose_change(&VerboseLoggingChange::Unchanged { on });
+    }
+    if let Err(cause) = updated.save(&path) {
+        return api::preferences::verbose_change(&VerboseLoggingChange::Failed {
+            message: api::preferences::verbose_save_failed(&cause.to_string()),
+        });
+    }
+    // 🔴 **先落壳自己这一格，再重启内核**（顺序承重）：反过来的话，内核重启那一段
+    //    （几十毫秒到几秒）里壳的级别还是旧的那一档，而那一刻正是最该记全的时候
+    //    （内核正在被换掉）。它与重启成不成功**无关** —— 内核起不来也不该让壳的
+    //    日志继续停在旧档上（回执会把"没改成"如实说出来）。
+    apply_shell_log_level(&updated);
+    match restart_kernel(
+        &app.session,
+        ChangedSetting::VerboseLogging.restart_timeout_message(),
+    ) {
+        Ok(()) => api::preferences::verbose_change(&VerboseLoggingChange::Changed { on }),
+        // 内核起不来的**原因原文**照登（与 `preferences_set` 同一条）。
+        Err(why) => api::preferences::verbose_change(&VerboseLoggingChange::Failed { message: why }),
     }
 }
 
@@ -959,6 +1136,47 @@ pub fn about() -> Value {
 // 上面的命令共用的几件东西（都在本文件里，因为它们都是"装配"而不是判据）
 // ===========================================================================
 
+/// **这一次改的是哪一格** —— "改了要重启内核的设置"有两个，各自的话不一样。
+///
+/// ## 🔴 它存在的理由：那张"哪一格 → 哪句话"的表以前是**按位置**传的
+///
+/// `restart_kernel(session, on_timeout)` 收一句 `&'static str`，两个调用点各传一个字面量。
+/// 那种写法**判不了**：把两句对调，用户改了下载目录却读到"详细日志开关已经记下来了"
+/// （而那个目录改动**确实**记下来了 —— 是一句假话），
+/// 而**所有测试照旧全绿**（`api::preferences` 那条钉的是两个常量**本身**，
+/// 不是"哪个调用方用哪一个"）。
+///
+/// ⇒ 把那个**选择**收进这张表：[`Self::restart_timeout_message`] 是个**纯函数**，
+///    在 `mod tests` 里有判据；两个调用点只传自己的那一类（`ChangedSetting::DownloadDir` /
+///    `ChangedSetting::VerboseLogging`），**不再传字符串**。
+///
+/// ⚠️ **残余（如实记账）**：把两个调用点上的 enum **写反**仍然没有自动判据 ——
+///    那两条命令的签名要 `tauri::State<'_, Shell>`，测试造不出来
+///    （与 `enqueue` 当初要拆出 `enqueue_with` 是同一道缝）。但那一次写反在代码上是
+///    **一眼可见**的（枚举名与函数名在同一屏），而原来那种"两个字符串按位置传"
+///    连读都读不出来。⇒ 记在这里，并挂到真机验收那两条旁边（见任务报告）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChangedSetting {
+    /// 下载目录（[`preferences_set`]）。
+    DownloadDir,
+    /// 详细日志开关（[`verbose_logging_set`]）。
+    VerboseLogging,
+}
+
+impl ChangedSetting {
+    /// **内核重启没在期限内落地**时该说的那句话（那一格里"已经记下来了"说的是**用户刚改的
+    /// 那一格** —— 所以这句话只能按"改的是哪一格"选，不能由内核那一侧代劳）。
+    ///
+    /// ⚠️ 两个取值**必须**各回各的那一句（`api::preferences` 的两条同构常量）：
+    ///    这一格的判据在 `mod tests` 的 `each_setting_gets_its_own_restart_timeout_message`。
+    pub fn restart_timeout_message(self) -> &'static str {
+        match self {
+            ChangedSetting::DownloadDir => api::preferences::restart_timed_out(),
+            ChangedSetting::VerboseLogging => api::preferences::verbose_restart_timed_out(),
+        }
+    }
+}
+
 /// 壳的**偏好文件**在哪。
 ///
 /// ⚠️ **这是唯一一处把「存放根」与「偏好文件名」拼起来的地方**：存放根怎么算在
@@ -985,6 +1203,46 @@ fn history_path() -> Result<PathBuf, String> {
 ///    用户没设 —— 而前者会让"用户的目录设置去哪了"变成一次无从归因的静默失效。
 pub fn load_preferences() -> Result<Preferences, String> {
     Ok(Preferences::load(&preferences_path()?))
+}
+
+/// **把偏好里那一格落到壳自己这个进程的日志档位上**（规格 §2.3 / §2.4）。
+///
+/// 🔴 **两处调用点共用这一份**（它们时机不同，缺一个就是一个方向不工作）：
+///   * **启动时**（`main.rs`，起 Tauri 之前、读完偏好之后）—— 少了它，客户把开关
+///     打开再重启应用，`diag-shell.log` **一行都不会出现**；
+///   * **开关被改时**（[`verbose_logging_set`]）—— 改内核的级别要重启内核，但
+///     **壳自己这个进程不重启**，所以它那一格必须当场跟着变。少了这一步的表现是
+///     "打开开关之后内核的日志变详细了、**壳那一份一行都不变**"，而**没有任何东西
+///     会变红**（两个文件都还在，只是其中一个没跟着走）。
+///
+/// ⚠️ **它是 `pub` 的，因为 bin（`main.rs`）是另一个 crate**（同 [`load_preferences`]）。
+/// ⚠️ **没有"读不到偏好"这一支**：调用方拿到的是一份已经读出来的偏好
+///    （读不到存放根时的处置在 [`load_preferences`] 那里 —— 起内核那条路把它当
+///    "未配置"，而壳自己的日志档位跟着落到 `Normal`，那是安全的默认值）。
+pub fn apply_shell_log_level(preferences: &Preferences) {
+    shell_core::diagnostics::init(shell_level(preferences));
+}
+
+/// 偏好里那一格 ⇒ **壳自己**日志的档位。**纯函数**：不碰进程静态、不写文件、不读时钟。
+///
+/// 🔴 **为什么把它从 [`apply_shell_log_level`] 里拆出来**（2026-10-06 终审）：
+///    原来那一整句就在 `init(...)` 的实参位置上，而 `init` 落的是**进程级静态** ——
+///    要判它就得让测试去翻全局（同进程里别的用例会跟着随机红）或者往真日志目录里写。
+///    于是**那一格一条判据都没有**：把 `if/else` 两支**对调**，全套判据照旧全绿。
+///    真机上那是本功能**最坏的那个形状** —— 用户勾上「详细日志」，**内核**那一档
+///    确实变详细了（那条路有判据：`core_arguments` 的拼装），而**壳自己那份日志
+///    停在 normal**，于是 `diag-shell.log` **根本不会被创建**，客户回传的仍然
+///    只有内核那一份。拆成纯函数之后，两个方向都钉得住。
+///
+/// ⚠️ **拆出来之后仍然没有判据的那一半**：`init(...)` 那个**调用点本身**
+///    （"这一句有没有被走到"）—— 要判它就得动上面那两样中的一样。它与 macOS 的
+///    `DiagnosticsLog.configure(...)` 是同一个缺口，只由真机验收那两条守着。
+pub fn shell_level(preferences: &Preferences) -> shell_core::diagnostics::Level {
+    if preferences.verbose_logging {
+        shell_core::diagnostics::Level::Verbose
+    } else {
+        shell_core::diagnostics::Level::Normal
+    }
 }
 
 /// 此刻的 Unix 秒。**本 crate 唯一一处读时钟**（时间戳怎么格式化在
@@ -1032,7 +1290,18 @@ fn current_unix_seconds() -> i64 {
 ///
 /// ⚠️ 它**不写偏好**（那是调用方在第 ② 步之前做的）：本函数只负责"把内核换成一个
 ///    按**当前** argv 起的新进程"，而 argv 是连接器在起内核那一刻现读的（`main.rs`）。
-fn restart_kernel(session: &Arc<Session>) -> Result<(), String> {
+///
+/// ## ⚠️ `on_timeout`：**"等超时了该说什么"由调用方给**
+///
+/// 那一刻的结论分两种（见 [`wait_for_the_kernel`]）：内核自己说了原因（`Unavailable`，
+/// 照登），或者**到点还停在 `Connecting`**（那句话由**调用方**给）。后者的原文里有一句
+/// "**已经记下来了**"——而**记下来的是哪一格只有调用方知道**（下载目录 / 详细日志开关）。
+/// 合成一句的结局是其中一半场合对着用户说错话（"下载目录已经记下来了"，
+/// 而他改的是一个勾选框、一个目录都没动）。
+///
+/// ⚠️ 调用方**不许**直接传字符串字面量：那一句要经 [`ChangedSetting::restart_timeout_message`]
+///    选出来（那张"哪一格 → 哪句话"的表有单测，见 [`ChangedSetting`]）。
+fn restart_kernel(session: &Arc<Session>, on_timeout: &str) -> Result<(), String> {
     if let Some(retired) = session.take_client() {
         let _ = std::thread::Builder::new()
             .name("core-retire".to_string())
@@ -1049,7 +1318,7 @@ fn restart_kernel(session: &Arc<Session>) -> Result<(), String> {
     // 与启动、与 `retry()` **同一条路**（不重写一遍连接逻辑）：连接器每次都真的重查
     // 一遍内核在哪（那是"把内核放到壳旁边再点重试"这条补救的唯一实现）。
     session::spawn_connect(session);
-    wait_for_the_kernel(session)
+    wait_for_the_kernel(session, on_timeout)
 }
 
 /// 等这一次重启**落地**（有界）。判据是**引擎那一格** —— 连接线程会把它写成
@@ -1063,7 +1332,10 @@ fn restart_kernel(session: &Arc<Session>) -> Result<(), String> {
 ///
 /// ⚠️ 等待期间**不阻塞前端**：`state()` 那一秒一问跑在别的命令线程上，引擎徽标会一路
 ///    显示"正在连接内核…"。这里等的只是**这一次调用**的结论。
-fn wait_for_the_kernel(session: &Session) -> Result<(), String> {
+///
+/// ⚠️ `on_timeout` 由调用方给（理由见 [`restart_kernel`] 的同名参数）：本函数只看得到
+///    **内核**的状态，而那句话里"已经记下来了"说的是**用户刚改的那一格**。
+fn wait_for_the_kernel(session: &Session, on_timeout: &str) -> Result<(), String> {
     /// 两次查看之间的间隔（10 ms：够密 —— 正常重启也就几十毫秒；又不至于空转）。
     const POLL: Duration = Duration::from_millis(10);
 
@@ -1079,7 +1351,8 @@ fn wait_for_the_kernel(session: &Session) -> Result<(), String> {
                 if started.elapsed() >= api::preferences::RESTART_DEADLINE {
                     // 到点了还是"正在连接"：继续等下去**不会再有新结论**（每一段都有上界，
                     // 说明某一段的上界破了）⇒ 把"这一次没改成"如实说出来。
-                    return Err(api::preferences::restart_timed_out().to_string());
+                    // ⚠️ 那句话**由调用方给**（它才知道记下来的是哪一格，见函数文档）。
+                    return Err(on_timeout.to_string());
                 }
                 std::thread::sleep(POLL);
             }
@@ -1261,6 +1534,40 @@ mod tests {
         LoadState::Loaded(a_batch_of(&v(&["a.bin", "b.bin", "c.bin"])))
     }
 
+    // -----------------------------------------------------------------------
+    // 任务 3：「哪一格 → 哪句超时话」那张表
+    // -----------------------------------------------------------------------
+
+    /// 🔴 **每一格拿到的是**它自己**那句话**（把两个臂对调 ⇒ 这一条红）。
+    ///
+    /// 判别力：`ChangedSetting::restart_timeout_message` 的两个分支一互换 ⇒
+    /// 用户改了**下载目录**、收到的却是"**详细日志开关**已经记下来了" ——
+    /// 而那句话是一句假话（那个目录改动确实记下来了）。在此之前两个调用点
+    /// **按位置**各传一个字符串字面量，这一条缝隙**一条判据都没有**。
+    ///
+    /// ⚠️ 断言分两半，**两半都要**：
+    ///   · 前半（`assert_eq!` 对常量）钉"这一格用的就是那句现成的话"（有人另编一句 ⇒ 红）；
+    ///   · 后半（`contains` / `!contains`）钉**归哪一格** —— 只对常量的话，
+    ///     把两个臂对调会是**恒真**的（`f() == f()` 那种写法）。
+    #[test]
+    fn each_setting_gets_its_own_restart_timeout_message() {
+        let dir = ChangedSetting::DownloadDir.restart_timeout_message();
+        let verbose = ChangedSetting::VerboseLogging.restart_timeout_message();
+
+        assert_eq!(dir, api::preferences::restart_timed_out(), "下载目录那一格用错句子了");
+        assert_eq!(
+            verbose,
+            api::preferences::verbose_restart_timed_out(),
+            "详细日志那一格用错句子了"
+        );
+
+        assert!(dir.contains("下载目录已经记下来了"), "{dir}");
+        assert!(!dir.contains("详细日志"), "改目录不许提详细日志：{dir}");
+        assert!(verbose.contains("详细日志开关已经记下来了"), "{verbose}");
+        assert!(!verbose.contains("下载目录"), "改开关不许提下载目录：{verbose}");
+        assert_ne!(dir, verbose, "两格的话不是同一句（同一句 = 其中一半场合在说假话）");
+    }
+
     /// 🔴 **勾选面 == 全集 ⇒ 交给内核的 `paths` 是空数组**（C-3，任务 16 的全部理由）。
     ///
     /// 判别力（**突变实测过**：把 `enqueue_with` 里那一行 [`super::kernel_paths`] 换回
@@ -1341,12 +1648,16 @@ mod tests {
     ///    ⚠️ **这个触发器（超大批次）碰到的是这条可读的报错**（结局由**壳自己那道闸**
     ///    给），**不是挂死**：请求在写出去之前就被拒了，内核根本看不到这一行。
     ///
-    ///    🔴 **"内核回 `id == 0` ⇒ 那条 `invoke` 永远不 resolve"是另一件事，今天仍然敞着**
+    ///    🔴 **"内核回 `id == 0` ⇒ 那条 `invoke` 永远不 resolve"曾经是另一件事、曾经敞着**
     ///    —— 它说的是闸的**另一侧**（内核按 `take(8 MiB)` 读不到整行、于是回一条对不上
-    ///    任何请求 id 的协议告警），而 `CoreClient::call` **没有每请求超时** ⇒ 任何一条
+    ///    任何请求 id 的协议告警），在 A5 之前 `CoreClient::call` 没有上界 ⇒ 任何一条
     ///    走到那条路上的请求都会让对应的 `invoke` 永久挂住。本用例**钉不到它**（这个触发器
     ///    在写出之前就被拦了，够不着内核），它归**真机验收清单**：账见
     ///    `.superpowers/sdd/2026-09-20-windows-tauri-client/task-16-report.md` §7①。
+    ///    ✅ **那条账已由 A5 关闭**（`client.rs` 的看门狗：一次调用超过**它那一档**的上界
+    ///    ⇒ 判死 ⇒
+    ///    走「内核没了」路径，横幅 + 「重试」）。⚠️ 本用例仍然钉不到它（够不着内核），
+    ///    所以这里记的是**判据的边界**，不是判据本身。
     ///    发 `[]` 之后请求体恒定，**报错**那条路也够不着了（本用例钉的就是这件事）。
     #[test]
     fn a_huge_batch_does_not_blow_up_the_request() {
@@ -1547,6 +1858,37 @@ mod tests {
             reported["data"]["selected"],
             serde_json::json!(default),
             "内核给的选择面不许因为前端报了一个面就被顶掉：{reported}"
+        );
+    }
+
+    /// 🔴 **档位映射的两个方向都要钉住**（规格 §2.4）。
+    ///
+    /// 为什么必须有它：`apply_shell_log_level` 原来把 `if/else` 直接写在 `init(...)`
+    /// 的实参位置上，而 `init` 落的是**进程级静态** ⇒ 那一格一条判据都没有：
+    /// **把两支对调，全套判据照旧全绿**（拆出 [`super::shell_level`] 就是为了这一条）。
+    /// 真机上那是本功能**最坏的那个形状**：用户勾上「详细日志」，**内核**那一档确实
+    /// 变详细了（`core_arguments` 有判据），而**壳那份日志停在 normal** ⇒
+    /// `diag-shell.log` **根本不会被创建**，客户回传的只有内核那一份 ——
+    /// 而那正是"详细日志要能回答壳当时在做什么"这件事要防的。
+    ///
+    /// 判别力：把 `shell_level` 的两支对调 ⇒ 下面两条断言同时红。
+    /// ⚠️ **它钉住的是映射本身**；`init(...)` 那个调用点有没有被走到仍然没有判据
+    ///    （理由见 `shell_level` 的文档），那一半只有真机验收那两条能回答。
+    #[test]
+    fn the_verbose_checkbox_maps_onto_the_shells_own_log_level_both_ways() {
+        use shell_core::diagnostics::Level;
+
+        let off = Preferences::new("D:\\out");
+        assert_eq!(super::shell_level(&off), Level::Normal, "关着就是普通档（缺省）");
+
+        let on = off.setting_verbose_logging(true);
+        assert_eq!(super::shell_level(&on), Level::Verbose, "勾上必须是详细档");
+
+        // 反向：**认的不是"偏好里有没有这个字段"，是它的取值**。
+        assert_eq!(
+            super::shell_level(&on.setting_verbose_logging(false)),
+            Level::Normal,
+            "关回去要跟着落回普通档（只认一个方向的实现过不了这一条）"
         );
     }
 }

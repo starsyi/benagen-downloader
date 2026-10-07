@@ -205,7 +205,17 @@ pub fn run(argv: Vec<String>) -> ExitCode {
     //    默认下载目录**不在这里建**——`preflight`（`enqueue` 的第一步）会 create_dir_all，
     //    目标目录可不可用只有那一处判据；壳提前建一遍就是第二份会漂移的判据。
     //    settings 路径用内核的默认（**只读**）：`-j/-x/-s` 只改内存，不落盘（spec §2）。
-    let mut k = Kernel::new(opts.download_dir.clone(), settings::default_path());
+    //    ⚠️ `default_path()` 自 2026-10-06 起返回 `Result`（Windows 上取不到 `%APPDATA%`
+    //    要大声失败，W-2）。CLI 这一侧照它的原话报出来、按"用法/环境不对"收口
+    //    （CLI 目前不在 Windows 上分发，但这条路径必须编得过、且失败时说得清）。
+    let settings_path = match settings::default_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("benagen-dl: {e}");
+            return ExitCode::Usage;
+        }
+    };
+    let mut k = Kernel::new(opts.download_dir.clone(), settings_path);
     // ⚠️ R11：签名是三个 `Option<i32>`，不是 `&Overrides`（内核不得依赖 `cli` 的类型）。
     k.apply_overrides_in_memory(
         opts.overrides.parallel,

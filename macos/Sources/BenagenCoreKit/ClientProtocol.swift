@@ -34,6 +34,20 @@ public protocol CoreCalling: AnyObject, Sendable {
 
     /// 收尾。**幂等**。
     func shutdown()
+
+    /// 告诉这条连接：**这几个字面串写进诊断日志之前必须抹掉**（交付码、下载目录）。
+    ///
+    /// 🔴 **它存在的全部理由是隐私，而且这次是"按构造"那一档**（规格 §2.3 B）：
+    ///    `kernel_call` 那一行失败时的 `why` 是**内核原文**，而交付码是**我们自己**
+    ///    拼进内核文案里的（`core/src/delivery.rs` 那条 404 把 `…/{交付码}/manifest.json`
+    ///    整条 URL 送了进来；`core/src/main.rs` 的 `preflight` 带着客户目录名）。
+    ///    壳**知道**这两个串（码在它刚发出去的请求里、目录在它自己存的偏好里）
+    ///    ⇒ 不必去猜任意第三方文案里像不像码。
+    ///
+    /// ⚠️ **它在协议上、不在具体类型上**：`AppModel` 持的是 `any CoreCalling`
+    ///    （见本文件头注），只有把它放进协议，"推下去"这一步才到得了真的那条连接。
+    ///    收的一份**完整清单**（不是追加）：换批次要换码、改设置要换目录。
+    func setRedactions(_ secrets: [String])
 }
 
 extension JSONValue {

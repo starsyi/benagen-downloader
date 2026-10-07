@@ -162,6 +162,17 @@ export const CMD = Object.freeze({
   //    （2026-09-20 真机反馈）—— 弹一个系统的「选择文件夹」是**平台 API**，
   //    只能在壳里做。实现与理由写在 `shell-win/src/commands.rs:pick_directory` 的头注里。
   pickDirectory: "pick_directory",
+  // ⚠️ **这一条规格 §3.4 的表里同样没有**（同 `preferencesCheck` / `pickDirectory`）：
+  //    它是**详细日志那个开关**（规格 §2.4），与 `preferencesSet` 是同一件事的另一半
+  //    （"改一项要重启内核的设置"）。它多出来的那半步（壳自己那一档日志要就地跟着变）
+  //    是本命令独有的，理由写在 `shell-win/src/commands.rs:verbose_logging_set` 的头注里。
+  verboseLoggingSet: "verbose_logging_set",
+  // ⚠️ **这一条规格 §3.4 的表里也没有**（同 `pickDirectory`）：它是**导出诊断日志**
+  //    那一次动作（规格 §2.5），与上面那条是同一件事的两半 —— 开关把日志打开、
+  //    导出把它取出来交给分析日志的人。它同时也会弹一次**系统对话框**（选目标文件夹），
+  //    判据与文案都在 `api::diagnostics`，实现与理由写在
+  //    `shell-win/src/commands.rs:diagnostics_export` 的头注里。
+  diagnosticsExport: "diagnostics_export",
   historyGet: "history_get",
   historyPut: "history_put",
   license: "license",

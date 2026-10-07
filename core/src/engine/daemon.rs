@@ -40,7 +40,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::Write;
+// ⚠️ `Read` 也要门控（与 `PermissionsExt` 同理，只是它是**告警**而不是错误）：
+// 本文件里唯一用它的是 `random_secret` 的非 Windows 那一支（`read_exact`），
+// Windows 那一支走 `BCryptGenRandom`。不门控的话 Windows 目标会凭空多一条
+// `unused_imports` 告警——而"告警净增 0"是硬约束（D-4，不许用 `#[allow]` 按掉）。
+#[cfg(not(windows))]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex, Once};
@@ -84,7 +90,8 @@ const FREE_PORT_RETRIES: usize = 5;
 // 内嵌资源
 // ---------------------------------------------------------------------------
 
-/// 内嵌的自包含 aria2c——**按（平台，架构）选**。
+/// 内嵌的自包含 aria2c——**按本内核自己的 (操作系统, 架构) 二元组选**
+/// （macOS×arm64 / macOS×x86_64 / Linux×x86_64 / Windows×x86_64.exe，只依赖系统库）。
 ///
 /// 字节来自 `core/assets/`——那是 `build.rs` 从 `downloader/internal/engine/assets/`
 /// 拷进来的副本（Go 侧用 `go:embed` 内嵌同一份文件）。拷一份而不是直接引用另一个
@@ -122,48 +129,419 @@ pub const ARIA2C_ASSET_NAME: &str = "aria2c-macos-x86_64";
 /// 由 `core/scripts/build_aria2_linux.sh` 在构建机上产出。
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub const ARIA2C_ASSET_NAME: &str = "aria2c-linux-x86_64";
+/// 见上。Windows 那份的资产名带 `.exe` 后缀（见下面 `ARIA2C_BIN` 的说明）——
+/// 从文件名反推架构的测试必须先把这一截剥掉。
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub const ARIA2C_ASSET_NAME: &str = "aria2c-windows-x86_64.exe";
 
-/// 见上。
+/// ⚠️ **F-2 的原始措辞只说"架构"是不完备的**（这是探路实测暴露的缺陷，见
+/// `docs/superpowers/2026-09-18-windows-spike.md` §3.4）：这里原来用的是
+/// `#[cfg(target_arch = "x86_64")]` 选资产，于是 Windows（也是 x86_64）
+/// **不触发 `compile_error!`，反而命中 macOS 的 `include_bytes!`**——
+/// 静默内嵌一份 macOS 的 Mach-O，编得过、链得过，直到客户点下载才炸。
+/// "内嵌了不能执行的二进制"这件事能沿**两个**方向发生（架构、操作系统），
+/// 守卫就必须判**两个**维度。本项目的检查项因此升级为：
+/// 「这条守卫判的维度，和它要防的那件事是同一个维度吗？」
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const ARIA2C_BIN: &[u8] = include_bytes!("../../assets/aria2c-macos-arm64");
 
-/// 见上。这几个 `#[cfg]` 与 `daemon.rs` 测试里的
+/// 见上一条的说明。这些 `#[cfg]` 与 `daemon.rs` 测试里的
 /// `embedded_aria2c_arch_matches_kernel_arch` 是同一件事的两面：
-/// **内嵌的这份必须与内核自己的架构一致**。
+/// **内嵌的这份必须与内核自己的 (操作系统, 架构) 一致**。
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 pub const ARIA2C_BIN: &[u8] = include_bytes!("../../assets/aria2c-macos-x86_64");
 
-/// 见上。
+/// 见上一条的说明。Linux x86_64 那份是 musl 静态链接的（客户机上不依赖 glibc 版本），
+/// 由 `core/scripts/build_aria2_linux.sh` 在构建机上产出。
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub const ARIA2C_BIN: &[u8] = include_bytes!("../../assets/aria2c-linux-x86_64");
+
+/// 见上一条的说明。
+///
+/// Windows 这份是**官方 prebuilt**（`aria2-1.37.0-win-64bit-build1.zip` 里的
+/// `aria2c.exe`），入库与否的裁定与来源登记见 `core/scripts/fetch_windows_aria2c.sh`
+/// 的文件头——那里记着来源 URL、版本、包 sha256 与这份文件自己的 sha256，
+/// 并提供一条**能一条命令复核**的脚本（规格 §6.4 的补偿措施）。
+///
+/// ⚠️ 它与 macOS 两份的**纪律不同**：macOS 是"从固定 sha256 的源码包自己编"，
+/// 这里是"官方 prebuilt + 逐字节 sha256 登记"。这是一处**显式记账的偏离**，
+/// 理由与代价见规格 §6.4 与那个脚本的文件头——**不要把两份资产的纪律说成一样**。
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub const ARIA2C_BIN: &[u8] = include_bytes!("../../assets/aria2c-windows-x86_64.exe");
 
 #[cfg(not(any(
     all(target_os = "macos", target_arch = "aarch64"),
     all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "x86_64"),
     all(target_os = "linux", target_arch = "x86_64"),
 )))]
 compile_error!(
-    "这个平台没有内嵌 aria2c（现只有 macOS arm64/x86_64 与 Linux x86_64 三份，\
-     见 core/assets/）。要加平台：先按 core/scripts/build_aria2_linux.sh 的路子产出资产，\
-     再在本文件与 core/build.rs 的 ASSETS 表里各加一行。\
-     绝不能回退到别的平台的内嵌二进制：那样编得出来，要到目标机器上才炸。"
+    "本内核只为这些 (操作系统, 架构) 组合内嵌了 aria2c：\
+     macOS×arm64、macOS×x86_64、Linux×x86_64、Windows×x86_64（core/assets/aria2c-*）。\
+     换别的组合，必须先入库**对应平台**的 aria2c 并在这里加一条 #[cfg] 分支——\
+     绝不能回退到别的平台的内嵌二进制：那样编得出来，要到目标机器上才以 \
+     `Bad CPU type in executable` / `cannot execute binary file` / 无法执行 暴露。"
+);
+
+/// 内嵌二进制的前 4 字节。
+///
+/// 编译期判据只能读**常量**，所以这里先把头部取出来——`ARIA2C_BIN` 是 `&[u8]`，
+/// 下面的断言要用它做 `const` 求值。
+const ARIA2C_BIN_HEAD: [u8; 4] = [ARIA2C_BIN[0], ARIA2C_BIN[1], ARIA2C_BIN[2], ARIA2C_BIN[3]];
+
+/// **本靶**上"能直接执行的二进制"的魔数判据（编译期可求值）。
+///
+/// 判据必须按 `target_os` 分叉：macOS 要 thin 64 位 Mach-O（`cffaedfe`），
+/// Linux 要 64 位小端 ELF（`\x7fELF` 四个字节），Windows 要 PE（只有两字节 `MZ`；
+/// `PE\0\0` 在 `e_lfanew` 处，由 `pe_machine()` 验）。
+/// 拿一种格式的魔数去判另一种平台的产物**永远为假**，反之亦然——这正是下面那条断言的意义。
+///
+/// 不认识的平台返回 `false`（**fail-closed**）：那边 `compile_error!` 已经先一步拦住了，
+/// 这里多报一条也无害，但绝不能默认放行。
+const fn aria2c_magic_ok_for_this_platform(head: [u8; 4]) -> bool {
+    if cfg!(target_os = "macos") {
+        // thin 64 位 Mach-O：`MH_MAGIC_64`（0xfeedfacf）按小端落盘的样子。
+        head[0] == 0xcf && head[1] == 0xfa && head[2] == 0xed && head[3] == 0xfe
+    } else if cfg!(target_os = "linux") {
+        // 64 位小端 ELF 的 `e_ident` 魔数。
+        head[0] == 0x7f && head[1] == b'E' && head[2] == b'L' && head[3] == b'F'
+    } else if cfg!(target_os = "windows") {
+        head[0] == b'M' && head[1] == b'Z'
+    } else {
+        false
+    }
+}
+
+/// **编译期断言：内嵌的那份二进制必须与内核自己的 `target_os` 相符。**
+///
+/// 为什么这条必须是**编译期**的（全局约束 W-1 的精神：守卫自己也要有判别力）：
+/// 内嵌二进制是 `include_bytes!` 进来的，**错平台的产物在编译期毫无提示**
+/// （编得过、链得过），要到客户机器上才以"无法执行"暴露。而运行时测试只能验证
+/// **正在跑的那个平台**——交叉编译出来的 Windows 测试可执行文件**在开发机上跑不了**，
+/// 所以"对着 Windows 目标"这件事只有编译期检查做得到。
+///
+/// 判别力：把 Windows 那条 `#[cfg]` 指回 macOS 资产 → 在
+/// `--target x86_64-pc-windows-gnu` 下**编译失败**，诊断就是本断言的那句话
+/// （任务 1 报告的「裁决 F 比对」一节有两次输出的原文）。
+///
+/// ⚠️ 与测试模块里 `native_executable_magic_ok()` 是**同一个不变量的两个落点**
+/// （这里编译期、那里运行时），判据有两份——改一处必须改另一处，
+/// 测试里那条"两处判据一致"的断言就是用来抓这种漂移的。
+const _: () = assert!(
+    aria2c_magic_ok_for_this_platform(ARIA2C_BIN_HEAD),
+    "内嵌 aria2c 的魔数与内核自己的操作系统不符：macOS 内核要 thin 64 位 Mach-O(cffaedfe)、\
+     Linux 内核要 64 位小端 ELF(7f 45 4c 46)、Windows 内核要 PE(MZ)，而内嵌内容三者都不是。\
+     最常见的原因是 ARIA2C_BIN 的 #[cfg] \
+     选错了轴（只判了 target_arch、没判 target_os），于是把别的平台的二进制内嵌了进来——\
+     这样编得出来，要到客户机器上才炸。见 core/assets/ 与 ARIA2C_BIN 的说明。"
+);
+
+// ---------------------------------------------------------------------------
+// 内嵌二进制的**架构**判据（编译期可求值）——上面那条只管"操作系统"那一半
+// ---------------------------------------------------------------------------
+
+/// 从 PE 头读出 `Machine` 字段（`0x8664` = x86_64）。
+///
+/// 对位 macOS 侧的 `macho_cpu_type` 与 Linux 侧的 `elf_machine`——三者是同一条不变量的
+/// 三个平台落点：**内嵌的那份必须与内核自己的架构一致**。三个平台的架构字段在
+/// **不同的编码空间**里（Mach-O 的 `cputype` 带 `CPU_ARCH_ABI64` 高位，PE 的 `Machine`
+/// 是裸的机器码，ELF 的 `e_machine` 又是一套），所以不要把它们硬凑成一个数。
+///
+/// 入参是**任意字节**（编译期要拿它验整个内嵌物、测试里要拿它验磁盘上的资产），
+/// 因此所有截断/畸形输入都必须安全地回 `None`——判断顺序是
+/// "够长 → 是 MZ → `e_lfanew` 在文件内 → 该处是 `PE\0\0` → 读 Machine"，
+/// 每一步都先验长度再索引。**不许出现越界索引**：`include_bytes!` 进来的东西长度
+/// 不受我们控制，越界在编译期会变成一条看不懂的 E0080、在客户机上会变成 panic。
+///
+/// ⚠️ **为什么它是 `const fn` 且住在生产代码里**（本任务新增，裁定 Q 第 3 件）：
+/// 在它之前，"架构"这一半**只有测试期判据**（`embedded_aria2c_arch_matches_kernel_arch`
+/// 只在**正在跑的那个平台**上可执行）。对 OS 正确、对**架构**错误的内嵌物因此
+/// 编得过、链得过——而交叉编译出来的 Windows 测试可执行文件在开发机上**跑不了**，
+/// 所以"对着 Windows 目标"这件事只有编译期检查做得到。
+/// 架构字段都是**纯字节**，于是同一份判据写一遍、编译期与测试期共用：
+/// 下面那条 `const _` 让 `cargo build` 在两个轴上都有判别力。
+///
+/// ⚠️ `#[cfg(any(target_os = "windows", test))]` 是**为了零告警**，不是语义收缩：
+/// 非 Windows 的生产构建里没有它的调用者（那条 `const _` 的 Windows 分支不参与编译），
+/// 而测试（`pe_machine_reads_the_field_instead_of_a_hardcoded_value`、
+/// `embedded_aria2c_arch_matches_kernel_arch`、`shipped_aria2c_assets_match_their_arch_in_name`）
+/// 在**任何平台**上都要用它。两个条件缺一就会在某一侧报 dead_code。
+#[cfg(any(target_os = "windows", test))]
+const fn pe_machine(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 0x40 || bytes[0] != b'M' || bytes[1] != b'Z' {
+        return None;
+    }
+    // `e_lfanew` 是 DOS 头 0x3c 处的 u32（小端）。逐字节拼而不是 `try_into()`：
+    // `const fn` 里能用什么、不能用什么是会随版本变的，逐字节拼不依赖任何 const 化状态。
+    let e_lfanew = (bytes[0x3c] as usize)
+        | ((bytes[0x3d] as usize) << 8)
+        | ((bytes[0x3e] as usize) << 16)
+        | ((bytes[0x3f] as usize) << 24);
+    // ⚠️ 写成"先判 e_lfanew 在不在文件里、再判剩下够不够 6 字节"，**不要**写
+    //    `e_lfanew + 6 > len`：后者在 32 位目标上会溢出（`e_lfanew` 可以接近 usize::MAX）。
+    if e_lfanew > bytes.len() || bytes.len() - e_lfanew < 6 {
+        return None;
+    }
+    if bytes[e_lfanew] != b'P'
+        || bytes[e_lfanew + 1] != b'E'
+        || bytes[e_lfanew + 2] != 0
+        || bytes[e_lfanew + 3] != 0
+    {
+        return None;
+    }
+    Some((bytes[e_lfanew + 4] as u16) | ((bytes[e_lfanew + 5] as u16) << 8))
+}
+
+/// 从 Mach-O 头里取 `cputype`；不是 thin 64 位 Mach-O 时返回 `None`。
+///
+/// 对位 Windows 侧的 `pe_machine` 与 Linux 侧的 `elf_machine`，三者是同一条不变量的
+/// 三个平台落点。
+///
+/// ⚠️ `cffaedfe` 是 `MH_MAGIC_64`（`0xfeedfacf`）**按小端落盘**的样子——字节序已经
+/// 编码进魔数本身。**arm64 与 x86_64 的 thin 产物用的是同一个魔数**，所以
+/// `embedded_binary_present` 里那条魔数断言不需要按**架构**分叉（x86_64 的产物实测过，
+/// 见任务 1 报告）——它按**操作系统**分叉，见 `native_executable_magic_ok`。
+/// `cputype` 才是区分两个 macOS 架构的字段。
+///
+/// ⚠️ 同样是 `const fn`（理由见 `pe_machine`），同样 `#[cfg(any(target_os = "macos", test))]`
+/// ——非 macOS 的生产构建里它没有调用者，而测试在任何平台上都要用它验磁盘上的 macOS 资产。
+#[cfg(any(target_os = "macos", test))]
+const fn macho_cpu_type(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < 8
+        || bytes[0] != 0xcf
+        || bytes[1] != 0xfa
+        || bytes[2] != 0xed
+        || bytes[3] != 0xfe
+    {
+        return None;
+    }
+    Some(
+        (bytes[4] as u32)
+            | ((bytes[5] as u32) << 8)
+            | ((bytes[6] as u32) << 16)
+            | ((bytes[7] as u32) << 24),
+    )
+}
+
+/// 是不是 **64 位小端 ELF**——`e_ident[EI_CLASS]=2`、`e_ident[EI_DATA]=1`。
+///
+/// 只看 `\x7fELF` 是不够的：那会把 32 位或大端的文件也当成"是 ELF"，
+/// 于是按偏移读出来的"架构"是垃圾值。
+///
+/// ⚠️ 同样是 `const fn`（理由见 `pe_machine`），同样 `#[cfg(any(target_os = "linux", test))]`
+/// ——非 Linux 的生产构建里没有它的调用者，而测试在任何平台上都要用它验磁盘上的资产。
+#[cfg(any(target_os = "linux", test))]
+const fn is_elf64_le(bytes: &[u8]) -> bool {
+    // 逐字节比而不是 `bytes[..4] == [..]`：切片比较不是 `const fn`，在编译期求值会报 E0015。
+    // 先判 `len() >= 20` 再用短路 `&&` 逐字节读，长度不够时根本走不到索引那一步。
+    const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+    bytes.len() >= 20
+        && bytes[0] == ELF_MAGIC[0]
+        && bytes[1] == ELF_MAGIC[1]
+        && bytes[2] == ELF_MAGIC[2]
+        && bytes[3] == ELF_MAGIC[3]
+        && bytes[4] == 2
+        && bytes[5] == 1
+}
+
+/// 从 ELF 头里取 `e_machine`（`0x3e` = x86_64）；不是 64 位小端 ELF 时返回 `None`。
+///
+/// 对位 macOS 侧的 `macho_cpu_type` 与 Windows 侧的 `pe_machine`——三者是同一条不变量
+/// 的三个平台落点。布局（`<elf.h>`）：`e_ident[16]` 之后紧跟 `e_type`(2) `e_machine`(2)，
+/// 所以 `e_machine` 在偏移 18，小端 2 字节。
+///
+/// 入参是**任意字节**（编译期要拿它验整个内嵌物、测试里要拿它验磁盘上的资产），
+/// 因此所有截断/畸形输入都必须安全地回 `None`。**不许越界索引**：
+/// `include_bytes!` 进来的东西长度不受我们控制。
+///
+/// ⚠️ 同样是 `const fn`（理由见 `pe_machine`），同样 `#[cfg(any(target_os = "linux", test))]`。
+#[cfg(any(target_os = "linux", test))]
+const fn elf_machine(bytes: &[u8]) -> Option<u16> {
+    if !is_elf64_le(bytes) {
+        return None;
+    }
+    Some(u16::from_le_bytes([bytes[18], bytes[19]]))
+}
+
+/// **本靶**上"内嵌的这份二进制与内核自己的架构一致"的编译期判据。
+///
+/// 三个平台的架构字段在**不同的编码空间**里（Mach-O 的 `cputype` 带 `CPU_ARCH_ABI64`
+/// 高位：arm64 是 `0x0100_000c`、x86_64 是 `0x0100_0007`；PE 的 `Machine` 是裸的
+/// 机器码：x86_64 是 `0x8664`；ELF 的 `e_machine` 又是一套：x86_64 是 `0x3e`），
+/// 所以下面按 `target_os` 分叉，**不硬凑成一个数**。
+///
+/// 不认识的组合返回 `false`（**fail-closed**）：那边 `compile_error!` 已经先一步拦住了，
+/// 这里多报一条也无害，但**绝不能默认放行**。
+///
+/// 判别力：把 Windows 那条 `#[cfg]` 指向 arm64 的 PE（`Machine == 0xaa64`）→
+/// 在 `--target x86_64-pc-windows-gnu` 下**编译失败**，诊断就是下面那条断言的那句话
+/// （任务 2 报告「裁决 Q 第 3 件的判别力自证」一节有两次输出的原文）。
+const fn aria2c_arch_matches_this_platform(bin: &[u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if cfg!(target_arch = "aarch64") {
+            matches!(macho_cpu_type(bin), Some(0x0100_000c))
+        } else if cfg!(target_arch = "x86_64") {
+            matches!(macho_cpu_type(bin), Some(0x0100_0007))
+        } else {
+            false
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if cfg!(target_arch = "x86_64") {
+            matches!(elf_machine(bin), Some(0x3e))
+        } else {
+            false
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if cfg!(target_arch = "x86_64") {
+            matches!(pe_machine(bin), Some(0x8664))
+        } else {
+            false
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        false
+    }
+}
+
+/// **编译期断言：内嵌的那份二进制必须与内核自己的 `target_arch` 相符。**
+///
+/// ⚠️ **它补的是上面那条魔数断言判不了的那一半**。4 字节魔数只能判**操作系统**
+/// （Mach-O 的 `cffaedfe` / ELF 的 `\x7fELF` / PE 的 `MZ`），判不了**架构**——给 Windows 分支塞一份 ARM64 或 IA64 的
+/// **合法 PE**，上面那条断言**照样通过**；而在开发机上没有任何东西会注意到这件事
+/// （Windows 目标的测试可执行文件跑不了，`ARIA2C_EMBED_SHA256` 的核对也只在
+/// Windows 机器上发生）。于是"下错了架构的 PE"会一路编到客户机器上才炸。
+/// 架构字段是纯字节，所以它**能**在编译期判——判不了的两个轴都补上，这条守卫才算完整。
+///
+/// ⚠️ **故意分成两条 `const _` 而不是合成一条**（`assert!(magic && arch)` 也成立）：
+/// 合成的写法在失败时**不告诉你是哪个轴不符**，而"OS 错了"与"架构错了"的补救完全不同
+/// （一个是换平台资产、一个是换架构资产）。诊断能指认轴，排障才不用猜。
+///
+/// ⚠️ 与测试模块里 `embedded_aria2c_arch_matches_kernel_arch` 是**同一个不变量的两个落点**
+/// （这里编译期、那里运行时），而判据本身**只有一份**（`aria2c_arch_matches_this_platform`）——
+/// 与魔数那对（两份实现 + 一条"两处判据一致"的断言）不同，这里没有漂移面。
+const _: () = assert!(
+    aria2c_arch_matches_this_platform(ARIA2C_BIN),
+    "内嵌 aria2c 的**架构**与内核自己的架构不符：macOS×arm64 要 Mach-O cputype 0x0100000c、\
+     macOS×x86_64 要 0x01000007、Linux×x86_64 要 ELF e_machine 0x3e、\
+     Windows×x86_64 要 PE Machine 0x8664。\
+     常见原因是入库时拿错了架构的资产（文件名说一个、字节是另一个），或者 ARIA2C_BIN 的 \
+     #[cfg] 分支指到了别的架构那份文件——这样编得出来、链得过，要到客户机器上才以 \
+     `Bad CPU type in executable` / 无法执行 暴露。见 core/assets/ 与 \
+     core/scripts/fetch_windows_aria2c.sh（它会在入库前自己从字节里读一遍 Machine）。"
+);
+
+// ---------------------------------------------------------------------------
+// Windows 资产的**内容登记**（sha256）——**全仓唯一一份**
+// ---------------------------------------------------------------------------
+
+/// `core/assets/aria2c-windows-x86_64.exe` 的 sha256（64 位小写十六进制）。
+///
+/// **为什么它必须是 cfg-free 的**：同一份资产被**两处**要求核对，而两处的**平台前提不同**——
+///   1. `sha256_known_answer_vectors` 核对"**内嵌进本靶**的那份字节"（`embed_hash_hex()`），
+///      因而只在 **Windows 目标**上成立；
+///   2. `shipped_aria2c_assets_match_their_arch_in_name` 核对"**磁盘上那个文件**"
+///      （`core/assets/aria2c-windows-x86_64.exe`），它在**任何平台上都跑**——
+///      正是这一条让"资产被换成了别的字节"在**开发机上**就能被抓到。
+/// 第二条要读这个值，所以它**不能**住在 `#[cfg(target_os = "windows")]` 里面。
+///
+/// ⚠️ **合一之前这里是两份字面量**（测试模块里 `ARIA2C_EMBED_SHA256` 的 Windows 分支，
+/// 以及另一个 `WINDOWS_ASSET_SHA256`），**值相同** ⇒ "改一处漏另一处"不会有任何东西
+/// 报错：在 macOS 上第二条照样绿，而第一条要到 Windows 目标上才编。现在两条路径读的是
+/// **同一个常量**，那个失效形态**不存在了**（这是消除漂移面，不是修一个已发生的 bug）。
+///
+/// ⚠️ **跨语言的那一份合不掉，有意保留**：`core/scripts/fetch_windows_aria2c.sh` 的
+/// `EXE_SHA256` 必须在**没有 Rust 工具链**的机器上也能读，所以它必须独立存在。
+/// 它与本常量的一致性由那个脚本核对（不一致时以**退出码 3** 打印该抄什么）。
+/// 权威口径在那个脚本的文件头（来源 URL、包 sha256、本摘要与复核命令都在那里）。
+const ARIA2C_WINDOWS_SHA256: &str =
+    "be2099c214f63a3cb4954b09a0becd6e2e34660b886d4c898d260febfe9d70c2";
+
+/// 是不是 64 位**小写**十六进制？`const fn`（下面那条编译期断言要它）。
+const fn is_lowercase_hex_64(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 64 {
+        return false;
+    }
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if !((c >= b'0' && c <= b'9') || (c >= b'a' && c <= b'f')) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// **编译期断言：上面那条登记必须是 64 位小写十六进制。**
+///
+/// ⚠️ 它同时是那个常量的**引用点**，而这一点是**必需的**：`ARIA2C_WINDOWS_SHA256`
+/// 在非 `test` 的生产构建里没有别的消费者，没有这条 `const _` 它就会变成一条**新的**
+/// `dead_code` 告警——而"告警净增 0"是硬约束（D-4，且不许用 `#[allow(dead_code)]` 按掉）。
+/// 所以这条断言不是装饰：它既让常量活着，又真的有判别力（截断、写成大写、
+/// 混进非十六进制字符都会当场编不过）。
+///
+/// ⚠️ **要如实说清它的能力边界**：它判的是**格式**，判不了"这 64 个字符就是那份资产的
+/// 摘要"——内容核对只能对**字节**做，落在 `shipped_aria2c_assets_match_their_arch_in_name`
+/// （任何平台都跑）、`sha256_known_answer_vectors`（Windows 目标上跑）与
+/// `core/scripts/fetch_windows_aria2c.sh`（有 Rust 工具链的机器上跑）里。
+/// 别把这条格式断言读成内容核对。
+const _: () = assert!(
+    is_lowercase_hex_64(ARIA2C_WINDOWS_SHA256),
+    "ARIA2C_WINDOWS_SHA256 必须是 64 位**小写**十六进制的 sha256（登记被截断、被写成了大写、\
+     或混进了非十六进制字符）。它是 core/assets/aria2c-windows-x86_64.exe 的内容登记；\
+     改它之前请重跑 core/scripts/fetch_windows_aria2c.sh（那个脚本会核对并打印该抄什么）。"
 );
 
 /// 内嵌的 GPLv2 全文。
 ///
-/// 内嵌分发 GPL 二进制**必须随附许可文本，且必须让用户能看到**——
-/// 界面入口是 Go 侧的"开源许可"按钮。文本由构建脚本从同一份源码拷入，与二进制版本一致。
+/// ⚠️ **本项（连同下面的 `license_text`）是一条既有的 `dead_code` 告警，保留不按掉**：
+/// 按 D-4「本任务**不新增**」执行——`#[allow(dead_code)]`、删符号两条路都不许。
+/// 基线账本见 `docs/superpowers/plans/2026-09-18-client-phase-d.md` **全局约束表的 D-4 行**
+/// （当前在 `:24`）：它点名了这四条告警（`crc64xz::sum` / `ARIA2_LICENSE` / `license_text` /
+/// `Daemon{secret,argv}`），并写明按"本任务**不新增**执行、
+/// **不要**用 `#[allow(dead_code)]` 或删符号去按掉它们"。
+/// ⚠️ 原指针写的是 `windows/scripts/test.sh` 头部——**那个文件在本仓库里不存在**
+/// （`windows/` 不在本工作树），照它去查会扑空；已订正为上面这处。
+///
+/// # 为什么它值得留着（论证保留，但**不是**按掉告警的理由）
+///
+/// ⚠️ **事实先摆清**：本内核**没有任何生产调用点**读它，读它的只有下面
+/// `embedded_license_is_gplv2` 这条测试。两个壳各自带着自己的那一份——
+/// macOS 由 `macos/scripts/build_app_macos.sh` 把**同一个文件**
+/// `core/assets/COPYING-GPLv2.txt` 拷进 `.app/Contents/Resources/`，Swift 侧从包里读
+/// （`macos/Sources/BenagenCoreKit/Presentation/LicenseText.swift`）；
+/// Windows 由任务 21 把同一份许可放进包里。**所以"没有这个常量，用户就看不到许可"
+/// 这句话是不成立的**——它曾经写在上面（"阶段 B 要给它接上展示入口"），
+/// 已经被两个壳的实际做法取代，那句话必须撤掉，不能留着误导后来者。
+///
+/// 它值得留的理由是**分发义务本身**，与界面无关：
+///
+///   1. 本内核 `include_bytes!` 了 aria2c（GPLv2 二进制），并且运行时把它
+///      **释放成一个独立文件**再执行（`extract_to`）——这份内核因此是那个 GPL 程序的
+///      **直接容器**；GPLv2 §1 要求向接收者"随附一份本许可"，而"随附"最直接的落点
+///      就是承载它的那个文件本身。包里的那一份覆盖正常安装路径，这一份覆盖
+///      "内核二进制被单独拷走"的路径（Windows 侧确实会把它释放到用户盘上）。
+///   2. 代价是 **18 KB 只读数据、零运行时开销**；收益是一项法律义务多一个独立载体。
+///      这个交换在合规问题上不需要犹豫。
+///
+/// ⚠️ 上面那段论证**说明它不该被删**（删它是从内核二进制里移除一份分发义务的载体，
+/// 那是合规层面的决定，不该由"清告警"顺手做掉）——但它**不构成按掉告警的理由**：
+/// 告警本身按 D-4 保留，`cargo build` 会照报。别再用 `reason =` 之类的写法把它盖掉。
 const ARIA2_LICENSE: &str = include_str!("../../assets/COPYING-GPLv2.txt");
 
 // ⚠️ 这里曾经有一个 `pub const ARIA2_SOURCE_URL = "https://github.com/aria2/aria2";`
 // ——**已删除**：它在整个内核里**没有任何消费者**（连测试都没有），而"没人读的常量"
-// 正是契约 §1.8 说的那种误导。许可全文（`license_text`）留着，因为它是 GPL 分发义务的
-// **载体**、阶段 B 要给它接上展示入口；"对应源码获取途径"的具体呈现方式（随 `.app` 的
-// COPYING 一起给，还是由内核经协议给出）是那个入口的一部分，
+// 正是契约 §1.8 说的那种误导。"对应源码获取途径"的具体呈现方式仍待定，
 // 届时应**连同入口一起**定，而不是先在这里留一个空常量。
-// 阶段 B 待办里有一条显式的「GPL 展示入口」。
 
-/// 内嵌的 aria2 许可全文（供界面展示）。
+/// 内嵌的 aria2 许可全文（为什么留着、以及为什么**不**按掉它的告警：见 `ARIA2_LICENSE`）。
 pub fn license_text() -> &'static str {
     ARIA2_LICENSE
 }
@@ -346,8 +724,35 @@ pub struct Daemon {
     url: String,
     /// RPC 的唯一凭据。收在结构体里是为了让"argv 里的 secret 与客户端用的必须是同一个"
     /// 这条断言有地方可查（对应 Go 测试里的 `d.client.secret`）。
+    ///
+    /// ⚠️ **本字段（连同下面的 `argv`）是一条既有的 `dead_code` 告警，保留不按掉**：
+    /// 按 D-4「本任务**不新增**」执行——`#[allow(dead_code)]`、`#[cfg(test)]` 门控、
+    /// 删符号三条路都不许（`cfg(test)` 字面上不是"删符号"，但它仍是"按掉它们"，
+    /// 而且会让 `Daemon` 的字段在测试与生产构建下**不一样**）。
+    /// 基线账本见 `docs/superpowers/plans/2026-09-18-client-phase-d.md` **全局约束表的 D-4 行**
+    /// （当前在 `:24`）：它点名了这四条告警（`crc64xz::sum` / `ARIA2_LICENSE` / `license_text` /
+    /// `Daemon{secret,argv}`），并写明按"本任务**不新增**执行、
+    /// **不要**用 `#[allow(dead_code)]` 或删符号去按掉它们"。
+    /// ⚠️ 原指针写的是 `windows/scripts/test.sh` 头部——**那个文件在本仓库里不存在**
+    /// （`windows/` 不在本工作树），照它去查会扑空；已订正为上面这处。
+    ///
+    /// **但"没人读"这件事本身是查过的**——判定依据是**认证有没有接上**，不是"字段有没有人读"：
+    ///   - 认证**接上了**：真正拿去发 RPC 的是 `client` 里那一份——`start_on_port` 把
+    ///     **同一个** `secret` 同时交给 `launch_args()`（进 argv 的 `--rpc-secret=`）
+    ///     与 `RpcClient::new()`，而 `daemon_starts_and_stops` 的 `ping()` 会真的打到
+    ///     aria2 上校验 token（错 secret 拿 400 `Unauthorized`）。所以"生成了却没人读"
+    ///     的两种解释里，这里是**前者（从这个字段读的人只有测试）**，**不是**"认证没接上"。
+    ///   - 留着它是为了让上面那条断言有地方可查：它钉的是**承重性质**"argv 里的 secret
+    ///     与客户端用的是同一个"，删字段等于删断言（阶段 A 账本 Ruling #105 的同一句）。
     secret: String,
     /// 实际传给 aria2c 的完整 argv（含 argv[0]），对应 Go 的 `cmd.Args`。
+    ///
+    /// ⚠️ 它是 `daemon_launch_args_pin_loopback_secret_and_resume` 观察
+    /// "**实际**传给了 aria2 什么"的唯一入口。那三条硬约束（只监听回环 / 必须带 secret /
+    /// 续传恒开）里有两条的取值恰好等于 aria2 的默认值——把断言换成"重新调一次
+    /// `launch_args()` 再比"就成了同义反复，唯有**记录真正发出去的那份 argv** 才有判别力。
+    /// 生产路径上没有读者（`Command` 自己持有它，std 不把它暴露出来），
+    /// 告警按 D-4 保留——理由同上面的 `secret`。
     argv: Vec<OsString>,
     /// 关闭只做一次，**且所有调用者都等到进程真的被回收之后才返回**。
     ///
@@ -365,8 +770,13 @@ impl Daemon {
         }
         let bin = match &opts.binary_path {
             Some(p) => p.clone(),
-            None => extract_to(&default_cache_dir())
-                .map_err(|e| format!("释放内嵌 aria2c 失败: {e}"))?,
+            None => {
+                // 两级错误各说各的：`default_cache_dir()` 的失败是"不知道往哪放"（W-2，
+                // 带补救话术），`extract_to` 的失败是"知道了但没放成"。压成一句话
+                // 会把可执行的那条补救（设 `%LOCALAPPDATA%`）淹掉。
+                let cache_dir = default_cache_dir()?;
+                extract_to(&cache_dir).map_err(|e| format!("释放内嵌 aria2c 失败: {e}"))?
+            }
         };
 
         let secret = random_secret()?;
@@ -485,8 +895,15 @@ impl Daemon {
     /// 列表方法不需要我们维护 GID 生命周期。
     ///
     /// ⚠️ `list` 在前、`global` 在后，且**第一次出错就返回**（`?`）：契约 §4.3 的代价
-    /// 论证建立在这上面——"一次快照失败即判定引擎断开"的实际代价是 **1 次** RPC 失败
-    /// （最坏约 10 秒，connection refused 约 0 秒），而不是 4 次 × 10 秒。
+    /// 论证建立在这上面——"一次快照失败即判定引擎断开"的实际代价是 **1–2 次** RPC 尝试
+    /// （最坏约 10 秒，connection refused 约 0 秒），而不是 8 次 × 10 秒。
+    /// ⚠️ 次数**不再恒为 1**：本方法打的四个方法**全是读方法**（`tellActive`/`tellWaiting`/
+    /// `tellStopped` + `getGlobalStat`），每一个在**传输层**失败时都会换一条新连接重试一次
+    /// （`rpc::is_retryable_read`，规格 §3 A1），所以是 1–2；**写方法从不重试**，恒为 1。
+    /// ⚠️ **"约 10 秒"是单次尝试的上界，且含连接阶段**：`rpc` 里两个 Agent 构造都显式设了
+    /// `timeout_connect(RPC_TIMEOUT)`（规格 §3 A4）。少了那一行，连接阶段会退到 ureq 默认的
+    /// **30 秒**（`timeout_connect` 在连接阶段**优先于**整体超时），上面那句"最坏约 10 秒"
+    /// 在连接阶段就不成立。
     pub fn snapshot(&self) -> Result<Snapshot, String> {
         let raw = self.client.list()?;
         let global = self.client.global()?;
@@ -861,6 +1278,14 @@ fn launch_args(dir: &Path, secret: &str, port: u16) -> Vec<OsString> {
         OsString::from("--auto-file-renaming=false"),
         OsString::from("--allow-overwrite=true"),
         OsString::from("--summary-interval=1"),
+        // IPv6 恒定关闭（规格 §12）：**不是**"顺手加的优化"，是修一个客户可见的故障。
+        // 内置引擎的 `disable-ipv6` 默认是 `false`（规格 §12.1 的 G2，实测）；开着它时，
+        // **有 IPv6 地址但没有可用 IPv6 路由**的机器上每个任务一启动就报网络不可达
+        // （Windows 上开过 Hyper-V、残留过 Teredo/ISATAP 的机器很常见）。
+        // ⚠️ 这一条属于"引擎的**启动形态**"（决定它用哪个地址族），不是逐任务行为——
+        //    所以它在 argv 里，而**不是** `settings.per_task_options()` 那一份。
+        //    三端都关，不加平台门（规格 §12.2）。
+        OsString::from("--disable-ipv6=true"),
     ];
     // 系统 CA 证书包（见 `SYSTEM_CA_BUNDLES` 的长注释）：**平台门就在这一句上**。
     //   - Linux：探三条候选，第一个存在的用 `--ca-certificate=` 传进去；都没有就不传。
@@ -887,6 +1312,10 @@ fn start_on_port(
     let dir = absolute_dir(&opts.download_dir)?;
     let args = launch_args(&dir, secret, port);
 
+    // 供测试断言用的那份 argv 记录（见 `Daemon::argv` 的说明）：内容就是下面交给
+    // `Command` 的 `bin` + `args`。它只被测试读，所以生产构建下那一处会报 dead_code
+    // ——**按 D-4 保留那条告警**，不门控、不 allow（`cfg(test)` 会让 `Daemon` 的字段
+    // 在两种构建下形状不同，那不该是一次顺手清理做的事）。
     let mut argv: Vec<OsString> = Vec::with_capacity(args.len() + 1);
     argv.push(bin.as_os_str().to_os_string());
     argv.extend(args.iter().cloned());
@@ -920,6 +1349,7 @@ fn start_on_port(
         inner,
         client,
         url,
+        // 两个只被测试读的观察面（见字段说明）：告警按 D-4 保留。
         secret: secret.to_string(),
         argv,
         close_once: Once::new(),
@@ -988,6 +1418,14 @@ fn free_port() -> Result<u16, String> {
 /// 而 **std 里没有 CSPRNG**。`/dev/urandom` 是 macOS/Linux 内核的密码学随机源，
 /// 正是 Go 的 `crypto/rand` 在同一个平台底下用的东西。
 /// 拿时间戳/进程号凑一个"看着随机"的串是**不行**的——那会让 RPC 凭据可预测。
+///
+/// ⚠️ **Windows 上随机源换了一条，而上面那条理由一字不改地成立**：`/dev/urandom`
+/// 在 Windows 上不存在（那是"这个**设备节点**在该平台不存在"），但"**不用库、直接用
+/// 操作系统的随机源**"这条纪律在两个平台上是同一条——`extern "system"` 调
+/// `BCryptGenRandom` 与读 `/dev/urandom` 一样不新增依赖。Windows 那一份见下面。
+/// ⚠️ 两个随机源都是**密码学**随机源（Go 的 `crypto/rand` 在 Windows 上用的也是
+/// `BCryptGenRandom`），所以这不是"降级到某个够用的东西"。
+#[cfg(not(windows))]
 fn random_secret() -> Result<String, String> {
     let mut buf = [0u8; 16];
     std::fs::File::open("/dev/urandom")
@@ -996,16 +1434,58 @@ fn random_secret() -> Result<String, String> {
     Ok(hex(&buf))
 }
 
+/// 见上一条的说明（Windows 那一份：`/dev/urandom` 是 Unix 的设备节点，本平台没有）。
+///
+/// 用 `BCryptGenRandom` + `BCRYPT_USE_SYSTEM_PREFERRED_RNG`：这是 Windows 上
+/// "拿操作系统的密码学随机源"的标准入口（CNG），与 `/dev/urandom` 是**对位**的东西，
+/// 不是退而求其次。同样**不新增依赖**（`bcrypt` 是系统导入库）。
+///
+/// ⚠️ **失败即大声失败，不许退到时间戳/进程号**：`secret` 是 RPC 唯一的凭据，
+/// 一个可预测的 secret 等于把本地 RPC 端口交给别人用（W-2）。
+#[cfg(windows)]
+fn random_secret() -> Result<String, String> {
+    // 见 `free_bytes` 的说明：`#[link]` + 裸 `extern "system"` 不引入 crate 依赖。
+    #[link(name = "bcrypt")]
+    extern "system" {
+        fn BCryptGenRandom(alg: *mut core::ffi::c_void, buf: *mut u8, len: u32, flags: u32) -> i32;
+    }
+    /// `BCRYPT_USE_SYSTEM_PREFERRED_RNG`：让 CNG 自己挑系统首选的 RNG 算法。
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    let mut buf = [0u8; 16];
+    // SAFETY：`buf` 是本函数栈上的 [u8; 16]，指针有效、可写、长度与 `len` 一致；
+    // `alg` 按 API 约定在给 `BCRYPT_USE_SYSTEM_PREFERRED_RNG` 时必须为 NULL。
+    let status = unsafe {
+        BCryptGenRandom(
+            core::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    // NTSTATUS：0 == STATUS_SUCCESS，非 0 一律当失败（不逐条映射，映射错反而更危险）。
+    if status != 0 {
+        return Err(format!(
+            "读取系统随机源失败（BCryptGenRandom 返回 {status:#010x}）"
+        ));
+    }
+    Ok(hex(&buf))
+}
+
 // ---------------------------------------------------------------------------
 // 内嵌 aria2c 的释放
 // ---------------------------------------------------------------------------
 
-/// 释放位置——Caches 下，不污染数据目录。
-pub fn default_cache_dir() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join("Library/Caches/BenagenDownloader"),
-        None => std::env::temp_dir().join("BenagenDownloader"),
-    }
+/// 释放位置——缓存目录下，不污染数据目录。
+///
+/// 按平台取**标准目录**（规格 §8 的表；判据集中在 `crate::paths`，本函数只做转发）：
+/// macOS 是 `~/Library/Caches/BenagenDownloader`（`$HOME` 取不到 ⇒ 回退临时目录），
+/// Windows 是 `%LOCALAPPDATA%\BenagenDownloader\cache`。
+///
+/// 返回值从 `PathBuf` 变成 `Result`：Windows 上 `%LOCALAPPDATA%` 取不到时
+/// **必须大声失败**（W-2），不许悄悄退到相对路径——双击启动时"当前工作目录"是
+/// exe 所在目录（可能是 `Program Files`，可能不可写），那不是个能放东西的地方。
+pub fn default_cache_dir() -> Result<PathBuf, String> {
+    crate::paths::cache_dir()
 }
 
 /// 释放文件名 / `--version` 里用的摘要长度：sha256 十六进制串的**前 12 位**。
@@ -1030,7 +1510,16 @@ pub const EMBED_HASH_PREFIX_LEN: usize = 12;
 pub fn extract_to(cache_dir: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(cache_dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
     // 文件名由内容哈希派生，天生恒定——这也是"复用"必须拿 inode/mtime 当证据的原因。
-    let name = format!("aria2c-{}", &embed_hash_hex()[..EMBED_HASH_PREFIX_LEN]);
+    //
+    // ⚠️ **Windows 上必须带 `.exe` 后缀**：能不能直接执行一个**没有扩展名**的
+    //    PE 是 `CreateProcess`/shell 的推断、不是实测过的事实（探路没验过），
+    //    而"不赌"在本项目是一条有代价换来的纪律。带上后缀两边行为一致、代价为零。
+    //    后缀**不进哈希判据**：下面复用与否仍然只看内容摘要，文件名变了不影响判据。
+    let name = if cfg!(windows) {
+        format!("aria2c-{}.exe", &embed_hash_hex()[..EMBED_HASH_PREFIX_LEN])
+    } else {
+        format!("aria2c-{}", &embed_hash_hex()[..EMBED_HASH_PREFIX_LEN])
+    };
     let path = cache_dir.join(&name);
 
     if let Ok(existing) = std::fs::read(&path) {
@@ -1066,15 +1555,35 @@ fn private_tmp(path: &Path) -> PathBuf {
 /// 写入一个**可执行**文件（对应 Go 的 `os.WriteFile(path, data, 0o755)`：
 /// 权限是在**创建时**给定的，不是写完再 chmod——中间那一瞬间不能留下一个
 /// 没有执行位、却被另一个进程看见的文件）。
+///
+/// ⚠️ **Windows 那一支没有 `mode(0o755)`，这是"该维度在该平台上不存在"，不是降级**
+/// （**不是**"Windows 版的权限设置漏了"——后来者别去补一个不存在的 API）：
+/// 文件模式位（`rwxr-xr-x` 那一套）是 POSIX 的概念，Windows 的 ACL 模型里没有"执行位"
+/// 这个字段——一个文件能不能被执行由**它的内容是不是可执行的 PE**决定
+/// （判据是 `pe_machine`，落在 `extract_writes_binary_and_verifies_hash` 那条测试里）。
+/// 于是 Windows 上"创建时就定好权限"这句顾虑**不成立**：没有权限位可定，
+/// 也就不存在"中间那一瞬间露出一个没有执行位的文件"这个窗口。
+/// 两边**共同**的那条不变量（"释放物必须是可执行的"）没有丢，只是 Windows 上
+/// 换了另一把尺子表达，见那条测试。
 fn write_executable(path: &Path, data: &[u8]) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o755)
+            .open(path)
+    };
+    // 见上面那条说明：非 Unix 上没有"执行位"这个维度，所以这里**没有**降级可言。
+    #[cfg(not(unix))]
+    let opened = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o755)
-        .open(path)
-        .map_err(|e| format!("释放 aria2c 失败: {e}"))?;
+        .open(path);
+    let mut f = opened.map_err(|e| format!("释放 aria2c 失败: {e}"))?;
     f.write_all(data)
         .map_err(|e| format!("释放 aria2c 失败: {e}"))?;
     Ok(())
@@ -1223,6 +1732,11 @@ mod tests {
     use super::*;
     use crate::testutil::{RawResponse, StubHttp, TempDir};
     use std::net::TcpListener;
+    // ⚠️ `PermissionsExt` 是 POSIX 专有（`mode()`/`from_mode` 在 Windows 上不存在），
+    // 所以这条 `use` 必须门控——不门控它本身就会让 `cargo check --target …-windows-gnu
+    // --all-targets` 红在"could not find `unix` in `os`"。本模块里用它的只有
+    // `extract_writes_binary_and_verifies_hash` 的 Unix 那一支（见那里的说明）。
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command as StdCommand;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -1310,11 +1824,18 @@ mod tests {
 
     /// 占住一个端口，用于构造"端口冲突"场景。
     ///
-    /// ⚠️ **必须同时占住 IPv4 与 IPv6 回环**，否则"冲突"根本不成立：aria2 的 RPC 在两个
-    /// 协议栈上各绑一次，只占 IPv4 时它会 `ERROR IPv4 RPC: failed to bind` 之后照样
-    /// `NOTICE IPv6 RPC: listening` **活下去**（实测）——进程不退，那走的是
-    /// "Ping 不到、耗满 10 秒超时再换端口"那条路，而不是这里要测的"端口被占、立刻换"。
-    /// Go 版的桩只占了 IPv4，于是那两条测试是**准永真**的；Rust 侧这条缺口必须堵上。
+    /// **两个回环都占住**：这样"冲突"在**两种配置下都成立**。
+    ///
+    /// ⚠️ 理由在 2026-10-05 变过一次（规格 §12），**旧理由已经作废**，照抄旧注释会写出假话：
+    /// - **旧**（aria2 启用 IPv6 时）：只占 IPv4 的话，aria2 会 `ERROR IPv4 RPC: failed to bind`
+    ///   之后照样 `NOTICE IPv6 RPC: listening` **活下去**——进程不退，走的是"Ping 不到、
+    ///   耗满 10 秒超时再换端口"那条路，而不是这里要测的"端口被占、立刻换"。
+    ///   （Go 版的桩只占了 IPv4，于是那两条测试是**准永真**的；Rust 侧当时把这个缺口堵上了。）
+    /// - **现在**：`launch_args` 带了 `--disable-ipv6=true` ⇒ aria2 **只绑 IPv4** ⇒
+    ///   占住 IPv4 那一个就足以构成冲突，而它会**绑不上就直接退**（不再是"活着但不可达"）。
+    ///
+    /// 既然两种配置下"占两个"都成立，就**继续占两个**——把这段助手的行为绑定到某一种
+    /// `launch_args` 上，等于给未来埋一次静默失效。
     ///
     /// 两个 listener **从不 accept**：内核的 backlog 会完成 TCP 握手，于是客户端
     /// connect 得上、却永远等不到响应——这正是 §4.1 要防的那种"占着端口不回话"的程序。
@@ -1357,6 +1878,7 @@ mod tests {
             }),
             client: Arc::new(RpcClient::new(&url, secret)),
             url,
+            // 同上：这两个字段只被测试读，告警按 D-4 保留。
             secret: secret.to_string(),
             argv: Vec::new(),
             close_once: Once::new(),
@@ -1403,6 +1925,26 @@ mod tests {
     }
 
     /// 与 Go 的 `os.SameFile` 同义：比 (dev, ino)。
+    ///
+    /// ⚠️ **这是"该维度在 Windows 上不存在"那一类，不是"同一个不变量换把尺子"**，
+    /// 所以 Windows 上**显式标为不适用**——不是"降级成别的判据"，也不是"忘了补"：
+    /// inode（连同 `dev`）是 **POSIX 的文件身份维度**，Windows 上没有它。
+    /// NTFS 有等价的 (volume serial number, file index)，但 **std 把它锁在 nightly 的
+    /// `windows_by_handle` feature 后面**（`std::os::windows::fs::MetadataExt::
+    /// {volume_serial_number,file_index}`），而本 crate 不用 nightly。
+    /// 自己写 `GetFileInformationByHandle` 的裸 extern **做得到**，但那会是一段
+    /// **在开发机上永远跑不到**的判据（交叉编译出来的 Windows 测试可执行文件跑不了），
+    /// 于是它"看起来在保障一条不变量、实际从没被执行过"——正是本阶段要根除的失效形态。
+    /// 与其造一条没人跑过的判据，不如**在这里说清楚它不适用**。
+    ///
+    /// ⚠️ **它守的那条不变量（"复用 = 不重写已有文件"）在 Windows 上并没有丢**：
+    /// 由紧随其后的 **mtime 断言**（`md.modified() == md2.modified()`）覆盖——
+    /// 那条是任何平台都跑的，而调用点上两次释放之间隔着两次 2.4 MB 的 sha256，
+    /// 一个"每次都无脑重写"的实现在那里必红。
+    /// 换句话说：Windows 上"**同一个文件**"这个**身份**判据不存在，
+    /// 而"**文件没被碰过**"这条**证据**换成 mtime 表达——两句话不一样，
+    /// 别把这里读成"Windows 上少测了一条"。
+    #[cfg(not(target_os = "windows"))]
     fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
         use std::os::unix::fs::MetadataExt;
         a.dev() == b.dev() && a.ino() == b.ino()
@@ -1525,9 +2067,12 @@ mod tests {
     ///
     /// 撞端口要**快速**换端口，不能把 10 秒的 RPC 就绪等待期耗满——界面在这期间是冻住的。
     ///
-    /// 3 秒这个上界是为判别而设的，不是性能指标：端口真被占住时 aria2 两个协议栈都绑不上，
-    /// ~10ms 就退出，走"进程没了就立刻换"这条路本测试不到 1 秒；而退回"只轮询 Ping"的写法时
-    /// （或只占 IPv4、让 aria2 在 IPv6 上活着但在 IPv4 上不可达），必然耗满 10 秒。
+    /// 3 秒这个上界是为判别而设的，不是性能指标：端口真被占住时 aria2 只绑 IPv4、而那个回环
+    /// 已被占住，绑不上就 ~10ms 退出，走"进程没了就立刻换"这条路本测试不到 1 秒；而换成
+    /// 别的写法（或退回"只轮询 Ping"的写法），必然耗满 10 秒。
+    /// ⚠️ 这里 2026-10-05 删掉过一个反例："只占 IPv4、让 aria2 在 IPv6 上活着但在 IPv4 上不可达"。
+    ///    那个反例**已经造不出来了**（`launch_args` 现在带 `--disable-ipv6=true`，aria2 只绑 IPv4，
+    ///    绑不上就退）——留着它会让下一个人去构造一个不存在的场景（规格 §12.3）。
     #[test]
     fn daemon_port_conflict_fails_fast() {
         let Some(blocker) = DummyListener::start() else {
@@ -2008,6 +2553,10 @@ mod tests {
     /// 启动参数里的三条硬约束（规格 §3）：只监听回环、必须带 secret、续传恒开。
     /// 断言的是实际传给 aria2 的 argv——这几条一旦某次重构掉了，普通的功能测试
     /// 全都还是绿的（aria2 的默认值恰好等于其中两条），所以得单独钉住。
+    ///
+    /// 第四条（`--disable-ipv6=true`）是 2026-10-05 按规格 §12 加的：**默认值恰好也是我们
+    /// 想要的反面**（aria2 的 `disable-ipv6` 默认 false，见规格 §12.1 的 G2），
+    /// 同样是"掉了不会红"的形状，所以与那三条并列钉在这里。
     #[test]
     fn daemon_launch_args_pin_loopback_secret_and_resume() {
         let dir = TempDir::new();
@@ -2021,6 +2570,11 @@ mod tests {
             "RPC 必须只监听回环：缺 --rpc-listen-all=false"
         );
         assert!(has_arg("-c"), "断点续传必须恒开：缺 -c");
+        assert!(
+            has_arg("--disable-ipv6=true"),
+            "IPv6 必须恒定关闭（规格 §12）：缺 --disable-ipv6=true —— \
+             部分 Windows 机器有 IPv6 地址但没有可用路由，开着它会让每个任务一启动就报网络不可达"
+        );
         assert!(!d.secret.is_empty(), "RPC 没带 secret");
         assert!(
             has_arg(&format!("--rpc-secret={}", d.secret)),
@@ -2138,12 +2692,57 @@ mod tests {
     fn extract_writes_binary_and_verifies_hash() {
         let cache = TempDir::new();
         let path = extract_to(cache.path()).expect("释放失败");
+        // ⚠️ **释放名的后缀**（`extract_to` 里那条 `cfg!(windows)` 分叉）必须有测试钉住：
+        //    Windows 上**必须**带 `.exe`（"能不能直接执行一个无扩展名的 PE"是**推断**、
+        //    不是实测，不赌——见 `extract_to` 的说明）；macOS 上**必须不带**后缀
+        //    （那是阶段 1 起的既有释放名，W-3 说它一个字不许坏）。
+        //    两边都写成**字面量**：拿 `cfg!(windows)` 去拼期望值等于把实现抄一遍，
+        //    改错了实现期望值会跟着错，什么也钉不住。
+        #[cfg(windows)]
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("exe"),
+            "Windows 上的释放名必须带 .exe 后缀（实际是 {}）",
+            path.display()
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            None,
+            "非 Windows 的释放名不该有后缀（阶段 1 起的既有形状，W-3）（实际是 {}）",
+            path.display()
+        );
+
         let md = std::fs::metadata(&path).expect("产物不存在");
+        // **"释放出来的这份东西必须能被执行"——同一条不变量，两个平台两把尺子。**
+        //
+        // ⚠️ 这是简报步骤 6 的第 3 类（**不是**"Windows 不支持"）：不变量在 Windows 上
+        //    **照样成立、照样被验**，只是可执行性在那边**不编码在权限位里**。
+        //      - Unix：可执行性 = **权限位**里的某一个 x 位 ⇒ `mode & 0o111 != 0`；
+        //      - Windows：**没有"执行位"这个字段**（模式位是 POSIX 概念，NTFS 的 ACL
+        //        模型里没有它），可执行性 = **文件内容是不是本平台可执行的 PE** ⇒
+        //        用 `pe_machine` 读 `Machine` 字段。这与内嵌资产、
+        //        `aria2c-windows-x86_64.exe` 用的是**同一把尺子**（生产代码里的 `const fn`，
+        //        编译期那条 `const _` 断言也用它），所以这里不存在"第二套判据"。
+        //    ⚠️ 别把 Windows 这一支读成"少测了一条"：它验的是**同一句话**，判据不同而已。
+        #[cfg(unix)]
         assert!(
             md.permissions().mode() & 0o111 != 0,
             "产物不可执行: {:o}",
             md.permissions().mode()
         );
+        #[cfg(windows)]
+        {
+            let raw = std::fs::read(&path).expect("读产物失败");
+            assert_eq!(
+                pe_machine(&raw),
+                Some(PE_MACHINE_AMD64),
+                "释放出来的产物不是一份 x86_64 的 PE（Machine 读出来是 {:?}）——它**不可执行**，\
+                 而「释放出来的东西必须能被执行」这条不变量在这里与 Unix 的 `mode & 0o111` 同义。\
+                 判据用的是生产代码里的 `pe_machine`（与内嵌资产、const_ 断言同一把尺子）。",
+                pe_machine(&raw)
+            );
+        }
         // 再释放一次应复用同一个文件（内容一致）
         let raw1 = std::fs::read(&path).expect("读产物失败");
         let path2 = extract_to(cache.path()).expect("第二次释放失败");
@@ -2156,6 +2755,10 @@ mod tests {
         // "复用"的实质是**不碰已有的正确文件**，所以要拿 inode 与 mtime 当证据。
         extract_to(cache.path()).expect("第三次释放失败");
         let md2 = std::fs::metadata(&path).expect("读产物元数据失败");
+        // ⚠️ **inode 身份这一条只对非 Windows 成立**（理由见 `same_file` 的说明：
+        // inode 是 POSIX 的维度，Windows 上没有它）。Windows 上这条**显式不适用**，
+        // 而"复用=不重写"这条不变量由紧随其后的 **mtime 断言**接着守——那条两边都跑。
+        #[cfg(not(target_os = "windows"))]
         assert!(
             same_file(&md, &md2),
             "第二次释放换掉了文件（inode 变了）——应当复用，不该重写"
@@ -2217,6 +2820,9 @@ mod tests {
             "--auto-file-renaming=false",
             "--allow-overwrite=true",
             "--summary-interval=1",
+            // 2026-10-05 按规格 §12 加入（理由见 `launch_args`）：aria2 的 `disable-ipv6`
+            // 默认 false，这里把它关掉。整条参数表逐字钉死，所以新增的一项也必须在此现身。
+            "--disable-ipv6=true",
         ]
         .iter()
         .map(OsString::from)
@@ -2522,6 +3128,12 @@ mod tests {
     /// 对应 Go `TestExtractTargetIsOutsideDataDir`。
     ///
     /// 释放位置必须在 Caches 下，不得落在数据目录里。
+    ///
+    /// ⚠️ **只对非 Windows 有意义**（因此带 `cfg`）：它钉的是 **macOS 规范位置**，
+    /// 而 Windows 的释放位置按规格 §8 是 `%LOCALAPPDATA%\BenagenDownloader\cache`——
+    /// 在那台机器上这条断言问的是一个**错误的期望**。Windows 那一半的判据在
+    /// `paths::tests::windows_cache_dir_*`（纯函数，任何平台都能跑，不需要真机）。
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn extract_target_is_outside_data_dir() {
         let home = std::env::var("HOME").expect("取 HOME 失败");
@@ -2531,11 +3143,13 @@ mod tests {
             .join("BenagenDownloader");
         // Go 用的是字符串前缀（`strings.HasPrefix`）；这里用**按路径分量**的前缀，
         // 意图相同而更严：`…/BenagenDownloaderX` 会被它拒掉（字符串前缀会放过）。
+        // `default_cache_dir()` 在非 Windows 上恒为 `Ok`（回退不是错误）。
+        let got = default_cache_dir().expect("非 Windows 上 default_cache_dir() 恒为 Ok");
         assert!(
-            default_cache_dir().starts_with(&want),
+            got.starts_with(&want),
             "缓存目录应为 {}...，得到 {}",
             want.display(),
-            default_cache_dir().display()
+            got.display()
         );
     }
 
@@ -2549,6 +3163,7 @@ mod tests {
     ///   `cafebabe`/`cafebabf`，同样不放行**——它也是 Mach-O，但不是本内核要的形态
     ///   （见 `ARIA2C_BIN` 的说明：分发形态本就是"每个平台/架构一个独立包"）。
     /// - Linux：64 位小端 ELF。
+    /// - Windows：PE（只有两字节 `MZ`；`PE\0\0` 在 `e_lfanew` 处，由 `pe_machine()` 验）。
     ///
     /// 不支持的平台返回 `false`（走不到：本文件顶部的 `compile_error!` 先拦住了）。
     fn is_native_executable(bytes: &[u8]) -> bool {
@@ -2557,6 +3172,8 @@ mod tests {
             bytes.len() >= 4 && bytes[..4] == MH_MAGIC_64_LE
         } else if cfg!(target_os = "linux") {
             is_elf64_le(bytes)
+        } else if cfg!(target_os = "windows") {
+            bytes.len() >= 2 && bytes[..2] == *b"MZ"
         } else {
             false
         }
@@ -2569,6 +3186,8 @@ mod tests {
              那同样是 Mach-O 但不是本内核要的形态——见 ARIA2C_BIN 的说明）。"
         } else if cfg!(target_os = "linux") {
             "应是 64 位小端 ELF。"
+        } else if cfg!(target_os = "windows") {
+            "应是 PE（`MZ` 开头；`PE\0\0` 在 `e_lfanew` 处）。"
         } else {
             "本平台不在支持列表里。"
         }
@@ -2583,15 +3202,20 @@ mod tests {
             ARIA2C_BIN.len()
         );
         // ⚠️ 这条的本意是"内嵌的确实是一个**本平台能直接执行的**可执行文件"，所以魔数
-        //    **按平台分派**（macOS 是 Mach-O、Linux 是 ELF），而**不是**整条 `#[cfg]` 掉——
-        //    后者等于 Linux 上不再检查这件事（裁定 R32 点了名）。
+        //    **按平台分派**（macOS 是 Mach-O、Linux 是 ELF、Windows 是 PE），
+        //    而**不是**整条 `#[cfg]` 掉——后者等于 Linux 上不再检查这件事（裁定 R32 点了名）。
+        //
+        // ⚠️ 文案要说准：`cafebabe`/`cafebabf` 也是 Mach-O（**fat / 通用二进制**的魔数），
+        //    这条断言的判据不是"是不是 Mach-O"，而是"是不是**可直接执行的、本平台的
+        //    原生格式**"。所以下面不能写成"不是 Mach-O 可执行文件"——那会把
+        //    "内嵌了 fat 包"这种**确实有问题**的情形描述成一个不成立的理由。
+        let head = &ARIA2C_BIN[..4.min(ARIA2C_BIN.len())];
         assert!(
             is_native_executable(ARIA2C_BIN),
-            "内嵌内容不是本平台的可执行文件（前 4 字节 {:?}）：{}",
-            &ARIA2C_BIN[..4.min(ARIA2C_BIN.len())],
+            "内嵌内容不是本平台可直接执行的原生格式（前 4 字节 {head:?}）：{}",
             native_executable_hint()
         );
-        // 光看大小与魔数不够：任何 ≥1MB 的可执行文件都能通过。
+        // 光看大小与魔数不够：任何 ≥1MB 的、本平台的原生格式都会通过。
         // 断言里面确实有 aria2 的版本串，才算"是它本人"。
         assert!(
             ARIA2C_BIN.windows(6).any(|w| w == b"aria2/"),
@@ -2625,14 +3249,151 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 按平台内嵌 aria2c（**非移植**：Go 版只有 arm64 一份资产，没有可对应的测试源）
+    // -----------------------------------------------------------------------
+    // 按 (操作系统, 架构) 内嵌 aria2c
+    // （**非移植**：Go 版只有 arm64 一份资产、也没有 Windows 目标，没有可对应的测试源）
     // -----------------------------------------------------------------------
 
-    /// 两个架构在 **Mach-O 头**里的 `cputype` 与人类可读名。
+    /// 内嵌的那份二进制，在这台目标平台上必须是**可直接执行的**原生格式。
+    /// macOS 上是 thin 64 位 Mach-O；Linux 上是 64 位小端 ELF；Windows 上是 PE（`MZ`）。
+    ///
+    /// ⚠️ 判据必须按 `target_os` 分叉：把 `cafebabe`（fat Mach-O）也当成"可用"是错的，
+    ///    而拿 Mach-O 魔数去判 Windows 产物则**永远为假**（探路 §3.4）。
+    ///
+    /// ⚠️ 这是**运行时**的那一层；同一不变量的**编译期**落点是生产代码里的
+    /// `aria2c_magic_ok_for_this_platform()` + 那条 `const _` 断言。两层都要有：
+    /// 交叉编译出来的 Windows 测试可执行文件**在开发机上跑不了**，所以
+    /// "对着 Windows 目标"这件事只有编译期那层查得到（理由详见生产代码里那条
+    /// `const _` 断言的说明）。
+    /// 两份判据是独立实现，改一处必须改另一处——`embedded_binary_is_native_executable_for_this_platform`
+    /// 里那条"两处判据一致"的断言就是用来抓这种漂移的。
+    fn native_executable_magic_ok(head: &[u8]) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            // 前 4 字节 == cffaedfe：**thin** 64 位 Mach-O（不是 fat 的 cafebabe）。
+            head.len() >= 4 && head[..4] == [0xcf, 0xfa, 0xed, 0xfe]
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // 64 位小端 ELF 的 `e_ident` 魔数 `\x7fELF`。
+            head.len() >= 4 && head[..4] == [0x7f, b'E', b'L', b'F']
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // PE 的魔数只有两字节 `MZ`；`PE\0\0` 在 e_lfanew 处，由 pe_machine() 验。
+            head.len() >= 2 && head[..2] == *b"MZ"
+        }
+    }
+
+    /// PE 头里的 `IMAGE_FILE_MACHINE_AMD64`——Windows×x86_64 的那个值。
+    ///
+    /// ⚠️ 判据函数 `pe_machine` / `macho_cpu_type` / `elf_machine` **已经挪到生产代码**（本任务裁定 Q
+    /// 第 3 件：架构判据要有编译期落点，而编译期判据只能读常量、只能由 `const fn` 给），
+    /// 所以这里**不再有它们的副本**——`use super::*` 直接引用那一份。这消灭了原先
+    /// "生产侧一份、测试侧一份"的漂移面：现在编译期断言与下面这些测试问的是**同一个函数**。
+    ///
+    /// 留在这个常量里的 `0x8664` 是**刻意的复述**：一个把架构码写错的判据会让本文件里
+    /// 所有相关断言一起错，所以这个数值得被独立写第二遍、由 `pe_machine` 的正例来对。
+    const PE_MACHINE_AMD64: u16 = 0x8664;
+
+    /// **内嵌的那份必须是本平台的原生可执行格式。**
+    ///
+    /// 判别力：把某条 `ARIA2C_BIN` 的 `#[cfg]` 指向另一个平台的资产 → 该平台构建下必红
+    /// （macOS 上把 Windows 分支指过去也一样红，因为这条测试读的是**编译进本靶**的字节）。
+    #[test]
+    fn embedded_binary_is_native_executable_for_this_platform() {
+        let head = &ARIA2C_BIN[..4.min(ARIA2C_BIN.len())];
+        assert!(
+            native_executable_magic_ok(head),
+            "内嵌内容不是本平台可直接执行的原生格式（前 4 字节 {head:?}）"
+        );
+        // 与**编译期**那条同义断言（生产代码的 `aria2c_magic_ok_for_this_platform`）
+        // 对同一份真实字节求值，钉住"两份判据不漂移"。这**不是**独立证据
+        // （两条本来就是同一个不变量的两份实现），它的唯一职责是抓单边修改。
+        assert_eq!(
+            native_executable_magic_ok(head),
+            aria2c_magic_ok_for_this_platform([
+                ARIA2C_BIN[0],
+                ARIA2C_BIN[1],
+                ARIA2C_BIN[2],
+                ARIA2C_BIN[3]
+            ]),
+            "编译期判据与运行时判据给出的答案不一致——同一个不变量的两份实现漂移了，\
+             改了一处忘了另一处"
+        );
+    }
+
+    /// `pe_machine()` 读的确实是**文件里那个字段**，不是写死的常量。
+    ///
+    /// 为什么必须单独测这个解析器：它是 Windows 侧"内嵌的与内核架构一致"那条断言的
+    /// **全部**判据所在。一个只会 `return Some(0x8664)` 的实现能让那条断言永远通过，
+    /// 却在客户机器上放行一份 x86 的 PE。所以下面既有**正例**（拼一个最小 PE 头）
+    /// 也有**反例**（Mach-O 必须读不出来、截断输入不许 panic）。
+    ///
+    /// 这条测试与平台无关：任何平台上 `cargo test` 都会跑它。
+    #[test]
+    fn pe_machine_reads_the_field_instead_of_a_hardcoded_value() {
+        /// 拼一个最小 PE 头：DOS 头（`MZ` + 0x3c 处的 `e_lfanew`）+ `PE\0\0` + `Machine`。
+        fn minimal_pe(machine: u16) -> Vec<u8> {
+            let mut pe = vec![0u8; 0x80];
+            pe[..2].copy_from_slice(b"MZ");
+            pe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+            pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+            pe[0x44..0x46].copy_from_slice(&machine.to_le_bytes());
+            pe
+        }
+
+        assert_eq!(
+            pe_machine(&minimal_pe(PE_MACHINE_AMD64)),
+            Some(PE_MACHINE_AMD64),
+            "读不出最小 PE 头里的 Machine 字段"
+        );
+        // 换一个**不是** 0x8664 的值：钉住"读的是文件里的字段"。
+        // 少了这条，"返回写死的 0x8664"这种实现照样能过上面的正例。
+        assert_eq!(
+            pe_machine(&minimal_pe(0x014c)),
+            Some(0x014c),
+            "Machine 字段被写死了——读出来的值不随文件内容变"
+        );
+        // 反例（承重的那几条）：**Mach-O 必须读不出来**，否则这道 PE 判据会把
+        // macOS 的二进制也判成合格，等于没有守卫——这正是探路 §3.4 的形态。
+        assert_eq!(
+            pe_machine(&[0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x01, 0x00]),
+            None,
+            "把 thin 64 位 Mach-O 读成了 PE——那就分不出平台了"
+        );
+        // 截断与畸形输入：不许 panic、不许给 Some（`include_bytes!` 进来的东西
+        // 长度不受我们控制，越界索引会以 panic 的形式在客户机器上炸）。
+        let too_short = vec![0u8; 0x3f]; // 连 DOS 头都不够长
+        let mut bad_lfanew = vec![0u8; 0x80]; // 是 MZ，但 e_lfanew 指向文件外
+        bad_lfanew[..2].copy_from_slice(b"MZ");
+        bad_lfanew[0x3c..0x40].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        // 是 MZ、e_lfanew 也合法，但那一处不是 `PE\0\0`（`minimal_pe` 的骨架正好够长，
+        // 把签名抹掉就得到这一例）。
+        let mut not_pe = minimal_pe(PE_MACHINE_AMD64);
+        not_pe[0x40..0x44].copy_from_slice(b"XXXX");
+        for bad in [
+            &b""[..],
+            &b"M"[..],
+            &b"MZ"[..],
+            &too_short[..],
+            &bad_lfanew[..],
+            &not_pe[..],
+        ] {
+            assert_eq!(
+                pe_machine(bad),
+                None,
+                "畸形输入（{} 字节）应回 None",
+                bad.len()
+            );
+        }
+    }
+
+    /// 两个 macOS 架构在 **Mach-O 头**里的 `cputype` 与人类可读名。
     ///
     /// 这是个**查表**（`arch_of_binary` 拿 `cputype` 反查名字用），不是"支持哪些架构"的
     /// 唯一真相——ELF 那一侧看的是 `e_machine`（见 `arch_of_binary`），Linux 的架构名
-    /// 由 `ARIA2C_ASSET_NAME` 给。架构名本身跨两种格式是同一套（`arm64`/`x86_64`），
+    /// 由 `ARIA2C_ASSET_NAME` 给。架构名本身跨三种格式是同一套（`arm64`/`x86_64`），
     /// 所以两边能对上。
     ///
     /// 定义在测试模块里而不是生产代码里：生产侧需要知道的只有 `ARIA2C_BIN` 那几条
@@ -2656,7 +3417,7 @@ mod tests {
         cpu_type: 0x0100_0007,
     };
 
-    /// 本靶应该带哪一份资产——**必须与 `ARIA2C_ASSET_NAME` 的三条 `#[cfg]` 一一对应**。
+    /// 本靶应该带哪一份资产——**必须与 `ARIA2C_ASSET_NAME` 的四条 `#[cfg]` 一一对应**。
     ///
     /// ⚠️ 用 `cfg!` **独立复述**，而不是读 `ARIA2C_ASSET_NAME`：读后者是**同义反复**
     /// （同一条 `#[cfg]` 选出来的），发现不了"某条 cfg 指错了平台"。
@@ -2670,52 +3431,66 @@ mod tests {
             Some("aria2c-macos-x86_64")
         } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
             Some("aria2c-linux-x86_64")
+        } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+            Some("aria2c-windows-x86_64.exe")
         } else {
             None
         }
     }
 
-    /// 从 Mach-O 头里取 `cputype`；不是 thin 64 位 Mach-O 时返回 `None`。
+    /// 本内核自己编出来的架构——**必须与 `ARIA2C_BIN` 的 macOS 两条 `#[cfg]` 一一对应**。
     ///
-    /// 入参是**任意字节**（下面要拿它验磁盘上的资产）。
+    /// 不支持的三元组返回 `None`：那边 `compile_error!` 已经先一步拦住了，
+    /// 走不到这里。
     ///
-    /// ⚠️ `cffaedfe` 是 `MH_MAGIC_64`（`0xfeedfacf`）**按小端落盘**的样子——字节序已经
-    /// 编码进魔数本身。**arm64 与 x86_64 的 thin 产物用的是同一个魔数**，所以魔数断言
-    /// 只按**平台**分叉（macOS 是 Mach-O、Linux 是 ELF，见 `is_native_executable`）、
-    /// 不需要按**架构**分叉（x86_64 的产物实测过，见任务 1 报告）。
-    /// `cputype` 才是区分两个 macOS 架构的字段。
-    fn macho_cpu_type(bytes: &[u8]) -> Option<u32> {
-        const MH_MAGIC_64_LE: [u8; 4] = [0xcf, 0xfa, 0xed, 0xfe];
-        if bytes.len() < 8 || bytes[..4] != MH_MAGIC_64_LE {
-            return None;
+    /// ⚠️ **只服务 macOS**：Windows 那边同一条不变量的判据是 PE 的 `Machine` 字段
+    /// （`pe_machine`），而 Linux 那边是 ELF 的 `e_machine`（`elf_machine`），
+    /// 三者**不在同一个编码空间**，硬把它们并成一个枚举只会得到一份说不清语义的东西。
+    /// `#[cfg]` 门控的另一个作用：非 macOS 目标下本函数没有调用者，留着会报 dead_code。
+    #[cfg(target_os = "macos")]
+    fn kernel_arch() -> Option<Arch> {
+        if cfg!(target_arch = "aarch64") {
+            Some(ARM64)
+        } else if cfg!(target_arch = "x86_64") {
+            Some(X86_64)
+        } else {
+            None
         }
-        Some(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
     }
 
-    /// **内嵌的 aria2c 必须与内核自身的（平台，架构）一致**（全局约束 F-1 落到代码上的那条）。
+    /// **内嵌的 aria2c 必须与内核自身的 (操作系统, 架构) 一致**（全局约束 F-1/F-2 落到代码上的那一条）。
     ///
     /// 为什么这条是承重的：`ARIA2C_BIN` 由 `include_bytes!` 编进内核，运行时释放成独立
-    /// 文件再执行。它**不是**由目标机器的架构挑的——内嵌错平台/架构时，
+    /// 文件再执行。它**不是**由目标机器的架构挑的——内嵌错平台/错架构时，
     /// **编译期毫无提示**，而且在"本机 CPU 恰好能原生跑内嵌那一份"的开发机上连跑都跑得过，
     /// 只有拿到真目标机器上才会以 `Bad CPU type in executable`（macOS）/
-    /// `cannot execute binary file`（Linux）炸掉。
+    /// `cannot execute binary file`（Linux）/ 无法执行（Windows）炸掉。
     ///
     /// 判据是"**两者一致**"，不是"必须是 x86_64"——所以这条在 arm64 构建下同样必须通过。
+    /// 三个平台的编码空间不同（macOS 读 Mach-O 头的 `cputype`，Linux 读 ELF 的
+    /// `e_machine`，Windows 读 PE 的 `Machine` 字段），所以下面按 `target_os` 分叉，
+    /// 不硬凑成一个数。
     ///
     /// 分两步（裁定 R32：**按平台分派**，不再只认 Mach-O）：
     ///   (a) `ARIA2C_ASSET_NAME` 必须是**本靶**该带的那一份（`kernel_asset_name()` 独立复述）；
-    ///   (b) `ARIA2C_BIN` 的**字节**必须真的是那个架构（`arch_of_binary` 按文件格式分派）。
+    ///   (b) `ARIA2C_BIN` 的**字节**必须真的是那个架构（按文件格式分派：macOS 看 Mach-O 的
+    ///       `cputype`、Linux 看 ELF 的 `e_machine`、Windows 看 PE 的 `Machine`）。
     /// **(a) 管"cfg 有没有指对平台"，(b) 管"指到的那份是不是那个架构"**——少了 (a)，
     /// "某条 cfg 分支指回了别的平台的资产"就没人发现。
     ///
     /// 判别力：把某条 `#[cfg]` 指向另一个平台/架构的资产 → (a) 或 (b) 必红
     /// （任务 1 报告「变异自证」一节有实测输出）。在"本机架构恰好等于内嵌那份"的构建下
-    /// (b) 是盲区，那由 `shipped_aria2c_asset_matches_its_name` 补。
+    /// (b) 是盲区，那由 `shipped_aria2c_asset_matches_its_name` 补；
+    /// 而"对着 Windows 目标"的盲区由生产代码里那条**编译期**断言补
+    /// （交叉编译出来的 Windows 测试可执行文件在开发机上跑不了，见本节顶部说明）。
+    ///
+    /// ⚠️ 判据函数（`macho_cpu_type` / `pe_machine` / `elf_machine`）已经**只有一份**
+    /// （生产代码里那组 `const fn`），本测试与那条编译期 `const _` 断言问的是同一个函数——
+    /// 所以这里**不需要**像魔数那一对那样再加一条"两处判据一致"的断言：没有第二份实现可漂移。
     #[test]
     fn embedded_aria2c_arch_matches_kernel_arch() {
         let want = kernel_asset_name()
             .expect("本靶不在支持列表里——与 ARIA2C_ASSET_NAME 的 cfg 分支已脱节");
-
         // (a) 名字这一层：cfg 选出来的资产名必须是本靶该带的那一份。
         assert_eq!(
             ARIA2C_ASSET_NAME, want,
@@ -2723,44 +3498,67 @@ mod tests {
              这份内核在目标机器上起 aria2c 会直接失败。"
         );
 
-        // (b) 字节这一层：内嵌的字节必须真的是那个架构。
-        let want_arch = want.rsplit('-').next().expect("资产名里连一个 '-' 都没有");
-        let got = arch_of_binary(ARIA2C_BIN);
-        assert_eq!(
-            got,
-            Some(want_arch),
-            "内嵌的 aria2c 与内核自身的架构不一致：内核是 {want_arch}（{want}），\
-             内嵌的那份是 {}。这份内核在目标机器上起 aria2c 会直接失败。",
-            got.unwrap_or("不是本平台认识的 64 位可执行格式")
-        );
-    }
-
-    /// 是不是 **64 位小端 ELF**——`e_ident[EI_CLASS]=2`、`e_ident[EI_DATA]=1`。
-    ///
-    /// 只看 `\x7fELF` 是不够的：那会把 32 位或大端的文件也当成"是 ELF"，
-    /// 于是下面按偏移读出来的"架构"是垃圾值。`is_native_executable` 也用它。
-    fn is_elf64_le(bytes: &[u8]) -> bool {
-        const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-        bytes.len() >= 20 && bytes[..4] == ELF_MAGIC && bytes[4] == 2 && bytes[5] == 1
-    }
-
-    /// 从 ELF 头里取 `e_machine`；不是 64 位小端 ELF 时返回 `None`。
-    ///
-    /// 布局（`<elf.h>`）：`e_ident[16]` 之后紧跟 `e_type`(2) `e_machine`(2)，
-    /// 所以 `e_machine` 在偏移 18，小端 2 字节。
-    fn elf_machine(bytes: &[u8]) -> Option<u16> {
-        if !is_elf64_le(bytes) {
-            return None;
+        #[cfg(target_os = "macos")]
+        {
+            // (b) 字节这一层：内嵌的字节必须真的是那个架构。
+            let arch =
+                kernel_arch().expect("本靶架构不在支持列表里——与 ARIA2C_BIN 的 cfg 分支已脱节");
+            let got = macho_cpu_type(ARIA2C_BIN);
+            assert_eq!(
+                got,
+                Some(arch.cpu_type),
+                "内嵌的 aria2c 与内核自身的架构不一致：内核是 {}（cputype {:#010x}），\
+                 内嵌的那份是 {}。这份内核在目标机器上起 aria2c 会以 \
+                 `Bad CPU type in executable` 失败。",
+                arch.name,
+                arch.cpu_type,
+                match got {
+                    Some(c) => format!("cputype {c:#010x}"),
+                    None => String::from("不是 thin 64 位 Mach-O"),
+                }
+            );
         }
-        Some(u16::from_le_bytes([bytes[18], bytes[19]]))
+        #[cfg(target_os = "linux")]
+        {
+            let want_arch = want.rsplit('-').next().expect("资产名里连一个 '-' 都没有");
+            let got = arch_of_binary(ARIA2C_BIN);
+            assert_eq!(
+                got,
+                Some(want_arch),
+                "内嵌的 aria2c 与内核自身的架构不一致：内核是 {want_arch}（{want}），\
+                 内嵌的那份是 {}。这份内核在目标机器上起 aria2c 会直接失败。",
+                got.unwrap_or("不是本平台认识的 64 位可执行格式")
+            );
+        }
+        // ⚠️ **本分支在开发机上跑不到**（交叉编译出来的 exe 不能在 macOS 上执行），
+        // 它的作用有两个：① 编译期被类型检查，② 到 Windows 上跑时承接同一条不变量。
+        // 任务 2 之前这里指着一份**占位文件**，于是它在 Windows 上是显式红的；
+        // 现在资产已是官方 prebuilt，这条在本机给不出任何证据（跑不了），
+        // 它的编译期对偶体是生产代码里那条 `const _` 断言——**那条在本机可自证**。
+        #[cfg(target_os = "windows")]
+        {
+            let got = pe_machine(ARIA2C_BIN);
+            assert_eq!(
+                got,
+                Some(PE_MACHINE_AMD64),
+                "内嵌的 aria2c 与内核自身的架构不一致：内核是 Windows×x86_64\
+                 （PE Machine {PE_MACHINE_AMD64:#06x}），内嵌的那份是 {}。\
+                 这份内核在客户机器上起 aria2c 会失败。",
+                match got {
+                    Some(m) => format!("PE Machine {m:#06x}"),
+                    None => String::from("不是合法 PE（读不出 Machine 字段）"),
+                }
+            );
+        }
     }
 
     /// 从二进制字节里读出它**实际**是什么架构；认不出来时返回 `None`。
     ///
-    /// 按格式分派：macOS 的产物是 Mach-O（看 `cputype`），Linux 的产物是 ELF（看 `e_machine`）。
-    /// 两条都不能只看魔数——魔数只说明**文件格式**，架构在头里的另一个字段。
+    /// 按格式分派：macOS 的产物是 Mach-O（看 `cputype`），Linux 的产物是 ELF（看 `e_machine`），
+    /// Windows 的产物是 PE（看 `Machine`）。都不能只看魔数——魔数只说明**文件格式**，
+    /// 架构在头里的另一个字段。
     ///
-    /// ⚠️ **返回的是"资产名里那个架构词"，不是 ELF 的规范名**（审查修复轮 Minor ②）：
+    /// ⚠️ **返回的是"资产名里那个架构词"，不是各文件格式的规范名**（审查修复轮 Minor ②）：
     /// ELF 管 64 位 ARM 叫 `aarch64`（`EM_AARCH64`），而本仓库的资产名用的是 `arm64`
     /// （`aria2c-macos-arm64`）。两边**必须同一套**，否则 `shipped_aria2c_asset_matches_its_name`
     /// 会拿"名字说 arm64、字节说 aarch64"判一份**完全正确**的资产为红。
@@ -2774,6 +3572,13 @@ mod tests {
                 .iter()
                 .find(|a| a.cpu_type == cpu)
                 .map(|a| a.name);
+        }
+        if let Some(machine) = pe_machine(bytes) {
+            return if machine == PE_MACHINE_AMD64 {
+                Some("x86_64")
+            } else {
+                None
+            };
         }
         match elf_machine(bytes)? {
             0x3e => Some("x86_64"), // EM_X86_64
@@ -2808,14 +3613,17 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap_or_else(|e| {
             panic!(
                 "读不到 {}（{e}）——本靶的内核会直接编译失败（include_bytes! 找不到文件）。\
-                 用 core/scripts/build_aria2_linux.sh（Linux）或 \
-                 downloader/scripts/build_aria2_macos.sh（macOS）产出。",
+                 用 core/scripts/build_aria2_linux.sh（Linux）、\
+                 downloader/scripts/build_aria2_macos.sh（macOS）或 \
+                 core/scripts/fetch_windows_aria2c.sh（Windows）产出。",
                 path.display()
             )
         });
-        // 期望的架构名从**资产名本身**推（`aria2c-<平台>-<架构>` 的最后一段），
-        // 而不是另立一张表：这样"名字说的架构"与"字节里的架构"是同一句话的两半。
+        // 期望的架构名从**资产名本身**推（`aria2c-<平台>-<架构>[.exe]` 的最后一段，
+        // 先剥掉 Windows 资产名那个 `.exe` 后缀），而不是另立一张表：
+        // 这样"名字说的架构"与"字节里的架构"是同一句话的两半。
         let want = ARIA2C_ASSET_NAME
+            .trim_end_matches(".exe")
             .rsplit('-')
             .next()
             .expect("资产名里连一个 '-' 都没有");
@@ -2828,6 +3636,122 @@ mod tests {
             path.display(),
             want,
             got.unwrap_or("不是本平台认识的 64 位可执行格式")
+        );
+    }
+
+    /// 入库的每份 aria2c 资产，**文件名说的架构与它真的是的架构必须一致**。
+    ///
+    /// 为什么必须有：资产按架构分文件入库，`ARIA2C_BIN` 的 `#[cfg]` 分支靠文件名指过去。
+    /// 某份资产名不符实（最典型的成因：构建脚本漏了 `-arch`，于是 `arch -x86_64 clang`
+    /// **静默编出 arm64**，见 `downloader/scripts/build_aria2_macos.sh` 里那段注释）时，
+    /// **编译期一无所知**——文件在场、名字对得上，只有真机器上跑才会炸。
+    ///
+    /// 与上面那条的分工：那条只看**本靶**、只在 x86_64 构建下才可能红；这条看**全部资产**，
+    /// 因此**在任何架构上跑 `cargo test` 都能发现另一个架构资产坏了**——包括
+    /// "加了新架构的选择分支却忘了入库对应文件"这个会让**那个架构的构建**直接编译失败的坑。
+    ///
+    /// 判别力：把 `assets/aria2c-macos-x86_64` 换成 arm64 的那份（或删掉）→ 必红。
+    ///
+    /// ⚠️ **已知的漂移风险（显式记账，裁定为"搁置"）**：下面那个 `[ARM64, X86_64]`
+    /// 是**写死**的，与生产侧 `ARIA2C_BIN` 的 `#[cfg]` 分支**没有机械关联**——
+    /// 将来加第三个架构、只改了生产侧的话，这条测试**不会自动覆盖**新架构的资产
+    /// （本文件顶部的 `compile_error!` 会拦住"忘了加分支"，但拦不住"加了分支忘了入库资产"）。
+    /// 现在不把它抽象成"单一来源"，是因为那等于**为一个还没发生的需求加机制**；
+    /// 加架构时请一并把这里补上。
+    ///
+    /// ⚠️ 函数名里的 "arch" 现在是历史包袱：它同时管**操作系统**那一半（见下面 Windows 资产
+    /// 的 `MZ` 检查）。改名的收益不抵一次全仓搜索的噪音，所以名字留着。
+    #[test]
+    fn shipped_aria2c_assets_match_their_arch_in_name() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        for arch in [ARM64, X86_64] {
+            let path = dir.join(format!("aria2c-macos-{}", arch.name));
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!(
+                    "读不到 {}（{e}）——该架构的内核会直接编译失败（include_bytes! 找不到文件）。\
+                     用 downloader/scripts/build_aria2_macos.sh {} 产出。",
+                    path.display(),
+                    arch.name
+                )
+            });
+            let got = macho_cpu_type(&bytes);
+            assert_eq!(
+                got,
+                Some(arch.cpu_type),
+                "{} 的架构与文件名不符：名字说 {}（cputype {:#010x}），实际是 {}。\
+                 名叫某个架构、其实是别的架构的产物，正是本阶段要根除的失效形态。",
+                path.display(),
+                arch.name,
+                arch.cpu_type,
+                match got {
+                    Some(c) => format!("cputype {c:#010x}"),
+                    None => String::from("不是 thin 64 位 Mach-O"),
+                }
+            );
+        }
+
+        // Windows 那一份：**两个轴都在这里查**。
+        //
+        // ⚠️ 这一段是**本靶唯一能在开发机上验 Windows 资产文件的地方**——Windows 目标下
+        // 那些测试（`embedded_aria2c_arch_matches_kernel_arch` 的 Windows 分支、
+        // `ARIA2C_EMBED_SHA256` 的核对）**在 macOS 上跑不了**，编译期那条 `const _`
+        // 断言也只在**对着 Windows 目标**构建时才求值。所以：
+        //   - **操作系统**这一半：文件名说它是 Windows 的 PE，字节就必须以 `MZ` 开头
+        //     ——一份 macOS 的 Mach-O 落在这个文件名下会被当场抓住；
+        //   - **架构**这一半（任务 2 补的，此前只查了 `MZ`）：`Machine` 字段必须是 x86_64
+        //     ——一份 **ARM64（0xaa64）/ IA64** 的合法 PE 能过 `MZ` 那一关，
+        //     却在客户机器上跑不起来。占位文件不是合法 PE，所以这一半当时查不了；
+        //     换成官方 prebuilt 之后就必须补上，否则"下错了架构"在本机依旧无人过问。
+        let win = dir.join("aria2c-windows-x86_64.exe");
+        let bytes = std::fs::read(&win).unwrap_or_else(|e| {
+            panic!(
+                "读不到 {}（{e}）——Windows×x86_64 的内核会直接编译失败\
+                 （include_bytes! 找不到文件）。用 core/scripts/fetch_windows_aria2c.sh 产出。",
+                win.display()
+            )
+        });
+        assert!(
+            bytes.len() >= 1_000_000 && bytes[..2] == *b"MZ",
+            "{} 的字节不像 Windows 的 PE（前 2 字节 {:?}，共 {} 字节）：文件名说的平台与\
+             文件内容不符。",
+            win.display(),
+            &bytes[..2.min(bytes.len())],
+            bytes.len()
+        );
+        let got = pe_machine(&bytes);
+        assert_eq!(
+            got,
+            Some(PE_MACHINE_AMD64),
+            "{} 的架构与文件名不符：名字说 x86_64（PE Machine {PE_MACHINE_AMD64:#06x}），\
+             实际是 {}。名叫某个架构、其实是别的架构的产物，正是本阶段要根除的失效形态\
+             （ARM64 是 0xaa64、IA64 是 0x0200）。用 core/scripts/fetch_windows_aria2c.sh \
+             重新入库——那个脚本会在写盘前从字节里读一遍 Machine。",
+            win.display(),
+            match got {
+                Some(m) => format!("PE Machine {m:#06x}"),
+                None => String::from("不是合法 PE（读不出 Machine 字段）"),
+            }
+        );
+
+        // **内容**这一半：与登记摘要逐字节相符（任务 2 审查的第三件）。
+        //
+        // ⚠️ 为什么必须有、且必须落在**这里**：`ARIA2C_EMBED_SHA256` 的核对在
+        // `sha256_known_answer_vectors` 里，而那条常量只在 **Windows 目标**上存在
+        // ⇒ **开发机跑不到**。于是本机此前只有"它是个 x86-64 的 PE"这一条判据，
+        // 而一份**合法的、x86-64 的、但不是那份官方包**的 PE 会全绿通过——
+        // 与 `MZ` 那个盲区是同一形状，只是高一层。
+        // 哈希是**本机唯一**能把"就是那一份"钉死的判据，成本与上面那条同级
+        // （`sha256` 是手写的，其正确性由 NIST 向量那条测试独立钉住）。
+        // ⚠️ 登记值读的是生产代码里那条**唯一**的 `ARIA2C_WINDOWS_SHA256`
+        // （2026-09-18 合并之前，这里与 `ARIA2C_EMBED_SHA256` 的 Windows 分支
+        //  各写一份相同字面量，"改一处漏另一处"没有任何东西会报错）。
+        assert_eq!(
+            hex(&sha256(&bytes)),
+            ARIA2C_WINDOWS_SHA256,
+            "{} 的**内容**与登记值不符：这不是 core/scripts/fetch_windows_aria2c.sh 落位的那一份\
+             （字节被改过，或是从别处拿的另一个同架构 PE）。用那个脚本重新入库，\
+             再按它的提示核对 ARIA2C_WINDOWS_SHA256（生产代码里那条登记）。",
+            win.display()
         );
     }
 
@@ -2854,8 +3778,8 @@ mod tests {
     /// 判别力：把实现改成"只哈希前 1000 字节"→ 第 4、5 条必红；padding 写错 → 第 2、4 条必红；
     /// 常量表抄错一位 → 全部必红。
     ///
-    /// ⚠️ 期望摘要**按（平台，架构）各一份**（内嵌资产本来就是按平台分文件入库的，
-    /// 见 `ARIA2C_ASSET_NAME`）——所以下面那三条 `#[cfg]` 的维度必须与生产侧一致：
+    /// ⚠️ 期望摘要**按 (操作系统, 架构) 各一份**（内嵌资产本来就是按平台入库的，
+    /// 见 `ARIA2C_ASSET_NAME` / `ARIA2C_BIN`）——所以下面那几条 `#[cfg]` 的维度必须与生产侧一致：
     /// 只按架构分的话，Linux x86_64 会**同时命中** macOS x86_64 那条与 Linux 那条，
     /// 直接是"重复定义"的编译错误。
     /// 取值的口径不变：**都在外部用 `shasum -a 256` 与 `openssl dgst -sha256`
@@ -2881,6 +3805,36 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     const ARIA2C_EMBED_SHA256: &str =
         "e167cf7dc0b1d4ab079a0d8ca98b29b02f380b417af0c40fe21c372690e6aee7";
+    /// Windows×x86_64 的期望摘要 —— **别名，不是第二份字面量**。
+    ///
+    /// 取值口径与 macOS 两份**完全相同**：`core/assets/aria2c-windows-x86_64.exe` 的
+    /// sha256，用 `shasum -a 256` 与 `openssl dgst -sha256` **两个独立工具各算一遍**，
+    /// 结果逐字一致（原始输出见任务 2 报告）。它是 `core/scripts/fetch_windows_aria2c.sh`
+    /// 落位的那一份；改这个值之前先重跑那个脚本（它会**核对**它，不一致时以退出码 3
+    /// 提示该抄什么），或手工重跑上面两条命令。
+    ///
+    /// ⚠️ **这里改成别名（`= ARIA2C_WINDOWS_SHA256`）是 2026-09-18 的一处合并**：
+    /// 此前这里与另一个 `WINDOWS_ASSET_SHA256` 各写一份**相同的**字面量，而
+    /// **没有任何东西**会注意到"改了一处、漏了另一处"（在 macOS 上后者照样绿，
+    /// 前者要到 Windows 目标上才编）。现在值只有**一处**（生产代码里那条 cfg-free 的
+    /// 登记），别名只负责把它接到"内嵌物"这条测试路径上。
+    /// 别名保留而不是直接引用那个常量：本模块的**每一处**都读 `ARIA2C_EMBED_SHA256`，
+    /// 保留这个名字=保留"本靶内嵌资产"这层语义（macOS 两份仍然是本地的独立字面量，
+    /// 它们的值由外部两个工具算过，**不**从这里派生）。
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    const ARIA2C_EMBED_SHA256: &str = ARIA2C_WINDOWS_SHA256;
+
+    /// 本靶对应的内嵌资产文件名——**只用于诊断文案**。
+    ///
+    /// ⚠️ **它转发生产侧那条 `ARIA2C_ASSET_NAME`，这里不另写一份平台→文件名的映射**：
+    /// 手写第二份映射就有"改一处漏另一处"的漂移面——文案里说的文件名会与 `#[cfg]`
+    /// 真正选中的资产对不上（例如在 Windows 构建下让排障的人去查
+    /// `core/assets/aria2c-macos-x86_64`，那份根本不在本靶的编译分支里）。
+    fn embedded_asset_name() -> &'static str {
+        ARIA2C_ASSET_NAME
+    }
+
+
     #[test]
     fn sha256_known_answer_vectors() {
         let cases: [(&[u8], &str); 4] = [
@@ -2914,7 +3868,8 @@ mod tests {
         // 写死在这里当第二重独立证据——它同时钉住"内嵌的确实是那一份文件"
         // （**本靶**的那一份，见 `ARIA2C_ASSET_NAME` / `ARIA2C_EMBED_SHA256`）。
         //
-        // 失败文案里的文件名直接用 `ARIA2C_ASSET_NAME`，不再像过去那样
+        // 失败文案里的文件名走 `embedded_asset_name()`（它转发 `ARIA2C_ASSET_NAME`），
+        // 不再像过去那样
         // `if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" }`：
         // 那个写法把平台维悄悄抹成了"不是 arm64 就是 macOS x86_64"，
         // 加进 Linux 之后它会指着一个**不存在**的 `core/assets/aria2c-macos-x86_64`
@@ -2922,8 +3877,9 @@ mod tests {
         assert_eq!(
             embed_hash_hex(),
             ARIA2C_EMBED_SHA256,
-            "内嵌 aria2c 的摘要与外部算出的不一致——先确认 core/assets/{ARIA2C_ASSET_NAME} \
-             是脚本产出的那份，再核对 ARIA2C_EMBED_SHA256"
+            "内嵌 aria2c 的摘要与外部算出的不一致——先确认 core/assets/{} \
+             是脚本产出的那份，再核对 ARIA2C_EMBED_SHA256",
+            embedded_asset_name()
         );
     }
 

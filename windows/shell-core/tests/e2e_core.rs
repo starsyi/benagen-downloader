@@ -100,7 +100,10 @@ impl Drop for TempDir {
 fn core_argv(tag: &str) -> (PathBuf, Vec<String>, TempDir) {
     let dir = TempDir::new(tag);
     let settings = dir.path().join("settings.json");
-    let args = core_arguments(Some(dir.path()), Some(settings.as_path()));
+    // ⚠️ 第三个实参是**详细日志**（任务 3）：这边**显式传 `false`** —— 本套件要的是
+    //    "与今天逐字同一条 argv"（它跑的是真内核，`diag-*` 那一档不该被这里悄悄改掉）。
+    //    它没有默认值正是为了这个：少传一个实参是编译错误，不是一次静默的 normal。
+    let args = core_arguments(Some(dir.path()), Some(settings.as_path()), false);
     (require_core_binary(), args, dir)
 }
 

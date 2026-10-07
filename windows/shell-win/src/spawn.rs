@@ -143,9 +143,9 @@ fn real_applier(cmd: &mut Command, flags: u32) {
 ///    （`shell-win`）组**，`shell-core` 只管"起进程 + 接管三条管道 + 收尾"。
 ///    平台知识留在壳里，纯逻辑留在 `shell-core` 里，两边都没有越界。
 ///
-/// ⚠️ **调用方负责把它放到后台线程上**：`CoreClient::call` 没有每请求超时
-///    （与 macOS 一致，刻意的），在 UI 线程上调用等于让窗口冻死——而"冻死"是**沉默的**。
-///    见 `main.rs` 顶部的裁决 Z 不变量。
+/// ⚠️ **调用方负责把它放到后台线程上**：`CoreClient::call` 的上界按方法名分两档
+///    （普通 **150 秒**、长调用家族 **600 秒**；两档都刻意取长），在 UI 线程上调用
+///    等于让窗口冻死——而"冻死"是**沉默的**。见 `main.rs` 顶部的裁决 Z 不变量。
 pub fn spawn_core(exe: &Path, args: &[String]) -> Result<CoreClient, ClientError> {
     Ok(CoreClient::new(Box::new(ProcessChannel::with_command(
         core_argv_cmd(exe, args),
@@ -242,9 +242,13 @@ mod tests {
     #[test]
     fn spawn_core_arguments_are_appended_to_the_command() {
         let exe = PathBuf::from("benagen-core.exe");
+        // ⚠️ 第三个实参是**详细日志**（任务 3）—— 这里显式传 `false`：本用例钉的是
+        //    "那两条**路径**参数一个都不少"，档位那一对由 `client.rs` 的
+        //    `core_arguments_match_the_kernel_flags` 钉（两条用例分工不同，不是重复）。
         let args = shell_core::client::core_arguments(
             Some(Path::new("C:\\Users\\x\\Downloads\\Benagen")),
             Some(Path::new("C:\\Users\\x\\AppData\\Roaming\\BenagenDownloader\\settings.json")),
+            false,
         );
         let cmd = core_argv_cmd(&exe, &args);
         // `Command` 只给得出程序名（argv[0]），拿不到后面那些参数——

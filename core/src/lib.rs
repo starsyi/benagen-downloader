@@ -8,8 +8,10 @@
 pub mod cli;
 pub mod crc64xz;
 pub mod delivery;
+pub mod diagnostics;
 pub mod engine;
 pub mod kernel;
+pub mod paths;
 pub mod planner;
 pub mod protocol;
 pub mod settings;

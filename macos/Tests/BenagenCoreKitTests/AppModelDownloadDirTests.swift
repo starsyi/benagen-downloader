@@ -200,7 +200,7 @@ private func aKernelThatCanReload(withTree tree: String) -> FakeCore {
 
     _ = await model.changeDownloadDir(to: "/Volumes/Data/交付/有 空格的目录")
 
-    #expect(temp.store.load() == AppPreferences(downloadDir: "/Volumes/Data/交付/有 空格的目录"),
+    #expect(temp.store.load() == AppPreferences(downloadDir: "/Volumes/Data/交付/有 空格的目录", verboseLogging: false),
             "必须落盘 —— 否则重启应用就白改了")
     // 下一次启动会传什么：生产里 `AppModel.live()` 做的就是这一句
     //（`argument(for: store.load())` 交给工厂、同时把 `downloadDir` 存进模型）。
@@ -253,7 +253,7 @@ private func aKernelThatCanReload(withTree tree: String) -> FakeCore {
     let factory = ClientFactory([spare])
     // 生产里模型那个初值就是盘上那份（`live()` 把 `store.load()` 的结果同时交给
     // 第一个内核与模型）—— 这里照着搭，免得测一个生产里不存在的状态。
-    try temp.store.save(AppPreferences(downloadDir: "/Volumes/一样"))
+    try temp.store.save(AppPreferences(downloadDir: "/Volumes/一样", verboseLogging: false))
     let model = AppModel(client: old, makeClient: factory.factory,
                          preferencesStore: temp.store, downloadDir: "/Volumes/一样")
 
@@ -262,7 +262,7 @@ private func aKernelThatCanReload(withTree tree: String) -> FakeCore {
     #expect(outcome == .unchanged(dir: "/Volumes/一样"))
     #expect(factory.madeCount == 0, "同值不许重启内核")
     #expect(old.shutdownCount == 0)
-    #expect(temp.store.load() == AppPreferences(downloadDir: "/Volumes/一样"),
+    #expect(temp.store.load() == AppPreferences(downloadDir: "/Volumes/一样", verboseLogging: false),
             "盘上那份原样不动")
     _ = await model.changeDownloadDir(to: "  /Volumes/一样  ")
     #expect(factory.madeCount == 0, "首尾空白不算改动（`AppPreferences` 会先归一化）")
@@ -453,7 +453,7 @@ private func aKernelThatCanReload(withTree tree: String) -> FakeCore {
         return
     }
     #expect(why.contains("内核重启失败"), "要有落点：\(why)")
-    #expect(temp.store.load() == AppPreferences(downloadDir: "/Volumes/Data/交付"),
+    #expect(temp.store.load() == AppPreferences(downloadDir: "/Volumes/Data/交付", verboseLogging: false),
             "偏好仍然留在盘上（用户的选择不该被一次失败悄悄撤销）")
     #expect(model.downloadDir == "/Volumes/Data/交付")
 }

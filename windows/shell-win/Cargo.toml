@@ -15,7 +15,7 @@
 # 那是这条拆分的账本。
 [package]
 name = "shell-win"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # ⚠️ 视图不单测（规格 §4.3）：能被写出断言的逻辑一律搬进 `shell-core`。
 #    本 crate 里的测试都只断言**"平台专属的那个值被传到了应用点"**，
@@ -122,4 +122,17 @@ windows-sys = { version = "0.59", features = [
     #    不开它就只能泄漏（每次点一次「选择…」漏一块）——那不叫省依赖，叫留一个洞。
     # 代价：导入表里多出 `ole32.dll`（系统 DLL，构建脚本的白名单里本来就有它）。
     "Win32_System_Com",
+    # `GetVersionExW` / `OSVERSIONINFOW`（`export.rs` 的 `os_version`：说明文件里
+    # 「操作系统与版本」那一格 —— 只写一个平台名等于把那一格废掉：规格 §2.6 的理由是
+    # "放一晚上就断"和"休眠回来就断"**在不同系统版本上是不同的问题**）。
+    #
+    # 🔴 **这一条是本 workspace 唯一一条具名豁免的 feature**（2026-10-06，控制者裁定，
+    #    记在`docs/superpowers/plans/2026-10-06-verbose-diagnostics-and-export.md` 的
+    #    约束 3 下）：其余任何新 feature 仍然**一律不许**，需要就停下报告。
+    #    为什么它能破例：`GetVersionExW` 住在 **`kernel32.dll`**（导入表里本来就有它）
+    #    ⇒ 不新增任何要随包发的文件、也不动依赖白名单。
+    #    ⚠️ 它报的版本**只有在有 manifest 时才是真的**（没有 manifest 的 exe 会被
+    #    兼容性垫片谎报成 6.2）—— 本 exe 的 manifest 声明了 `supportedOS` = Windows 10
+    #    （`build.rs:632-660`，W-7），所以这一格可信。
+    "Win32_System_SystemInformation",
 ] }

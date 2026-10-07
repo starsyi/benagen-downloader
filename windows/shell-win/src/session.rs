@@ -3,7 +3,9 @@
 //! ## ⚠️ 锁的纪律（本模块**唯一**容易写错的地方）
 //!
 //! 里面是 `Mutex<Inner>`，**临界区一律极短**（读几个字段、写几个字段）。
-//! **绝不在持锁时调用 `kernel::*`** —— 那些函数会阻塞（`load_delivery` 最坏约 91.5 秒），
+//! **绝不在持锁时调用 `kernel::*`** —— 那些函数会阻塞（`load_delivery` 那一档的上界是
+//! `CoreClient::LONG_CALL_TIMEOUT` ＝ 600 秒；它的三段记账见 `client.rs` 那一档的文档 ——
+//! ⚠️ 不是 91.5 秒：那只是三段里的第一段），
 //! 持锁等着它们会让 `state()` 命令也一起卡住，而前端正是靠轮询 `state()` 显示进度的
 //! （规格 §3.5：`state()` 一秒一问）。
 //!
@@ -289,11 +291,50 @@ impl Session {
     }
 }
 
+/// 告诉**这条连接**：写进 `diag-shell.log` 之前，哪几个字面串必须抹掉（规格 §2.3 B）。
+///
+/// 🔴 **它为什么是"按构造"而不是"事后过滤"**：`kernel_call` 那一行的 `why` 是**内核原文**，
+///    而交付码是**我们自己**拼进内核文案里的（`core/src/delivery.rs` 那条 404 把
+///    `…/{交付码}/manifest.json` 整条 URL 送了进来；`core/src/main.rs` 的 `preflight`
+///    带着客户的目录名）。这两个串**壳都知道** —— 码在它刚发出去的请求里，目录在它
+///    自己存的偏好里 ⇒ 不必去猜任意第三方文案里像不像码。
+///
+/// ⚠️ **推的是"此刻该抹的整份清单"，不是追加**：换批次要换码、改设置要换目录
+///    （`CoreClient::set_redactions` 的文档记着"追加式接口会留下看不出来的残留"）。
+///
+/// ⚠️ **目录是现读偏好得到的**（不是缓存的行）：缓存会在"改了目录、内核还没重启完"
+///    那个窗口里说错话 —— 而那正是错误信息最可能出现的时候。代价是一次小文件读，
+///    与起内核那条路已经在做的事同一量级。
+///
+/// ⚠️ **诚实记账**：本函数的调用点（`spawn_load` / `spawn_connect`）**没有判据**
+///    —— 要判它们得读真的偏好、或者翻进程全局，两条都越过了本仓对测试的底线。
+///    本 crate 里被钉住的是**抹**这一步（`shell-core/src/client.rs` 的
+///    `the_delivery_code_and_download_directory_never_reach_the_written_line`）。
+///    "调用点有没有被走到"只有真机验收那两条能回答（规格 §5.2）。
+fn remember_for_redaction(client: &CoreClient, code: Option<&str>) {
+    // 读不到偏好 ⇒ 空串 ⇒ `diagnostics::redact` 跳过它（**不是**"抹掉整行"）。
+    // 这与"没有配置下载目录"是同一件事：壳不传 `--download-dir`，内核用它的默认值。
+    let download_dir = crate::commands::load_preferences()
+        .map(|preferences| preferences.download_dir)
+        .unwrap_or_default();
+    let mut secrets: Vec<String> = vec![download_dir];
+    if let Some(code) = code {
+        secrets.push(code.to_string());
+    }
+    client.set_redactions(secrets);
+}
+
 /// 起一条后台线程做一次 `load_delivery`，结果落回 `session.load`（D6）。
 ///
 /// ⚠️ **锁的纪律**：本函数**先**把 `client` 克隆出来（调用方已经克隆过了），
 ///    线程里**不再碰** `session` 的锁去做内核调用 —— 只在拿到结果之后短暂地写一次。
 pub fn spawn_load(session: &Arc<Session>, client: Arc<CoreClient>, code: String, base_url: String) {
+    // 🔴 **在这个码被发出去之前**就告诉这条连接该抹什么（规格 §2.3 B）。
+    //    ⚠️ **时机是承重的**（`CoreClient::set_redactions` 的文档记着同一条）：
+    //    晚一步 —— 比如挪到失败之后 —— 的表现是**那一次失败的日志里仍然带着码**，
+    //    而那一次恰恰是最可能失败（码打错）、也最需要那份日志的一次。
+    remember_for_redaction(&client, Some(&code));
+
     // ⚠️ **两份句柄**：一份给线程（`move` 进去），一份**留在本线程**给下面那条
     //    「起不了线程」的分支用。只克隆一份的话编译器会报 E0382 —— 而那一支
     //    正需要把话说出去（它会写 `session.load`，前端轮询 `state()` 才看得见）。
@@ -378,8 +419,8 @@ pub fn spawn_load(session: &Arc<Session>, client: Arc<CoreClient>, code: String,
 ///    内核真没了的时候还会翻引擎那一格。**不许静默吞掉** —— 吞掉的表现是
 ///    "换完目录批次没了"，而根因在别处（W-2）。
 ///
-/// ⚠️ 重放是**异步**的（又起一条线程）：这条连接线程不该被那 91.5 秒的 `load_delivery`
-///    按住 —— 它手里那份 `Arc` 还要供 `state()` 之类的读写用。
+/// ⚠️ 重放是**异步**的（又起一条线程）：这条连接线程不该被那条长调用（`load_delivery`，
+///    上界 600 秒）按住 —— 它手里那份 `Arc` 还要供 `state()` 之类的读写用。
 pub fn spawn_connect(session: &Arc<Session>) {
     let Some(connector) = session.connector() else {
         session.set_engine(EngineState::Unavailable(
@@ -393,16 +434,32 @@ pub fn spawn_connect(session: &Arc<Session>) {
         .name("core-connect".to_string())
         .spawn(move || match connector() {
             Ok((client, reply)) => {
+                let replay = worker.load_request();
+                // 🔴 **新连接 = 空的可抹清单**（`set_redactions` 挂在连接上，不是进程全局）
+                //    ⇒ 这里必须**立刻**重推一遍，否则"换了下载目录 ⇒ 重启内核"之后，
+                //    新连接上再没有东西挡着客户目录名了（`remember_for_redaction` 的文档）。
+                //    重放那一支随后还会推一次（多推一次是幂等的），这里管的是**没有重放**
+                //    的那一半：首次启动、以及上一批加载失败的那些会话。
+                //
+                // 🔴🔴 **必须在 `install_client` 之前**（修复轮 2 抓的一个窗口）：那一句是
+                //    **把这条连接公布给所有别的命令线程**的那一下，而在此之前它只活在**本
+                //    线程**手里 —— 顺序反过来时，那个窗口里失败的命令会**按空清单**落盘
+                //    （即：交付码/目录名**原样进日志**），而这里的注释还会说"立刻重推过了"。
+                //    判据是 `the_redaction_list_goes_out_before_the_client_is_published`。
+                //    ⚠️ 先算 `replay` 再推（两者不相干）：`load_request()` 读的是会话锁，
+                //    把它放在公布之后也行，但放前面更简单 —— 与公布的先后无关。
+                remember_for_redaction(&client, replay.as_ref().map(|(code, _)| code.as_str()));
                 // ⚠️ `Arc::clone` 出来一份给重放用（`install_client` 要拿走所有权）。
                 worker.install_client(Arc::clone(&client), reply);
                 // ⚠️ 与 `main.rs` 的 `start_connect` 的 `Reply::Connected` 那一支逐条对齐：
                 //    内核只在 `enqueue` 里起引擎，而这个内核进程是壳刚起的 ⇒
                 //    握手完成后「引擎未启动」是**事实**，不是猜测。
                 worker.set_engine(EngineState::NotStarted);
+
                 // ⚠️ **重放放在最后**（引擎那一格先落）：`preferences_set` 那条命令
                 //    等的就是"引擎变成 NotStarted/Unavailable"，它不该被一次重放拖住
                 //    —— 重放的结论由 `load` 那一格说（前端在轮询里看得见）。
-                if let Some((code, base_url)) = worker.load_request() {
+                if let Some((code, base_url)) = replay {
                     worker.set_load(LoadState::Loading);
                     spawn_load(&worker, client, code, base_url);
                 }
@@ -443,6 +500,45 @@ mod tests {
         //    （`spawn_connect` 成功那一支就是它的调用点），写入者是有的、只是不在本条用例里。
         //    断言与它的位置（"刚建出来的会话手上没有连接"）一字未改。
         assert!(s.client().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // 装连接那一步的**顺序**：可抹清单先推、再公布（修复轮 2 抓的窗口）
+    // -----------------------------------------------------------------------
+
+    /// 🔴 **可抹清单必须在"公布这条连接"之前推下去**。
+    ///
+    /// 判别力：把 `spawn_connect` 里那两句换回**原来的**顺序（`install_client` 在前、
+    /// `remember_for_redaction` 在后）⇒ 本用例红。
+    ///
+    /// ⚠️ **为什么是源码文本判据，而不是行为判据**：这个窗口是**并发**的 —— 别的命令
+    ///    线程只有在 `install_client` 之后才看得见这条连接，而复现"它恰好在那两句之间
+    ///    失败"得让测试去猜别的线程跑到哪一步（那种判据会抖，本仓明令禁止）。
+    ///    承重的事实是**那两句的先后**，而它在源码里是逐字的。
+    /// ⚠️ **它证明的是"源码里那两句的先后"**，不是"运行时任何交错都安全"：那条推理是
+    ///    "`remember_for_redaction` 之前这条连接不离开本线程（`client` 是这条线程的局部
+    ///    变量），所以先推后公布 ⇒ 公布时清单已经是满的"。将来若有人**在公布之后再补推
+    ///    一次**（把窗口补回来），这一条**仍是绿的** —— 这条判据的边界就在这里。
+    #[test]
+    fn the_redaction_list_goes_out_before_the_client_is_published() {
+        // ⚠️ 从 `spawn_connect` 的定义处**切起**：`remember_for_redaction` 在本文件里
+        //    还有另一个调用点（`spawn_load`，位置在它**之前**），不切就会拿那个位置当答案。
+        let source = include_str!("session.rs");
+        let body = &source[source
+            .find("pub fn spawn_connect")
+            .expect("找不到 spawn_connect —— 本用例的前提没了")..];
+        let pushed = body
+            .find("remember_for_redaction(")
+            .expect("spawn_connect 里没有推可抹清单那一步");
+        let published = body
+            .find("worker.install_client(")
+            .expect("spawn_connect 里没有公布连接那一步");
+        assert!(
+            pushed < published,
+            "可抹清单推晚了：`install_client` 是**把这条连接公布给别的命令线程**的那一下\
+             （在那之前它只活在本线程手里）。在它之后推 ⇒ 那个窗口里失败的命令会**按空清单**\
+             落盘，也就是交付码/目录名**原样进日志**（pushed={pushed} published={published}）。"
+        );
     }
 
     /// 🔴 **内核说"引擎还没起来" ⇒ 引擎那一格翻成 `NotStarted`**（审查要的那条：

@@ -205,7 +205,16 @@ impl Kernel {
             let ok = ping.is_ok();
             let cause = ping.err().unwrap_or_default();
             let (disconnected, outcome) = reconnect_outcome(ok, &cause);
-            self.engine_disconnected = disconnected;
+            // `why` 传**这条探活路径的成败短语**，不是探活的错误串：探活成功时那个串是空串，
+            // 而"true → false"这一格**只**在探活成功时发生，传它会让日志以 `why=` 结尾。
+            // （进到这一格 ⇔ 标志本来就是 `true`，所以失败那一支的值没变、
+            // `set_engine_disconnected` 不落日志；失败本身由 `ping_failed` 记。）
+            let why = if disconnected {
+                "ensure_engine_probe_failed"
+            } else {
+                "ensure_engine_probe_ok"
+            };
+            self.set_engine_disconnected(disconnected, why);
             outcome?;
             return Ok(d);
         }
@@ -231,7 +240,11 @@ impl Kernel {
         eprintln!("benagen-core: 下载引擎已就绪（RPC {}）", d.rpc_url());
         let d = Arc::new(d);
         self.daemon = Some(Arc::clone(&d));
-        self.engine_disconnected = false;
+        // 新引擎起来了 ⇒ 一定不是断开态。走同一个口子（而不是直接赋值）是为了让
+        // "`engine_disconnected` 只在 `set_engine_disconnected` 里被写"这条不变式
+        // **用 grep 就能核**——这里实际上从不改变值（进这一支时 `daemon` 还是 `None`，
+        // 而 `None` 只出现在首次启动前，那时标志必为 `false`），所以也从不落日志。
+        self.set_engine_disconnected(false, "engine_started");
         Ok(d)
     }
 
@@ -260,7 +273,10 @@ impl Kernel {
         let ping = d.ping();
         let ok = ping.is_ok();
         let (disconnected, outcome) = reconnect_outcome(ok, &err);
-        self.engine_disconnected = disconnected;
+        // `why` 带上**出错的调用名**：那是客户在壳里唯一能看到的定位信息，
+        // 只记 `err` 的话日志里会有一堆看不出发生在哪一步的失败。
+        // （探活自己的错误已经由 `ping()` 以 `ping_failed` 单独记过一条，不在这里重复。）
+        self.set_engine_disconnected(disconnected, &format!("{op}: {err}"));
         match outcome {
             // ping 不通 → 判定断开
             Err(b) => b,
@@ -332,6 +348,73 @@ fn reconnect_outcome(ping_ok: bool, cause: &str) -> (bool, Result<(), ErrorBody>
             )),
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// 自愈线程：断开之后**自己**定期探活（规格 §3 A3）
+// ---------------------------------------------------------------------------
+
+/// 断开之后重新探活的节拍（规格 §3 A3）。
+///
+/// 取值理由：一次失败的探活最坏要花 `RPC_TIMEOUT`（10 秒），所以节拍**不能**比它短——
+/// 短了就是"探活永远在做，别的什么也做不了"。10 秒是两次探活**发起**之间的下限
+/// （`last` 在探活**之前**更新，见 [`spawn_recovery`]），探活自己最坏能填满一整个窗口；
+/// 恢复的发现延迟也在节拍量级——一次正在飞的探活最长还能再吃掉 10 秒。
+///
+/// ⚠️ 它替代的是**客户手点「重试」**——而那一颗按钮会把**整个内核重启一遍**。
+const RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 该不该探一次？纯函数，把节拍判据从线程里择出来，好在宿主上真测。
+fn should_recover_probe(disconnected: bool, since_last_probe: Duration) -> bool {
+    disconnected && since_last_probe >= RECOVERY_INTERVAL
+}
+
+/// **引擎断开之后的后台自愈**（规格 §3 A3）：每 [`RECOVERY_INTERVAL`] 探一次，
+/// 探通了就把「已断开」翻回去——客户不必手点「重试」（那颗按钮会重启整个内核）。
+///
+/// ⚠️ **`daemon` 句柄每轮从锁里现取**，不当作启动参数传进来：句柄是会变的，
+///    启动时传进来的那份会**过期**——而过期的句柄上 ping 只会永远失败，
+///    表现为"自愈永远不生效"，**且没有任何东西会红**。
+///    （今天的写入点只有两处：`ensure_engine` 首次启动、`main()` 收尾的 `take()`
+///    ——所以这一条是**防将来**：一旦有人加上"关掉引擎重建"的路径
+///    （见 `clear_engine_batch` 上方提到而否掉的那个方案），它立刻承重。）
+///
+/// ⚠️ **网络 I/O 在锁外**（`d.ping()` 不持 `kernel` 锁），只有翻标志那一下（连同它那条诊断）
+///    进锁——照抄本仓既有纪律（见校验工作线程那段注释：持锁做网络 I/O 会让协议循环停摆）。
+pub fn spawn_recovery(kernel: Arc<Mutex<Kernel>>) {
+    std::thread::Builder::new()
+        .name("engine-recovery".to_string())
+        .spawn(move || {
+            let mut last = std::time::Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                // 锁里：取当前 daemon 句柄 + 问"到点了吗"，随即放锁。
+                let (due, d) = {
+                    let k = kernel.lock().unwrap_or_else(PoisonError::into_inner);
+                    let Some(d) = k.daemon.clone() else { continue };
+                    (
+                        should_recover_probe(k.engine_disconnected, last.elapsed()),
+                        d,
+                    )
+                };
+                if !due {
+                    continue;
+                }
+                last = std::time::Instant::now();
+                // 锁外探活（最坏 RPC_TIMEOUT）。
+                if d.ping().is_ok() {
+                    let mut k = kernel.lock().unwrap_or_else(PoisonError::into_inner);
+                    if k.engine_disconnected {
+                        crate::diagnostics::log(
+                            "engine_recovered",
+                            &[("by", "recovery_probe".to_string())],
+                        );
+                        k.set_engine_disconnected(false, "recovery_probe");
+                    }
+                }
+            }
+        })
+        .expect("起自愈线程失败");
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,7 +1631,10 @@ impl Kernel {
         let ok = ping.is_ok();
         let cause = ping.err().unwrap_or_default();
         let (disconnected, outcome) = reconnect_outcome(ok, &cause);
-        self.engine_disconnected = disconnected;
+        // 与 `on_rpc_failure` 同一条口子：这里是**动作**路径上的断开判定
+        // （`on_rpc_failure` 管的是读/写方法），漏了它就等于"从动作路径闩死的断开"
+        // 在日志里没有对应的一行。
+        self.set_engine_disconnected(disconnected, &format!("action: {cause}"));
         outcome?;
         Ok(d)
     }
@@ -1577,6 +1663,36 @@ impl Kernel {
 
     /// 取走引擎句柄，收尾用。**只交出所有权、不关引擎**——关不关由调用方决定，
     /// 而且必须在**锁外** `close`（它最坏要等满 5 秒的兜底）。
+    /// **`engine_disconnected` 的唯一写入点**（规格 §3 A6）。
+    ///
+    /// 只在**值发生变化**时落一条诊断：这个标志在重连路径上被反复置位，
+    /// "每次都记"会把日志刷成同一行的复读机，而真正要回答的问题是
+    /// "**从哪一刻起**引擎被认为没了、**因为什么**"。
+    ///
+    /// `why` 是给人看的因果串，四个调用点各传各的：
+    ///   - `on_rpc_failure` 传 `调用名: 错误`；
+    ///   - `require_engine_for_action` 在探活的错误串前加一个 `action: ` 前缀
+    ///     （好把"动作路径闩死的"与"读路径闩死的"在日志里分开）；
+    ///   - `ensure_engine` 传它**自己那条探活路径的成败短语**（`ensure_engine_probe_ok` /
+    ///     `ensure_engine_probe_failed`）——**不是**探活的错误串：探活成功时那个串是空的，
+    ///     而"true → false"这一格**只**在探活成功时发生，传它会让日志以 `why=` 结尾；
+    ///   - [`spawn_recovery`] 传 `"recovery_probe"`。
+    ///
+    /// 值里的空格在 `diagnostics::format_line` 里换成 `_`。
+    ///
+    /// ⚠️ 这是**对外接口**：另外两条恢复路径都按这个签名调——`spawn_recovery` 的
+    ///     后台探活，以及 `ensure_engine` 的读路径就地探活。签名与"只在变化时记"
+    ///     都是定死的，别改成别的形状。
+    fn set_engine_disconnected(&mut self, now: bool, why: &str) {
+        if now != self.engine_disconnected {
+            crate::diagnostics::log(
+                "engine_disconnected_changed",
+                &[("now", now.to_string()), ("why", why.to_string())],
+            );
+        }
+        self.engine_disconnected = now;
+    }
+
     pub fn take_daemon(&mut self) -> Option<Arc<Daemon>> {
         self.daemon.take()
     }
@@ -1926,6 +2042,22 @@ mod tests {
             "断开原因必须出现在消息里: {}",
             e.message
         );
+    }
+
+    /// **断开之后必须有人去探活**（规格 §3 A3）。这条守的是节拍判据本身。
+    ///
+    /// ⚠️ 免责声明（必须留着）：它守的是**这张表**，不是**线程真的起来了**。
+    /// "把 `spawn_recovery` 的调用删掉"这个变异体**本测试抓不住**——那一层只有真机看得见。
+    #[test]
+    fn recovery_probe_cadence_table() {
+        // 没断开：永远不探（省掉无谓的 RPC）。
+        assert!(!should_recover_probe(false, Duration::from_secs(0)));
+        assert!(!should_recover_probe(false, Duration::from_secs(3600)));
+        // 断开了但还没到点：不探。
+        assert!(!should_recover_probe(true, Duration::from_secs(9)));
+        // 断开了且到点：探。
+        assert!(should_recover_probe(true, RECOVERY_INTERVAL));
+        assert!(should_recover_probe(true, Duration::from_secs(30)));
     }
 
     /// `engine_rpc_failed` 的消息必须带**出错的调用名**。

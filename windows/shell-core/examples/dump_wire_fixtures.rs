@@ -39,7 +39,9 @@ use std::collections::BTreeSet;
 
 use shell_core::api;
 use shell_core::presentation::about_info::AboutInfo;
-use shell_core::presentation::app_preferences::{DownloadDirChange, DownloadDirectory};
+use shell_core::presentation::app_preferences::{
+    DownloadDirChange, DownloadDirectory, VerboseLoggingChange,
+};
 use shell_core::presentation::batch_history::NoteDrafts;
 use shell_core::presentation::breadcrumb::Breadcrumb;
 use shell_core::presentation::browser_row::{BrowserRow, BrowserSelection, SelectionSummary};
@@ -813,6 +815,17 @@ fn main() {
         "settingsGet": api::settings::payload(&settings_result(), Some(HELLO_WIRE)),
         // `preferences_get`：已配置 / 未配置（后者那一行是 Rust 给的"默认（…）"，不是空行）。
         "preferencesGet": api::preferences::current(&preferences()),
+        // 🔴 **同一条链路的 Windows 形状那一份**（修复轮 2）：真机是 Windows ⇒ 路径里
+        //    **一个 `/` 都没有**，而"下载到哪儿了"那一行与改目录的回执都要按**最后一个
+        //    分隔符**切（尾段是那个名字，一个字都不许少）。只认 `/` 的实现在这里会把
+        //    整条路径塞进"会被省略号吃掉的那一段"（`.mid__head` 可缩、`.mid__tail`
+        //    是 `flex: none`）⇒ **用户最需要看的那一格恰好看不见**。
+        //    ⚠️ 它是**独立的一份载荷**，不是把上面那一组改成 Windows：上面那一组仍在
+        //    验 POSIX 分支（两种形状各有一条判据，谁也替不了谁）。
+        "preferencesGetWindows": api::preferences::current(&Preferences::new(r"D:\交付\Benagen")),
+        "preferencesSetWindowsChanged": api::preferences::change(&DownloadDirChange::Changed {
+            dir: r"D:\交付\交付_新盘".to_string(),
+        }),
         "preferencesGetDefault": api::preferences::current(&Preferences::empty()),
         // `preferences_check`：**能用的**那一档（`check` 为 null = 可以用 ⇒ 前端弹确认）。
         // ⚠️ 确认文案取**真的那一段**（三条后果全在里面，`DownloadDirectory::confirmation`）。
@@ -843,6 +856,33 @@ fn main() {
         "preferencesSetFailed": api::preferences::change(&DownloadDirChange::Failed {
             message: api::preferences::restart_timed_out().to_string(),
         }),
+        // `verbose_logging_set` 的两支回执（任务 3）：**形状与 `preferences_set` 逐格相同**，
+        // 但话不一样（那三句把主词写死成了"下载目录"）—— 见 `VerboseLoggingChange` 的文档。
+        // ⚠️ 这一句同样取自 Rust（不在夹具里编），理由与上面那条一字不差。
+        "verboseLoggingSetChanged": api::preferences::verbose_change(
+            &VerboseLoggingChange::Changed { on: true },
+        ),
+        "verboseLoggingSetFailed": api::preferences::verbose_change(
+            &VerboseLoggingChange::Failed {
+                message: api::preferences::verbose_restart_timed_out().to_string(),
+            },
+        ),
+        // `diagnostics_export` 的三支回执（任务 4）：成功（带那句隐私提醒）/ 取消 /
+        // 失败。⚠️ 那几句同样**取自 Rust**（不在夹具里编）：前端那套验收的期望值
+        // 只许有一个来源，理由与上面那两条一字不差。
+        // ⚠️ 这一条的路径是 **Windows 形状的**（`D:\…`）——**故意的**，与夹具里其余那些
+        //    POSIX 路径不同：导出那一段（`settings.js:paintExportReceipt`）要把路径**中间
+        //    截断**，而真机上**一个 `/` 都没有** ⇒ 只认 `/` 的实现会把整条路径放进
+        //    "会被压缩的那一段"，**用户最需要看的文件夹名刚好被省略号吃掉**。
+        //    夹具用 POSIX 形状的话，本机**永远看不见**这个缺陷（判据会照着假形状绿）。
+        "diagnosticsExportDone": api::diagnostics::export_done(
+            "D:\\导出\\诊断日志-20260101-000000",
+        ),
+        "diagnosticsExportCancelled": api::diagnostics::export_cancelled(),
+        "diagnosticsExportFailed": api::diagnostics::export_failed(&shell_core::export::folder_failure_text(
+            "/Volumes/Data/只读/诊断日志-20260101-000000",
+            "Permission denied (os error 13)",
+        )),
         // `about`：正常那一档（短版本优先）+ 两个来源都空的那一档（兜底文案必须非空）。
         "about": api::about::about(&AboutInfo::version(Some("0.1.0"), Some("1"))),
         "aboutFallback": api::about::about(&AboutInfo::version(None, None)),

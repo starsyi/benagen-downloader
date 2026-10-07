@@ -39,6 +39,55 @@ public final class CoreClient: CoreCalling, @unchecked Sendable {
     private let alertLock = NSLock()
     private var alerts: [ErrorBody] = []
 
+    /// 诊断日志的出口。**生产恒为 [`DiagnosticsLog.logVerbose`]**；测试注入一个记账替身。
+    ///
+    /// ⚠️ 做成**可注入**而不是直接调那个函数，是为了让判据能在**不写文件、不翻全局**的
+    ///    前提下钉住"每一次调用记一行、成功不带 `why`、失败带原文"。两个陷阱都是
+    ///    实测踩出来的（内核那一侧的同位判据是任务 1 的任务审查 + 修复轮，
+    ///    Windows 壳那一侧是任务 2）：
+    ///    ① 往真日志目录里写会污染**人类伙伴自己**那份日志
+    ///      （`logVerbose` 走 `ShellStorage.directory`，macOS 上就是他的
+    ///      `~/Library/Application Support/BenagenDownloader/`）；
+    ///    ② 翻 `DiagnosticsLog.configure` 的进程级静态会让同进程里假设普通档的用例
+    ///      **随调度随机红**（更糟：随机往真日志里灌测试数据）—— 那种 flaky 比没有判据更坏。
+    ///
+    /// 同形的先例（"决策与调用分开"）：`windows/shell-core/src/client.rs` 的 `VerboseSink`
+    /// 与 `core/src/engine/rpc.rs` 的同名类型（那边是内核→aria2 的那一条）。
+    ///
+    /// ⚠️ **不给 setter**：那会多出一条只在测试里用的公开面。测试直接赋这个格子
+    ///    （`@testable import` 能看到 internal），就像 Windows 那一侧一样。
+    var verboseSink: @Sendable (String, [(String, String)]) -> Void = DiagnosticsLog.logVerbose
+
+    /// **写进日志之前必须抹掉的字面串**（交付码、下载目录）—— 见 [`setRedactions`]。
+    ///
+    /// ⚠️ 它挂在**连接**上而不是挂在进程级静态上：翻静态会让同进程里别的用例
+    ///    随调度随机红（`verboseSink` 那段文档记着的同一个坑）；而挂在连接上还有一条
+    ///    **语义上**的好处：**换一条连接 = 换一份该抹的东西**（新内核是壳带着新偏好
+    ///    起出来的，旧的那些串已经不在任何一条在飞的请求里）。
+    private let redactionLock = NSLock()
+    private var redactions: [String] = []
+
+    /// 告诉这条连接：**这几个字面串写进日志之前必须抹掉**（协议里的那一条，理由见
+    /// `ClientProtocol.setRedactions` 的文档）。
+    ///
+    /// ⚠️ **推下来的是"此刻该抹的整份清单"，不是追加**：交付码会换、下载目录会换，
+    ///    追加式的接口会把上一个批次的码永久留下，而那种残留**看不出来**。
+    /// ⚠️ **调用点在"发请求之前"**（`AppModel` 的两处）—— 晚一步的表现是
+    ///    **那一次**的日志里带着码，而那一次恰恰是最可能失败、最需要那份日志的一次。
+    public func setRedactions(_ secrets: [String]) {
+        redactionLock.lock()
+        redactions = secrets
+        redactionLock.unlock()
+    }
+
+    /// 把那一刻的清单套到一段文字上。**纯计算**（只在取清单时碰一次锁）。
+    private func redact(_ text: String) -> String {
+        redactionLock.lock()
+        let secrets = redactions
+        redactionLock.unlock()
+        return DiagnosticsLog.redact(text, secrets: secrets)
+    }
+
     /// 测试用：接一条现成的通道。
     public init(channel: LineChannel) {
         self.channel = channel
@@ -56,25 +105,51 @@ public final class CoreClient: CoreCalling, @unchecked Sendable {
     /// 起一个真内核（`locateCoreBinary()` + `ProcessChannel`），用内核自己的默认值
     /// （下载目录 `~/Downloads/Benagen`、设置 `~/Library/Application Support/…`）。
     public static func live() throws -> CoreClient {
-        try live(settingsPath: nil, downloadDir: nil)
+        try live(settingsPath: nil, downloadDir: nil, verboseLogging: false)
     }
 
-    /// 起一个真内核，并指定"设置存哪"与"文件下到哪"。
+    /// 起一个真内核，并指定"设置存哪""文件下到哪""日志多详细"。
     ///
-    /// 两者都是**内核的输入**而不是协议消息，所以走 argv（结构化传参，不经 shell）。
-    public static func live(settingsPath: String?, downloadDir: String?) throws -> CoreClient {
+    /// 三者都是**内核的输入**而不是协议消息，所以走 argv（结构化传参，不经 shell）。
+    ///
+    /// ⚠️ **`verboseLogging` 没有默认值**（与 [`coreArguments`] 同一条纪律，见那里的注释）：
+    ///    同一门课上一个默认值正是本功能修掉的那个 `AppPreferences.settingDownloadDir`
+    ///    bug 的成因 —— "没传"与"传了 false"在行为上一样，但前者是**没人说出口的决定**。
+    ///    **同一个洞不要只堵上一层**：调用点要么显式给 `false`，要么显式给偏好里那一格。
+    public static func live(settingsPath: String?, downloadDir: String?,
+                            verboseLogging: Bool) throws -> CoreClient {
         let binary = try locateCoreBinary()
         let channel = try ProcessChannel(
             executableURL: binary,
-            arguments: coreArguments(settingsPath: settingsPath, downloadDir: downloadDir))
+            arguments: coreArguments(settingsPath: settingsPath, downloadDir: downloadDir,
+                                     verboseLogging: verboseLogging))
         return CoreClient(channel: channel)
     }
 
     /// 内核的 argv（顺序与 `core/src/main.rs` 的 `parse_args` 一致）。
-    static func coreArguments(settingsPath: String?, downloadDir: String?) -> [String] {
+    ///
+    /// ## 🔴 `verboseLogging`：**开了才拼那一对，关了什么都不拼**
+    ///
+    /// 关着的时候拼一个 `--log-level normal` 是**错的**：内核的缺省就是 normal
+    /// （`parse_args` 的 `log_level.unwrap_or(Level::Normal)`），多拼一对只是多一处
+    /// 会漂的东西 —— 而它漂起来的方式是静默的（两种写法在真机上行为一样）。
+    /// 判据：`CoreClientTests.theVerboseFlagIsOnlySpelledOutWhenItIsOn`。
+    ///
+    /// ⚠️ `--log-level` 排在**最后**，与 Windows 那份（`shell-core/src/client.rs` 的
+    ///    `core_arguments`）逐个一致 —— 内核认顺序无关，但两边"什么时候有哪几格"
+    ///    要对得上，不然并排读两份 argv 时像是壳少拼了一个。
+    ///
+    /// 🔴 **`verboseLogging` 故意没有默认值**（与 Windows 那份 `core_arguments` 同一条：
+    ///    计划的风险表 P3 写着"**不许**给默认值"）。理由：给了默认值之后，漏传这一格的
+    ///    新调用点会**静默地**走普通档 —— 而"客户以为开了详细日志、导出的却是普通档"
+    ///    正是这一整份规格要消灭的那类失败。**少传一个实参应该是编译错误。**
+    static func coreArguments(settingsPath: String?, downloadDir: String?,
+                              verboseLogging: Bool) -> [String] {
         var args: [String] = []
         if let downloadDir { args += ["--download-dir", downloadDir] }
         if let settingsPath { args += ["--settings", settingsPath] }
+        // ⚠️ **关了就不拼这一对**（缺省即 normal）—— 拼 `--log-level normal` 会多一处会漂的东西。
+        if verboseLogging { args += ["--log-level", "verbose"] }
         return args
     }
 
@@ -169,7 +244,58 @@ public final class CoreClient: CoreCalling, @unchecked Sendable {
     }
 
     /// 请求-响应循环。**必须在 `queue` 上跑**（它读写 `nextId`，且独占通道）。
+    ///
+    /// ⚠️ **本函数是"壳→内核"的唯一收口**：详细档那一行（`kernel_call`）记在**这里**，
+    ///    于是所有调用点自动全覆盖 —— 散在调用点各记一遍会漏掉下一个人新加的那条路。
+    ///    真正的实现是 [`performCallInner`]（本函数只负责计时与记账）。
+    ///
+    /// ⚠️ **"记不记"由出口决定，本函数无条件记**：闸门在
+    ///    [`DiagnosticsLog.logVerbose`]（只有详细档才真落盘）。所以判据可以往
+    ///    `verboseSink` 注入一个替身来数行数，**不必**碰文件系统、也不必翻进程级静态。
     private func performCall(_ method: String, _ params: JSONValue) throws -> JSONValue {
+        let started = DispatchTime.now()
+        let outcome = Result { try performCallInner(method, params) }
+        recordKernelCall(method, started: started, outcome: outcome)
+        return try outcome.get()
+    }
+
+    /// 详细档那一行（`kernel_call`）。**字段与 Windows 那一行同形**
+    /// （`method` / `ms` / `ok`，失败时才多一个 `why`）—— 客户回传时两个文件要能对着读。
+    ///
+    /// ⚠️ **只有失败时才带 `why`**：成功时补一个空字段会让"这一行有几个字段"
+    ///    随结果变，而按空格切字段读它的下一个人会读到空值。
+    ///    `why` 走的是壳既有的那个**给用户看**的映射（`AppModel.message(of:)`）——
+    ///    与界面上显示的那句是**同一份**，不是这里另写一句。
+    /// ⚠️ **参数一律不进这一行**：`enqueue` 的参数里有文件路径、`load_delivery` 的参数里
+    ///    有交付码，而诊断日志会被客户回传（模块头"不记什么"那一段）。
+    private func recordKernelCall(_ method: String, started: DispatchTime,
+                                  outcome: Result<JSONValue, Error>) {
+        let elapsed = DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds
+        let ok: String
+        switch outcome {
+        case .success: ok = "true"
+        case .failure: ok = "false"
+        }
+        var fields: [(String, String)] = [
+            ("method", method),
+            ("ms", String(elapsed / 1_000_000)),
+            ("ok", ok),
+        ]
+        if case .failure(let error) = outcome {
+            // 🔴 **落进这一行之前必须过 [`redact`]**（规格 §2.3 B）：`why` 是**内核原文**，
+            //    而交付码是**我们自己**拼进内核文案里的（`core/src/delivery.rs` 那条 404
+            //    把 `…/{交付码}/manifest.json` 整条 URL 送了进来，`core/src/main.rs` 的
+            //    `preflight` 那一档带着客户目录名）。
+            //    ⚠️ 这一处**只抹日志**：`AppModel.message(of:)` 给用户看的那句话一个字都不动
+            //    —— 界面上显示客户自己的交付码/目录是应当的，问题只出在"要离开这台机器
+            //    的那一份"上。
+            fields.append(("why", redact(AppModel.message(of: error))))
+        }
+        verboseSink("kernel_call", fields)
+    }
+
+    /// [`performCall`] 的本体：**只做事、不记账**（计时与详细档那一行在上面那一层）。
+    private func performCallInner(_ method: String, _ params: JSONValue) throws -> JSONValue {
         guard !requestsClosed else {
             throw CoreError.transport("内核连接已关闭（shutdown 已调用）")
         }

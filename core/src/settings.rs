@@ -187,24 +187,26 @@ pub fn parse_size_mb(s: &str) -> Result<i64, String> {
     Ok(n)
 }
 
-/// macOS 规范位置。
+/// 内核参数 `settings.json` 的路径。
 ///
 /// ⚠️ 这里的 `$HOME/Library/Application Support/...` 是**由测试钉死的例外**
 /// （`default_path_is_macos_canonical`，对应 Go `settings_test.go` 的
 /// `TestDefaultPathIsMacOSCanonical`），不是内核里新引入的平台界面习惯。
-/// 内核不含界面概念这条约束照旧：整个内核里只有这一处平台路径，
-/// 且删掉它会让已冻结的 Go 测试失去对应物。
+/// 内核不含界面概念这条约束照旧。
 ///
-/// Go 的 `os.UserHomeDir()` 在 Unix 上就是读 `$HOME`，取不到（未设或为空）时回退 `"settings.json"`。
-pub fn default_path() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) if !home.is_empty() => Path::new(&home)
-            .join("Library")
-            .join("Application Support")
-            .join("BenagenDownloader")
-            .join("settings.json"),
-        _ => PathBuf::from("settings.json"),
-    }
+/// ⚠️ **订正（原注释说"整个内核里只有这一处平台路径"，那句话已经不成立）**：
+/// 内核的**平台标准目录**是**三处**——本函数、`engine::daemon::default_cache_dir`
+/// （aria2c 的释放位置）、`main::parse_args`（默认下载目录）。
+/// 三处的判据**集中在 `crate::paths` 这一个模块里**（规格 §8 的那张表的内核那一半），
+/// 本文只是它在"设置文件"这一格上的入口。**要查平台路径，去 `crate::paths` 查**——
+/// 原先那句话会让后来者不去看另外两处。
+///
+/// 失败语义按平台**有意不同**（W-3 与 W-2 的交点，别"统一"）：
+/// macOS 上 `$HOME` 取不到（未设或为空）⇒ 回退相对路径 `"settings.json"`（**冻结的 Go 行为**，
+/// 对应 `os.UserHomeDir()` 的失败分支）；Windows 上 `%APPDATA%` 取不到 ⇒ **大声失败**。
+/// 理由与话术都在 `crate::paths` 里，本函数只做转发。
+pub fn default_path() -> Result<PathBuf, String> {
+    crate::paths::settings_file()
 }
 
 /// 反序列化的中间形态：**缺失字段留零值**（Go 的 `json.Unmarshal` 语义）。
@@ -752,11 +754,16 @@ mod tests {
             .join("Application Support")
             .join("BenagenDownloader")
             .join("settings.json");
-        assert_eq!(default_path(), want, "default_path() 不符");
+        // ⚠️ 这条测试是 **W-3 的落点**：它钉的是 macOS 上**逐字不变**的那条路。
+        // `default_path()` 现在返回 `Result`（Windows 取不到 `%APPDATA%` 时要能大声失败），
+        // 但在 macOS 上它**恒为 `Ok`**（`$HOME` 取不到时回退相对路径，不是错误）——
+        // 所以这里的 `expect` 不是"把错误吞掉"，恰恰是那条冻结语义的断言本身。
+        let got = default_path().expect("macOS 上 default_path() 恒为 Ok（$HOME 取不到时回退相对路径）");
+        assert_eq!(got, want, "default_path() 不符");
         assert!(
-            default_path().to_string_lossy().ends_with("settings.json"),
+            got.to_string_lossy().ends_with("settings.json"),
             "default_path() 应指向 settings.json，实际 {:?}",
-            default_path()
+            got
         );
     }
 }

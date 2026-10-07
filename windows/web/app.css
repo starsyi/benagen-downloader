@@ -60,7 +60,11 @@
         比的也是那一份。
       · **交付副本**：`windows/web/fonts/ui-subset.otf` —— 就是本行 `url()` 指向的文件。
         它与上面那份**逐字节相同**（改动时实测：两边 sha256 都是
-        `8b2c504a…f70f80`，等于 `SUBSET_SHA256`）。
+        `d2287332…ff7035`，等于 `SUBSET_SHA256`）。
+        ⚠️ **这一格是"当时那一份"的读数，会随子集重生而过期**（没有门会因此变红：
+        `make_font_subset.sh` 第 10 步核的是规格里那两个体积数，不核本文件）——
+        重生成之后**顺手把它一起改掉**，别让它烂在这里。
+        最近一次：2026-10-06（任务 4，导出诊断日志）：190744 B → **193944 B**。
       · 🔴 **重新生成子集之后，必须把新产物拷到 `windows/web/fonts/`**：
         `cp windows/assets/ui-subset.otf windows/web/fonts/`
         （许可全文同理：`cp windows/assets/OFL-1.1.txt windows/web/fonts/`）

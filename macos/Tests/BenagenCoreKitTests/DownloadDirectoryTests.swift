@@ -40,8 +40,8 @@ private struct TempDirectory {
     // E-5 的全部内容：**未配置 ⇒ 不传**。传 `nil` 而不是"一个和内核默认一样的值" ——
     // 后者会在内核改默认值的那天**静默分叉**（壳以为还是那个目录，内核已经换了）。
     #expect(DownloadDirectory.argument(for: .empty) == nil)
-    #expect(DownloadDirectory.argument(for: AppPreferences(downloadDir: "")) == nil)
-    #expect(DownloadDirectory.argument(for: AppPreferences(downloadDir: "   ")) == nil,
+    #expect(DownloadDirectory.argument(for: AppPreferences(downloadDir: "", verboseLogging: false)) == nil)
+    #expect(DownloadDirectory.argument(for: AppPreferences(downloadDir: "   ", verboseLogging: false)) == nil,
             "只有空白 = 未配置（`AppPreferences` 的归一化）")
 }
 
@@ -57,18 +57,19 @@ private struct TempDirectory {
     //    形态（空串 / 只有空白）下，argv 里都不许出现**路径形式的**参数 ——
     //    把"壳自己造了一个默认路径"这个变异体放进来，下面三行立刻红。
     let unconfigured = [AppPreferences.empty,
-                        AppPreferences(downloadDir: ""),
-                        AppPreferences(downloadDir: "   ")]
+                        AppPreferences(downloadDir: "", verboseLogging: false),
+                        AppPreferences(downloadDir: "   ", verboseLogging: false)]
     for prefs in unconfigured {
         let argv = CoreClient.coreArguments(settingsPath: nil,
-                                            downloadDir: DownloadDirectory.argument(for: prefs))
+                                            downloadDir: DownloadDirectory.argument(for: prefs),
+                                            verboseLogging: false)
         #expect(argv.isEmpty,
                 "未配置 ⇒ argv 里一个参数都不许有（不许自己编一个「和内核默认一样」的路径），实际 \(argv)")
     }
 }
 
 @Test func aConfiguredPreferencePassesTheDirectoryVerbatim() {
-    let prefs = AppPreferences(downloadDir: "/Volumes/Data/交付/有 空格的目录")
+    let prefs = AppPreferences(downloadDir: "/Volumes/Data/交付/有 空格的目录", verboseLogging: false)
     #expect(DownloadDirectory.argument(for: prefs) == "/Volumes/Data/交付/有 空格的目录",
             "原样进 argv：壳不规范化（理由见 `AppPreferences.normalized` 的注释）")
 }
@@ -77,10 +78,12 @@ private struct TempDirectory {
     // 判据与**真正的 argv 构造器**对上（`CoreClient.coreArguments` 是那唯一一份实现）：
     // 未配置 ⇒ argv 里**没有** `--download-dir` 这个 flag（E-5 的"逐字节保持今天的形态"）。
     #expect(CoreClient.coreArguments(settingsPath: nil,
-                                     downloadDir: DownloadDirectory.argument(for: .empty)) == [])
+                                     downloadDir: DownloadDirectory.argument(for: .empty),
+                                     verboseLogging: false) == [])
     #expect(CoreClient.coreArguments(
         settingsPath: nil,
-        downloadDir: DownloadDirectory.argument(for: AppPreferences(downloadDir: "/data/交付")))
+        downloadDir: DownloadDirectory.argument(for: AppPreferences(downloadDir: "/data/交付", verboseLogging: false)),
+        verboseLogging: false)
         == ["--download-dir", "/data/交付"])
 }
 

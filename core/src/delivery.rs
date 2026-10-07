@@ -273,6 +273,12 @@ pub struct UreqTransport {
 impl UreqTransport {
     pub fn new() -> Self {
         Self {
+            // ⚠️ **这里不设 `timeout_connect` 是刻意的**（别来"顺手补齐"）：这条路径的整体
+            //    超时就是 `FETCH_TIMEOUT`（30 秒），而 ureq 的连接默认值也是 30 秒 ⇒ **两者同量级**，
+            //    A4 要修的那种"声明一个数、连接阶段实际 30 秒"的不一致**在它身上不存在**。
+            //    （`rpc.rs` 那两处**必须**显式写，是因为那里的整体超时是 10 秒 ——
+            //     比连接默认值**小**，不写就等于声明 10 秒、实际 30 秒。）
+            //    ⇒ 改了 `FETCH_TIMEOUT` 才需要回来看这一句。
             agent: ureq::AgentBuilder::new().timeout(FETCH_TIMEOUT).build(),
         }
     }
@@ -286,9 +292,40 @@ impl Default for UreqTransport {
     }
 }
 
+/// 一次交付页往返的**分类** —— 给诊断日志用。
+///
+/// 🔴 **它存在的全部理由是隐私**：`url` 里含交付码，而 `ureq::Error` 的 `Display`
+///    会把 URL 打出来 ⇒ 这一路**必须**只落一个结构化取值，不许落 `e.to_string()`。
+///    ⚠️ 这与 A6 那条"接受 aria2 原文的残留"**不同**：那边是**第三方文案我们识别不了**，
+///    这边是**我们自己拼的串、我们自己知道里面有交付码** —— 能按构造避开就必须避开。
+///
+/// ⚠️ **这一格的取值是一份契约，不是随手写的**：`ok` / `status_<码>` / `transport_<Kind>`
+///    由 `the_delivery_fetch_outcome_vocabulary_is_a_contract` 逐条钉住
+///    （那条用例是把真 `ureq` 打到本地桩上跑的，不是拿一个手工造的 `Error` 顶替）。
+///    ⚠️ **它钉住的到此为止**：`delivery_fetch` 那两个 `log_verbose` **调用点本身**
+///    仍然没有判据 —— 把 `get`/`head` 里那两段删掉，全套判据照旧全绿。
+///    那一半只由真机验收那条（详细档下真的出现 `event=delivery_fetch`）守着，如实记账。
+fn outcome_category<T>(outcome: &Result<T, ureq::Error>) -> String {
+    match outcome {
+        Ok(_) => "ok".to_string(),
+        Err(ureq::Error::Status(code, _)) => format!("status_{code}"),
+        Err(ureq::Error::Transport(t)) => format!("transport_{:?}", t.kind()),
+    }
+}
+
 impl Transport for UreqTransport {
     fn get(&self, url: &str) -> Result<Vec<u8>, String> {
-        match self.agent.get(url).call() {
+        let started = std::time::Instant::now();
+        let outcome = self.agent.get(url).call();
+        crate::diagnostics::log_verbose(
+            "delivery_fetch",
+            &[
+                ("stage", "get".to_string()),
+                ("ms", started.elapsed().as_millis().to_string()),
+                ("outcome", outcome_category(&outcome)),
+            ],
+        );
+        match outcome {
             Ok(resp) => {
                 let mut buf = Vec::new();
                 // 与 Go 的 `io.LimitReader(resp.Body, 64<<20)` 同义：超过上限**截断**而非报错
@@ -312,7 +349,17 @@ impl Transport for UreqTransport {
     }
 
     fn head_crc64(&self, url: &str) -> Option<String> {
-        let resp = self.agent.head(url).call().ok()?;
+        let started = std::time::Instant::now();
+        let outcome = self.agent.head(url).call();
+        crate::diagnostics::log_verbose(
+            "delivery_fetch",
+            &[
+                ("stage", "head".to_string()),
+                ("ms", started.elapsed().as_millis().to_string()),
+                ("outcome", outcome_category(&outcome)),
+            ],
+        );
+        let resp = outcome.ok()?;
         // Go 侧 `resp.Header.Get` 在没有该头时返回 ""，这里用 `None` 表示同一件事：
         // 只有拿到**非空**的 CRC 才算补齐成功。
         resp.header("X-Tos-Hash-Crc64ecma")
@@ -952,5 +999,82 @@ mod tests {
             !err.contains("base_url"),
             "正常基址被 validate_base_url 误拒了: {err}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // `delivery_fetch` 那一行的**分类词表**（规格 §2.3 B）
+    //
+    // ⚠️ 这一条**只钉住词表**，别把它读成"这一路有证据了"：
+    //    `delivery.rs` 里那两个 `log_verbose` **调用点本身**仍然没有判据 ——
+    //    把 `get`/`head` 里那两段整段删掉，**全套判据照旧全绿**。那一半只有真机验收
+    //    能回答（详细档下真的跑一次拉清单 ⇒ `event=delivery_fetch` 的条数 > 0）。
+    // ------------------------------------------------------------------
+
+    /// 起一个**只回一行 HTTP 响应**的桩服务，返回它的基址。
+    ///
+    /// 与 `core/tests/e2e.rs` 的桩同一个形状（裸 `TcpListener`，`wiremock` 不在依赖表里）。
+    fn a_one_shot_http_stub(response: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定桩端口失败");
+        let addr = listener.local_addr().expect("取端口失败");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}/AbCdEfGhIjKlMnOpQrSt/manifest.json")
+    }
+
+    /// 🔴 **分类的取值是一份契约**：`ok` / `status_<码>` / `transport_<Kind>`。
+    ///
+    /// 为什么值得一条用例（终审重要 ③）：这个函数是**整个"不记 url"决定**在实现上的
+    /// 全部落点，而在此之前**没有任何一条测试引用过 `delivery_fetch`**（全仓只有
+    /// `delivery_fetch_failed`，那是另一个东西）⇒ 删掉那两个 `log_verbose`、或者把
+    /// 分类改成 `format!("{outcome:?}")`（那就把 URL 带出去了），**没有任何东西会红**。
+    ///
+    /// ⚠️ **它钉住的是词表，不是调用点**（见上面那一段记账）。
+    /// ⚠️ 桩走的是**真 ureq**（不是手工造的 `Error`，那个造不出来）：
+    ///    本地环回、一次性连接，与 `core/tests/e2e.rs` 同一手法。
+    #[test]
+    fn the_delivery_fetch_outcome_vocabulary_is_a_contract() {
+        let t = UreqTransport::new();
+
+        // ① 200 ⇒ `ok`
+        let url = a_one_shot_http_stub("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        let ok = t.agent.get(&url).call();
+        assert_eq!(outcome_category(&ok), "ok", "成功那一档的词是 `ok`");
+
+        // ② 404 ⇒ `status_404`（交付码打错那一档，也是这一路最常出现的失败）
+        let url = a_one_shot_http_stub("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let not_found = t.agent.get(&url).call();
+        assert_eq!(
+            outcome_category(&not_found),
+            "status_404",
+            "状态码要出现在**词**里（`status_<码>`），而不是从文案里截"
+        );
+
+        // ③ 连不上 ⇒ `transport_<Kind>`：`127.0.0.1:1` 立刻 ECONNREFUSED
+        //    （同文件上面那条"正常基址不被误拒"的用例用的就是它）。
+        let refused = t.agent.get("http://127.0.0.1:1/AbCdEfGhIjKlMnOpQrSt/manifest.json").call();
+        let category = outcome_category(&refused);
+        assert!(
+            category.starts_with("transport_") && category.len() > "transport_".len(),
+            "传输层失败要带上**种类**（`transport_<Kind>`），实际 {category:?}"
+        );
+
+        // 🔴 **而这三档一个都不许带上 URL** —— 那才是这个函数存在的理由：
+        //    URL 里含交付码，而 `ureq::Error` 的 `Display` 会把它原样打出来。
+        for (what, category) in [
+            ("status_404", outcome_category(&not_found)),
+            ("transport", category),
+        ] {
+            assert!(
+                !category.contains("AbCdEfGhIjKlMnOpQrSt"),
+                "{what} 那一档把交付码带出去了：{category}"
+            );
+            assert!(!category.contains("http"), "{what} 那一档把 URL 带出去了：{category}");
+        }
     }
 }

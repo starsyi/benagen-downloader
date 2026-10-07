@@ -19,6 +19,22 @@ use crc::{Crc, CRC_64_XZ};
 pub static CRC64XZ: Crc<u64> = Crc::<u64>::new(&CRC_64_XZ);
 
 /// 一次性计算。
+///
+/// ⚠️ **只有测试用它**——生产路径一条都不走它：`verify.rs` 一律走 `sum_file`（流式，
+/// 交付文件有 50GB+，见那个函数的注释）。它的读者是 `streaming_matches_one_shot` 与
+/// `sum_file_multi_chunk`（拿它当"一次性"的对照实现）。
+///
+/// ⚠️ **因此生产构建下这里会报一条既有的 `dead_code` 告警，而且它必须留着**：
+/// 按 D-4「本任务**不新增**」执行——`#[allow(dead_code)]`、`#[cfg(test)]` 门控、
+/// 删符号**三条路都不许**（删它就要把那两条测试改写成直接调 `CRC64XZ.checksum(...)`，
+/// 那是把"对照"淹进实现细节，不是清理）。
+///
+/// 基线账本见 `docs/superpowers/plans/2026-09-18-client-phase-d.md` **全局约束表的 D-4 行**
+/// （当前在 `:24`）：它点名了这四条告警（`crc64xz::sum` / `ARIA2_LICENSE` / `license_text` /
+/// `Daemon{secret,argv}`），并写明按"本任务**不新增**执行、
+/// **不要**用 `#[allow(dead_code)]` 或删符号去按掉它们"。
+/// ⚠️ 原指针写的是 `windows/scripts/test.sh` 头部——**那个文件在本仓库里不存在**
+/// （`windows/` 不在本工作树），照它去查会扑空；已订正为上面这处。
 pub fn sum(data: &[u8]) -> u64 {
     CRC64XZ.checksum(data)
 }

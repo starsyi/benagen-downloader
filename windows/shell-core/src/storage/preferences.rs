@@ -41,6 +41,15 @@ pub struct Preferences {
     ///    所以**手工用结构体字面量构造出来的那一份不会过 [`Preferences::new`] 的规范化**
     ///    —— 要规范化就用构造函数或 [`Preferences::setting_download_dir`]。
     pub download_dir: String,
+
+    /// **详细诊断日志**（规格 §2.4）。开着的时候壳给内核多拼一对
+    /// `--log-level verbose`，壳自己那一份也用 [`crate::diagnostics::Level::Verbose`]。
+    ///
+    /// 🔴 **缺字段 = `false`**（老客户机器上那份 `preferences.json` 里没有这一格）——
+    ///    这条不是靠"构造函数给它 `false`"，而是靠**反序列化那一侧的 `#[serde(default)]`**
+    ///    （见下面 `Deserialize` 的实现里那段注释）：少了它，老文件会**整份解析失败**，
+    ///    而那时候连 `download_dir` 一起丢，**没有任何东西会变红**。
+    pub verbose_logging: bool,
 }
 
 impl Preferences {
@@ -49,13 +58,20 @@ impl Preferences {
     pub const VERSION: i64 = 1;
 
     /// 没有配置过任何东西（= 一切走默认）。对齐 `AppPreferences.empty`。
+    ///
+    /// ⚠️ 详细日志那一格同样是**关着**的：它是"没配过"这个状态的一部分，
+    ///    而不是一个"默认打开"的东西（诊断日志开着的时候单文件能长到 4 MiB，
+    ///    那是客户报障时才需要的一档）。
     pub fn empty() -> Preferences {
-        Preferences { download_dir: String::new() }
+        Preferences { download_dir: String::new(), verbose_logging: false }
     }
 
     /// 造一份偏好（**过一遍规范化**）。对齐 `AppPreferences.init(downloadDir:)`。
+    ///
+    /// ⚠️ **只造"下载目录"那一格**：详细日志起手是关着的，要开用
+    ///    [`Self::setting_verbose_logging`]。
     pub fn new(download_dir: &str) -> Preferences {
-        Preferences { download_dir: normalized(download_dir) }
+        Preferences { download_dir: normalized(download_dir), verbose_logging: false }
     }
 
     /// 配过下载目录没有。**它是"要不要传 `--download-dir`"的唯一判据**
@@ -66,8 +82,26 @@ impl Preferences {
 
     /// 改下载目录（返回新值）。传空串 = 回到未配置（设置窗口那颗「恢复默认」）。
     /// 对齐 `AppPreferences.settingDownloadDir(_:)`。
+    ///
+    /// ⚠️ **详细日志那一格要原样带过去**（不是走 [`Self::new`]）：`new` 把它置回 `false`，
+    ///    而"改下载目录"与"关掉详细日志"是**两件事** —— 合成一件的表现是客户在排查
+    ///    一次故障的中途换了个目录，诊断日志**静默地退回普通档**，而
+    ///    `diag-shell.log` 还照样在长（只是不再记那每一次往返了）。
     pub fn setting_download_dir(&self, path: &str) -> Preferences {
-        Preferences::new(path)
+        Preferences {
+            download_dir: normalized(path),
+            verbose_logging: self.verbose_logging,
+        }
+    }
+
+    /// 开关详细诊断日志（返回新值）。**这是那一格的唯一入口**。
+    ///
+    /// ⚠️ 对称的那一条：`download_dir` **原样带过去**（同上，两件事不许互相覆盖）。
+    pub fn setting_verbose_logging(&self, on: bool) -> Preferences {
+        Preferences {
+            download_dir: self.download_dir.clone(),
+            verbose_logging: on,
+        }
     }
 
     /// 读。文件不存在、读不动、内容坏了、`version` 不认识 ⇒ **当未配置**
@@ -107,16 +141,24 @@ fn normalized(raw: &str) -> String {
 // 磁盘形状（字段名逐字，见模块头）
 // ---------------------------------------------------------------------------
 
-/// 落盘的形状：`{"version": 1, "download_dir": "/abs/path"}`。
+/// 落盘的形状：`{"version": 1, "download_dir": "/abs/path", "verbose_logging": false}`。
 impl Serialize for Preferences {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Raw<'a> {
             version: i64,
             download_dir: &'a str,
+            // ⚠️ **写出去时这一格永远在场**（读的时候可以缺 —— 见下面 `Deserialize`）：
+            //    写一份"能省就省"的形状会让"老文件"与"这份偏好根本没配过"在盘上
+            //    长得一样，而它们要区分开（后者是 E-1 那条"整份当未配置"）。
+            verbose_logging: bool,
         }
-        Raw { version: Preferences::VERSION, download_dir: &self.download_dir }
-            .serialize(serializer)
+        Raw {
+            version: Preferences::VERSION,
+            download_dir: &self.download_dir,
+            verbose_logging: self.verbose_logging,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -137,6 +179,19 @@ impl<'de> Deserialize<'de> for Preferences {
             version: i64,
             #[serde(default)]
             download_dir: serde_json::Value,
+            /// 🔴 **`#[serde(default)]` 是"缺字段 = 没开"这条红线的全部依靠**。
+            ///
+            /// 老客户机器上那份 `preferences.json` 里**没有这一格**。少了这个属性，
+            /// `Raw::deserialize` 会以"缺字段"当场失败 ⇒ 整份 `Preferences` 解析不出来
+            /// ⇒ [`Preferences::load`] 回 `empty()` ⇒ **下载目录凭空消失**，
+            /// 而 `version` 明明是 1、日志里一个字都没有。**别删它**。
+            ///
+            /// ⚠️ 它**只**管"这一格不在"。这一格在场而**不是布尔**（有人手改成 `"true"`）
+            ///    时这里会报错 ⇒ 整份当未配置（连 `download_dir` 一起）——
+            ///    与 `download_dir` 不是字符串时的口径**不同**（那一格只退化成"未配置"，
+            ///    见本函数上面那段文档）。如实记在这里，免得下一个人以为两处一样严。
+            #[serde(default)]
+            verbose_logging: bool,
         }
         let raw = Raw::deserialize(deserializer)?;
         if raw.version != Self::VERSION {
@@ -146,7 +201,8 @@ impl<'de> Deserialize<'de> for Preferences {
                 Self::VERSION
             )));
         }
-        Ok(Preferences::new(raw.download_dir.as_str().unwrap_or("")))
+        Ok(Preferences::new(raw.download_dir.as_str().unwrap_or(""))
+            .setting_verbose_logging(raw.verbose_logging))
     }
 }
 
@@ -155,11 +211,25 @@ mod tests {
     use super::*;
     use crate::storage::test_support::TempDir;
 
-    /// 磁盘形状（**字段名逐字**）：`version` + `download_dir`，两个键、不多不少。
+    /// 磁盘形状（**字段名逐字**）：`version` + `download_dir` + `verbose_logging`，
+    /// 三个键、不多不少。
+    ///
+    /// ⚠️ 第三个键是**写出去时永远在场**的（读进来时可以缺 —— 那是
+    ///    `an_old_preferences_file_without_the_new_field_reads_as_off` 钉的事）：
+    ///    写一份"省着写"的形状会让"老文件"与"这份偏好根本没配过"在盘上长得一样。
     #[test]
-    fn the_disk_shape_is_version_plus_download_dir() {
+    fn the_disk_shape_is_version_plus_download_dir_and_verbose_logging() {
         let v = serde_json::to_value(Preferences::new("/abs/path")).expect("一定能序列化");
-        assert_eq!(v, serde_json::json!({"version": 1, "download_dir": "/abs/path"}));
+        assert_eq!(
+            v,
+            serde_json::json!({"version": 1, "download_dir": "/abs/path", "verbose_logging": false})
+        );
+        // 开着的时候那一格要真的跟着走（否则上面那条可以靠"永远写 false"变绿）。
+        let on = Preferences::new("/abs/path").setting_verbose_logging(true);
+        assert_eq!(
+            serde_json::to_value(on).expect("一定能序列化")["verbose_logging"],
+            serde_json::json!(true)
+        );
     }
 
     /// 写出去、读回来是同一份（`load`/`save` 走的是同一条形状）。
@@ -242,6 +312,114 @@ mod tests {
         let path = dir.path().join(FILE_NAME);
         std::fs::write(&path, br#"{"version": 1, "download_dir": "  /abs/path\n"}"#).unwrap();
         assert_eq!(Preferences::load(&path).download_dir, "/abs/path");
+    }
+
+    /// 把一段**原文**写进一个一次性的临时文件，返回它的路径。
+    ///
+    /// ⚠️ 为什么要有它（而不是用既有的 `TempDir` + `std::fs::write` 两行）：下面那条
+    ///    "旧客户端的文件"要的输入是**盘上逐字就是那样**的一段字节 —— 拿
+    ///    `Preferences` 反过来序列化一份再读，测的就成了"自己写的自己读得回来"，
+    ///    而**缺字段**这件事根本不会出现（我们写出去的那一份永远带着新字段）。
+    ///
+    /// ⚠️ **这个临时目录是有意泄漏的**（`std::mem::forget`）：本函数的签名只回一个
+    ///    `PathBuf`，没有东西持有 `TempDir` 的句柄 ⇒ 它一 drop 就把刚写的文件删掉。
+    ///    代价如实记：`std::env::temp_dir()` 下会留下几个 `benagen-storage-pref-old-*`
+    ///    空目录（每次跑用例一个，名字里带 pid 与纳秒）。它**不碰真机上那份偏好**
+    ///    （`storage::dir()` 那个目录），这是本模块用例唯一的硬底线。
+    fn write_temp(text: &str) -> std::path::PathBuf {
+        let dir = TempDir::new("pref-old");
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(&path, text).expect("写临时偏好文件");
+        std::mem::forget(dir);
+        path
+    }
+
+    /// 🔴 **缺字段的文件必须读成"没开"**（规格 §2.4 的红线）。
+    ///
+    /// 判别力：把 `Raw` 里那个 `#[serde(default)]` 删掉 ⇒ 老客户机器上那份
+    /// **只有 `{version, download_dir}` 的 preferences.json 会整份解析失败** ⇒
+    /// `load()` 回 `empty()` ⇒ **下载目录凭空消失**，而没有任何东西会变红。
+    #[test]
+    fn an_old_preferences_file_without_the_new_field_reads_as_off() {
+        let old = r#"{"version": 1, "download_dir": "D:\\交付"}"#;
+        let parsed = JsonFile::read::<Preferences>(&write_temp(old)).expect("旧文件必须还能读");
+        assert_eq!(parsed.download_dir, "D:\\交付", "旧字段不许丢");
+        assert!(!parsed.verbose_logging, "缺字段 = 没开详细日志");
+    }
+
+    /// ⚠️ **两格互不覆盖**（这是**生产那条路**：`commands::preferences_set` 走的就是
+    /// `setting_download_dir`）。
+    ///
+    /// 判别力：把 `setting_download_dir` 写回 `Preferences::new(path)`（它把那一格置回
+    /// `false`），这一条立刻红 —— 而真机上的表现是客户排查到一半换了个下载目录，
+    /// 诊断日志**静默地退回普通档**，而 `diag-shell.log` 还照样在长
+    /// （只是不再记那每一次往返了），**没有任何东西会变红**。
+    #[test]
+    fn the_two_settings_never_overwrite_each_other() {
+        let on = Preferences::new("/data/交付").setting_verbose_logging(true);
+        assert!(on.setting_download_dir("/data/新的").verbose_logging, "改目录把开关带跑了");
+        assert_eq!(on.setting_download_dir("/data/新的").download_dir, "/data/新的");
+        assert_eq!(
+            on.setting_verbose_logging(false).download_dir,
+            "/data/交付",
+            "改开关把目录带跑了"
+        );
+        // 「恢复默认」那条路同样是"只动目录那一格"。
+        assert!(on.setting_download_dir("").verbose_logging);
+    }
+
+    /// 🔴 **版本号不许递增**（规格 §2.4 与全局约束 5）。
+    ///
+    /// 判别力：把 `VERSION` 改成 2 ⇒ 上面那条用例立刻红（旧文件被当成"不认识的版本"
+    /// 整份丢弃）。这一条钉的是那个常量本身，好让"递增"这个动作**必须**先改一条用例。
+    #[test]
+    fn the_version_does_not_move_when_a_field_is_added() {
+        assert_eq!(Preferences::VERSION, 1, "递增版本号会让旧客户端的下载目录被清空");
+    }
+
+    /// **开启之后写盘、再读回来还是开着的。**（**真的过一遍盘**）
+    ///
+    /// 🔴 **判别力（变异实测，见报告「修复轮 1」）**：把 `Deserialize` 末尾那行
+    ///    `.setting_verbose_logging(raw.verbose_logging)` 换成
+    ///    `.setting_verbose_logging(false)`，**全仓只有这一条会红**。
+    ///
+    ///    它藏起来的正是这个功能的主链：**勾上 → `save` → 下次启动 `load` →
+    ///    `apply_shell_log_level` → `Verbose`**。反序列化在这里错的表现是
+    ///    "**客户开了详细日志、重启之后 `diag-shell.log` 一行都没有**" ——
+    ///    那正是这个 task 存在的理由。
+    ///
+    /// ⚠️ 这一条**必须是盘上往返**，不许退回成"内存里的构造函数检查"：
+    ///    那种写法（`new()` / `setting_verbose_logging()` 各看一眼）走的是**构造**那一侧，
+    ///    反序列化那一侧一个字都碰不到 —— 而错的恰恰可以是那一侧。
+    ///    同形的那条在呈现层（`presentation/app_preferences.rs` 的
+    ///    `a_preference_without_the_verbose_field_reads_as_off_and_the_version_stays`
+    ///    最后那一段），两条各钉各的一层，**别把任何一条删成另一条的重复**。
+    #[test]
+    fn the_verbose_flag_round_trips() {
+        let dir = TempDir::new("pref-verbose-roundtrip");
+        let path = dir.path().join(FILE_NAME);
+
+        // 起手（没配过）是**关**的 —— 它是"没配过"这个状态的一部分。
+        assert!(!Preferences::new("D:\\交付").verbose_logging);
+
+        // 打开 → **写盘** → 读回来：那一格必须原样还在。
+        let on = Preferences::new("D:\\交付").setting_verbose_logging(true);
+        assert!(on.verbose_logging);
+        on.save(&path).expect("写盘要成功");
+        let back = Preferences::load(&path);
+        assert_eq!(back, on, "整份要原样回来");
+        assert!(
+            back.verbose_logging,
+            "开着的那一份写下去、读回来必须还是开着的（盘上真的写了这一格）"
+        );
+
+        // ⚠️ **反方向**：关着的那一份写下去、读回来也是关的 —— 少了它，上面那条
+        //    可以靠"读的时候永远给 true"变绿。
+        Preferences::new("D:\\交付").save(&path).expect("写盘要成功");
+        assert!(
+            !Preferences::load(&path).verbose_logging,
+            "关着的那一份读回来不许变成开着的"
+        );
     }
 
     /// ⚠️ **写失败要能到调用方手里**（E-2 的下半条）：

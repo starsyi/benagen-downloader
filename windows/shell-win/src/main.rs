@@ -7,6 +7,7 @@
 //! ① BenagenDownloader.exe 启动
 //! ② wv2::install()      把内嵌的 WebView2Loader.dll 释放出来并装载（规格 §4）
 //! ③ bootstrap::locate_core_binary()  内核在哪三条路（env → 内嵌释放 → 同目录）
+//! ③b commands::apply_shell_log_level(…)  **壳自己**那一档日志（规格 §2.4，任务 3）
 //! ④ session.set_connector(…)         装那个"重新找一次 + 握手"的连接器
 //! ⑤ tauri::Builder      起 Tauri：建窗口、挂 webview、装 Session、注册全部命令、
 //!                       再在起之前发一趟后台连接（`session::spawn_connect`）
@@ -223,6 +224,26 @@ fn main() {
             false
         }
     };
+
+    // ---- ③b **壳自己的日志档位**（规格 §2.3 / §2.4，**必须在起 Tauri 之前**）----
+    //
+    // 🔴 **少了这一步，`diag-shell.log` 一行都不会出现**（2026-10-06，Task 2 的任务审查
+    //    抓到的那个缺口）：那一格是个**进程级静态**（`shell_core::diagnostics`），
+    //    不落它就永远是 `Normal`，而**没有任何东西会变红** —— 文件根本不会被创建，
+    //    客户把开关打开、重启应用、复现了故障，回传给我们的仍然只有内核那一份。
+    //
+    // ⚠️ **时机是承重的**：要**早于任何一次 `log`**（连接线程一跑起来就会记东西，
+    //    级别落晚了它的头几行会按普通档的规矩走），也要早于起 Tauri（用户的第一次
+    //    点击就可能出错，而那一次错误正是最该记下来的）。⇒ 就落在这里：
+    //    偏好已经读得出来（下面那个连接器读的是同一份文件），而什么都还没开始跑。
+    //
+    // ⚠️ **读不到偏好时落到 `Normal`**（`Err(_)` 那一支什么都不做）：与下面连接器那一段
+    //    同一条口径 —— "没有偏好"与"读不到偏好"在**落档位**这件事上是同一件事
+    //    （都用默认的普通档）。这不是静默降级：读不到存放根（`%APPDATA%` 缺失）
+    //    会在设置窗口那条路上大声报出来（`preferences_get` 回失败信封）。
+    if let Ok(preferences) = commands::load_preferences() {
+        commands::apply_shell_log_level(&preferences);
+    }
 
     // ---- ④ 装连接器（**必须在起 Tauri 之前**）--------------------------------
     //

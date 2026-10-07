@@ -2,22 +2,25 @@ import SwiftUI
 import AppKit               // NSOpenPanel：选下载目录那一下
 import BenagenCoreKit
 
-/// 设置窗口（⌘,）：**壳自己的**下载目录 + 七个可调参数 + 开源许可入口。
+/// 设置窗口（⌘,）：**壳自己的**下载目录与详细日志 + 七个可调参数 + 开源许可入口。
 ///
 /// ⚠️ **这是客户唯一能改内核参数的地方**（规格 §7.1 工具栏的「设置」、菜单
-///    `CommandGroup(replacing: .appSettings)` 都指向这个场景）。它做四件事：
+///    `CommandGroup(replacing: .appSettings)` 都指向这个场景）。它做五件事：
 ///      ① 「下载目录」（阶段 E §2）—— **壳自己的偏好**，与内核参数面板无关；
-///      ② 把**内核手里那一份**参数摊成可编辑的表（初值来自 `get_settings` 的回执，
+///      ② 「诊断 / 详细日志」（详细诊断日志规格 §2.4）—— 同样是**壳自己的偏好**，
+///         同样要重启内核才生效；
+///      ③ 把**内核手里那一份**参数摊成可编辑的表（初值来自 `get_settings` 的回执，
 ///         不是壳里的一份默认值 —— 壳不造值）；
-///      ③ 「保存」→ `AppModel.applySettings(_:)` → `set_settings`；
+///      ④ 「保存」→ `AppModel.applySettings(_:)` → `set_settings`；
 ///         失败时**内核原文照登**（`invalid_params` 那句"并行文件数必须在 1–64 之间，
 ///         当前 99"就长在这里，客户照着就能改）；
-///      ④ 「开源许可…」→ `LicenseView`（GPLv2 全文，**分发义务**）。
+///      ⑤ 「开源许可…」→ `LicenseView`（GPLv2 全文，**分发义务**）。
 ///
-/// ⚠️ **「下载目录」那一段在 `if let form` 之外**（任务 3 的一个判断）：内核参数面板
+/// ⚠️ **①②两段都在 `if let form` 之外**（任务 3 的一个判断）：内核参数面板
 ///    要等握手才画得出来，而"改下载目录"恰恰是**内核起不来时**最可能要去改的一件事
 ///    （状态文件就在下载目录里）。把它塞进 `SettingsEditor` 的话，内核一挂它就跟着消失
-///    —— 而那正是用户最需要它的时候。
+///    —— 而那正是用户最需要它的时候；而"打开详细日志"更是排查**内核为什么起不来**
+///    的第一步，同样不能在那一刻消失。
 ///
 /// ⚠️ 本文件**只有绑定与渲染分派**（全局约束 8）：七个值的来龙去脉、
 ///    `-k` 的枚举面、七个线上键、六个区间、那两句有语义的文案，全部在
@@ -48,12 +51,19 @@ struct SettingsView: View {
             //    ⚠️ 合成一个 `Form` **不动**「下载目录那一段永远在」这条设计
             //    （文件头 §「下载目录」那一段的①）：它仍然是 `if let form` **之外**的
             //    第一个 `Section`，内核起不来、参数还没到手时照样画得出来。
+            //
+            //    ⚠️ 「诊断」那一段（规格 §2.4）与它同理：也是 `if let form` **之外**的
+            //    一个 `Section`，所以同样只加进这**一个** `Form` 里，**不另起第二个 `Form`**
+            //    —— 那正是上面这个现场 bug 的长相。
             // -------------------------------------------------------------------
             Form {
                 // ① 壳自己的偏好。**永远在**（理由见文件头那一段）。
                 DownloadDirectorySection(model: model)
 
-                // ② 内核那份参数。⚠️ `Binding($form)` 是 SwiftUI 自带的"可选 Binding 拆包"：
+                // ② 「诊断」紧挨在下载目录之后、编辑器之前（规格 §2.4 指定的位置）。
+                DiagnosticsSection(model: model)
+
+                // ③ 内核那份参数。⚠️ `Binding($form)` 是 SwiftUI 自带的"可选 Binding 拆包"：
                 //    编辑器的 `Stepper` / `Picker` / `TextField` 都要**非可选**的
                 //    `Binding<SettingsForm>`。
                 if let form = Binding($form) {
@@ -234,7 +244,7 @@ private struct DownloadDirectorySection: View {
     }
 
     private var isConfigured: Bool {
-        AppPreferences(downloadDir: model.downloadDir).isConfigured
+        AppPreferences(downloadDir: model.downloadDir, verboseLogging: false).isConfigured
     }
 
     private var alertTitle: String {
@@ -282,6 +292,228 @@ private struct DownloadDirectorySection: View {
         changing = true
         defer { changing = false }
         _ = await model.changeDownloadDir(to: target)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 诊断（详细诊断日志规格 §2.4，任务 5）
+// ---------------------------------------------------------------------------
+
+/// 「诊断」那一段：**详细日志**那一个开关 + **导出诊断日志…**那颗按钮。
+///
+/// 两条交互链：
+///   · 勾选（判据在 `Presentation/AppPreferences.swift`，有单测）：
+///     `AppModel.changeVerboseLogging(to:)`（落盘 → 落壳自己的日志档位 → 重启内核）
+///     → 回执落在 **`AppModel.verboseLoggingChange`** 上（渲染的是它的 `headline`）。
+///   · 导出（判据在 `BenagenCoreKit/DiagnosticsExport.swift`，有单测）：
+///     选一个目标文件夹 → `DiagnosticsExport.export(…)`（建时间戳子目录 → 拷日志 →
+///     写说明文件）→ 回执落在**本视图的 `@State`** 上。
+///
+/// ⚠️ **导出那颗按钮与它的回执都住在本节里**（紧挨着按钮）：上一轮那个开关的教训 ——
+///    「勾选框在自己那一节、回执却画在头顶那一节」不是假话，是**误导**。同一句话
+///    Windows 那一侧的 `index.html` 也逐字写着（`#set-export-receipt` 就在 `#set-export` 下面）。
+///
+/// ⚠️ **那条回执落 `@State`，而上面那条落模型** —— 两者**故意不同**，理由不是省事：
+///    改档位改的是**内核的 argv**，用户关掉设置窗口之后它还在生效（"没改成"那一格是唯一的
+///    提示，见 `AppModel.verboseLoggingChange` 的文档）；而导出是**一次同步跑完的动作**
+///    （系统对话框 → 拷贝 → 哈希，全在同一次调用里），回执写下的那一刻用户还没拿回控制权，
+///    窗口关掉之后也没有任何"还在生效的状态"会被误解。Windows 那一侧同形（回执画在本节，
+///    不落会话状态）。
+///
+/// ⚠️ **开关的取值直接绑模型**（`get:` 读 `model.verboseLogging`）：它同时是**内核 argv 的
+///    来源**，所以不许在这个视图里另存一份 —— 两份一旦分叉，界面显示"开着"而内核拿到的是
+///    普通档，且没有任何提示。改动在飞的时候控件禁用（那一次改动要重启内核）。
+///
+/// ⚠️ 导出**会阻塞这一拍**（与那个选目录面板同一条）：`NSOpenPanel` 是模态的，而紧接着的
+///    拷贝与逐文件哈希也是同步的（日志上界 12 MiB ⇒ 最多几十毫秒；内核那份二进制大一些）。
+///
+/// 🔴 **正因为它整段是同步的，"在飞"这个状态一次都画不出来**（2026-10-06 实测核出）：
+///    `exporting = true` 只在 `panel.runModal()` 返回**之后**才设，而从那一句到
+///    `exporting = false`（`defer`）之间全是主线程上的同步动作 —— SwiftUI 没有机会重绘。
+///    ⇒ 本轮**删掉了那个 `ProgressView`**（它是一次都渲染不出来的死视图），
+///    `exporting` 只剩一个用途：**重入护栏**（`guard !exporting else { return }`）。
+///    ⚠️ 别把这读成"导出卡住了也不说"：回执（成功 / 取消 / 失败三档）照旧落在本节里，
+///    而且是**同步落完**的 —— 用户拿回控制权时它已经在屏幕上了。
+private struct DiagnosticsSection: View {
+    /// ⚠️ **`@ObservedObject`，不是 `let`**（2026-09-21 的观测改造）：本节读的
+    ///    `model.verboseLogging` / `model.verboseLoggingChange` 是 `@Published` 的，
+    ///    用 `let` 收下的话它们变了这一节**不会重绘**，而且**不会有任何东西变红**。
+    @ObservedObject var model: AppModel
+
+    /// 一次改动在飞：控件禁用 + 转圈（改档位要重启内核，最长几秒）。
+    @State private var changing = false
+    /// **重入护栏，不是可见状态** —— 导出整段（系统对话框 + 拷贝 + 逐文件哈希）是主线程上的
+    /// 同步动作，`true` 只在那一拍里存在，SwiftUI **一次都重绘不到它**
+    /// （所以那颗按钮旁边的 `ProgressView` 已经删掉了，见 `runExport()` 上面那段）。
+    @State private var exporting = false
+    /// 最近一次导出的回执（`nil` = 还没导过，或用户已经收起了那一行）。
+    @State private var exportOutcome: DiagnosticsExport.Outcome?
+
+    private var outcome: VerboseLoggingChange? { model.verboseLoggingChange }
+
+    var body: some View {
+        Section {
+            Toggle(DiagnosticsToggle.label,
+                   isOn: Binding(get: { model.verboseLogging },
+                                 set: { on in Task { await apply(on) } }))
+                .disabled(changing)
+                .help(DiagnosticsToggle.note)
+            if changing { ProgressView().controlSize(.small) }
+
+            if let outcome {
+                // 回执（🔴 这两句是壳自己写的：内核不会为一次成功的重启主动说话）。
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: outcome.isFailure ? "exclamationmark.triangle"
+                                                        : "checkmark.circle")
+                        .foregroundStyle(outcome.isFailure ? Color.red : Color.green)
+                    // ⚠️ 走**有界可滚**的那个正文块（同 `DownloadDirChangeNotice` 的标题）：
+                    //    `.failed` 那一格是内核 / 系统原文，**不许截断**（约束 3），
+                    //    而它的长度不受我们控制 —— 上限管的是高度，不是内容。
+                    BoundedNoticeText(text: outcome.headline, font: .caption)
+                    Spacer(minLength: 8)
+                    Button {
+                        // 收起的是**模型那一份**（回执的唯一出口）。
+                        model.dismissVerboseLoggingChange()
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("收起这条提示")
+                }
+            }
+
+            // 「导出诊断日志…」（规格 §2.5）。与上面那个开关是**同一节**的两半：
+            // 开关把日志打开、导出把它取出来交给分析的人。
+            HStack(spacing: 8) {
+                // ⚠️ `.disabled(exporting)` 留着：它今天**画不出来**（见 `exporting` 的注释），
+                //    但它是那一格状态唯一说得通的用法 —— 哪天把导出改成异步，它立刻就是对的行为。
+                Button(DiagnosticsExport.buttonLabel) { runExport() }
+                    .disabled(exporting)
+                    .help(DiagnosticsExport.buttonHelp)
+                Spacer(minLength: 8)
+            }
+
+            if let export = exportOutcome {
+                exportReceipt(export)
+            }
+        } footer: {
+            Text(DiagnosticsToggle.note)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// 一次导出的回执。形状与 `DownloadDirChangeNotice` 逐条同款（**布局事故的修法**）：
+    /// ① 固定短的标题走**有界可滚**的散文块（`.failed` 那一格是系统原文，不许截断）；
+    /// ② 路径**单独一行**、中间截断、悬停看全文；③ 那句隐私提醒是**第三行**。
+    ///
+    /// ⚠️ 第 ③ 行是规格 §2.7 的**第 2 处明说**，**只在成功那一档**出现
+    ///    （没导出东西的时候没有什么可提醒的）。
+    private func exportReceipt(_ export: DiagnosticsExport.Outcome) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: export.isFailure ? "exclamationmark.triangle" : "checkmark.circle")
+                .foregroundStyle(export.isFailure ? Color.red : Color.green)
+            VStack(alignment: .leading, spacing: 2) {
+                BoundedNoticeText(text: export.headline, font: .caption)
+                if let path = export.pathDetail {
+                    Text(path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)     // 完整路径可选中复制（约束 3 / C-7）
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(path)
+                }
+                if let note = export.privacyNote {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 8)
+            Button {
+                exportOutcome = nil
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .help("收起这条提示")
+        }
+    }
+
+    /// 「导出诊断日志…」：选目标文件夹 → 拷日志 + 写说明文件 → 把回执画在**本节里**。
+    ///
+    /// ⚠️ **三档都不是错误**（成功 / 取消 / 失败都落在那条回执行上，`isFailure` 决定图标）：
+    ///    用户点了「导出」而界面一动不动，与"卡住了"分不开（约束 4）。
+    ///
+    /// ⚠️ **日志目录取自 `DiagnosticsLog.logURL` 的父目录**（不是这里另拼一个）：
+    ///    壳那份日志与 `preferences.json` / `history.json` 同处一源（`ShellStorage.directory`），
+    ///    而内核那份 `diag-kernel.log` 按 `core/src/paths.rs` 落在同一个目录里 ——
+    ///    两处各推一次路径的结局是它们哪天分叉，而客户回传时会少拿到一个文件。
+    ///
+    /// ⚠️ **失败那句话照登**（`ExportFailure.message` 是三个 `…FailureText` 拼好的：
+    ///    哪一步、哪个位置、系统原话、下一步）—— 这一层不加工、不换一句更客气的话。
+    private func runExport() {
+        guard !exporting else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "导出到"
+        panel.message = DiagnosticsExport.panelMessage
+        guard panel.runModal() == .OK, let target = panel.url else {
+            // ⚠️ **取消也要说一句**（同 `pick_directory` 的口径）：什么都不显示会与"卡住了"分不开。
+            exportOutcome = .cancelled
+            return
+        }
+
+        exporting = true
+        defer { exporting = false }
+        // 🔴 **这一次导出只读一次时钟**（2026-10-06 终审）：这个时刻有**两个**落点 ——
+        //    说明文件那格 `exported_at`（`header(at:)`）与文件夹名
+        //    `诊断日志-YYYYMMDD-HHMMSS`（`export(now:)`）。两处各写一个 `Date()`
+        //    就会跨过秒边界时**差一秒**，而它看起来完全正常（两个都是"合理的时间"）。
+        //    ⇒ 取一次，两个调用点都用它（`export` 的 `now` 因此**故意没有默认值**）。
+        //    ⚠️ 这一行本身**没有判据**（视图不单测，见项目的硬约束）：判得住的是
+        //    "`now` 决定了文件夹名"那一半（`DiagnosticsExportTests`）。
+        let at = Date()
+        // 说明文件要写的七格**在这里取齐**（成句与摆位置都在 `DiagnosticsExport` 里）。
+        let header = DiagnosticsExport.header(
+            appVersion: AboutInfo.version(in: .main),
+            // ⚠️ 内核那份二进制的**身份**：macOS 上是**导出时现算**那个文件的 sha256
+            //    （Windows 是编译期常量，见 `DiagnosticsExport` 模块头那处不对称）。
+            //    找不到 ⇒ `nil` ⇒ 那一格如实写"取不到"，不编一个哈希。
+            coreBinary: try? CoreClient.locateCoreBinary(),
+            // ⚠️ **内核自报的**协议版本（不是壳自己的 `kProtocolVersion`）：
+            //    连不上 ⇒ `nil` ⇒ 那一格如实写"未连上"。
+            protocolVersion: model.kernelProtocolVersion.map(Int.init),
+            verboseLogging: model.verboseLogging,
+            os: DiagnosticsExport.osVersion(),
+            arch: DiagnosticsExport.arch,
+            at: at)
+        do {
+            let folder = try DiagnosticsExport.export(
+                from: DiagnosticsLog.logURL.deletingLastPathComponent(),
+                to: target, header: header, now: at)
+            exportOutcome = .done(folder: folder.path)
+        } catch let failure as DiagnosticsExport.ExportFailure {
+            exportOutcome = .failed(message: failure.message)
+        } catch {
+            // 理论上到不了（`export` 只抛 `ExportFailure`）；真到了也**不许静默**
+            // （约束 4）：系统原文照登。
+            exportOutcome = .failed(message: "诊断日志没有导出：\(error.localizedDescription)")
+        }
+    }
+
+    /// ⚠️ **回执不在这里装**：`changeVerboseLogging` 自己把它写进
+    ///    `AppModel.verboseLoggingChange`（上面那条注释里那张回执**唯一**的落点）。
+    private func apply(_ on: Bool) async {
+        changing = true
+        defer { changing = false }
+        _ = await model.changeVerboseLogging(to: on)
     }
 }
 

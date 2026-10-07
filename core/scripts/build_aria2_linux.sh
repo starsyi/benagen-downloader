@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # 为 Linux（x86_64-musl）构建**真静态**的 aria2c，供 benagen-dl 内嵌。
 #
-# 构建机：root@<构建机>（Oracle Linux Server 9.5，x86_64，8 核 / 74G 空闲 / 外网通）
+# 构建机：root@172.20.204.11（Oracle Linux Server 9.5，x86_64，8 核 / 74G 空闲 / 外网通）
 # 在**那台机器上**以 root 运行本脚本（它只写 $BUILD_ROOT，默认 /root/benagen-cli-build）。
 #
-#     scp core/scripts/build_aria2_linux.sh root@<构建机>:/tmp/
-#     ssh root@<构建机> 'bash /tmp/build_aria2_linux.sh'
+#     scp core/scripts/build_aria2_linux.sh root@172.20.204.11:/tmp/
+#     ssh root@172.20.204.11 'bash /tmp/build_aria2_linux.sh'
 #
 # 产物：$BUILD_ROOT/out/aria2c-linux-x86_64（静态、能跑，末尾打印 sha256 与 file 输出）
 #

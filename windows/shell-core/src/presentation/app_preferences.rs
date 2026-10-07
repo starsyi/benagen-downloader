@@ -7,6 +7,7 @@
 //!   | [`AppPreferences`] | `macos/Sources/BenagenCoreKit/Presentation/AppPreferences.swift` |
 //!   | [`DownloadDirectory`] | `macos/Sources/BenagenCoreKit/Presentation/DownloadDirectory.swift` |
 //!   | [`DownloadDirChange`] | `DownloadDirectory.swift` 下半段（**上游没有独立文件**）+ `macos/Sources/BenagenDownloader/Settings/SettingsView.swift:120-180` 附近那几段 |
+//!   | [`DiagnosticsToggle`] / [`VerboseLoggingChange`] | 规格 §2.4 + macOS `SettingsView` 新增的那一节「诊断」（**上游是一句写死在视图里的话**，这一侧必须由壳给：前端不许自造文案） |
 //!
 //! ⚠️ **为什么合成一个文件**：`DownloadDirChange` 在上游**散在两处**（值类型在
 //!    `DownloadDirectory.swift` 里、而它的两个渲染落点与那几句壳自己写的话在
@@ -72,6 +73,13 @@ use serde_json::{json, Value};
 pub struct AppPreferences {
     /// 用户选的下载目录。**空串 = 未配置**（不传 `--download-dir`）。
     pub download_dir: String,
+
+    /// **详细诊断日志**（规格 §2.4）。开着 ⇒ 壳给内核多拼一对
+    /// `--log-level verbose`（见 [`DownloadDirectory::core_arguments_for`]）。
+    ///
+    /// 🔴 **缺字段 = `false`**：老客户那份 `preferences.json` 里没有这一格，
+    ///    而 [`Self::parse`] 的办法是 `as_bool().unwrap_or(false)`（见那里）。
+    pub verbose_logging: bool,
 }
 
 impl AppPreferences {
@@ -86,15 +94,20 @@ impl AppPreferences {
     pub const fn empty() -> AppPreferences {
         AppPreferences {
             download_dir: String::new(),
+            verbose_logging: false,
         }
     }
 
     /// 建一份偏好（路径按 [`Self::normalized`] 归一化）。
     ///
     /// 上游 `AppPreferences.init(downloadDir:)`。
+    ///
+    /// ⚠️ **只造"下载目录"那一格**：详细日志起手是关着的，要开用
+    ///    [`Self::setting_verbose_logging`]（与 `storage::preferences` 同一条口径）。
     pub fn new(download_dir: &str) -> AppPreferences {
         AppPreferences {
             download_dir: Self::normalized(download_dir),
+            verbose_logging: false,
         }
     }
 
@@ -108,8 +121,25 @@ impl AppPreferences {
     /// 改下载目录（返回新值）。传空串 = 回到未配置（那颗「恢复默认」）。
     ///
     /// 上游 `AppPreferences.settingDownloadDir(_:)`。
+    ///
+    /// ⚠️ **详细日志那一格原样带过去**（不走 [`Self::new`]，它会把那一格置回 `false`）：
+    ///    "改目录"与"关掉详细日志"是两件事，合成一件的表现是客户排查到一半换了个目录、
+    ///    日志**静默地退回普通档**。
     pub fn setting_download_dir(&self, path: &str) -> AppPreferences {
-        AppPreferences::new(path)
+        AppPreferences {
+            download_dir: Self::normalized(path),
+            verbose_logging: self.verbose_logging,
+        }
+    }
+
+    /// 开关详细诊断日志（返回新值）。**这是那一格的唯一入口**。
+    ///
+    /// 对称的那一条：`download_dir` **原样带过去**（同上，两件事不许互相覆盖）。
+    pub fn setting_verbose_logging(&self, on: bool) -> AppPreferences {
+        AppPreferences {
+            download_dir: self.download_dir.clone(),
+            verbose_logging: on,
+        }
     }
 
     /// 从文件内容解析（**任何**问题都当未配置，绝不抛）。
@@ -135,19 +165,27 @@ impl AppPreferences {
         if version.as_i64() != Some(Self::VERSION) {
             return AppPreferences::empty();
         }
+        // 🔴 **缺字段 = `false`**（老客户那份文件里没有这一格）：`as_bool()` 对
+        //    "不在"与"不是布尔"都给 `None` ⇒ 一律落回"没开"。
+        //    ⚠️ 与 `download_dir` 那条**逐字同一条纪律**：**一格读歪了不牵连整份** ——
+        //       这条路的全部意义就是"读不出偏好也照样启动"（所以它没有 `Result`）。
+        let verbose_logging = map.get("verbose_logging").and_then(Value::as_bool).unwrap_or(false);
         match map.get("download_dir") {
             Some(Value::String(dir)) => AppPreferences::new(dir),
             _ => AppPreferences::empty(),
         }
+        .setting_verbose_logging(verbose_logging)
     }
 
-    /// 落盘的形状（`{"version": 1, "download_dir": "/abs/path"}`，键名逐字）。
+    /// 落盘的形状（`{"version": 1, "download_dir": "/abs/path", "verbose_logging": false}`，
+    /// 键名逐字）。
     ///
     /// 上游 `AppPreferences.serialized()`。
     pub fn serialized(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(&json!({
             "version": Self::VERSION,
             "download_dir": self.download_dir,
+            "verbose_logging": self.verbose_logging,
         }))
     }
 
@@ -295,6 +333,7 @@ impl DownloadDirectory {
         crate::client::core_arguments(
             download_dir.as_deref().map(std::path::Path::new),
             settings_path,
+            preferences.verbose_logging,
         )
     }
 
@@ -376,6 +415,119 @@ fn probe_file_name() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!(".benagen-write-probe-{}-{nanos}", std::process::id())
+}
+
+// ---------------------------------------------------------------------------
+// 「详细日志」那一个勾选框：标签 / 说明 / 一次开关的结果
+// ---------------------------------------------------------------------------
+
+/// 「详细日志」那一个勾选框的**纯计算**（规格 §2.4）。
+///
+/// 上游：macOS `SettingsView` 新增的那一节「诊断」（与既有的 `DownloadDirectorySection`
+/// 并列）—— 那边是一句写死在视图里的说明，这边**必须由壳给**：
+/// 本代的前端是一个字都不许自己造的（`check_frontend_copy.sh` 会把硬编码中文拦下）。
+pub enum DiagnosticsToggle {}
+
+impl DiagnosticsToggle {
+    /// 勾选框的**标签**（规格 §2.4 逐字：「勾选「详细日志」」）。
+    ///
+    /// ⚠️ 它**进的是载荷**（不是 `index.html` 的结构文案）：勾选框是运行时由 JS 画出来的
+    ///    （`settings.js:paintPreferences` 要按偏好的当前值去设 `checked`），
+    ///    字跟着那一格一起下来，就不必在 HTML 与 Rust 里各存一份。
+    pub const LABEL: &'static str = "详细日志";
+
+    /// 标签下面那句说明。**三件事缺一不可**：
+    ///   * 它**是什么用的**（排查问题）—— 否则用户会以为这是个"性能档"；
+    ///   * **用完要关**（详细档是"每一次往返都记"，开着不放会一直占盘）；
+    ///   * **改了会重启内核**（与下载目录那条同一后果，不说的话用户会在一次
+    ///     正在跑的下载被停掉时才莫名其妙）。
+    ///
+    /// ⚠️ 最后那半句与 [`DownloadDirectory::SECTION_NOTE`] 说的是**同一件事**
+    ///    （那次重启），措辞也尽可能同源 —— 但**不许**为了"少一句话"就把它省掉：
+    ///    这是本面板上第二处会让内核重启的控件。
+    pub const NOTE: &'static str = "打开后日志会详细很多（用于排查问题），排查完请关掉。\
+改动会立刻重启内核（正在跑的任务会停）。";
+}
+
+/// 一次「改详细日志」的结果。
+///
+/// ## 🔴 为什么它是**另一个类型**，而不是复用 [`DownloadDirChange`]
+///
+/// 简报让 `verbose_logging_set` 复用 `preferences_set` 那一套**回执形状**
+/// （"对用户来说这是同一件事：改了一项要重启内核的设置"）——本类型**就是那个形状**
+/// （四格：标题 / 路径行 / 完整那句 / 是不是失败，`api::preferences` 装成同一组键）。
+///
+/// ⚠️ 但**那三句话没有复用**：`DownloadDirChange` 的三句把主词写死成了"下载目录"
+///    （`下载目录已改（内核已按新目录重启）` / `已恢复默认下载目录（…）` /
+///    `下载目录没有变化，没有重启内核`）。拿它去报一次**勾选框**的改动，用户会在
+///    常驻回执上读到一句**假话** —— 他一个目录都没改。这个仓库对"界面上说假话"的
+///    口径是明确的（`the_confirmation_never_claims_every_file_will_be_reverified`
+///    那条用例就是为同一件事立的），所以宁可多这一个类型。
+///
+/// ⚠️ 与 [`DownloadDirChange`] 的第二个差别：**没有"路径"那一格**
+///    （`path_detail` 恒 `None`）—— 这一格改的是一个开关，没有路径可显示。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum VerboseLoggingChange {
+    /// 改成了：偏好已落盘、内核已按**新**档位重启、**壳自己那一格也已经就位**。
+    Changed {
+        /// 改完之后是"开着"吗（它只影响那句话的措辞）。
+        on: bool,
+    },
+    /// 目标与当前一致 ⇒ **什么都没做**（内核没重启、正在跑的任务不受影响）。
+    Unchanged {
+        /// 当前是"开着"吗。
+        on: bool,
+    },
+    /// 没改成：这是**可直接显示给用户的那句话**（内核原文 / 写盘失败原文，照登）。
+    Failed { message: String },
+}
+
+impl VerboseLoggingChange {
+    /// 成功那支的**固定标题**（**两个方向各一句**：开着与关着是两件事，
+    /// 说成同一句会让用户分不清自己那一下把它改成了什么）。
+    ///
+    /// ⚠️ 它不含任何**长度不受控**的东西（没有路径、没有批次号）——
+    ///    与 `DownloadDirChange::headline` 同一条纪律：这条回执是**常驻**的那一行，
+    ///    高度不许由外部文本决定（那是一次真实布局事故的根因）。
+    const CHANGED_ON: &'static str = "详细日志已打开（内核已按详细档重启）";
+    const CHANGED_OFF: &'static str = "详细日志已关闭（内核已按普通档重启）";
+
+    /// 没改动那一支的固定全文（与 `DownloadDirChange::UNCHANGED` 逐字同构）。
+    const UNCHANGED_ON: &'static str = "详细日志没有变化，没有重启内核";
+
+    /// **这条回执的第一行**：固定短的标题，任何情况下都不含外部文本。
+    ///
+    /// ⚠️ `Failed` 那一格**照登原文**（内核的失败原因 / 写盘失败的系统文本），
+    ///    不加工、不截断成"标题"—— 与 `DownloadDirChange::headline` 逐字同一条。
+    pub fn headline(&self) -> String {
+        match self {
+            VerboseLoggingChange::Changed { on: true } => Self::CHANGED_ON.to_string(),
+            VerboseLoggingChange::Changed { on: false } => Self::CHANGED_OFF.to_string(),
+            VerboseLoggingChange::Unchanged { .. } => Self::UNCHANGED_ON.to_string(),
+            VerboseLoggingChange::Failed { message } => message.clone(),
+        }
+    }
+
+    /// **要单独占一行显示的路径**；**恒 `None`**（见类型文档：这一格没有路径）。
+    ///
+    /// ⚠️ 方法留着、不删：两个回执在 `api::preferences` 里装的是**同一组键**
+    ///    （前端只有一条渲染路径），那一格空着比缺着好 —— 缺键会让前端读到的
+    ///    是 `undefined` 而不是"没有这一行"。
+    pub fn path_detail(&self) -> Option<String> {
+        None
+    }
+
+    /// 这条回执**完整的一句话**。
+    ///
+    /// ⚠️ 没有路径可拆 ⇒ 全文就是 [`Self::headline`]（两处不可能分叉）。
+    pub fn notice_text(&self) -> String {
+        self.headline()
+    }
+
+    /// 这一行说的是"没成"吗（调用方据此选图标与颜色）。
+    pub fn is_failure(&self) -> bool {
+        matches!(self, VerboseLoggingChange::Failed { .. })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -512,7 +664,10 @@ mod tests {
     //! ⚠️ 本文件所有碰文件系统的用例都只碰 `std::env::temp_dir()` 下的临时目录
     //!    —— 用户真实的下载目录是**人类伙伴在用的现场**，测试碰它 = 破坏现场。
 
-    use super::{AppPreferences, DownloadDirChange, DownloadDirectory};
+    use super::{
+        AppPreferences, DiagnosticsToggle, DownloadDirChange, DownloadDirectory,
+        VerboseLoggingChange,
+    };
     use std::path::{Path, PathBuf};
 
     // -----------------------------------------------------------------------
@@ -609,6 +764,53 @@ mod tests {
         assert!(text.contains("\"download_dir\""));
         assert!(!text.contains("downloadDir"));
         assert!(text.contains("/Volumes/Data/交付"), "路径原样写出去（含中文）");
+    }
+
+    /// 🔴 **缺字段 = `false`**，而且 **`version` 一个字都不许动**
+    /// （递增会让装了旧版程序的客户的下载目录被清空 —— 规格 §2.4 / F6）。
+    ///
+    /// 判别力：把 `VERSION` 改成 2 ⇒ 第一条立刻红；把 `parse` 里那句
+    /// `as_bool().unwrap_or(false)` 删掉 ⇒ 第二条红；把 `serialized` 里那一格删掉 ⇒
+    /// 最后那条往返红。
+    #[test]
+    fn a_preference_without_the_verbose_field_reads_as_off_and_the_version_stays() {
+        assert_eq!(AppPreferences::VERSION, 1, "递增版本号会让旧客户端的下载目录被清空");
+
+        let old = AppPreferences::parse(r#"{"version": 1, "download_dir": "/tmp/x"}"#);
+        assert_eq!(old.download_dir, "/tmp/x", "旧字段不许丢");
+        assert!(!old.verbose_logging, "缺字段 = 没开详细日志");
+
+        // 反方向：写着一格时要真的读进来（否则上面那条可以靠"永远 false"变绿）。
+        let written = AppPreferences::parse(
+            r#"{"version": 1, "download_dir": "/tmp/x", "verbose_logging": true}"#,
+        );
+        assert!(written.verbose_logging);
+
+        // 而且它要能原样往返（`serialized` 也得带上那一格）。
+        let on = AppPreferences::new("/tmp/x").setting_verbose_logging(true);
+        assert_eq!(
+            AppPreferences::parse(&on.serialized().expect("序列化不得失败")),
+            on
+        );
+    }
+
+    /// ⚠️ **两格互不覆盖**：改目录不许把详细日志带跑，反之亦然。
+    ///
+    /// 判别力：把任一 `setting_*` 写成走 `AppPreferences::new`（它把 verbose 置回 `false`），
+    /// 这一条立刻红 —— 而真机上的表现是客户排查到一半换了个下载目录，
+    /// 诊断日志**静默地退回普通档**（文件还在长，只是不再记那每一次往返了）。
+    #[test]
+    fn the_two_settings_never_overwrite_each_other() {
+        let base = AppPreferences::new("/data/交付").setting_verbose_logging(true);
+        assert!(base.setting_download_dir("/data/新的").verbose_logging, "改目录把开关带跑了");
+        assert_eq!(base.setting_download_dir("/data/新的").download_dir, "/data/新的");
+        assert_eq!(
+            base.setting_verbose_logging(false).download_dir,
+            "/data/交付",
+            "改开关把目录带跑了"
+        );
+        // 「恢复默认」那条路同样是"只动目录那一格"。
+        assert!(base.setting_download_dir("").verbose_logging);
     }
 
     /// 上游 `settingADirectoryKeepsThePathVerbatimExceptForSurroundingWhitespace`。
@@ -726,6 +928,17 @@ mod tests {
                 "/tmp/settings.json".to_string(),
             ]
         );
+    }
+
+    /// 🔴 **开了才拼那个 flag，关了**不拼**（不是拼 `--log-level normal`）。
+    #[test]
+    fn the_verbose_flag_enters_the_argv_only_when_it_is_on() {
+        let off = DownloadDirectory::core_arguments_for(&AppPreferences::new("D:\\交付"), None);
+        assert!(!off.iter().any(|a| a == "--log-level"), "没开就不该出现：{off:?}");
+
+        let on = DownloadDirectory::core_arguments_for(
+            &AppPreferences::new("D:\\交付").setting_verbose_logging(true), None);
+        assert!(on.windows(2).any(|w| w == ["--log-level", "verbose"]), "{on:?}");
     }
 
     /// 上游 `aConfiguredPreferencePassesTheDirectoryVerbatim`。
@@ -1052,6 +1265,79 @@ mod tests {
             DownloadDirectory::SECTION_NOTE.contains("本机磁盘"),
             "光说「网络盘」不够 —— 要说出该选什么"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 「详细日志」那一个勾选框（规格 §2.4）
+    // -----------------------------------------------------------------------
+
+    /// 标签与说明都是**非空**的，而且说明把该说的三件事都说了。
+    ///
+    /// 判别力：把说明删成一句"详细日志"（或空串），第二、三条立刻红 ——
+    /// 而真机上的表现是**用户打开了详细档然后再也没关过**（他不知道要关、
+    /// 也不知道这一下会把正在跑的任务停掉）。
+    #[test]
+    fn the_diagnostics_toggle_explains_what_it_does_and_what_it_costs() {
+        assert_eq!(DiagnosticsToggle::LABEL, "详细日志", "规格 §2.4 逐字");
+        let note = DiagnosticsToggle::NOTE;
+        assert!(note.contains("排查"), "要说清它是干什么用的：{note}");
+        assert!(note.contains("关"), "要提醒用完关掉（详细档一直在记）：{note}");
+        assert!(
+            note.contains("重启内核"),
+            "改了会重启内核 ⇒ 正在跑的任务会停，这件事必须在按之前就说：{note}"
+        );
+    }
+
+    /// 四种回执各自说什么，而且**一句都不许提"下载目录"**。
+    ///
+    /// 🔴 最后那条断言是这条用例的**全部要点**：勾选框那一格改的是一个开关，
+    ///    一个目录都没动。复用 `DownloadDirChange` 的三句（它们把主词写死成
+    ///    "下载目录"）会让用户在常驻回执上读到一句假话 —— 而那句话是**绿的**
+    ///    （没有任何东西会因为"文案说错了对象"而变红）。
+    #[test]
+    fn the_verbose_receipts_never_talk_about_the_download_directory() {
+        let opened = VerboseLoggingChange::Changed { on: true };
+        assert!(opened.headline().contains("详细日志"));
+        assert!(opened.headline().contains("打开"));
+        assert!(opened.headline().contains("重启"), "要说出内核重启过");
+        assert!(!opened.is_failure());
+        assert_eq!(opened.path_detail(), None, "这一格没有路径可显示");
+        assert_eq!(
+            opened.notice_text(),
+            opened.headline(),
+            "没有路径可拆 ⇒ 全文就是标题（两处不可能分叉）"
+        );
+
+        // 关掉那一支与打开那一支**必须说得出区别**（说成同一句 = 用户不知道自己那一下
+        // 把它改成了什么）。
+        let closed = VerboseLoggingChange::Changed { on: false };
+        assert!(closed.headline().contains("关闭"));
+        assert_ne!(closed.headline(), opened.headline());
+
+        // 没改动：内核没重启（那句"正在跑的任务会停"说的是**真的改了**的时候）。
+        let unchanged = VerboseLoggingChange::Unchanged { on: true };
+        assert!(unchanged.headline().contains("没有"));
+        assert!(!unchanged.is_failure());
+
+        // 失败：**原文照登**，不加工、不加前缀。
+        let failed = VerboseLoggingChange::Failed {
+            message: "内核重启失败：内核无响应（等待超过 5 秒）".to_string(),
+        };
+        assert_eq!(failed.headline(), "内核重启失败：内核无响应（等待超过 5 秒）");
+        assert!(failed.is_failure());
+        assert_eq!(failed.path_detail(), None);
+
+        for text in [
+            opened.headline(),
+            closed.headline(),
+            unchanged.headline(),
+            failed.headline(),
+        ] {
+            assert!(
+                !text.contains("下载目录"),
+                "这一格改的是开关、不是目录：{text}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

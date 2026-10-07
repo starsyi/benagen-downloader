@@ -883,9 +883,30 @@ mod tests {
         // 不需要手动删：`outside_dir` 的 `Drop` 会连目录一起收掉（失败路径上也是）。
     }
 
-    /// 改权限。Unix 专有；本项目的生产与开发环境都是 Unix。
+    /// 改权限。
+    ///
+    /// ⚠️ **非 Unix 那一支是 no-op，这是"该维度在该平台上不存在"，不是降级、
+    /// 也不是"忘了实现"**：`mode`（`rwxr-xr-x` 那套模式位）是 POSIX 的概念，
+    /// Windows 的 ACL 模型里没有它，`std::os::unix::fs::PermissionsExt::from_mode`
+    /// 在那里**根本不存在**（不是被门控，是没有这个 API）。
+    /// ⚠️ **no-op 不会造出假绿**：本文件里用它的两条测试（`check_state_only_written_for_verified`、
+    /// `check_unreadable_file_is_reported_not_fatal`）都先用 `perms_enforced()` 探一次
+    /// "chmod 000 之后这个文件还打得开吗"——no-op 之下**当然**打得开，于是那两条测试
+    /// 打印理由后**跳过**，而不是把"读不了"当成通过。
+    /// 也就是说：这两条测试**依赖的前提**（权限检查生效）在 Windows 上不成立，
+    /// 而"前提不成立就跳过"是本文件既有的、go 侧也有的做法（对应 `os.Geteuid() == 0`）。
     fn set_mode(p: &StdPath, mode: u32) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod 失败");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
+                .expect("chmod 失败");
+        }
+        #[cfg(not(unix))]
+        {
+            // 见上面那条说明：Windows 上没有模式位可设。显式吃掉两个参数，
+            // 免得它们变成"未使用"的新告警（D-4：告警净增 0）。
+            let _ = (p, mode);
+        }
     }
 }

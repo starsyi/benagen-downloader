@@ -23,7 +23,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::api::envelope;
-use crate::presentation::app_preferences::{AppPreferences, DownloadDirChange, DownloadDirectory};
+use crate::presentation::app_preferences::{
+    AppPreferences, DiagnosticsToggle, DownloadDirChange, DownloadDirectory, VerboseLoggingChange,
+};
 use crate::storage::preferences::Preferences;
 
 /// 设置窗口里"下载目录"那一段的**只读部分**。
@@ -39,6 +41,14 @@ pub fn current(preferences: &Preferences) -> Value {
         "dir": preferences.download_dir,
         "display": DownloadDirectory::display(&preferences.download_dir),
         "section_note": DownloadDirectory::SECTION_NOTE,
+        // ---- 「详细日志」那一个勾选框（任务 3，规格 §2.4）--------------------
+        // ⚠️ 标签与说明**跟着载荷下来**（不是 `index.html` 里的结构文案）：
+        //    那个控件是运行时画的（JS 要按 `verbose_logging` 设 `checked`），
+        //    两句话跟它一起走就不必在 HTML 与 Rust 里各存一份。
+        //    ⇒ 前端一个字都不用自己造（`check_frontend_copy.sh` 的判据因此不用动）。
+        "verbose_logging": preferences.verbose_logging,
+        "verbose_label": DiagnosticsToggle::LABEL,
+        "verbose_note": DiagnosticsToggle::NOTE,
     }))
 }
 
@@ -66,11 +76,47 @@ pub fn plan(check: Option<String>, confirmation: String) -> Value {
 ///   * `notice_text` 是那条回执**完整的一句话**（防回归的锚）；
 ///   * `is_failure` 决定前端挑哪个图标与颜色。
 pub fn change(change: &DownloadDirChange) -> Value {
+    receipt(
+        change.headline(),
+        change.path_detail(),
+        change.notice_text(),
+        change.is_failure(),
+    )
+}
+
+/// 一次「改详细日志」的结果（[`VerboseLoggingChange`] 的四格 → **同一组键**）。
+///
+/// 🔴 **形状与 [`change`] 逐格相同**（简报要的"复用 `preferences_set` 那一套回执形状"）
+///    ⇒ 前端只有**一条**渲染路径（`settings.js:paintChangeReceipt` 读 `headline` /
+///    `path_detail` / `is_failure` 那三格），多一个回执不需要多一屏。
+///    ⚠️ 但**那三句话取自另一个类型**：`DownloadDirChange` 的三句把主词写死成
+///       "下载目录"，拿它报一次勾选框的改动会让用户读到一句假话 ——
+///       理由逐条写在 `VerboseLoggingChange` 的类型文档里。
+pub fn verbose_change(change: &VerboseLoggingChange) -> Value {
+    receipt(
+        change.headline(),
+        change.path_detail(),
+        change.notice_text(),
+        change.is_failure(),
+    )
+}
+
+/// 两个回执共用的**唯一**装帧处（四格：标题 / 路径行 / 完整那句 / 是不是失败）。
+///
+/// ⚠️ 抽出来只有一个理由：**同一组键只许有一份实现** —— 两个回执各写一遍 `json!`
+///    的结局是"某一格哪天在一边改了、另一边没改"，而前端只有一条渲染路径，
+///    读到的会是一个 `undefined`（界面安静地少一行，不会有任何东西变红）。
+fn receipt(
+    headline: String,
+    path_detail: Option<String>,
+    notice_text: String,
+    is_failure: bool,
+) -> Value {
     envelope::ok(json!({
-        "headline": change.headline(),
-        "path_detail": change.path_detail(),
-        "notice_text": change.notice_text(),
-        "is_failure": change.is_failure(),
+        "headline": headline,
+        "path_detail": path_detail,
+        "notice_text": notice_text,
+        "is_failure": is_failure,
     }))
 }
 
@@ -96,7 +142,11 @@ pub fn change(change: &DownloadDirChange) -> Value {
 ///    下面那条 `an_unconfigured_preference_never_puts_a_path_in_the_argv` 从**存储层那一份**
 ///    出发把它再钉一遍（那条缝以前只在呈现层被钉过）。
 pub fn core_arguments(preferences: &Preferences) -> Vec<String> {
-    let preferences = AppPreferences::new(&preferences.download_dir);
+    // ⚠️ **两格都要接上**：`AppPreferences::new` 只造"下载目录"那一格（详细日志起手是
+    //    关着的）—— 少接下面那一句，客户打开开关之后内核**照样按 normal 起**
+    //    （壳自己那半边的日志倒是会变详细，于是两个文件对不上，而没有任何东西会变红）。
+    let preferences = AppPreferences::new(&preferences.download_dir)
+        .setting_verbose_logging(preferences.verbose_logging);
     DownloadDirectory::core_arguments_for(&preferences, None)
 }
 
@@ -111,6 +161,15 @@ pub fn core_arguments(preferences: &Preferences) -> Vec<String> {
 ///    错误原文接在括号里：它是**可复制的证据**（磁盘满 / 权限 / 只读介质各说各的）。
 pub fn save_failed(cause: &str) -> String {
     format!("下载目录没有改成（偏好写入失败：{cause}）")
+}
+
+/// 「详细日志」那一格**写盘失败**那句话。
+///
+/// 🔴 与 [`save_failed`] **同一个理由、同一个位置**（壳自己写的：那一刻内核还不知道
+///    这件事），但**不是同一句话** —— 那一句的主词是"下载目录"，而这一下用户改的是
+///    一个开关、一个目录都没动。两件事共用一句 = 用户读到一句假话。
+pub fn verbose_save_failed(cause: &str) -> String {
+    format!("详细日志开关没有改成（偏好写入失败：{cause}）")
 }
 
 /// 改下载目录之后"内核重启**有没有落地**"的等待上界。
@@ -149,6 +208,19 @@ pub const RESTART_DEADLINE: Duration = Duration::from_secs(20);
 ///    （"下次启动会按它生效"），不需要我们再加一句。
 pub fn restart_timed_out() -> &'static str {
     "内核还在重启中，这一次没有改成。下载目录已经记下来了，下次启动会按它生效。"
+}
+
+/// 「详细日志」那一格的**同一件事**：内核重启没有在期限内落地。
+///
+/// 🔴 与 [`restart_timed_out`] **逐字同构**（前一句与第三句一个字都不改 —— 那两句说的是
+///    内核与"下次启动"，与改的是哪一格无关），**只有中间那半句换了主词**：
+///    用户改的是一个开关、一个目录都没动，说成"下载目录已经记下来了"就是一句假话。
+///
+/// ⚠️ 这一句与上面那句由**调用方**挑（`commands::restart_kernel` 收一个"超时该说什么"
+///    的参数）：那一刻**只有调用方知道**这一次改的是哪一格，
+///    而 `wait_for_the_kernel` 手上只有内核的状态。合成一句的结局就是其中一半场合说错话。
+pub fn verbose_restart_timed_out() -> &'static str {
+    "内核还在重启中，这一次没有改成。详细日志开关已经记下来了，下次启动会按它生效。"
 }
 
 /// 原生「选择文件夹」对话框里那句话（**它自己那一格的标题**）。
@@ -200,6 +272,88 @@ mod tests {
             json!("默认（~/Downloads/Benagen，由内核决定）"),
             "未配置时那一行不许是空白：{v}"
         );
+    }
+
+    /// 🔴 **两格都接上了**：开关那一格的**值**与它的**标签/说明**都在载荷里。
+    ///
+    /// 判别力（三条各挡一种写法）：
+    ///   · 漏发 `verbose_logging` ⇒ 前端读到的永远是 `undefined` ⇒ 勾选框**永远不勾**，
+    ///     用户会以为"打开了但没记住"（而没有任何东西会变红）；
+    ///   · 漏发标签/说明 ⇒ 前端要么画一个没有字的框，要么自己造一句中文（§3.2 明禁）；
+    ///   · 把值写成恒 `false` ⇒ 第二条断言红（开着的那一份必须发 `true`）。
+    #[test]
+    fn the_current_state_carries_the_diagnostics_toggle() {
+        let off = current(&prefs("/Volumes/Data/交付"));
+        assert_eq!(off["data"]["verbose_logging"], json!(false));
+        assert_eq!(
+            off["data"]["verbose_label"],
+            json!(DiagnosticsToggle::LABEL),
+            "标签必须跟着载荷下来（前端一个字都不许自己造）"
+        );
+        assert_eq!(off["data"]["verbose_note"], json!(DiagnosticsToggle::NOTE));
+
+        let on = current(&Preferences::new("/Volumes/Data/交付").setting_verbose_logging(true));
+        assert_eq!(on["data"]["verbose_logging"], json!(true), "开着的那一份要发 true");
+        // 未配置那一份同样带着这三格（开关与"配没配过目录"是两件事）。
+        let empty = current(&Preferences::empty());
+        assert_eq!(empty["data"]["verbose_logging"], json!(false));
+        assert!(empty["data"]["verbose_label"].is_string());
+    }
+
+    /// 两个回执**发的是同一组键**（前端只有一条渲染路径）。
+    ///
+    /// 判别力：把 [`verbose_change`] 里的某格漏掉（或换成别的键名）⇒ 这一条红 ——
+    /// 而真机上的表现是设置窗口里那条回执**安静地少一行**（`undefined`）。
+    #[test]
+    fn both_receipts_carry_the_same_four_keys() {
+        let dir = change(&DownloadDirChange::Changed {
+            dir: "/data/交付".to_string(),
+        });
+        let verbose = verbose_change(&VerboseLoggingChange::Changed { on: true });
+        let keys = |v: &Value| {
+            let mut k: Vec<String> = v["data"]
+                .as_object()
+                .expect("回执的 data 一定是个对象")
+                .keys()
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&dir), keys(&verbose), "两个回执的键必须逐字相同");
+        assert_eq!(keys(&dir).len(), 4);
+
+        // 而且**那句话说的是对的**（不是"下载目录已改"）。
+        assert!(
+            verbose["data"]["headline"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("详细日志"),
+            "{verbose}"
+        );
+        assert!(
+            !verbose["data"]["headline"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("下载目录"),
+            "勾选框那一格一个目录都没改：{verbose}"
+        );
+        assert_eq!(verbose["data"]["path_detail"], Value::Null, "这一格没有路径行");
+        assert_eq!(verbose["data"]["is_failure"], json!(false));
+    }
+
+    /// 🔴 **写盘失败那句话点名了根因，而且说的是"详细日志"**。
+    ///
+    /// 判别力：把它换成 `save_failed`（那一句的主词是"下载目录"），第二条立刻红 ——
+    /// 而真机上的表现是用户改了一个开关、却看到一句"下载目录没有改成"。
+    #[test]
+    fn the_verbose_save_failure_names_the_switch_not_the_directory() {
+        let message = verbose_save_failed("磁盘空间不足");
+        assert!(message.contains("详细日志"), "主词必须是这一下改的那一格：{message}");
+        assert!(message.contains("偏好写入失败"), "要说清是哪一步失败了：{message}");
+        assert!(message.contains("磁盘空间不足"), "系统原文必须照登：{message}");
+        assert!(!message.contains("下载目录"), "一个目录都没改，不许提目录：{message}");
+        assert_ne!(message, save_failed("磁盘空间不足"));
     }
 
     /// 确认文案**含三条后果**，且 `check` 的两档形状分明（`null` = 可以用）。
@@ -293,6 +447,32 @@ mod tests {
         );
     }
 
+    /// 🔴 **存储层那一格真的接到了 argv 上**（"偏好在盘上"到"内核的参数"只有这一座桥）。
+    ///
+    /// 判别力：把 `core_arguments` 里那句 `.setting_verbose_logging(…)` 删掉 ⇒
+    /// `AppPreferences::new` 不再带上那一格 ⇒ argv 里没有 `--log-level` ⇒ 这一条红 ——
+    /// 而真机上的表现是客户打开了详细日志、**内核那份日志一行都没变详细**，
+    /// 而壳自己那一半倒是变详细了（两个文件对不上，**没有任何东西会变红**）。
+    #[test]
+    fn the_verbose_flag_reaches_the_argv_from_the_stored_preferences() {
+        assert_eq!(
+            core_arguments(&Preferences::new("/data/交付").setting_verbose_logging(true)),
+            vec![
+                "--download-dir".to_string(),
+                "/data/交付".to_string(),
+                "--log-level".to_string(),
+                "verbose".to_string(),
+            ],
+            "开着 ⇒ 那一对必须拼进内核的 argv（内核那一份的档位只在 argv 上）"
+        );
+        assert!(
+            !core_arguments(&Preferences::new("/data/交付"))
+                .iter()
+                .any(|arg| arg == "--log-level"),
+            "关着 ⇒ 那一对一个字都不许出现（缺省就是 normal）"
+        );
+    }
+
     /// 🔴 **写盘失败那句话点名了根因（偏好写入失败）**，而且带上了系统的原文。
     ///
     /// 判别力：把它改成一句笼统的"保存失败"，下面那两条立刻红 ——
@@ -325,6 +505,26 @@ mod tests {
             restart_timed_out().contains("已经记下来了"),
             "偏好那一半**已经成立**必须说出来（否则用户会再改一遍）"
         );
+    }
+
+    /// 🔴 **超时那句话有两句、而且只有中间那半句不同**（改的是哪一格只有调用方知道）。
+    ///
+    /// 判别力：让 `verbose_logging_set` 去用 `restart_timed_out()`（那一句说"下载目录
+    /// 已经记下来了"），第一条断言立刻红 —— 而真机上的表现是用户**改了一个勾选框**、
+    /// 却读到一句关于下载目录的话（两件事他都没做错，是界面在说假话）。
+    #[test]
+    fn the_two_restart_timeouts_differ_only_in_what_was_recorded() {
+        let dir = restart_timed_out();
+        let verbose = verbose_restart_timed_out();
+        assert!(verbose.contains("详细日志"), "要说清记下来的是哪一格：{verbose}");
+        assert!(!verbose.contains("下载目录"), "这一个目录都没改：{verbose}");
+        // ⚠️ 另两句**逐字相同**（同一件事不许两处说不同的话）：内核那一半、以及
+        //    "下次启动会按它生效"那条补救 —— 它们与改的是哪一格无关。
+        for shared in ["内核还在重启中，这一次没有改成。", "下次启动会按它生效。"] {
+            assert!(dir.contains(shared) && verbose.contains(shared), "共有那半句必须逐字相同：{shared}");
+        }
+        assert!(dir.contains("下载目录已经记下来了"));
+        assert!(verbose.contains("详细日志开关已经记下来了"));
     }
 
     /// ⚠️ 等待上界是个**有限的数**，而且不是"够用就行"的量级乱写。

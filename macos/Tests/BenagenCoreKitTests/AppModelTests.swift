@@ -204,6 +204,17 @@ final class FakeCore: CoreCalling, @unchecked Sendable {
         events?.record("shutdown:\(name)")
     }
 
+    /// 每次 [`setRedactions`] 推下来的那一份清单（按时间顺序）。
+    ///
+    /// ⚠️ **它是记账，不是判据**：本文件里没有哪条用例读它（`AppModel` 那两个调用点
+    ///    要判就得让测试去读真的偏好目录，那是本仓不许做的事 —— 与 `DiagnosticsLog.configure`
+    ///    那两处同一条账）。留着它是为了让"推下去了什么"在**调试**时看得见。
+    private var redactionPushes: [[String]] = []
+
+    func setRedactions(_ secrets: [String]) {
+        lock.lock(); redactionPushes.append(secrets); lock.unlock()
+    }
+
     /// 最近一次 `shutdown()` 是否发生在主线程上（nil = 还没调过）。
     var lastShutdownWasOnMainThread: Bool? {
         lock.lock(); defer { lock.unlock() }
@@ -229,6 +240,11 @@ final class ClientFactory: @unchecked Sendable {
     ///    这是阶段 E 任务 3 的判据：**重启出来的内核拿到的是新目录**
     ///    （`AppModelDownloadDirTests`）。
     private var requestedDirs: [String?] = []
+    /// 每一次 `make(downloadDir:verboseLogging:)` **被要求**的那一格 `--log-level` 开关，
+    /// 按调用顺序。与 `requestedDirs` 同一条理由（判据落点是**工厂收到的那一格参数**，
+    /// 也就是最终进 `CoreClient.coreArguments` 的那个值）。
+    /// 这是任务 5 的判据：**重启出来的内核拿到的是**壳此刻持有的那一档。
+    private var requestedVerbose: [Bool] = []
     /// 调用顺序账本（任务 4b）：`spawn` 这一笔记在**发放**的那一刻，
     /// 所以它相对 `shutdown:<名字>` 的先后就是"先收尾旧的、再造新的"的判据。
     private let events: EventLog?
@@ -249,9 +265,16 @@ final class ClientFactory: @unchecked Sendable {
         return requestedDirs
     }
 
-    func make(downloadDir: String?) throws -> any CoreCalling {
+    /// 每一次被要求的 `--log-level` 那一对拼不拼（任务 5）。
+    var verboseLoggings: [Bool] {
+        lock.lock(); defer { lock.unlock() }
+        return requestedVerbose
+    }
+
+    func make(downloadDir: String?, verboseLogging: Bool = false) throws -> any CoreCalling {
         lock.lock(); defer { lock.unlock() }
         requestedDirs.append(downloadDir)
+        requestedVerbose.append(verboseLogging)
         guard !pending.isEmpty else {
             // 走到这里 ⇔ 壳多重启了一次 —— 用一条明确的错误把那次多选题变成必答题。
             throw CoreError.transport("测试里没有更多内核替身了（工厂被多调了一次？）")
@@ -261,8 +284,11 @@ final class ClientFactory: @unchecked Sendable {
         return pending.removeFirst()
     }
 
-    /// 直接当 `makeClient` 用（`AppModel` 的工厂签名带一格里内核的 `--download-dir`）。
-    var factory: @Sendable (String?) throws -> any CoreCalling { { dir in try self.make(downloadDir: dir) } }
+    /// 直接当 `makeClient` 用（`AppModel` 的工厂签名带内核 argv 上的那两格：
+    /// `--download-dir` 与 `--log-level`）。
+    var factory: @Sendable (String?, Bool) throws -> any CoreCalling {
+        { dir, verbose in try self.make(downloadDir: dir, verboseLogging: verbose) }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +389,7 @@ func waitUntil(_ what: String, timeout: Double = 3, _ cond: () -> Bool) async ->
 /// 由 enqueue 立起来的。
 @MainActor
 private func runningModel(_ fake: FakeCore,
-                          makeClient: (@Sendable (String?) throws -> any CoreCalling)? = nil) async -> AppModel {
+                          makeClient: (@Sendable (String?, Bool) throws -> any CoreCalling)? = nil) async -> AppModel {
     let model = makeClient.map { AppModel(client: fake, makeClient: $0) } ?? AppModel(client: fake)
     fake.stub("enqueue", Wire.enqueue)
     _ = try? await model.enqueue(paths: [])
@@ -408,13 +434,56 @@ private func runningModel(_ fake: FakeCore,
     #expect(fake.callCount("hello") == 1)
 }
 
+/// 🔴 **内核自报的协议版本 = `hello` 回执里那一格**（不是壳自己的 `kProtocolVersion`）。
+///
+/// 判别力：把 `start()` 里那句 `kernelProtocolVersion = handshake.protocolVersion` 换成
+/// `= kProtocolVersion` ⇒ 第一条红 —— 而真机上的表现是**导出说明文件里那一格写的是
+/// 「我们以为的」而不是「内核说的」**（规格 §2.6 明禁：连不上要如实写"未连上"，
+/// 不许回落成壳自己的常量）。
+/// ⚠️ 夹具**故意用 7**（不是 `Wire.hello` 里那个 1）：用 1 的话，"写死 kProtocolVersion"
+/// 这个变异体是**绿的**。
+@MainActor
+@Test func theProtocolVersionIsTheKernelsNotOurs() async {
+    let fake = FakeCore()
+    fake.stub("hello", #"{"protocol":7,"min_split_size_choices":["1M"]}"#)
+    fake.stub("get_settings", Wire.getSettings)
+    let model = AppModel(client: fake)
+
+    #expect(model.kernelProtocolVersion == nil, "还没握手 ⇒ 这一格是空的（不许拿壳的常量顶上）")
+
+    await model.start()
+
+    #expect(model.kernelProtocolVersion == 7, "必须是**内核**说的那个数，不是壳的 kProtocolVersion")
+}
+
+/// **一次没握上的手不许继承上一个内核的答复**（"未连上"是事实，"上一个连上的那个"不是）。
+///
+/// 判别力：把 `start()` 开头那句 `kernelProtocolVersion = nil` 删掉 ⇒ 第二条红 ——
+/// 而真机上的表现是**内核已经崩了、导出说明文件里仍然写着 `protocol_version: 7`**
+/// （一句没人说过的假话，且没有任何东西会变红）。
+@MainActor
+@Test func aLaterFailedHandshakeDoesNotInheritThePreviousAnswer() async {
+    let fake = FakeCore()
+    fake.stub("hello", #"{"protocol":7,"min_split_size_choices":["1M"]}"#)
+    fake.stub("get_settings", Wire.getSettings)
+    let model = AppModel(client: fake)
+    await model.start()
+    #expect(model.kernelProtocolVersion == 7)
+
+    // 内核没了（管道结束）：下一次 `start()` 的握手必然失败 —— 这是重启之后的形状。
+    fake.failEverything(with: CoreError.transport("内核进程已退出（管道结束）"))
+    await model.start()
+
+    #expect(model.kernelProtocolVersion == nil, "上一个内核的答复不许留到这一次")
+}
+
 @MainActor
 @Test func startWithoutAClientDoesNothing() async {
     // `AppModel.live()` 起不来（找不到内核二进制）时造的就是这种模型：原因已经装在
     // `engine` 里（约束 4 要它出现在界面上），而 `start()` 不该再去敲一个不存在的客户端、
     // 更不该把那条原因冲掉。
     let model = AppModel(engine: .unavailable("找不到内核可执行文件 benagen-core（找过：\n/a\n/b）"),
-                         makeClient: { _ in throw CoreError.transport("没有内核") })
+                         makeClient: { _, _ in throw CoreError.transport("没有内核") })
 
     await model.start()
 
@@ -618,7 +687,7 @@ private func runningModel(_ fake: FakeCore,
     // 但用户**仍然能粘交付码**（空态页上就摆着那个输入框）。重启工厂也起不来，
     // 于是这里必须给出一句能照着排查的话（约束 4：不得静默少交）。
     let model = AppModel(engine: .unavailable("找不到内核可执行文件 benagen-core（找过：\n/a\n/b）"),
-                         makeClient: { _ in throw CoreError.transport("还是没有内核") })
+                         makeClient: { _, _ in throw CoreError.transport("还是没有内核") })
 
     await model.loadDelivery(code: "AAA-1", baseURL: nil)
 

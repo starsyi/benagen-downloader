@@ -22,6 +22,23 @@
 //! * **`id` 单调递增、响应按 `id` 配对**：不许把"下一行"当成"我那条"。
 //!   内核**会**在回你那条之前先吐 `id == 0` 的协议级错误（超长请求就是这么回事）。
 //!
+//! ## ⚠️ 一次调用**有上界**（A5）：看门狗，不是读线程
+//!
+//! 上面第 2 条那个"读回配对的那一行"本来**没有上界**：`std::io` 在管道上**没有读超时**
+//! （Windows 的匿名管道尤其没有），内核不回话，那个 `invoke` 就永久挂住 ——
+//! 界面上的表现是"某一块一直转圈，点别的也没用"。
+//!
+//! 处置**不是**"把读搬进独立读线程 + `recv_timeout`"（那会是本模块唯一一处结构性改动，
+//! 而读路径正是最不该在这一波里动的地方）。用的是一条**看门狗**：超时之后它调
+//! `ProcessChannel::close()`，而 `close()` 会 kill 子进程 ⇒ 管道关掉 ⇒ **卡在
+//! `read_line` 上的那一次立刻返回 EOF**。⇒ 读路径一行都不用碰。
+//!
+//! ⚠️ **超时之后这条通道判死**（[`CoreClient::call`] 从此快速失败，见那里的判断），
+//! **不许**接着在这条管道上收发 —— 协议按请求号顺序配对，一条迟到的响应会被**下一条**
+//! 请求当成自己的答案，**错配比报错更坏**。判死之后走的是既有的「内核没了」路径：
+//! `KernelDeath::reason_of` 把 [`ClientError::CallTimedOut`] 与 [`ClientError::KernelGone`]
+//! **同等对待**（界面上要做的动作是同一个：点「重试」）。
+//!
 //! ⚠️ **跨平台**：本模块只用 `std::process` / `std::thread` / `std::io`——没有一行平台 API。
 //!    "shell-core 不含 OS 调用"（见 `lib.rs`）指的是不许出现 `winapi`/`eframe` 这类
 //!    **平台专属**依赖；`std::process` 不是（规格 §5 第 2 条明确把"驱动内核子进程"放在壳里）。
@@ -33,7 +50,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -104,6 +121,33 @@ pub enum ClientError {
     LineTooLong { limit: usize },
     /// 管道结束：内核进程没了（这条是"内核已死"的唯一可靠信号）。
     KernelGone,
+    /// 一次 [`CoreClient::call`] 在允许的时间内没等到配对的那条响应：**看门狗已经把这条
+    /// 通道关掉、子进程也收了**（见 [`CoreClient::call_timeout_for`] 与 `spawn_watchdog`）。
+    /// 这条通道**从此判死** —— 后续调用给 [`ClientError::Closed`]。
+    ///
+    /// ⚠️ 它与 [`ClientError::KernelGone`] **不是同一件事**：那是"内核进程真的没了"
+    /// （管道结束，唯一可靠信号），这是"**我们**等够了"。**内核可能还活着**，
+    /// 所以不许报成 `KernelGone` —— 报"内核进程已退出"是一句假话，
+    /// 会把客户与支持一起引向错误的方向。
+    /// 两者的**相同之处**只有一个：界面上要做的动作（点「重试」），
+    /// 所以「内核没了」那条共享判定把它们同等对待（`presentation::kernel_death`）。
+    ///
+    /// ⚠️ `waited` 是**允许它等的上限**（这一次调用那一档的取值），不是"精确等了多久"：
+    /// 实际耗时是它，加上看门狗一个节拍（[`WATCHDOG_TICK`]），加上收尾那条链的耗时。
+    ///
+    /// ## 🔴 这一档的**承诺有一个洞**，如实记在这里（别以为它不可能发生）
+    ///
+    /// 看门狗的超时**只会调 `ProcessChannel::close()`**，而 `close()` 在
+    /// **kill 之后仍未回收**子进程时会**提前 return**（`client.rs` 的
+    /// `ProcessChannel::close` 第 ② 步那段，那里记账了"可能变成孤儿进程"）。
+    /// 那一刻**读端没有被放掉**（它走不到第 ④ 步）⇒ 卡在 `read_line` 上的那次调用
+    /// **永远不会拿到 EOF** ⇒ 看门狗虽然已经落了 `timed_out`，那个 `invoke` **仍然挂住**。
+    ///
+    /// 也就是说：这一档的"有界"建立在**"kill 一定收得掉子进程"**之上。
+    /// 真机上 `TerminateProcess` 几乎总能成功，所以这条路的可达性很低；
+    /// 但它是**可达**的（同一个 `close()` 自己就写着"收不掉"那一支），
+    /// 所以不许把 [`CoreClient::call`] 说成"保证有界"。
+    CallTimedOut { method: String, waited: Duration },
     /// 内核发来的一行不是合法 JSON。`line_prefix` 截断到 200 字符——那行可能是几 MB 的垃圾，
     /// 而它会显示在界面上。
     MalformedResponse {
@@ -117,7 +161,9 @@ pub enum ClientError {
     Kernel { code: String, message: String },
     /// `ok:true` 却没有 `result`（内核的 `skip_serializing_if` 保证了这两个键互斥）。
     MissingResult { id: u64 },
-    /// 已经收尾（`shutdown` 已调用），不再收新请求。
+    /// 这条通道已经收场，不再收新请求。两种来源，**都是终局**：
+    /// [`CoreClient::shutdown`] 已调用，或者一次调用超时之后看门狗把通道关掉了
+    /// （见 [`ClientError::CallTimedOut`]）。两种都不许再往这条管道上写一个字节。
     Closed,
 }
 
@@ -161,6 +207,15 @@ impl std::fmt::Display for ClientError {
                  这通常意味着内核发疯或流被污染。"
             ),
             ClientError::KernelGone => write!(f, "内核进程已退出（管道结束）"),
+            // ⚠️ 这句话里那句"请点「重试」"**是真的**：`CallTimedOut` 与 `KernelGone`
+            //    在「内核没了」那条共享判定里同等对待（`presentation::kernel_death`），
+            //    所以点「重试」那颗按钮真的会出现、也真的会重连。改这里之前先确认那一处 —
+            //    本项目明令：补救只说界面上真的做得到的动作（`RequestTooLong` 那一句
+            //    就是这么改过的）。
+            ClientError::CallTimedOut { method, waited } => write!(
+                f,
+                "内核在 {waited:?} 内没有回应 {method}——这条通道已判死，请点「重试」"
+            ),
             ClientError::MalformedResponse { line_prefix, cause } => write!(
                 f,
                 "内核发来的一行不是合法 JSON：{cause}（行首：{line_prefix:?}）"
@@ -175,7 +230,12 @@ impl std::fmt::Display for ClientError {
             ClientError::MissingResult { id } => {
                 write!(f, "ok:true 的响应里没有 result（id {id}）")
             }
-            ClientError::Closed => write!(f, "内核连接已关闭（shutdown 已调用）"),
+            // ⚠️ 两种来源都要说出来（见变体的文档）：只写"shutdown 已调用"会在
+            //    **超时判死**那条路上变成一句假话 —— 而客户会照着它去找一件没发生的事。
+            ClientError::Closed => write!(
+                f,
+                "内核连接已关闭（已收尾，或者一次调用超时之后这条通道被判死了）"
+            ),
         }
     }
 }
@@ -536,8 +596,10 @@ impl LineChannel for ProcessChannel {
         //
         //    ⚠️ **`try_lock`，不是 `lock`**：`write_line` 是**持着这把锁**做整行的写的
         //    （正文 + 换行，不许被劈开），而"子进程不再读 stdin + 请求大于管道缓冲区"
-        //    会让那次写**无限期**阻塞。收尾若在这里 `lock`，就会跟着卡死——而收尾正是
-        //    「`call` 没有超时」（裁决 Z）唯一被认可的逃生口，那样"最坏约 5 秒"就不真了。
+        //    会让那次写**无限期**阻塞。收尾若在这里 `lock`，就会跟着卡死——而收尾是
+        //    既有的**唯一**逃生口（A5 的看门狗那条路要等满**那一档**的上界 —— 150 或 600 秒，
+        //    见 `CoreClient::call_timeout_for`；用户点「退出」等不了那么久），
+        //    那样"最坏约 5 秒"就不真了。
         //    拿不到锁 ⇒ 跳过"体面告别"，直接走下面的 kill 分支：子进程一死，那次写拿到
         //    `EPIPE` 并以结构化错误收场，锁随之让出。**没有静默降级**——只是少了一句
         //    "请你体面退出"，而它本来就已经不读 stdin 了。
@@ -642,6 +704,54 @@ struct ClientInner {
     alerts: ProtocolAlerts,
 }
 
+/// 一次 [`CoreClient::call`] 在飞期间的时间戳守卫：**任何返回路径**（含 `?` 提前返回）
+/// 都会把它清成 `None`（见 [`CoreClient::call`]）。
+///
+/// ⚠️ 用 `Drop` 而不是散在各处赋值，是因为"漏清一条路"的后果是**静默**的：
+/// 看门狗会把一次**早就返回**的调用当成"还在等"，于是超时之后把一条**健康的**通道
+/// 关掉 —— 而那只在那条路被走到（外加一次超时）时才发生。
+/// `Drop` 由编译器保证每条出路都走，漏不掉。
+struct InFlightGuard<'a> {
+    slot: &'a Mutex<Option<InFlight>>,
+}
+
+/// 在飞中的那一次调用。
+#[derive(Clone, Copy)]
+struct InFlight {
+    /// 这次调用是什么时候开始的。
+    since: Instant,
+    /// 这次调用的**有效上界**：[`CoreClient::call_timeout_for`] 按方法名查出来的，
+    /// 或者测试用 [`CoreClient::with_call_timeout`] 注入的那个固定值。
+    ///
+    /// ⚠️ 它**随请求一起落在在飞格子里**（而不是让看门狗自己去查表）：
+    /// 看门狗只认"这一次调用允许等多久"这一个事实，两处各算一次迟早会分叉。
+    timeout: Duration,
+}
+
+impl<'a> InFlightGuard<'a> {
+    /// 置上时间戳与该次的上界，交出守卫。守卫活多久，"在飞"就成立多久。
+    fn arm(slot: &'a Mutex<Option<InFlight>>, timeout: Duration) -> InFlightGuard<'a> {
+        *lock(slot) = Some(InFlight {
+            since: Instant::now(),
+            timeout,
+        });
+        InFlightGuard { slot }
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        *lock(self.slot) = None;
+    }
+}
+
+/// 看门狗**多久看一眼**（不是超时本身）。
+///
+/// 它是"多等一会儿"的界：一次调用实际被放行的时间最多是
+/// 它那一档的上界 + 一个节拍 + 收尾那条链的耗时。取 50 ms 是因为它相对 150 秒的
+/// 最短那一档可以忽略，而相对"判据的响应速度"又足够细。
+const WATCHDOG_TICK: Duration = Duration::from_millis(50);
+
 /// 驱动一个内核：发一条请求、等它那条响应、收尾。
 ///
 /// **同一时刻至多一条在飞的请求**（约束 15）：[`CoreClient::call`] 全程持着一条内部的
@@ -652,26 +762,244 @@ struct ClientInner {
 /// [`CoreClient::shutdown`] 能在一条请求**正卡在 `read_line` 上**时照样收尾
 /// （见那里的两条路径）。这是 macOS `CoreClient` 那套队列 + 状态锁的等价物，
 /// 只是把"串行队列"换成了"一把闸门锁"。
+/// 诊断日志的出口。**生产恒为 [`crate::diagnostics::log_verbose`]**；测试注入一个记账替身。
+///
+/// ⚠️ 做成**可注入**而不是直接调那个函数，是为了让判据能在**不写文件、不翻全局**的前提下
+///    钉住"每一次调用记一行、成功不带 `why`、失败带原文"。两个陷阱都是实测踩出来的
+///    （内核那一侧的同位判据，任务 1 的任务审查 + 修复轮）：往真日志目录里写会污染
+///    开发者自己那份日志（`log_verbose` 走 `storage::dir()`）；翻 `diagnostics::init`
+///    的进程级静态会让同进程里假设 normal 的用例随机红。
+///
+/// 同形的先例（"决策与调用分开"）：`core/src/engine/rpc.rs` 的 `VerboseSink`
+/// （那边是内核→aria2 的同一条判据）。
+type VerboseSink = Arc<dyn Fn(&str, &[(&str, String)]) + Send + Sync>;
+
 pub struct CoreClient {
-    channel: Box<dyn LineChannel>,
+    /// ⚠️ `Arc` 而不是 `Box`：看门狗线程要拿一份（它要在超时之后 `close()` 这条通道）。
+    channel: Arc<dyn LineChannel>,
     inner: Mutex<ClientInner>,
     /// 单飞闸门。`call` 全程持有；`shutdown` 用 `try_lock` 有界地探它。
     gate: Mutex<()>,
-    shutdown_started: AtomicBool,
+    /// ⚠️ `Arc` 而不是裸的 `AtomicBool`：看门狗拿一份，用它判"通道已经没了，线程收工"。
+    shutdown_started: Arc<AtomicBool>,
+    /// **测试注入**的上界；`None` = 按方法名查表（生产路径）。
+    ///
+    /// ⚠️ 为什么是被 `Mutex` 包着的共享格子、而不是一个按值捕获的 `Duration`：
+    ///    [`CoreClient::with_call_timeout`] 是在 `new` **之后**才调的，而看门狗那时候
+    ///    已经起来了 —— 按值捕获的话，注入的时间**到不了**看门狗，测试就只能等满 150 秒
+    ///    （而那看起来像"测试本来就慢"，不是"注入没生效"）。
+    call_timeout: Arc<Mutex<Option<Duration>>>,
+    /// 当前那次调用是什么时候开始的、它那一档的上界是多少（没人在飞时是 `None`）。
+    /// `call` 里那个 [`InFlightGuard`] 维护它；看门狗读它。
+    in_flight_since: Arc<Mutex<Option<InFlight>>>,
+    /// 看门狗**已经判过一次超时**。⚠️ 它与 `in_flight_since` 是两个事实，别合并：
+    /// 前者是"这条通道已经判死"（粘滞，`call` 与读的 EOF 分支都读它），
+    /// 后者是"此刻有没有人在飞"（每次调用各自置、清）。
+    timed_out: Arc<AtomicBool>,
+    /// 详细档那一行的出口（见 [`VerboseSink`]）。生产恒为 `diagnostics::log_verbose`。
+    verbose_sink: VerboseSink,
+    /// **写进日志之前必须抹掉的字面串**（交付码、下载目录）—— 见
+    /// [`CoreClient::set_redactions`] 与 `diagnostics::redact`。
+    ///
+    /// ⚠️ 它挂在**连接**上而不是挂在进程级静态上：翻静态会让同进程里别的用例
+    ///    随线程调度随机红（那是 `VerboseSink` 那段文档记着的同一个坑）。
+    ///    而挂在连接上还有一条**语义上**的好处：**换一条连接 = 换一份该抹的东西**
+    ///    （新内核是壳带着新偏好起出来的，旧的那些串已经不在任何一条在飞的请求里）。
+    redactions: Arc<Mutex<Vec<String>>>,
 }
 
 impl CoreClient {
     /// 接一条现成的通道（测试替身走这里）。
+    ///
+    /// ⚠️ 看门狗线程在这里就起来（随 client 一起活）。起不来的话**大声 panic**：
+    /// 本函数没有错误通道（`Box<dyn LineChannel>` 交出去就收不回来了，改签名会动
+    /// 所有调用点），而"没有看门狗也照跑"= 悄悄把 F7 那个永久挂住放回来 ——
+    /// 本仓对静默降级的口径是"宁可大声失败"。线程起不来只可能是进程资源耗尽。
     pub fn new(channel: Box<dyn LineChannel>) -> Self {
-        CoreClient {
-            channel,
+        let client = CoreClient {
+            channel: Arc::from(channel),
             inner: Mutex::new(ClientInner {
                 next_id: 1,
                 closed: false,
                 alerts: ProtocolAlerts::default(),
             }),
             gate: Mutex::new(()),
-            shutdown_started: AtomicBool::new(false),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
+            call_timeout: Arc::new(Mutex::new(None)),
+            in_flight_since: Arc::new(Mutex::new(None)),
+            timed_out: Arc::new(AtomicBool::new(false)),
+            // 生产路径**恒为**它；`mod tests` 才会换成记账替身（见 [`VerboseSink`]）。
+            verbose_sink: Arc::new(crate::diagnostics::log_verbose),
+            // 起手**没有可抹的串**：壳还没告诉过我们它此刻在处理哪个交付码、下到哪个目录。
+            // ⚠️ 这不是"永远抹不掉"——`set_redactions` 的调用点在**发请求之前**
+            //    （`shell-win/src/session.rs` 的 `remember_for_redaction`）。
+            redactions: Arc::new(Mutex::new(Vec::new())),
+        };
+        client.spawn_watchdog();
+        client
+    }
+
+    /// 看门狗：一次调用在飞超过 `call_timeout` 就**把通道关掉**。
+    ///
+    /// ⚠️ 顺序是承重的：**先落 `timed_out` 这个事实，再关通道**。卡住的那次读会在
+    /// `close()` 之后返回 EOF，它要靠这个标志才知道"这不是内核退出，是我们等超时了"。
+    /// 反过来写的话，`call` 会把它报成 `KernelGone`——**而内核可能活着**，
+    /// 报"内核进程已退出"是一句假话，会把客户与支持一起引向错误的方向。
+    ///
+    /// ⚠️ 关通道走的是既有的 `ProcessChannel::close()`：它**会 kill 子进程**，而 kill
+    /// 会关掉管道 ⇒ 卡在 `read_line` 上的那一次立刻返回 EOF。**这一条不是推断**：
+    /// 本模块的 `the_watchdog_unblocks_a_real_blocking_read_on_a_real_pipe` 用一条
+    /// 真子进程 + 真管道踩住了它（替身配合得起来不算数）。
+    ///
+    /// ⚠️ 超时之后**不再收发**（判死，见 [`CoreClient::call`] 里的判断）：协议按请求号
+    /// 顺序配对，一条迟到的响应会被**下一条**请求当成自己的答案。
+    fn spawn_watchdog(&self) {
+        let in_flight = Arc::clone(&self.in_flight_since);
+        let timed_out = Arc::clone(&self.timed_out);
+        let shutdown_started = Arc::clone(&self.shutdown_started);
+        let channel = Arc::clone(&self.channel);
+        std::thread::Builder::new()
+            .name("shell-call-watchdog".to_string())
+            .spawn(move || loop {
+                // 判据粒度，不是超时本身 —— 50 ms 的量级让"多等一会儿"有界。
+                std::thread::sleep(WATCHDOG_TICK);
+                if shutdown_started.load(Ordering::SeqCst) {
+                    return; // 通道已经没了（`shutdown` / `Drop` 收的尾），线程收工
+                }
+                let current = *lock(&in_flight);
+                let Some(current) = current else { continue };
+                // ⚠️ 比的是**这一次调用自己那一档**的上界（随请求落在格子里），不是某个全局值。
+                if current.since.elapsed() < current.timeout {
+                    continue;
+                }
+                timed_out.store(true, Ordering::SeqCst);
+                channel.close(); // kill 子进程 ⇒ 卡住的那次读立刻 EOF
+                return;
+            })
+            .expect("起看门狗线程失败（没有它，内核不回话时 call 会永久挂住）");
+    }
+
+    /// **普通**调用的上界（生产路径；测试用 [`CoreClient::with_call_timeout`] 调小）。
+    ///
+    /// 只覆盖**不在** [`Self::LONG_CALL_METHODS`] 表里的方法。常见调用都在秒级
+    /// （一次 aria2 RPC 的传输上限是内核侧的 `RPC_TIMEOUT` ＝ 10 秒，`core/src/engine/rpc.rs:17`），
+    /// 150 秒是**一个数量级**以上的余量。
+    ///
+    /// ⚠️ **别拿它去衡量长调用**：`load_delivery` 这一家族的记账见
+    /// [`Self::LONG_CALL_TIMEOUT`] —— 那个数**不是** 91.5 秒（91.5 只是它三段里的第一段）。
+    /// 这一条在 A5 的第一版里写错过（把 91.5 当成了 `load_delivery` 的最坏值），
+    /// 于是"网络慢 + 换码 + 清单大"的一次**合法**慢调用会被判死**并杀掉内核** ——
+    /// 那正是规格 §3 A5 的取值段要防的那件事。两档就是这么来的。
+    pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(150);
+
+    /// **已知的长调用家族**的上界。
+    ///
+    /// 名单（[`Self::LONG_CALL_METHODS`]）取的是**内核侧不用 `with_kernel` 包起来的那几个
+    /// RPC 方法**（`core/src/main.rs:882-887` 的分派表：`load_delivery` / `list_dir` /
+    /// `get_tree` / `plan` / `enqueue`），它们的共同点是最贵的部分都是网络 I/O。
+    ///
+    /// ## 取值 600 秒的依据（逐条可核）
+    ///
+    /// 内核自己对 `load_delivery` 的记账在 `core/src/main.rs:993-998`，三段**顺序执行**：
+    ///   * `delivery::fetch`：30 秒 × 3 次 + 1.5 秒退避 = 最坏 **91.5 秒**；
+    ///   * `clear_engine_batch`：最坏约 **100 秒**；
+    ///   * 全量 `plan`：每个 crc64 为空的文件一次 HEAD，最坏 **30 秒 × N**
+    ///     （单次 30 秒：`core/src/delivery.rs:22` 的 `FETCH_TIMEOUT`）。
+    ///
+    /// 三段是**顺序**跑的（那一段注释写的就是这个），所以算第三段时前两段已经花掉了：
+    /// `600 − 191.5 = 408.5` 秒，按 30 秒一次折算 ⇒ **N ≈ 13**。
+    /// （不是 600 ÷ 30 ＝ 20 —— 那个算法把三段当成并行的了。）
+    ///
+    /// ⚠️ **余量就到这里为止，别把它读成"600 秒一定够"**：`plan` 是 **30 秒 × N、
+    /// 内核里没有全局 deadline**（`core/src/planner.rs:186` 的记账）⇒ **N 很大时任何常数
+    /// 都盖不住**。那时壳会按本档判死、`close()` ⇒ **杀掉内核**。这是 `plan` 缺全局
+    /// deadline 的直接后果，是**既有问题**（本批不动它，也不假装本档把它解决了）。
+    /// 一个"网络慢 + 换交付码 + 清单里几千个 crc64 为空"的批次会走到那里。
+    ///
+    /// ⚠️ 改这个数字前先读 [`ClientError::CallTimedOut`] 与 `spawn_watchdog`：
+    /// 它同时是"判死"的阈值（超时之后这条通道不再收发）。
+    pub const LONG_CALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+    /// 走 [`Self::LONG_CALL_TIMEOUT`] 的方法名。**表外的走 [`Self::DEFAULT_CALL_TIMEOUT`]。**
+    ///
+    /// ⚠️ **按方法名查表，不是按"调用的地方"**：`call` 只拿得到方法名，而"这次会不会慢"
+    ///    完全由**内核那一条 RPC 的实现**决定（见 `LONG_CALL_TIMEOUT` 的记账）。
+    ///    写在调用点会把同一个方法的两种预算散到各处。
+    ///
+    /// ⚠️ 名单与内核分派表**必须一起改**：内核多一个"长方法"而这里漏了，那个方法就会
+    ///    被按 150 秒判死、**并杀掉内核**（比"没超时"更坏）。
+    ///
+    /// 🔴 **但"必须一起改"这件事今天没有任何自动判据守着**（终审点名，如实记账）：
+    ///    `the_long_method_table_matches_the_hand_copied_list`
+    ///    比的是**下面这份名单与测试里手抄的同一份名字**（本 crate 读不到内核源码），
+    ///    **内核从来没被读过**。⇒ **内核新增第六个"锁外跑网络 I/O"的方法时，那条用例
+    ///    不会红**。这是已知缺口，不是"已经守住了"。
+    ///    ⚠️ 另外，那条用例**没有集合相等断言**（往表里塞一个两份手抄名单里都没有的名字，它不会红）。
+    ///    （下一批要么 `include_str!("../../../core/src/main.rs")` 真把分派表读进来比，
+    ///    要么想别的办法；本批刻意不做 —— 那是另一件事的规模。）
+    ///
+    /// ⚠️ `tree_json` **不在**这张表里，因为它**不是**一个 RPC 方法名：它是内核里的一个
+    ///    私有函数（`core/src/main.rs:1097`），由 `op_list_dir` / `op_get_tree` 调用
+    ///    （`core/src/main.rs:20` 那句"被 `list_dir`/`get_tree`/`enqueue`/`tree_json`
+    ///    的路径调用"说的是**代码路径**）。写进来只会是一条**永远匹配不到**的假条目。
+    /// ⚠️ `plan` **在**表里但**壳今天不发它**（`grep -rn '\.call("' windows/` 没有它）：
+    ///    它是一个真方法、而且正是本档取值理由里的第三段（30 秒 × N）挂在的那个方法，
+    ///    所以留着 —— 这是一条**保险**，不是一条活路径。
+    pub const LONG_CALL_METHODS: &'static [&'static str] = &[
+        "load_delivery",
+        "list_dir",
+        "get_tree",
+        "plan",
+        "enqueue",
+    ];
+
+    /// 这个方法该用哪一档上界。**唯一**的查表处。
+    pub fn call_timeout_for(method: &str) -> Duration {
+        if Self::LONG_CALL_METHODS.contains(&method) {
+            Self::LONG_CALL_TIMEOUT
+        } else {
+            Self::DEFAULT_CALL_TIMEOUT
+        }
+    }
+
+    /// 换一个超时值。**只给测试注入**：生产路径一律走 [`Self::call_timeout_for`] 的查表。
+    ///
+    /// ⚠️ 它必须存在：真实取值是 150 / 600 秒，而本任务的判据全都以"耗时"为判据 ——
+    /// 逐条等 600 秒的测试不会有人跑，而**没人跑的判据与没有判据等价**（本仓的 W-2）。
+    /// ⚠️ 注入的是**一个固定值，对所有方法生效**（查表被它盖过去）。
+    /// ⚠️ 它写的是那个**共享格子**，所以调用的时机不影响生效 —— 见 `call_timeout` 字段的文档。
+    pub fn with_call_timeout(self, t: Duration) -> Self {
+        *lock(&self.call_timeout) = Some(t);
+        self
+    }
+
+    /// 这一次调用该等多久：测试注入优先，否则按方法名查表。
+    fn effective_call_timeout(&self, method: &str) -> Duration {
+        match *lock(&self.call_timeout) {
+            Some(injected) => injected,
+            None => Self::call_timeout_for(method),
+        }
+    }
+
+    /// 一条通道错误该报成什么：**判死只有一个出口**。
+    ///
+    /// 看门狗一旦判过超时，这条通道就**已经永久死了**（后续每次调用都是
+    /// [`ClientError::Closed`]）—— 所以此刻无论拿到的是 EOF（[`ClientError::KernelGone`]）、
+    /// 写失败还是读失败，对客户来说都是**同一件事**：走「内核没了」那条路（横幅 + 「重试」）。
+    ///
+    /// ⚠️ 少了这一层，"判死"就会被报成 [`ClientError::WriteFailed`] / [`ClientError::ReadFailed`]
+    ///    —— 它们**不在** `KernelDeath::reason_of` 认的那一档里 ⇒ 落 `last_error` ⇒
+    ///    **瞬时横幅、没有「重试」**，而通道其实再也不会好。
+    ///    ⚠️ 写那一路是**可达**的：内核僵住（不再读 stdin）+ 请求体大于管道缓冲区
+    ///    （大批 `enqueue` 很容易）⇒ 那次写卡住 ⇒ 看门狗 `close()` ⇒ 写拿到 EPIPE。
+    fn death_or(&self, method: &str, timeout: Duration, error: ClientError) -> ClientError {
+        if self.timed_out.load(Ordering::SeqCst) {
+            ClientError::CallTimedOut {
+                method: method.to_string(),
+                waited: timeout,
+            }
+        } else {
+            error
         }
     }
 
@@ -698,7 +1026,8 @@ impl CoreClient {
     ///
     /// 读它不经过单飞闸门（`gate`），所以**不会被一条在飞的慢请求挡住**——`inner` 只在
     /// 极短的临界区里被持有（取一个 id、推一条告警），不跨那次阻塞读。
-    /// 这条是给界面线程用的：一条 90 秒的 `load_delivery` 不该把"显示一条告警"也拖住。
+    /// 这条是给界面线程用的：一条跑满那一档（最长 600 秒）的 `load_delivery`
+    /// 不该把"显示一条告警"也拖住。
     pub fn protocol_alerts(&self) -> ProtocolAlerts {
         lock(&self.inner).alerts.clone()
     }
@@ -707,10 +1036,102 @@ impl CoreClient {
     ///
     /// 返回的是**原始 [`Value`]**，不在这里做任何强类型解码：要不要强类型是调用方的事
     /// （少一次"编解码往返"就少一次 `.integer`/`.number` 被抹平的机会）。
+    ///
+    /// ⚠️ **本函数是"壳→内核"的唯一收口**：详细档那一行（`kernel_call`）记在**这里**，
+    ///    于是所有调用点自动全覆盖——散在调用点各记一遍会漏掉下一个人新加的那条路。
+    ///    真正的实现是 `Self::call_inner`（本函数只负责计时与记账）。
+    ///
+    /// ⚠️ **"记不记"由调用点决定，本函数无条件记**：闸门在
+    ///    [`crate::diagnostics::log_verbose`]（只有详细档才真落盘）。所以判据可以
+    ///    往 `VerboseSink` 注入一个替身来数行数，**不必**碰文件系统、也不必翻
+    ///    进程级静态。
     pub fn call(&self, method: &str, params: Value) -> Result<Value, ClientError> {
+        let started = Instant::now();
+        let outcome = self.call_inner(method, params);
+        let mut fields = vec![
+            ("method", method.to_string()),
+            ("ms", started.elapsed().as_millis().to_string()),
+            ("ok", outcome.is_ok().to_string()),
+        ];
+        // ⚠️ **只有失败时才带 `why`**：成功时补一个空字段会让"这一行有几个字段"
+        //    随结果变，而按空格切字段读它的下一个人会读到空值。
+        //    `why` 走的是壳既有的那个只读访问器（`presentation::error_text`）——
+        //    与界面上给用户看的那句**同一份**，不是这里另写一句。
+        //    它与内核 `RpcClient::send` 那一行**同形**（`method`/`ms`/`ok`/失败时 `why`）
+        //    —— 客户回传时两个文件要能对着读。
+        //
+        // 🔴 **落进这一行之前必须过 [`CoreClient::redact`]**（规格 §2.3 B）：`why` 是
+        //    **内核原文**，而交付码是**我们自己**拼进内核文案里的
+        //    （`core/src/delivery.rs` 那条 404 把 `…/{交付码}/manifest.json` 整条 URL
+        //    送了进来，`core/src/main.rs` 的 `preflight` 那一档带着客户目录名）。
+        //    ⇒ 这一处**只抹日志**：给用户看的那句话一个字都不动（界面上显示客户自己的
+        //    交付码/目录是应当的，问题只出在"要离开这台机器的那一份"上）。
+        if let Err(error) = &outcome {
+            fields.push(("why", self.redact(&crate::presentation::error_text::error_text(error))));
+        }
+        (self.verbose_sink)("kernel_call", &fields);
+        outcome
+    }
+
+    /// 告诉这条连接：**这几个字面串写进日志之前必须抹掉**（交付码、下载目录）。
+    ///
+    /// 🔴 **它存在的全部理由是隐私，而且这次是"按构造"那一档**（规格 §2.3 B）：
+    ///    `why` 里出现交付码的字符串**是我们自己拼的**（不是第三方文案），
+    ///    而壳**知道**那个码（就在它刚发出去的请求里）与那个目录（就在它自己存的偏好里）
+    ///    ⇒ 能按构造避开，就必须避开。
+    ///
+    /// ⚠️ **推下来的是"此刻该抹的整份清单"，不是追加**：交付码会换（用户换了批次），
+    ///    下载目录会换。追加式的接口会把上一个批次的码永久留在里面，
+    ///    而那种残留**看不出来**（它只是偶尔多抹掉一段无害的文字）。
+    /// ⚠️ **调用点是"发请求之前"**（`shell-win/src/session.rs` 的 `remember_for_redaction`，
+    ///    在 `spawn_load` 与 `spawn_connect` 两处）—— 晚一步的表现是**那一次**的日志里
+    ///    带着码，而那一次恰恰是最可能失败、最需要那份日志的一次。
+    /// ⚠️ **它不是一个过滤器**：只做字面子串替换，做不到的事见 `diagnostics::redact` 的文档。
+    pub fn set_redactions(&self, secrets: Vec<String>) {
+        *lock(&self.redactions) = secrets;
+    }
+
+    /// 把 [`CoreClient::set_redactions`] 那一份清单套到一段文字上。
+    fn redact(&self, value: &str) -> String {
+        // ⚠️ 先把清单克隆出来再抹：临界区里只有一个 `clone`（`redact` 是纯计算，
+        //    而它可能走过 200 个字符 —— 不需要占着这把锁做）。
+        let secrets = lock(&self.redactions).clone();
+        crate::diagnostics::redact(value, &secrets)
+    }
+
+    /// `call` 的本体：**只做事、不记账**（计时与详细档那一行在 [`Self::call`] 上）。
+    fn call_inner(&self, method: &str, params: Value) -> Result<Value, ClientError> {
         // 单飞：整条请求-响应循环都在闸门里。它同时保证了"同一个内核上不会有两条在飞的
         // 请求"，于是下面那个 `id` 配对**不可能**撞上别人的响应（撞上就是失步，要吵）。
         let _gate = lock(&self.gate);
+
+        // 🔴 一次调用超时之后这条通道**已经判死**（看门狗关掉了它）：与 `shutdown` 之后
+        //    走同一条**快速失败**的路 —— **绝不再往这条管道上写一个字节**。
+        //    承重的理由：协议按请求号顺序配对，一条迟到的响应会被**下一条**请求当成
+        //    自己的答案 —— **错配比报错更坏**。所以这里不是"再等一次超时"，是立刻失败。
+        if self.timed_out.load(Ordering::SeqCst) {
+            return Err(ClientError::Closed);
+        }
+
+        // 这一次调用允许等多久：**按方法名查表**（长调用家族另有上界，见
+        // `LONG_CALL_TIMEOUT` 的记账），测试注入的值盖过查表。
+        let timeout = self.effective_call_timeout(method);
+
+        // 在飞计时：从这一句起，本函数**任何**一条出路（含下面那些 `?`）都会清掉它
+        // —— `Drop` 保证，见 `InFlightGuard`。上界随请求一起落格（看门狗只认这一个事实）。
+        //
+        // 🔴 **这一句必须在上面那句 `let _gate = lock(&self.gate);` 之后**（设计不变量：
+        //    **排队的时间不计入预算**）。
+        //    挪到闸门**之前**的后果是承重的、而且**判据全绿**：一次排在内核里的请求
+        //    （前面压着一条最长 600 秒的 `load_delivery`）会从**自己被写出去之前**就开始计时，
+        //    于是它可能在**自己那一档的 150 秒**被判死 ⇒ `close()` ⇒ **杀掉一个健康的内核**
+        //    —— 正是规格 §3 A5 的取值段要防的那件事。
+        //    ⚠️ 下面这些用例**抓不到**这种挪动：套件里没有哪两条 `call` 是**重叠**的
+        //    （几处 `thread::scope` 都是"调用 vs 逃生口"，不是两条调用），而 `InFlightGuard`
+        //    的 `Drop` 语义与它被 arm 的位置无关 ⇒ 把这一行挪上去，全绿。
+        //    ⇒ 所以这条不变量靠**这一行注释**与 `transfer_list` 那条排队路径的语义守着，
+        //    改这里之前先读 `CoreClient` 上"同一时刻至多一条在飞的请求"那段。
+        let _in_flight = InFlightGuard::arm(&self.in_flight_since, timeout);
 
         let id = {
             let mut inner = lock(&self.inner);
@@ -740,11 +1161,25 @@ impl CoreClient {
                 limit: MAX_REQUEST_LINE_BYTES,
             });
         }
-        self.channel.write_line(&line)?;
+        // 写失败也过 [`Self::death_or`]：卡在**写**上的那次调用会被看门狗判死
+        // （内核僵住、连 stdin 都不读，而请求体大于管道缓冲区），那时写拿到的是 EPIPE
+        // —— 把它当传输层错误报出去，客户看到的会是一句**没有「重试」**的提示，
+        // 而通道其实已经永久死了。
+        if let Err(e) = self.channel.write_line(&line) {
+            return Err(self.death_or(method, timeout, e));
+        }
 
         loop {
-            let Some(reply) = self.channel.read_line()? else {
-                return Err(ClientError::KernelGone);
+            // 读的三条结局都过 [`Self::death_or`]：**判死只有一个出口**。
+            // （EOF 那一条的判据是看门狗有没有动过手，见 `spawn_watchdog` 那段"顺序是承重的"：
+            //  超时 ⇒ 通道是**我们**关的、内核可能还活着；否则 ⇒ 内核进程真没了。
+            //  报错要说对根因：把"我们等够了"说成"内核进程已退出"会把客户与支持引向错的方向。）
+            let reply = match self.channel.read_line() {
+                Ok(Some(reply)) => reply,
+                Ok(None) => {
+                    return Err(self.death_or(method, timeout, ClientError::KernelGone));
+                }
+                Err(e) => return Err(self.death_or(method, timeout, e)),
             };
             let resp: Response = serde_json::from_str(&reply).map_err(|cause| {
                 ClientError::MalformedResponse {
@@ -800,9 +1235,12 @@ impl CoreClient {
     /// ——等下去会把"退出应用"变成"卡住不动"。内核收到 EOF 一样会收尾（关 aria2、落盘），
     /// 所以"没读到那条响应"不影响正确性。
     ///
-    /// ⚠️ **也不能无界地等闸门**：内核正在跑长请求（`load_delivery` 最坏约 91.5 秒）时，
-    /// 用户点退出，那条请求正卡在 `read_line` 上持着闸门——而唯一能让它松开的
-    /// `channel.close()` 就在等闸门之后：那就成了"点了没反应"（约束 4）。所以：
+    /// ⚠️ **也不能无界地等闸门**：内核正在跑长请求（`load_delivery` 那一档的上界是
+    /// [`Self::LONG_CALL_TIMEOUT`] ＝ 600 秒，见那里的记账）时，
+    /// 用户点退出，那条请求正卡在 `read_line` 上持着闸门——而能让它松开的
+    /// `channel.close()` 就在等闸门之后（A5 的看门狗也会关它，但要等满**那一档**的上界
+    /// —— 150 或 600 秒，见 `call_timeout_for`；退出等不了那么久）：那就成了"点了没反应"
+    /// （约束 4）。所以：
     ///
     ///   1. 闸门**空着**（正常路径，毫秒级）：把 `shutdown` 请求发出去，再从容关通道；
     ///   2. 闸门**被占着**：走强制收尾——不等它，直接 `close()`。`ProcessChannel::close`
@@ -855,7 +1293,22 @@ impl Drop for CoreClient {
 ///
 /// ⚠️ 传了 `settings_path` 就**同时**决定了 `last_code` 落盘的目录
 /// （`Kernel::new`：同一目录下的 `last_code`）——测试要的正是这个"不碰用户家目录"的效果。
-pub fn core_arguments(download_dir: Option<&Path>, settings_path: Option<&Path>) -> Vec<String> {
+///
+/// ## 🔴 `verbose_logging`：**开了才拼那一对，关了什么都不拼**
+///
+/// 关着的时候**不许**拼 `--log-level normal`：那一对与"这个 flag 根本不出现"在内核侧
+/// 是**同一件事**（`parse_args` 的 `log_level.unwrap_or(Level::Normal)`），拼出来只是给
+/// 将来的自己多一处会漂的地方（内核改了默认档，壳还在显式地要 normal）。
+/// 这与 `--download-dir` 那条 E-5 是同一个道理（未配置就别替内核写死一个默认值）。
+///
+/// ⚠️ **它是一个显式参数、不给默认值**：默认值会让"调用点忘了把它接上"退化成
+/// 静默的 normal —— 而"客户开了详细日志、导出的却是一份普通档的"正是这条功能
+/// 最怕的那种"没有任何东西会变红"。少一个实参就编不过，那才是要的。
+pub fn core_arguments(
+    download_dir: Option<&Path>,
+    settings_path: Option<&Path>,
+    verbose_logging: bool,
+) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     if let Some(d) = download_dir {
         args.push("--download-dir".to_string());
@@ -864,6 +1317,13 @@ pub fn core_arguments(download_dir: Option<&Path>, settings_path: Option<&Path>)
     if let Some(s) = settings_path {
         args.push("--settings".to_string());
         args.push(s.to_string_lossy().into_owned());
+    }
+    // ⚠️ 排在最后：与 macOS 那侧 `coreArguments(settingsPath:downloadDir:verboseLogging:)`
+    //    的拼接次序逐个一致（内核的 `parse_args` 认顺序无关，但两边"什么时候有哪几格"
+    //    要对得上，不然并排读两份 argv 时像是壳少拼了一个）。
+    if verbose_logging {
+        args.push("--log-level".to_string());
+        args.push("verbose".to_string());
     }
     args
 }
@@ -877,7 +1337,7 @@ mod tests {
     use std::io::Cursor;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
     // ------------------------------------------------------------------
@@ -952,6 +1412,81 @@ mod tests {
 
     fn line(s: &'static str) -> Reply {
         Reply::Line(s)
+    }
+
+    /// **会真阻塞**的通道：`read_line` 一直等到 `close()` 才返回 EOF。
+    ///
+    /// ⚠️ 既有的 `StubChannel` 造不出这个场景：它脚本用完之后**立刻**返回 `Ok(None)`，
+    /// 而"内核活着但不回话"恰恰是**什么都不返回**。
+    /// 用 `Condvar` 而不是 sleep 轮询：轮询会让"等了多久"变成不确定的量，
+    /// 而本任务的判据正是耗时。
+    ///
+    /// ⚠️ 状态挂在 `Arc` 后面、替身**可 `Clone`**（与 `StubChannel` 同形）：用例要
+    /// **在把它交给 `CoreClient` 之后**还能查到 `close()` 被调过几次 ——
+    /// 一个在移交之前抄下来的计数快照会永远是 0，那条断言就成了"从构造上不可能红"。
+    #[derive(Clone)]
+    struct SilentChannel {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        closes: Arc<AtomicUsize>,
+        /// `true` ⇒ **连写都阻塞**：`write_line` 也等到 `close()` 才收场。
+        ///
+        /// 它造的是"内核僵住（连 stdin 都不读）+ 请求体大于管道缓冲区"那一路 ——
+        /// 那时卡住的是**写**，而判死之后写拿到的是 EPIPE（见 `CoreClient::death_or`）。
+        block_write: bool,
+    }
+
+    impl SilentChannel {
+        fn new() -> Self {
+            Self::with(Default::default())
+        }
+        /// 连**写**都阻塞的替身（见 `block_write` 那段）。
+        fn with_blocking_write() -> Self {
+            Self::with(true)
+        }
+        fn with(block_write: bool) -> Self {
+            Self {
+                gate: Arc::new((Mutex::new(false), Condvar::new())),
+                closes: Arc::new(AtomicUsize::new(0)),
+                block_write,
+            }
+        }
+        fn closes(&self) -> usize {
+            self.closes.load(Ordering::SeqCst)
+        }
+        /// 等到 `close()`（或者已经关过）为止。`read_line` 与 `write_line` 共用。
+        fn wait_for_close(&self) {
+            let (lock, cv) = &*self.gate;
+            let mut closed = lock.lock().unwrap();
+            while !*closed {
+                closed = cv.wait(closed).unwrap();
+            }
+        }
+    }
+
+    impl LineChannel for SilentChannel {
+        fn write_line(&self, _line: &str) -> Result<(), ClientError> {
+            if !self.block_write {
+                return Ok(()); // 写得进去——问题出在对方不回话
+            }
+            self.wait_for_close();
+            // `close()` 之后 = 子进程被杀 ⇒ 这一写拿到 EPIPE（`ProcessChannel` 同形）。
+            Err(ClientError::WriteFailed {
+                cause: std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "内核僵住之后被杀，这一写拿到 EPIPE",
+                ),
+            })
+        }
+        fn read_line(&self) -> Result<Option<String>, ClientError> {
+            self.wait_for_close();
+            Ok(None) // `close()` 之后 = 管道断了
+        }
+        fn close(&self) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            let (lock, cv) = &*self.gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
     }
 
     /// 造一个 `params`，使 `{"id":1,"method":<method>,"params":<它>}` 序列化后**正好**
@@ -1236,6 +1771,293 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // 每请求上界（A5）：内核**活着但不回话**
+    // ------------------------------------------------------------------
+
+    /// 跑一次 `call` 并**带期限**地等它：超过 `limit` 就先把 `escape` 收掉（把卡住的那次读
+    /// 放出来），然后 panic。
+    ///
+    /// ⚠️ 为什么需要它：`SilentChannel` 的读**永远不返回**，所以"看门狗没生效"的表现是
+    /// **本用例挂住** —— 而挂住不是判据（它毒掉整个套件、还没有任何诊断，
+    /// 与"这条判据从构造上不可能红"是同一类问题）。有了期限，同样的改法变成**红**。
+    /// 这也是本仓既有的做法（`stderr_is_drained_so_the_child_never_blocks_on_write`）。
+    fn call_within(
+        client: &CoreClient,
+        escape: &SilentChannel,
+        limit: Duration,
+    ) -> (Result<Value, ClientError>, Duration) {
+        let started = Instant::now();
+        std::thread::scope(|s| {
+            let call = s.spawn(|| client.call("get_state", Value::Null));
+            while !call.is_finished() {
+                if started.elapsed() > limit {
+                    escape.close(); // 把卡住的那次读放出来，否则它会把本用例挂在这里
+                    let _ = call.join();
+                    panic!("{limit:?} 内没返回：看门狗没生效，call 在管道上永久挂住了");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let took = started.elapsed();
+            (call.join().expect("调用线程不该 panic"), took)
+        })
+    }
+
+    /// **内核不回话时，`call` 必须有界地失败**（规格 §3 A5）。
+    ///
+    /// 判别力：把看门狗去掉、或让它不落 `timed_out`，这一条红（见上面 `call_within`
+    /// 那段"挂住不是判据"）。
+    #[test]
+    fn call_fails_bounded_when_the_kernel_never_answers() {
+        let channel = SilentChannel::new();
+        // 注入一个**测试用**的超时：生产默认 150 秒，逐条等不起。
+        let client = CoreClient::new(Box::new(channel.clone()))
+            .with_call_timeout(Duration::from_millis(300));
+
+        let (outcome, took) = call_within(&client, &channel, Duration::from_secs(5));
+        let e = outcome.expect_err("不回话必须有界地失败，而不是永久挂住");
+
+        match e {
+            ClientError::CallTimedOut { ref method, .. } => assert_eq!(method, "get_state"),
+            other => panic!("期望 CallTimedOut，得到 {other:?}"),
+        }
+        assert!(took < Duration::from_secs(5), "等了 {took:?}，超时没生效");
+    }
+
+    /// 🔴 **超时之后这条通道必须判死**（规格 §3 A5）——不是"接着用"。
+    ///
+    /// 判据是"后续调用**立刻**失败"：迟到的那条响应**绝不能**被下一条请求当成自己的答案。
+    #[test]
+    fn a_timed_out_channel_is_dead_for_good() {
+        let channel = SilentChannel::new();
+        let client = CoreClient::new(Box::new(channel.clone()))
+            .with_call_timeout(Duration::from_millis(300));
+        let (first, _) = call_within(&client, &channel, Duration::from_secs(5));
+        assert!(matches!(first, Err(ClientError::CallTimedOut { .. })));
+
+        // 看门狗必须真的把通道关掉（在 Windows 上这一步会 kill 子进程）。
+        // ⚠️ 现查，**不抄快照**（见 `a_normal_call_is_untouched_by_the_watchdog` 里那段）。
+        assert!(channel.closes() >= 1, "超时之后通道没有被关掉");
+
+        // 后续调用**立刻**失败，绝不再等一次完整超时。
+        let started = Instant::now();
+        let e = client.call("get_state", Value::Null).expect_err("通道已判死");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "判死之后必须立刻失败，实际等了 {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(e, ClientError::Closed), "期望 Closed，得到 {e:?}");
+    }
+
+    /// 两档上界都必须**大于各自那一族最慢的合法调用**，否则会把"慢"判成"错"。
+    ///
+    /// 🔴 **本用例的模型在 A5 修复轮 3 改过一次，理由留在下面**：第一版拿
+    /// **91.5 秒**当"最慢的合法调用"，而那个数只是 `load_delivery` **三段里的第一段**
+    /// （`core/src/main.rs:993-998`：fetch 三段里的 fetch）。按那个模型，
+    /// "网络慢 + 换交付码 + 清单大"的一次**合法**慢调用会被判死 —— 而判死的代价是
+    /// `close()` ⇒ **杀掉内核**，比修复前的"一直等"更坏。所以模型必须**按段相加**。
+    #[test]
+    fn the_call_timeouts_are_above_the_slowest_legitimate_call_of_their_family() {
+        // ── 长调用那一档：内核自己给的三段记账（`core/src/main.rs:993-998`）──────────
+        // 前两段**有界**，而且**顺序执行**：
+        const FETCH_WORST: Duration = Duration::from_millis(91_500); // 30 s × 3 + 1.5 s 退避
+        const CLEAR_WORST: Duration = Duration::from_secs(100); // 开头快照 + 3×2×10 + 收尾快照
+        assert!(
+            CoreClient::LONG_CALL_TIMEOUT > FETCH_WORST + CLEAR_WORST,
+            "长调用那一档 {:?} 不大于两段有界之和 {:?}——那会把「慢」判成「错」，\
+             而判死的代价是**杀掉内核**",
+            CoreClient::LONG_CALL_TIMEOUT,
+            FETCH_WORST + CLEAR_WORST
+        );
+        // 第三段（全量 `plan`）是 **30 秒 × N、内核里没有全局 deadline**：任何常数都盖不住
+        // N 很大时的它。三段**顺序**跑 ⇒ 留给第三段的预算是 600 − 191.5 = 408.5 秒，
+        // 按 30 秒一次折算 ⇒ N ≈ 13（也就是下面这条断言的 30×13 = 390 秒）。
+        // 把这个**下界**钉住，免得有人把 600 当成"随手取的大数"再调小。
+        // ⚠️ 那个"盖不住"的缺口写在 `LONG_CALL_TIMEOUT` 的文档里（既有问题，本批不动）。
+        assert!(
+            CoreClient::LONG_CALL_TIMEOUT >= Duration::from_secs(30) * 13,
+            "长调用那一档 {:?} 盖不到 N = 13 个 crc64 为空的文件（每个一次 30 秒 HEAD）",
+            CoreClient::LONG_CALL_TIMEOUT
+        );
+
+        // ── 普通那一档：最贵的一条是单次 aria2 RPC（内核侧 `RPC_TIMEOUT` ＝ 10 秒，
+        //    `core/src/engine/rpc.rs:17`；A1 之后读方法最坏再重试一次）⇒ ≈ 20 秒。
+        //    150 秒给的是一个数量级以上的余量。
+        const SLOWEST_ORDINARY_CALL: Duration = Duration::from_secs(20);
+        assert!(
+            CoreClient::DEFAULT_CALL_TIMEOUT > SLOWEST_ORDINARY_CALL,
+            "默认超时 {:?} 不大于普通调用最慢的一条 {:?}——那会把「慢」判成「错」",
+            CoreClient::DEFAULT_CALL_TIMEOUT,
+            SLOWEST_ORDINARY_CALL
+        );
+
+        // 两档不许倒挂（倒挂的话"长调用"会拿到更短的上界）。
+        assert!(
+            CoreClient::LONG_CALL_TIMEOUT > CoreClient::DEFAULT_CALL_TIMEOUT,
+            "两档倒挂了：长调用那一档必须更宽"
+        );
+    }
+
+    /// 🔴 **查表本身要有牙**：长家族的方法走 `LONG_CALL_TIMEOUT`，表外的走
+    /// `DEFAULT_CALL_TIMEOUT`；下面这份名单逐字列的是**应该**在表里的那些方法。
+    ///
+    /// ⚠️⚠️ **这条用例守的是什么、不守什么（终审点名，别读大了）**：
+    ///    * **守**：就这三件 —— `call_timeout_for` 对**下面手抄的这五个长名字**都返回
+    ///      `LONG_CALL_TIMEOUT`、对**另外五个短名字**都返回 `DEFAULT_CALL_TIMEOUT`、
+    ///      且 `tree_json` **不在** `LONG_CALL_METHODS` 里。表被误改、这五个里的某一个
+    ///      被挪出表、这五个短名字里的某一个被塞进表，都会红；
+    ///    * **不守（集合相等）**：**没有"表与手抄名单集合相等"这条断言**，所以往表里塞一个
+    ///      **两份手抄名单里都没有**的名字（例：`push("get_progress")`）**两条循环都不红**，
+    ///      而那个方法此后会拿到 600 秒那一档。本条钉的只是"这十个名字各自归哪一档
+    ///      ＋ `tree_json` 不在表里"；
+    ///    * **也不守（两档倒挂）**：`LONG_CALL_TIMEOUT <= DEFAULT_CALL_TIMEOUT` 是
+    ///      `the_call_timeouts_are_above_the_slowest_legitimate_call_of_their_family`
+    ///      末尾那句断言的事，**不在本条**；
+    ///    * **不守**：这份手抄名单**与内核分派表**是否一致。本 crate 读的是内核源码吗？
+    ///      **不是** —— 内核从来没被读过，而这正是缺口：**内核新增第六个"锁外跑网络 I/O"
+    ///      的方法时，这条用例不会红**，而那个方法会被按 150 秒判死、并杀掉内核。
+    ///      ⇒ 这一条是**已知缺口**，已同步记账在 `LONG_CALL_METHODS` 的文档里；
+    ///      真要守住得让本 crate 去读内核源码（`include_str!` 那条路，另一件事的规模）。
+    ///
+    /// 判别力（实测过，见报告里的变异读数）：挪出去、或把某一档调小 ⇒ 数值断言红
+    /// （后者红在 `the_call_timeouts_are_above_the_slowest_legitimate_call_of_their_family`
+    /// 的阈值断言上，不在本条）；**塞进来只有在那个名字同时出现在下面那份手抄名单里时
+    /// 才会红** —— 名单外的新名字两条循环都不红（见上面「守什么/不守什么」）。
+    #[test]
+    fn the_long_method_table_matches_the_hand_copied_list() {
+        // ⚠️ **这是手抄的一份副本**（不是从内核读来的）：内核那五个"锁外跑网络 I/O"的方法
+        //    写在 `core/src/main.rs:882-887` 的分派表里，抄过来只是为了让"表被改坏"能红。
+        //    两边**不会自动同步** —— 见上面那段"守什么、不守什么"。
+        // ⚠️ `tree_json` **不在这里**：它是内核的私有函数（`core/src/main.rs:1097`），
+        //    不是 RPC 方法名（表里写它 = 一条永远匹配不到的假条目）。
+        for method in ["load_delivery", "list_dir", "get_tree", "plan", "enqueue"] {
+            assert_eq!(
+                CoreClient::call_timeout_for(method),
+                CoreClient::LONG_CALL_TIMEOUT,
+                "{method} 是内核里「锁外跑网络 I/O」的方法，必须走长调用那一档"
+            );
+        }
+        for method in ["hello", "get_state", "transfer_list", "task_action", "verify_status"] {
+            assert_eq!(
+                CoreClient::call_timeout_for(method),
+                CoreClient::DEFAULT_CALL_TIMEOUT,
+                "{method} 不在长家族里，必须走默认那一档（别把表放大）"
+            );
+        }
+        assert!(
+            !CoreClient::LONG_CALL_METHODS.contains(&"tree_json"),
+            "`tree_json` 不是 RPC 方法名（它是内核里的私有函数），写进表里是一条\
+             永远匹配不到的假条目"
+        );
+    }
+
+    /// 🔴 **判死只有一个出口**：卡在**写**上的那次调用，超时之后必须报 `CallTimedOut`，
+    /// **不是** `WriteFailed`。
+    ///
+    /// 为什么这条承重：`WriteFailed` 不在 `KernelDeath::reason_of` 认的那一档里 ⇒
+    /// 它落 `CallFailure::Text` ⇒ **瞬时横幅、没有「重试」**，而通道其实**已经永久死了**
+    /// （后续每次调用都是 `Closed`，落同一格）——客户看到一句没有出路的提示，只能重启应用。
+    ///
+    /// 场景是**可达的**（不是构造出来的）：内核僵住（不再读 stdin）+ 请求体大于管道缓冲区
+    /// —— 大批 `enqueue` 很容易撞上。那时卡住的是**写**，看门狗 `close()` 之后它拿到 EPIPE。
+    ///
+    /// 判别力：把 `call` 里写失败那一路的 `death_or` 换回 `?`（直接抛原错）⇒ 本条红，
+    /// 报的是 `WriteFailed`（实测读数见报告）。
+    #[test]
+    fn a_call_stuck_in_the_write_is_reported_as_the_timeout_not_a_transport_error() {
+        let channel = SilentChannel::with_blocking_write();
+        let client = CoreClient::new(Box::new(channel.clone()))
+            .with_call_timeout(Duration::from_millis(300));
+
+        let (outcome, _) = call_within(&client, &channel, Duration::from_secs(5));
+        match outcome.expect_err("写卡住之后必须有界地失败") {
+            ClientError::CallTimedOut { ref method, .. } => assert_eq!(method, "get_state"),
+            other => panic!(
+                "期望 CallTimedOut（判死那一档，客户才会看到「重试」），得到 {other:?}"
+            ),
+        }
+        // 看门狗必须真的关过通道（关掉 ⇒ 卡住的那次写才拿得到 EPIPE 而收场）。
+        assert!(channel.closes() >= 1, "看门狗没有关通道");
+    }
+
+    /// 正常路径**不许**被看门狗碰到：调用已经返回之后，看门狗不许再关通道。
+    ///
+    /// 判别力：把 `call` 里那个在飞守卫去掉（或漏清一条返回路径），本用例红 ——
+    /// 而真机上那是"一次正常的调用过去一个节拍之后，一条健康的通道被无缘无故关掉"。
+    #[test]
+    fn a_normal_call_is_untouched_by_the_watchdog() {
+        let ch = StubChannel::new(vec![
+            line(r#"{"id":1,"ok":true,"result":{"a":1}}"#),
+            Reply::Eof,
+        ]);
+        let client = CoreClient::new(Box::new(ch.clone()))
+            .with_call_timeout(Duration::from_millis(300));
+
+        let v = client.call("get_state", Value::Null).expect("正常应答必须照常返回");
+        assert_eq!(v["a"], 1);
+
+        // 睡过注入的超时：这一次调用早就返回了，看门狗**不许**再动手。
+        // ⚠️ `ch.closes()` 必须**在这一刻现查**（`ch` 是共享状态的一份 clone）。
+        //    把它先抄成一个 `usize` 再比，那条断言就恒真 —— 成了一个
+        //    **从构造上不可能红**的判据（实测：把守卫的清理整个删掉，它也照样绿）。
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(ch.closes(), 0, "调用早就返回了，看门狗却把通道关了");
+    }
+
+    /// 🔴 **看门狗放出来的必须是那次真卡住的读** —— 用**真子进程 + 真管道**验，
+    /// 不是靠 `SilentChannel` 替身"说"它会 EOF。
+    ///
+    /// 为什么非有这一条：`SilentChannel` 的 `close()` 与 `read_line` 是**同一个替身**
+    /// 里的一对函数，它们当然配合得起来；而生产上那条链是
+    /// **`close()` ⇒ kill 子进程 ⇒ 管道写端关掉 ⇒ 卡在 `read_until` 上的那次返回 EOF**。
+    /// 这四步里任何一步不成立（例如 `close()` 不再 kill、或读端被换成一个不会 EOF 的
+    /// 东西），替身那两条用例**照样全绿**，而真机上那个 `invoke` 依然永久挂住。
+    ///
+    /// `sh -c 'exec sleep 30'`：收下 stdin/stdout 两根管道，但**既不读 stdin、也不写
+    /// stdout** —— 它就是"内核活着但不回话"。它不会因为 stdin 的 EOF 退出（它不读
+    /// stdin），所以这一次收尾走的是 `close()` 的**kill 那一步**，于是本用例的耗时
+    /// 约等于注入的超时 + `close()` 里那 3 秒的"体面告别"窗口（`client.rs` 的
+    /// `ProcessChannel::close` 第 ② 步，有上界，不是等待）。
+    ///
+    /// ⚠️ 那条链要是断了（看门狗不关通道、或 `close()` 不再 kill），这次读会**永远**卡在
+    ///    真管道上 —— 所以下面用**带期限的 `recv_timeout` + 一条 detached 线程**，不等
+    ///    `join`：同样的改法于是变成**红**（带一句指名根因的话），不是**挂住**。
+    #[test]
+    fn the_watchdog_unblocks_a_real_blocking_read_on_a_real_pipe() {
+        let (prog, args) = sh("exec sleep 30");
+        let channel = ProcessChannel::new(Path::new(&prog), &args, None).expect("必须能起 sh");
+        let client = Arc::new(
+            CoreClient::new(Box::new(channel)).with_call_timeout(Duration::from_millis(300)),
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&client);
+        std::thread::spawn(move || {
+            let _ = tx.send(worker.call("get_state", Value::Null));
+        });
+
+        let started = Instant::now();
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("15 秒内没返回：真管道上卡住的那次读没有被放出来（close ⇒ kill ⇒ EOF 这条链断了）");
+        let took = started.elapsed();
+        let e = outcome.expect_err("内核不答话时，真管道上那一次读也必须被放出来");
+
+        assert!(
+            matches!(e, ClientError::CallTimedOut { .. }),
+            "期望 CallTimedOut，得到 {e:?}"
+        );
+        assert!(
+            took >= Duration::from_millis(300),
+            "还没到注入的超时就返回了（{took:?}）——那说明它压根没等到看门狗动手"
+        );
+        assert!(
+            took < Duration::from_secs(15),
+            "等了 {took:?}：卡住的那次读没有被放出来（close ⇒ kill ⇒ EOF 这条链断了）"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // 读侧：超限 / 收尾
     // ------------------------------------------------------------------
 
@@ -1345,20 +2167,43 @@ mod tests {
     }
 
     /// argv 是**内核的输入**（不是协议消息），顺序与 `core/src/main.rs::parse_args` 一致。
+    ///
+    /// ⚠️ 第三个实参是**详细日志**（任务 3 加的）。它**没有默认值** —— 这正是要的：
+    ///    少传一个实参走的是编译错误，而不是一次静默的 normal 档（见 `core_arguments`
+    ///    的文档）。下面每一行都显式写 `false` / `true`。
     #[test]
     fn core_arguments_match_the_kernel_flags() {
-        assert_eq!(core_arguments(None, None), Vec::<String>::new());
+        assert_eq!(core_arguments(None, None, false), Vec::<String>::new());
         assert_eq!(
-            core_arguments(Some(Path::new("/tmp/d")), None),
+            core_arguments(Some(Path::new("/tmp/d")), None, false),
             vec!["--download-dir", "/tmp/d"]
         );
         assert_eq!(
-            core_arguments(None, Some(Path::new("/tmp/s"))),
+            core_arguments(None, Some(Path::new("/tmp/s")), false),
             vec!["--settings", "/tmp/s"]
         );
         assert_eq!(
-            core_arguments(Some(Path::new("/tmp/d")), Some(Path::new("/tmp/s"))),
+            core_arguments(Some(Path::new("/tmp/d")), Some(Path::new("/tmp/s")), false),
             vec!["--download-dir", "/tmp/d", "--settings", "/tmp/s"]
+        );
+        // 开着的时候：那一对**排在最后**（与 macOS 那侧的拼接次序逐个一致）。
+        assert_eq!(
+            core_arguments(Some(Path::new("/tmp/d")), Some(Path::new("/tmp/s")), true),
+            vec![
+                "--download-dir",
+                "/tmp/d",
+                "--settings",
+                "/tmp/s",
+                "--log-level",
+                "verbose"
+            ]
+        );
+        // 别的都在、只有它在：证明这三格**互不依赖**（不是"有目录才拼得出级别"）。
+        assert_eq!(
+            core_arguments(None, None, true),
+            vec!["--log-level", "verbose"],
+            "关的那一侧由 core_arguments 的文档钉着：关了**什么都不拼**（连 --log-level \
+             normal 也不许拼）"
         );
     }
 
@@ -1474,8 +2319,9 @@ mod tests {
     /// **收尾在任何情形下都有上界**——包括"有线程正卡在 `write_line` 里"这一种。
     ///
     /// 场景：子进程收下 stdin 的写端却从不读它，而请求大于管道缓冲区 ⇒ 那次写**永远卡在
-    /// `write` 里**并**持着 stdin 的锁**。收尾若在那里用 `lock` 就会跟着卡死——而收尾正是
-    /// 「`call` 没有超时」（裁决 Z）唯一被认可的逃生口，它一卡，"最坏约 5 秒"就不真了。
+    /// `write` 里**并**持着 stdin 的锁**。收尾若在那里用 `lock` 就会跟着卡死——而收尾是
+    /// 既有的**唯一**逃生口（A5 的看门狗那条路要等满**那一档**的上界 —— 150 或 600 秒），
+    /// 它一卡，"最坏约 5 秒"就不真了。
     ///
     /// 判别力：把 `close()` 里那句 `try_lock` 换回 `lock`，本用例会**挂住**（不是变红）——
     /// 所以下面每条断言都带时间上界，且写线程在收尾之后必须能收场。
@@ -1609,5 +2455,236 @@ mod tests {
             }
             Err(other) => panic!("根因说错了：{other}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // **详细档"每一次壳→内核的调用"那一行**（任务 2 的主判据）。
+    //
+    // 为什么必须有它：`call` 里那一句记账是**整档新增行为在壳侧的收口**，而同一个缺口
+    // 在内核那侧已经撞过一次（任务 1 的审查：`aria2_call` 那一行——那个功能的主角——
+    // 一条判据都没有，删掉记账 / 把 `why` 改成无条件 / 把闸门反过来，**全套判据仍然全绿**）。
+    //
+    // 🔴 **两条硬约束**（下面那条用例逐条绕开，机制见 [`VerboseSink`]）：
+    //   ① **不许往真的用户日志目录里写**：`log_verbose` 走 `storage::dir()`
+    //      （`%APPDATA%\BenagenDownloader\`，macOS 上是开发者自己那份 Application Support）
+    //      ——用例往里写 = "跑一次测试"变成"往用户的日志里灌测试数据"。
+    //   ② **不许翻进程级静态**：`diagnostics::init(Level::Verbose)` 写的是全局，而同进程里
+    //      那几条假设 normal 的用例（含 `diagnostics` 自己的轮转用例）会**随线程调度随机红**，
+    //      那种 flaky 比没有判据更坏。
+    //
+    // 注入 sink 把两条**同时**绕开：用例既不取那条路径（不碰 ①），也不读不写 `LEVEL`
+    // （不碰 ②）。残余：`log_verbose` 里那道**闸门本身**（normal 档不记）仍没有判据 ——
+    // 要判它就得动上面两样中的一样；它与内核那侧的同位缺口是同一个，如实记账。
+    // ------------------------------------------------------------------
+
+    /// `call` 落下来的每一行：`(事件名, 字段表)`。
+    type Recorded = Vec<(String, Vec<(String, String)>)>;
+
+    /// 一个**记账替身** sink：把每一行收进内存，**不碰文件系统、不碰全局**。
+    ///
+    /// 返回 `(注入用的 sink, 读记录用的句柄)`。
+    fn recording_sink() -> (VerboseSink, Arc<Mutex<Recorded>>) {
+        let got: Arc<Mutex<Recorded>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_got = Arc::clone(&got);
+        let sink: VerboseSink = Arc::new(move |event, fields| {
+            sink_got
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((
+                    event.to_string(),
+                    fields
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.clone()))
+                        .collect(),
+                ));
+        });
+        (sink, got)
+    }
+
+    /// 取一条记录里某个字段的值（没有这个字段 ⇒ `None`）。
+    fn field_of(line: &(String, Vec<(String, String)>), key: &str) -> Option<String> {
+        line.1
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// 🔴 **每一次壳→内核的调用都落一行；失败那一行带着壳自己给用户看的那句话**。
+    ///
+    /// 三拍成功 + 一拍失败 ⇒ **四行**，且：
+    ///   · 成功那三条**不带 `why`**（补一个空字段会让"这一行有几个字段"随结果变）；
+    ///   · 失败那一条的 `why` **就是 `error_text` 给的那句话**（与界面上显示的同一份）。
+    ///
+    /// 判别力（两条都实测过，读数见任务 2 报告）：
+    ///   · 把 `call` 里那句 `(self.verbose_sink)("kernel_call", &fields)` 删掉
+    ///     ⇒ 记录 **0 行**，第一条断言红；
+    ///   · 把 `why` 改成**无条件**追加 ⇒ 成功那三条多出 `why=`，最后那道"不许带 why"红。
+    #[test]
+    fn every_kernel_call_is_logged_with_the_shells_own_words_on_failure() {
+        let stub = StubChannel::new(vec![
+            line(r#"{"id":1,"ok":true,"result":{"protocol":1}}"#),
+            line(r#"{"id":2,"ok":true,"result":{}}"#),
+            line(r#"{"id":3,"ok":true,"result":{}}"#),
+            line(
+                r#"{"id":4,"ok":false,"error":{"code":"no_delivery","message":"这一批不存在或已过期"}}"#,
+            ),
+        ]);
+        let (sink, got) = recording_sink();
+        let mut client = CoreClient::new(Box::new(stub.clone()));
+        // ⚠️ 只换出口：不加 setter（那会多出一条只在测试里用的公开面，且在本仓的
+        //    零告警口径下还可能给非测试构建带出一条 `dead_code`）。
+        client.verbose_sink = sink;
+
+        client.call("hello", json!({"protocol": 1})).expect("第一拍成功");
+        client.call("get_state", Value::Null).expect("第二拍成功");
+        client.call("get_state", Value::Null).expect("第三拍成功");
+        let failure = client
+            .call("verify", Value::Null)
+            .expect_err("第四拍必须失败（内核回 ok:false）");
+
+        let lines = got
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            lines.len(),
+            4,
+            "每一次调用都要落一行（3 拍成功 + 1 拍失败 = 4 行），实际 {lines:?}"
+        );
+        for l in &lines {
+            assert_eq!(l.0, "kernel_call", "事件名必须是 kernel_call：{l:?}");
+            assert!(field_of(l, "ms").is_some(), "每一行都要带耗时：{l:?}");
+            assert!(field_of(l, "ok").is_some(), "每一行都要带成败：{l:?}");
+        }
+        let methods: Vec<String> = lines.iter().filter_map(|l| field_of(l, "method")).collect();
+        assert_eq!(
+            methods.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["hello", "get_state", "get_state", "verify"],
+            "记的是方法名（参数里可能有交付码之类，一律不许进来）；\
+             顺序也要对得上——一行一次的对应关系本身是判据"
+        );
+
+        // 成功那三条：`ok=true`，且**没有 `why`**
+        for l in &lines[..3] {
+            assert_eq!(field_of(l, "ok").as_deref(), Some("true"), "{l:?}");
+            assert!(
+                field_of(l, "why").is_none(),
+                "成功时**不许**带 `why` —— 补一个空字段会让这一行的字段数随结果变，\
+                 而按空格切字段读它的下一个人会读到空值：{l:?}"
+            );
+        }
+        // 失败那一条：`ok=false`，且 `why` 是壳给用户看的那句话（内核原文，逐字）
+        let last = &lines[3];
+        assert_eq!(field_of(last, "ok").as_deref(), Some("false"), "{last:?}");
+        assert_eq!(
+            field_of(last, "why").as_deref(),
+            Some("这一批不存在或已过期"),
+            "失败时 `why` 必须是壳既有那句人话（`presentation::error_text`），\
+             不是这里另写的、也不是 `{{:?}}` 的调试形态：{last:?}"
+        );
+        assert_eq!(
+            field_of(last, "why").as_deref(),
+            Some(crate::presentation::error_text::error_text(&failure).as_str()),
+            "`why` 与界面上给用户看的那句必须是**同一份**"
+        );
+    }
+
+    /// 🔴 **交付码与下载目录**绝不许出现在**写下去的那一行**里（隐私，规格 §2.3 B）。
+    ///
+    /// 为什么必须有它：这一批把**内核**那条拉交付页的路收窄成了"只记分类"
+    /// （`core/src/delivery.rs` 的 `outcome_category`），正是**因为 URL 里含交付码** ——
+    /// 而同一个码从**另一条**路回来了：内核 404 那句文案是**我们自己**拼的
+    /// （`清单不存在（404）——请确认交付码是否正确：{url}`），它经 RPC 错误体
+    /// 流进 `why`，而 `why` 是**逐字**落的。`core/src/main.rs` 的 `preflight`
+    /// 同样把客户目录名带进来。⇒ 壳在**它自己知道的那一刻**把这两个串推下来，
+    /// 由 [`CoreClient::set_redactions`] 在落盘前抹掉。
+    ///
+    /// 判别力（两条都实测过，读数见终审修复报告）：
+    ///   · 把 `call` 里那两个 `self.redact(...)` 换回 `…error_text(error)`（即不抹）⇒
+    ///     本用例两条断言都红 —— 而真机上的表现是**交付码与客户目录名被回传给我们**；
+    ///   · 把 `set_redactions` 的调用点从**发请求之前**挪到**失败之后**（`shell-win/src/
+    ///     session.rs`）⇒ 那一次失败的日志里仍然带着码（`set_redactions` 的文档记着这条）。
+    ///
+    /// ⚠️ **它钉住的是"抹掉"这一步本身**，不是"壳有没有把那两个串推下来"：
+    ///    推的那一处（`remember_for_redaction`）的调用点判据不在本 crate —— 如实记账。
+    #[test]
+    fn the_delivery_code_and_download_directory_never_reach_the_written_line() {
+        // 形状按真的来：码是 20 位随机码里的那种、目录是客户机上那种带用户名的绝对路径。
+        let code = "C24-8ZQ7K3M9P1W5X7T2";
+        let dir = r"C:\Users\张明\Downloads\Benagen";
+        // 内核 404 那句（`core/src/delivery.rs`）—— 码**是 URL 的一个路径段**。
+        let not_found = format!(
+            "清单不存在（404）——请确认交付码是否正确：\
+             http://download.benagen.com/{code}/manifest.json"
+        );
+        // 内核 preflight 那句（`core/src/main.rs`）—— 客户目录名在里面。
+        let preflight = format!("目标目录不可写（{dir}）：拒绝访问");
+        // ⚠️ `line()` 收的是 `&'static str`（脚本通道的既有形状），而这两条脚本是
+        //    现拼的 ⇒ 用 `Box::leak` 造那两份**只活这一次测试**的静态串
+        //    （测完进程就结束，泄漏的是两个几十字节的 `String`，没有代价）。
+        //    ⚠️ 正文**必须交给 `serde_json` 去转义**：客户目录名里有 `\`（Windows 路径），
+        //    手写 `format!` 拼出来的那一行**不是合法 JSON**，内核那一侧会先把它拒掉
+        //    —— 于是这条用例会以"内核发来的一行不是合法 JSON"红，而它想测的东西
+        //    一个字节都没走到（第一版就是这么红的，记在这里）。
+        let envelope = |id: u64, code: &str, message: &str| -> &'static str {
+            Box::leak(
+                json!({"id": id, "ok": false, "error": {"code": code, "message": message}})
+                    .to_string()
+                    .into_boxed_str(),
+            )
+        };
+        let not_found_line = envelope(1, "delivery_fetch_failed", &not_found);
+        let preflight_line = envelope(2, "preflight_failed", &preflight);
+        let stub = StubChannel::new(vec![line(not_found_line), line(preflight_line)]);
+        let (sink, got) = recording_sink();
+        let mut client = CoreClient::new(Box::new(stub));
+        client.verbose_sink = sink;
+        client.set_redactions(vec![code.to_string(), dir.to_string()]);
+
+        client.call("load_delivery", Value::Null).expect_err("第一拍必须失败");
+        client.call("enqueue", Value::Null).expect_err("第二拍必须失败");
+
+        let lines = got.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        assert_eq!(lines.len(), 2, "两次失败两次记账：{lines:?}");
+
+        let first = field_of(&lines[0], "why").expect("失败那一行必须带 why");
+        assert!(!first.contains(code), "交付码进了日志：{first}");
+        // **诊断价值要留住**：抹掉的是那两个串，不是整句话 —— URL 那个**路径段**
+        // 只剩 `[已隐去]`，而主机名、文件名、那句人话都还在（看日志的人仍然看得出
+        // "问题出在拉清单这一路上"）。
+        assert!(first.contains("清单不存在（404）"), "只抹那两个串，别把话抹没了：{first}");
+        assert!(first.contains("download.benagen.com"), "别把整条 URL 抹掉：{first}");
+        assert!(first.contains("manifest.json"), "别把整条 URL 抹掉：{first}");
+        assert!(first.contains(crate::diagnostics::REDACTED), "要看得出来这里被抹过：{first}");
+
+        let second = field_of(&lines[1], "why").expect("失败那一行必须带 why");
+        assert!(!second.contains(dir), "客户目录名进了日志：{second}");
+        assert!(!second.contains("张明"), "目录名的任一段都不该在：{second}");
+        assert!(second.contains("目标目录不可写"), "只抹那两个串，别把话抹没了：{second}");
+        assert!(second.contains("拒绝访问"), "内核原文的其余部分必须逐字留着：{second}");
+    }
+
+    /// ⚠️ **没被告知要抹什么时，`why` 逐字透传**（这道防线不是"顺手改文案"的地方）。
+    ///
+    /// 判别力：把 `redact` 改成"无条件把整段 `why` 抹成 [`crate::diagnostics::REDACTED`]"
+    /// ⇒ 本用例红 —— 而真机上那是**最需要的那半句诊断信息没了**（`why` 存在的全部意义
+    /// 就是"引擎为什么没回话"）。它同时钉住"默认清单是空的"这件事。
+    #[test]
+    fn without_secrets_the_why_is_verbatim() {
+        let stub = StubChannel::new(vec![line(
+            r#"{"id":1,"ok":false,"error":{"code":"no_delivery","message":"这一批不存在或已过期"}}"#,
+        )]);
+        let (sink, got) = recording_sink();
+        let mut client = CoreClient::new(Box::new(stub));
+        client.verbose_sink = sink;
+
+        client.call("load_delivery", Value::Null).expect_err("这一拍必须失败");
+
+        let lines = got.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        assert_eq!(
+            field_of(&lines[0], "why").as_deref(),
+            Some("这一批不存在或已过期"),
+            "没有要抹的串时一个字都不许动：{lines:?}"
+        );
     }
 }

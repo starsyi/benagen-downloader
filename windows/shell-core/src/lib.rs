@@ -17,7 +17,17 @@
 
 pub mod api;
 pub mod client;
+// ⚠️ 壳侧的有界日志器（`diag-shell.log`）。它与 `core/src/diagnostics.rs` 是**两份实现**
+//    ——本 crate 不依赖 `core`，所以同一个模块写了两遍，**改动必须成对**
+//    （理由与那条跨 crate 的常量判据写在 `diagnostics.rs` 头上）。
+pub mod diagnostics;
 pub mod embedded_core;
+/// **导出诊断日志**的纯逻辑（规格 §2.5 / §2.6）：时间戳子目录名、要拷哪些文件、
+/// 以及那份 `说明.txt` 的全文。
+///
+/// ⚠️ 它**一件 IO 都没有**（字节数 / sha256 / 覆盖范围都是量好之后传进来的事实）——
+///    真正去拷文件的那一半在 `shell-win/src/export.rs`（平台那一侧）。
+pub mod export;
 pub mod platform;
 pub mod presentation;
 pub mod protocol;

@@ -11,6 +11,13 @@ windows/target/
 downloader/dist/
 dist_cli/
 
+# 客户解包工具的构建产物（可再生产物，不入库）：
+#   extract_tools/build/       PyInstaller 的中间物（.toc / .pyz / .pkg，几十 MB）
+#   extract_tools/dist_linux/  交叉编译出来的 Windows EXE
+# 开发仓那边这两条**是入库的**，所以每次同步都要显式排除它们，否则会一次带进 40 MB。
+extract_tools/build/
+extract_tools/dist_linux/
+
 # Rust
 target/
 

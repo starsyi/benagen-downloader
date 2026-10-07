@@ -424,6 +424,31 @@
   color: var(--c-secondary);
 }
 
+/* 「详细日志」那个勾选框（规格 §2.4）。
+   ⚠️ 它是**原生** `<input type="checkbox">`：文件页那一颗自绘的 `.files__cb`
+      是那一屏自己的控件形状（要与 macOS 行首那对方框对位），而这一格的勾选框
+      旁边永远跟着一句 label ⇒ 原生控件的可及性、键盘焦点与"点了就切换"
+      都不用再写一遍。`accent-color` 让它与本应用的 accent 同色。 */
+.set__check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  cursor: pointer;
+}
+
+.set__check input[type="checkbox"] {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--c-accent);
+}
+
+.set__check-label {
+  font-size: var(--text-body);
+  color: var(--c-label);
+}
+
 .set__inline-note {
   flex: none;
   font-size: var(--text-caption);
