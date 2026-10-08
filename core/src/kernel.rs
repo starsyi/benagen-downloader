@@ -1342,11 +1342,23 @@ fn preflight(dir: &Path, need_bytes: i64) -> Result<(), ErrorBody> {
     Ok(())
 }
 
-/// 目标所在文件系统的剩余字节数。
+/// 目标所在文件系统的**可用**字节数。
 ///
-/// ⚠️ **没有用 crate**：`Cargo.toml` 里没有 `libc`/`fs4` 之类，而 std 不提供 statvfs。
-/// 本项目的纪律是"不要新增依赖"，所以走 `df -k` 这个到处都在的 POSIX 工具。
-/// 代价是一次进程创建——它只在 `enqueue` 的开工前检查里发生，不在热路径上。
+/// ⚠️ **两个平台各一条实现**：std 不提供 `statvfs` 那一类入口，而本 crate 不许新增依赖
+///    （`Cargo.toml` 里没有 `libc`/`fs4`）⇒ "问文件系统还剩多少"没有可移植的写法。
+///
+/// 🔴 **2026-10-08 修的一个**Windows 上必现**的缺陷**：原先**只有** Unix 那一支
+///    （起 `df`），而 **Windows 上没有 `df`** ⇒ 每一次 `enqueue` 的开工前检查都在这里
+///    失败，客户看到的是「无法读取磁盘剩余空间（df 不可用）：**program not found**」，
+///    **一点下载就报**。
+///
+///    ⚠️ 这条代码从 2026-09-16 就在（早于两条线的共同祖先），**不是**哪一次合并带进来的；
+///    而两侧的自动化判据都碰不到它：`cargo test` 跑在 macOS/Linux 上，那里 `df` 恒在；
+///    Windows 侧只做过交叉编译、从没真跑过。⇒ 它**只**能在真机上暴露。
+///
+/// Windows 那一支走的是与 `bcrypt` 同一套手法（`#[link]` + 裸 `extern "system"`），
+/// **不引入 crate 依赖**；先例见 `engine::daemon::random_secret` 的 `BCryptGenRandom`。
+#[cfg(unix)]
 fn free_bytes(dir: &Path) -> Result<u64, String> {
     let out = std::process::Command::new("df")
         .arg("-k")
@@ -1356,7 +1368,16 @@ fn free_bytes(dir: &Path) -> Result<u64, String> {
     if !out.status.success() {
         return Err("df 读取磁盘剩余空间失败".to_string());
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    available_bytes_from_df(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `df -k` 的输出 → 可用**字节**数。
+///
+/// 单独拆成一个纯函数，是因为**这一段是 Unix 那条路上唯一会算错的地方**
+/// （`df` 要真的存在、真的跑得起来，只有真机上才有那个前提；而取哪一列、乘多少
+/// 是本机就能钉住的）。
+#[cfg(unix)]
+fn available_bytes_from_df(text: &str) -> Result<u64, String> {
     let line = text
         .lines()
         .nth(1)
@@ -1370,6 +1391,57 @@ fn free_bytes(dir: &Path) -> Result<u64, String> {
         .parse::<u64>()
         .map(|k| k.saturating_mul(1024))
         .map_err(|e| format!("解析 df 的可用空间失败（{line:?}）：{e}"))
+}
+
+/// Windows 那一支：`GetDiskFreeSpaceExW`（`kernel32`，系统导入库，**不新增依赖**）。
+///
+/// ⚠️ **本支在开发机（macOS）上证不了"取得到数"** —— 本机能证的只有"**编得过**"
+///    （`cargo build --target x86_64-pc-windows-gnu`）。它的真行为只在 Windows 上验，
+///    已列进 `windows/README.md` 的真机验收清单。**这是如实记账，不是"验过了"。**
+///
+/// ⚠️ **路径长度**：`GetDiskFreeSpaceExW` 走的是 `MAX_PATH` 那一套，除非给 `\\?\` 前缀。
+///    这里**不加**前缀——下载目录那一条 `Path` 来自 argv/偏好，正常都在 `MAX_PATH` 内；
+///    真遇到超长路径时下面那条 `last_os_error()` 会把原因原样说出来（不静默）。
+#[cfg(windows)]
+fn free_bytes(dir: &Path) -> Result<u64, String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // `#[link]` + 裸 `extern "system"`：与 `random_secret` 取 `BCryptGenRandom` 同一条手法。
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            dir_name: *const u16,
+            free_to_caller: *mut u64,
+            total_bytes: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+
+    // 宽字符串、以 NUL 结尾。
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    let (mut to_caller, mut total, mut free_total) = (0u64, 0u64, 0u64);
+    // SAFETY：`wide` 以 NUL 结尾、在本调用期间一直存活；三个出参都是本函数栈上的 `u64`，
+    //         指针有效且可写。这是 `GetDiskFreeSpaceExW` 的契约。
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut to_caller,
+            &mut total,
+            &mut free_total,
+        )
+    };
+    // `BOOL`：非 0 即成功。失败时**把系统给的原因原样带出来**（W-2：失败必须看得见）。
+    if ok == 0 {
+        return Err(format!(
+            "无法读取磁盘剩余空间（GetDiskFreeSpaceExW 失败：{}）",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // 用 `free_to_caller`（**调用方**可用的那一个）而不是 `total_free`：磁盘配额下
+    // 两者会不同，而我们关心的正是"这个进程还能写多少"。
+    Ok(to_caller)
 }
 
 /// `enqueue`：加任务（单文件 / 多选 / 整个目录）。
@@ -2087,6 +2159,117 @@ mod tests {
             !e.message.contains("探活：)"),
             "不得再出现空括号（那正是修复前的问题）: {}",
             e.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 磁盘剩余空间（`preflight` 的那一步）
+    // -----------------------------------------------------------------------
+
+    /// `df -k` 的解析：**取第 4 列（Available），按 1024 换算成字节**。
+    ///
+    /// 判别力（两个方向都会红）：取错列（例如第 2 列的 1024-blocks）会得到另一个数；
+    /// 忘了乘 1024 会差 1024 倍。
+    #[cfg(unix)]
+    #[test]
+    fn df_available_column_is_read_in_kib_and_scaled_to_bytes() {
+        let mac = "Filesystem   1024-blocks      Used Available Capacity iused      ifree %iused  Mounted on\n\
+                   /dev/disk3s5  971350584  505729716 465620868    53%  3410860 4294967295    1%   /System/Volumes/Data\n";
+        assert_eq!(
+            available_bytes_from_df(mac).unwrap(),
+            465_620_868u64 * 1024,
+            "macOS 那一行取的是 Available（第 4 列），不是 Used、也不是 1024-blocks"
+        );
+
+        let linux = "Filesystem     1K-blocks     Used Available Use% Mounted on\n\
+                     /dev/sda1       103080896 51540448  46308352  53% /\n";
+        assert_eq!(
+            available_bytes_from_df(linux).unwrap(),
+            46_308_352u64 * 1024,
+            "Linux 那一行同理：第 4 列 × 1024"
+        );
+    }
+
+    /// 解析不出来的 `df` 输出**必须是一个错误**，不许当成 0、也不许编一个数出来。
+    ///
+    /// ⚠️ 这条承重，两个方向都有后果：返回 0 会让**每一次** `enqueue` 都被判成
+    ///    "磁盘剩余空间不足"（下载彻底用不了）；而"编一个够大的数"会让这条检查
+    ///    形同虚设。两种都必须红。
+    #[cfg(unix)]
+    #[test]
+    fn a_malformed_df_output_is_an_error_not_a_number() {
+        assert!(available_bytes_from_df("").is_err(), "空输出必须报错");
+        assert!(
+            available_bytes_from_df("only one line\n").is_err(),
+            "没有数据行必须报错"
+        );
+        assert!(
+            available_bytes_from_df("hdr\n/dev/sda1 100 200\n").is_err(),
+            "列数不够必须报错"
+        );
+        assert!(
+            available_bytes_from_df("hdr\n/dev/sda1 100 200 abc 53% /\n").is_err(),
+            "可用那一列不是数字必须报错（不许当成 0）"
+        );
+    }
+
+    /// **Windows 上不许依赖任何外部程序**（2026-10-08 那条客户报障的回归判据）。
+    ///
+    /// 报障原文是「无法读取磁盘剩余空间（df 不可用）：**program not found**」——
+    /// 那台机器上没有 `df`，于是**每一次点下载**都在开工前检查这一步失败。
+    ///
+    /// ⚠️ **本机（macOS）跑不到这一条**，这是**如实记账**、不是"验过了"：
+    ///    它只在真 Windows 的测试套件里执行。开发机上能证的只有"Windows 靶编得过"
+    ///    （`cargo build --target x86_64-pc-windows-gnu`），以及下面那条源码级判据。
+    #[cfg(windows)]
+    #[test]
+    fn free_bytes_works_without_any_external_program() {
+        let dir = std::env::temp_dir();
+        let n = free_bytes(&dir).expect("Windows 上必须能取到磁盘剩余空间（不许再依赖 df）");
+        assert!(n > 0, "可用空间应当是正数，实际 {n}");
+    }
+
+    /// **源码级判据：`free_bytes` 必须有 Windows 那一支，且那一支不许起外部进程。**
+    ///
+    /// ⚠️ 为什么要有它：上一条（真行为）**只在 Windows 上跑**，而这条缺陷恰恰是
+    ///    "在 macOS 上永远看不见"的那一类 —— 所以本机需要一条**够得着源码**的判据。
+    ///    `include_str!` 的手法在本仓有先例（`windows/shell-core/src/diagnostics.rs`
+    ///    用它钉住两份 logger 的共享常量）。
+    ///
+    /// 判别力：把 `#[cfg(windows)]` 从 `free_bytes` 上摘掉、或让 Windows 那一支
+    /// 重新写上 `Command::new("df")`，这条立刻红。
+    #[test]
+    fn free_bytes_has_a_windows_arm_that_shells_out_to_nothing() {
+        let src = include_str!("kernel.rs");
+
+        // ① 两支都在：Unix 那支起 `df`，Windows 那支调系统 API。
+        assert!(
+            src.contains("#[cfg(unix)]\nfn free_bytes("),
+            "Unix 那一支不见了（`df` 那条路）"
+        );
+        assert!(
+            src.contains("#[cfg(windows)]\nfn free_bytes("),
+            "Windows 那一支不见了 —— 那正是 2026-10-08 客户报的「df 不可用」"
+        );
+        assert!(
+            src.contains("GetDiskFreeSpaceExW"),
+            "Windows 那一支必须走 `GetDiskFreeSpaceExW`（不新增依赖的系统入口）"
+        );
+
+        // ② Windows 那一支里**不许**再出现起外部进程的写法。
+        let win_arm = src
+            .split("#[cfg(windows)]\nfn free_bytes(")
+            .nth(1)
+            .expect("Windows 那一支的正文");
+        let win_body = &win_arm[..win_arm.find("\n}\n").map_or(win_arm.len(), |i| i + 2)];
+        assert!(
+            !win_body.contains("Command::new"),
+            "Windows 那一支里又出现了起外部进程的写法：{}",
+            win_body
+        );
+        assert!(
+            !win_body.contains("\"df\""),
+            "Windows 那一支里又出现了 `df`"
         );
     }
 }
