@@ -16,6 +16,39 @@ use super::status::{parse_num, RawTask};
 /// 单次 RPC 的超时。对应 Go 的 `&http.Client{Timeout: 10 * time.Second}`。
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// **`tellActive` / `tellWaiting` / `tellStopped` 的 `keys` 白名单**（2026-10-08）。
+///
+/// 恰好是 [`RawTask`] 反序列化时会读的那些键 —— 一个不多、一个不少。
+/// 判据是 `the_keys_whitelist_matches_what_raw_task_reads`：它把一个**每个字段都非默认**
+/// 的 `RawTask` 序列化出来，断言白名单与那份 JSON 的键集合**逐字相同**
+/// ⇒ 给 `RawTask` 加字段而忘了加到这里，那条立刻红（少了键的表现是
+/// **静默落空成 `0` / `""`**，也就是本项目已经栽过一次的"没有下载进度"那个形状）。
+///
+/// ⚠️ **为什么要传它**：不传时 aria2 为每个任务返回**全部字段**，其中 `files[]`
+///    （每个分片的 uri / 路径 / 已完成字节）是响应里的大头 —— 而内核一个字节都不读。
+///    一份真机日志（677 个任务的批次）里，`tell*` 的中位耗时 **600–2500 ms**、
+///    最大 9940 ms；连只回几个数字的 `getGlobalStat` 也中位 **912 ms**。
+///    aria2 只有一条事件循环，那几次巨大的序列化把它占住 ⇒ 同循环里所有请求一起等
+///    ⇒ 撞满 `RPC_TIMEOUT` ⇒ 内核判「引擎已断开」。**这一条是那件事的一半。**
+const TASK_KEYS: [&str; 7] = [
+    "gid",
+    "status",
+    "totalLength",
+    "completedLength",
+    "downloadSpeed",
+    "connections",
+    "errorMessage",
+];
+
+/// `tellWaiting` / `tellStopped` 一次拉多少条。
+///
+/// ⚠️ **沿用 Go 的 1000，本轮不动它**：它决定传输列表里能看到多少条"已完成"，
+///    改小是**行为变更**（界面少显示几条），得单独评估 —— 不该混在"只改传输形状"
+///    的这一轮里。真要收，正确的路子是让计数走 `getGlobalStat` 的
+///    `numStopped` / `numWaiting` / `numActive`（那几个数字本来就在同一次快照里取了），
+///    而列表只拉界面当前要显示的那一页。
+const TELL_RANGE: u64 = 1000;
+
 /// 一次 RPC 的失败。
 ///
 /// `transport` 为真表示**传输层**失败（连不上 / 读到超时 / 半路断开）——**只有这一类**
@@ -466,17 +499,41 @@ impl RpcClient {
         // 顺序逐字照 Go：active → waiting → stopped。见本方法的文档注释——
         // 这是契约 §1.2 的前提，不是随手排的。
         let mut out: Vec<RawTask> = Vec::new();
+        // 🔴 **只问用得上的那七个键**（2026-10-08）。
+        //
+        // 不传 `keys` 时 aria2 会为**每个任务**返回**全部字段** —— 含 `files[]`
+        // （每个分片的 uri / 路径 / 已完成字节）、`bittorrent`、`uris`、时间戳……
+        // 而 `RawTask` 只读七个（见 [`TASK_KEYS`] 的文档）。
+        //
+        // ⚠️ **这不是"省点流量"**：一份真机诊断日志（677 个任务的批次）里，
+        //    `tell*` 的中位耗时是 **600–2500 ms**、最大 9940 ms，而
+        //    `getGlobalStat`（只回几个数字）也中位 **912 ms**、最大 9805 ms ——
+        //    **aria2 只有一条事件循环**，那几次巨大的序列化把它占住，
+        //    排在同一循环里的所有请求（包括那几次只有几个数字的）一起等
+        //    ⇒ 撞满 10 秒的 `RPC_TIMEOUT` ⇒ 内核判「引擎已断开」。
+        //    整场 41% 的调用失败、`transfer_list` 撞壳的 30 秒超时。
+        let keys = serde_json::Value::Array(
+            TASK_KEYS
+                .iter()
+                .map(|k| serde_json::Value::from(*k))
+                .collect(),
+        );
         for (method, with_range) in [
             ("aria2.tellActive", false),
             ("aria2.tellWaiting", true),
             ("aria2.tellStopped", true),
         ] {
-            // `tellActive` 只收一个可选的 keys 数组，不收 [offset, num]；另两个要。
+            // `tellActive` 只收一个可选的 keys 数组，不收 [offset, num]；另两个要
+            // （`tellWaiting(offset, num, keys)` / `tellStopped(offset, num, keys)`）。
             // （Go 里就是 `if m != "aria2.tellActive"` 这一句的效果。）
             let params: Vec<serde_json::Value> = if with_range {
-                vec![serde_json::Value::from(0), serde_json::Value::from(1000)]
+                vec![
+                    serde_json::Value::from(0),
+                    serde_json::Value::from(TELL_RANGE),
+                    keys.clone(),
+                ]
             } else {
-                Vec::new()
+                vec![keys.clone()]
             };
             // 第一次出错就返回：不跑完剩下的子请求（契约 §4.3 的代价论证）。
             let raw = self.call(method, &params)?;
@@ -953,18 +1010,41 @@ mod tests {
                 (m, p.len())
             })
             .collect();
+        // ⚠️ **参数个数在 2026-10-08 各 +1**：末尾多了一个 **keys 白名单数组**。
+        //    少了它的表现**不是报错**，而是每次快照都要 aria2 为**每个任务**返回
+        //    **全部字段**（`files[]` 是响应里的大头）—— 一份真机日志（677 个任务的批次）里
+        //    `tell*` 中位 600–2500 ms、最大 9940 ms，连只回几个数字的 `getGlobalStat`
+        //    也中位 912 ms（aria2 只有一条事件循环，被那几次序列化占住了），
+        //    最后一起撞满 `RPC_TIMEOUT` ⇒ 内核判「引擎已断开」。
         assert_eq!(
             calls,
             vec![
-                ("aria2.tellActive".to_string(), 1),
-                ("aria2.tellWaiting".to_string(), 3),
-                ("aria2.tellStopped".to_string(), 3),
+                ("aria2.tellActive".to_string(), 2),
+                ("aria2.tellWaiting".to_string(), 4),
+                ("aria2.tellStopped".to_string(), 4),
             ],
-            "方法名与参数形状（Go 里只有 tellActive 不带 [offset, num]）"
+            "方法名与参数形状（只有 tellActive 不带 [offset, num]；三个都要带 keys）"
         );
         let (_, waiting) = method_and_params(&srv.requests()[1].body);
         assert_eq!(waiting[1], json!(0), "tellWaiting 的 offset 应是 0");
         assert_eq!(waiting[2], json!(1000), "tellWaiting 的 num 应是 1000");
+        // **只数个数不够**：传一个空数组同样过上面那条，而那等于"不传 keys"、
+        // 也就是每次快照都拉全字段。三个请求的 keys 内容都要**逐字**对上白名单。
+        let mut want: Vec<String> = TASK_KEYS.iter().map(|k| (*k).to_string()).collect();
+        want.sort();
+        for r in srv.requests() {
+            let (method, p) = method_and_params(&r.body);
+            let keys = p
+                .last()
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("{method} 的最后一个参数必须是 keys 数组"));
+            let mut got: Vec<String> = keys
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            got.sort();
+            assert_eq!(got, want, "{method} 的 keys 白名单不对（空数组 = 不传 = 拉全字段）");
+        }
     }
 
     /// `list` 第一次出错就返回，**不**跑完剩下的子请求。
@@ -1670,5 +1750,64 @@ mod tests {
                  这个 agent 必须显式 .timeout_connect(RPC_TIMEOUT)"
             );
         }
+    }
+
+    /// **`keys` 白名单必须与 `RawTask` 真正读的字段逐字相同**（2026-10-08）。
+    ///
+    /// 判别力（三个方向都会红）：
+    ///   · 白名单**少一个**键 ⇒ 那个字段永远读不回来，**静默落空成 `0` / `""`** ——
+    ///     本项目栽过一次的形状（`RawTask` 缺 `camelCase` 重命名 ⇒ 客户报"没有下载进度"）；
+    ///   · 白名单**多一个** ⇒ 白问一次，它就不再等于"真正用得上的那组"；
+    ///   · 给 `RawTask` **加了字段**而忘了加进白名单 ⇒ 等于少一个键。
+    ///
+    /// ⚠️ 为什么从**源码**里取字段名：`RawTask` 只 derive 了 `Deserialize`
+    ///    （序列化不出来），而"它有哪些字段"这件事只有在源码里是权威的。
+    ///    手法与 `commands.rs` 那条"会阻塞的命令不许开在主线程上"同源：够不着运行时的
+    ///    不变量，就用源码本身当判据 —— 并且**明确写出它够不着什么**。
+    #[test]
+    fn the_keys_whitelist_matches_what_raw_task_reads() {
+        let src = include_str!("status.rs");
+        let start = src.find("pub struct RawTask {").expect("RawTask 不见了");
+        let end = start + src[start..].find("\n}").expect("结构体没有收尾");
+        let mut got: Vec<String> = src[start..end]
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim().strip_prefix("pub ")?;
+                // ⚠️ **必须有冒号**：没有它就不是字段行。少了这一条会把
+                //    `pub struct RawTask {` 也当成一个"字段"（第一版就是这么红的）。
+                let (name, _) = t.split_once(':')?;
+                let name = name.trim();
+                (!name.is_empty()).then(|| camel(name))
+            })
+            .collect();
+        let mut want: Vec<String> = TASK_KEYS.iter().map(|k| (*k).to_string()).collect();
+        got.sort();
+        want.sort();
+        assert!(
+            !got.is_empty(),
+            "一个字段都没从 `status.rs` 的 RawTask 里取到 —— 这条判据的切法坏了，不是「通过」"
+        );
+        assert_eq!(
+            got, want,
+            "`keys` 白名单与 `RawTask` 的字段对不上：少了哪个键，那个字段就永远读不回来\
+             （静默落空成 0/\"\"，不报错）"
+        );
+    }
+
+    /// `snake_case` → `camelCase`（serde 的 `rename_all` 对这几个字段就是这个规则）。
+    fn camel(s: &str) -> String {
+        let mut out = String::new();
+        let mut upper_next = false;
+        for c in s.chars() {
+            if c == '_' {
+                upper_next = true;
+            } else if upper_next {
+                out.extend(c.to_uppercase());
+                upper_next = false;
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 }

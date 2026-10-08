@@ -18,6 +18,13 @@ dist_cli/
 extract_tools/build/
 extract_tools/dist_linux/
 
+# ⚠️ 上面那条排除还带来一个连带后果：开发仓里 `extract_tools/数据包解压工具.exe`
+#    是一条指向 `dist_linux/` 的**符号链接**（开发仓的 dist_linux/ 是入库的，所以那边能解析）。
+#    这边 dist_linux/ 不入库 ⇒ 同步过来之后它是一条**悬空链接**。
+#    不忽略它的话，每次 `git add -A` 都会把它加进来（0.2.3 那次就误加了一次、当场撤掉），
+#    而它对这边的使用者没有任何意义。`extract_tools/` 里真正的交付物是那几个源文件与脚本。
+extract_tools/数据包解压工具.exe
+
 # Rust
 target/
 

@@ -1634,14 +1634,39 @@ pub fn op_enqueue(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, 
         resolve_targets(&m, &raw)?
     };
 
+    // 🔴 **分段计时**（详细档，2026-10-08）。一次 `enqueue` 在真机上花过 **47 / 70 / 79 秒**
+    //    （壳日志），而日志里原先只看得到"总耗时"——**钱花在哪一段读不出来**，
+    //    连着两轮排查都卡在这一格。下面每一段各记一条，下一次导出就能直接指认。
+    //    ⚠️ 只在 `verbose` 档写（`log_verbose`）：普通档多这几行是噪声。
+    //    ⚠️ 三段都记了、却都只有几十毫秒 ⇒ 时间在**上面**那一段（解析勾选面 /
+    //      `ensure_complete`），那时这三条小读数本身就是线索。
+
     // ① 开工前检查：**先于**引擎启动
     let need: i64 = targets.iter().map(|f| f.size).sum();
+    let t0 = std::time::Instant::now();
     preflight(&k.download_dir, need)?;
+    crate::diagnostics::log_verbose(
+        "enqueue_stage",
+        &[
+            ("stage", "preflight".to_string()),
+            ("n", targets.len().to_string()),
+            ("ms", t0.elapsed().as_millis().to_string()),
+        ],
+    );
 
     // ② 起引擎
+    let t1 = std::time::Instant::now();
     let daemon = k.ensure_engine()?;
+    crate::diagnostics::log_verbose(
+        "enqueue_stage",
+        &[
+            ("stage", "ensure_engine".to_string()),
+            ("ms", t1.elapsed().as_millis().to_string()),
+        ],
+    );
 
     // ③ 加任务
+    let t2 = std::time::Instant::now();
     let mut added: Vec<Value> = Vec::new();
     let mut rejected: Vec<Value> = Vec::new();
     for f in &targets {
@@ -1670,6 +1695,15 @@ pub fn op_enqueue(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, 
             "没有任何文件被加入下载：{rejected:?}"
         )));
     }
+    crate::diagnostics::log_verbose(
+        "enqueue_stage",
+        &[
+            ("stage", "add_uri".to_string()),
+            ("n", targets.len().to_string()),
+            ("ok", added.len().to_string()),
+            ("ms", t2.elapsed().as_millis().to_string()),
+        ],
+    );
     Ok(json!({"added": added, "rejected": rejected}))
 }
 
