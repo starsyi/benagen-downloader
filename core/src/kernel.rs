@@ -693,6 +693,7 @@ fn plan_off_lock(
     mut state: FileState,
     m: &Manifest,
     strict: bool,
+    fill_budget: usize,
 ) -> planner::Todo {
     let transport = UreqTransport::new();
     let mut p = Planner {
@@ -700,7 +701,75 @@ fn plan_off_lock(
         state: Some(&mut state),
         transport: &transport,
     };
-    p.plan(m, PlanOptions { strict })
+    p.plan_with_budget(m, PlanOptions { strict }, fill_budget)
+}
+
+/// **一拍最多为多少个「crc64 为空」的文件发 HEAD。**
+///
+/// 这个数是"**一拍最长能挡多久**"的预算：HEAD 每次上限 30 秒，取 8 ⇒ 最坏 4 分钟、
+/// 典型（每次几十毫秒）**不到一秒**。取更大的值不会让总时间变短（总量由文件数决定），
+/// 只会让**单拍**更长 —— 而"单拍有多长"正是客户看到的东西：壳的命令是同步的，
+/// 一拍挡住主线程多久，窗口就「未响应」多久。
+///
+/// ⚠️ 它只管**界面读路径**（`ensure_complete`）。`load_delivery` / `enqueue` 走
+/// **不限预算**那一支：那两个是客户**主动发起**的动作，语义上就是"把这一批准备齐"
+/// ——而且到那时后台那条补齐线程（[`spawn_crc_filler`]）通常已经补完了。
+const CRC_FILL_BUDGET_PER_READ: usize = 8;
+
+/// **后台补齐 crc64**：一小批一小批地把清单里空着的 crc64 从服务端补回来。
+///
+/// 为什么要有一条**后台**线程（而不是只靠界面那一拍的预算）：
+///   · 界面读路径的预算只保证"不卡"，**不保证"会走完"** —— 那一拍只有用户动一下才发生；
+///   · 补齐必须**在下载之前**完成（没补到的文件这一轮只能比大小，等于少一半校验），
+///     所以它得在"加载完"到"用户点下载"之间的那几秒里自己往前走。
+///
+/// 客户提的「少数量、多批次、逐步加载」落在**这里**：每拍 8 个、跑完就睡。
+/// ⚠️ 界面那一侧**不需要**分批 —— 实测 3000 行全选只要 6 ms（`check_big_screen.sh`）。
+///
+/// 停的条件：**清单里再没有空 crc64** 就退回慢节拍（1 秒一次只做一次检查，不跑 plan）。
+/// 补不到的文件**每拍都会重试**（`adopt_filled_crc64` 只记成功的那些），
+/// 所以一次网络抖动不会把它钉成永久"无法校验"。
+pub fn spawn_crc_filler(kernel: Arc<Mutex<Kernel>>) {
+    std::thread::Builder::new()
+        .name("crc-filler".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(1));
+            // 锁内看一眼：还有没有等着补的？（**只读**，立刻放锁）
+            let pending = {
+                let k = kernel.lock().unwrap_or_else(PoisonError::into_inner);
+                k.manifest
+                    .as_ref()
+                    .is_some_and(|m| m.files.iter().any(|f| f.crc64.is_empty()))
+            };
+            if !pending {
+                continue;
+            }
+            fill_crc_batch(&kernel);
+        })
+        .expect("起 crc 补齐线程失败");
+}
+
+/// 跑**一拍**补齐（锁外做网络 I/O，锁内取数与装结果）。
+///
+/// ⚠️ 与 [`ensure_complete`] 分开写、而不是复用它：那一条是**按需**触发的
+/// （`complete_dirty` 门控），而这一条是**推进**用的 —— 它不等任何人的信号，
+/// 只要还有空着的 crc64 就往前走。把两者并成一个函数，会让"谁在推动"这件事读不出来。
+fn fill_crc_batch(kernel: &Arc<Mutex<Kernel>>) {
+    let work = {
+        let mut k = lock(kernel);
+        match k.manifest.clone() {
+            Some(m) => (k.plan_inputs(&m), m),
+            None => return,
+        }
+    };
+    let (dir, state) = work.0;
+    let todo = plan_off_lock(dir, state, &work.1, false, CRC_FILL_BUDGET_PER_READ);
+    let mut k = lock(kernel);
+    adopt_filled_crc64(&mut k, &todo);
+    // 这一拍补到了东西 ⇒ `complete` 就该重算（否则界面要等到下一次 `complete_dirty`
+    // 才看得到"这几个已经能校验了"）。
+    k.complete = complete_from(&todo);
+    k.complete_dirty = false;
 }
 
 /// 若 `complete` 已过期，**在锁外**重算它。
@@ -738,8 +807,55 @@ fn ensure_complete(kernel: &Arc<Mutex<Kernel>>) {
         }
     };
     let (dir, state) = work.0;
-    let todo = plan_off_lock(dir, state, &work.1, false);
-    lock(kernel).complete = complete_from(&todo);
+    // 🔴 **带预算**（见 `CRC_FILL_BUDGET_PER_READ`）：这一条挂在**界面读路径**上
+    //（`list_dir` / `get_tree` / `enqueue` 都会走它），所以它**不许**为了一批文件的 HEAD
+    // 把壳的主线程挡上几分钟。没补到的交给 `spawn_crc_filler` 下一拍接着补。
+    let todo = plan_off_lock(dir, state, &work.1, false, CRC_FILL_BUDGET_PER_READ);
+    let mut k = lock(kernel);
+    // 🔴 **把这一轮从服务端补到的 crc64 写回清单**（2026-10-08）。
+    //
+    // 少了这一步，`plan` 补到的值**只活在那份克隆上**（`planner.rs` 的补齐那一段对
+    // `f.clone()` 动的手）—— 清单本身一个字节没变 ⇒ 下一次 `complete_dirty` 再跑 plan 时，
+    // **同一批文件又得重问一遍服务器**。
+    //
+    // ⚠️ **而 `complete_dirty` 在每一批校验结果写回之后都会被置起**（本文件上方那个
+    //    校验工作线程的收尾）：一次大下载里它会反复变真 ⇒ 「每次勾选/全选 ⇒ `get_tree`
+    //    ⇒ `ensure_complete` ⇒ 全量 plan ⇒ N 次 HEAD」会**反复发生**，代价 ∝ 文件数。
+    //    壳的每一个命令都是**同步**的（Tauri 的 `ResponseTag::block` 就在收 IPC 的那条
+    //    线程上回），而 IPC 走主线程 ⇒ 这一串的直接表现是**窗口「未响应」**。
+    //    N=10 就已经是 5 分钟以上（`plan_off_lock` 的文档里写着这条账）。
+    //
+    // ⚠️ **只写成功的那些**：补不到的（`crc64` 仍为空）**故意不写**——那是一句"这次没问到"，
+    //    换一批校验结果之后就是一次新的机会。把失败也缓存下来，等于把一次网络抖动
+    //    **钉成永久"无法校验"**（那会让客户在盘上明明有数据的情况下被判成 `unverifiable`）。
+    adopt_filled_crc64(&mut k, &todo);
+    k.complete = complete_from(&todo);
+}
+
+/// 把本轮 `plan` 从服务端补到的 crc64 **写回清单** —— 下一次规划不再为同一批文件重发 HEAD。
+///
+/// 纯记账：不做判定、不碰 `complete`（那是 [`complete_from`] 的事）。
+/// 复杂度 O(N log N)：先把补到的收成一张表，再扫一遍清单，**不是**对每个文件线性扫清单。
+fn adopt_filled_crc64(k: &mut Kernel, todo: &planner::Todo) {
+    let filled: std::collections::BTreeMap<&str, &str> = todo
+        .items
+        .iter()
+        .filter(|i| !i.file.crc64.is_empty())
+        .map(|i| (i.file.path.as_str(), i.file.crc64.as_str()))
+        .collect();
+    if filled.is_empty() {
+        return; // 这一轮一个都没补到：什么都不用做（下次照常重试）
+    }
+    let Some(m) = k.manifest.as_mut() else {
+        return;
+    };
+    for f in &mut m.files {
+        if f.crc64.is_empty() {
+            if let Some(c) = filled.get(f.path.as_str()) {
+                f.crc64 = (*c).to_string();
+            }
+        }
+    }
 }
 
 /// **廉价的磁盘核对**（阶段 D 任务 A）：把 `k.complete` 里"盘上**现在**已经不满足
@@ -981,11 +1097,23 @@ pub fn op_load_delivery(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<V
     };
 
     // ── 锁外 ④：全量 plan（最坏 30 秒 × N）──────────────────────────
-    let todo = plan_off_lock(dir, state, &m, false);
+    // ⚠️ **不限预算**（`usize::MAX`）：加载是客户**主动发起**的动作，语义就是"把这一批
+    //    准备齐"。这里的 N 次 HEAD 是**一次性的**，而且到这一刻后台那条补齐线程
+    //    通常已经补完了（它从上一批加载完就开始跑）—— 补完了这里就是 0 次。
+    let todo = plan_off_lock(dir, state, &m, false, usize::MAX);
 
     // ── 锁内 ③（短）：装 `complete` 并出树 ────────────────────────────
     let mut k = lock(kernel);
+    // 🔴 **这一趟补到的 crc64 必须写回清单**（2026-10-08）：不写回去，它只活在 `plan`
+    // 内部那份克隆上 —— 而 `complete_dirty` 会在**每一批校验结果写回之后**被置起
+    // ⇒ 紧接着的每一次 `get_tree`/`list_dir`/`enqueue` 都会把**同一批文件的 HEAD
+    // 全部重发一遍**，代价 ∝ 文件数（N=10 就已 5 分钟以上）。壳的命令是**同步**的
+    // （Tauri 在收 IPC 的那条线程上跑完才回，IPC 走主线程）⇒ 客户看到的是窗口「未响应」。
+    adopt_filled_crc64(&mut k, &todo);
     k.complete = complete_from(&todo);
+    // ⚠️ 出树仍用 `m`（plan **之前**那份克隆）是**对的**：`tree_json` 只消费
+    //    path / size / source_mtime，**一个字节的 `crc64` 都不读**（`view::build_tree`）。
+    //    两者在这一维上等价 —— 所以不必为了"看起来一致"多克隆一份清单。
     let tree = tree_json(&mut k, &m);
 
     Ok(json!({
@@ -1268,7 +1396,10 @@ pub fn op_plan(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, Err
     };
 
     // ── 锁外（长）：全量扫描 ────────────────────────────────────────
-    let todo = plan_off_lock(dir, state, &m, strict);
+    // ⚠️ **不限预算**（同 `op_load_delivery`）：点「下载」是客户主动发起的，
+    //    而 `unverifiable` 那张表是**给客户看的**（"这 N 个文件本轮只能比大小"）——
+    //    带预算会让它多出一些"其实还能补上"的条目，那是一句不该说的话。
+    let todo = plan_off_lock(dir, state, &m, strict, usize::MAX);
 
     // ── 锁内 ②（短）：非严格模式顺手刷新 `complete` ────────────────────
     let mut k = lock(kernel);
@@ -2271,5 +2402,75 @@ mod tests {
             !win_body.contains("\"df\""),
             "Windows 那一支里又出现了 `df`"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // crc64 补值必须写回清单（2026-10-08）
+    // -----------------------------------------------------------------------
+
+    /// **`plan` 从服务端补到的 crc64 必须写回清单**，否则下一轮会把同一批文件的 HEAD
+    /// 全部重发一遍。
+    ///
+    /// 为什么它值一条判据（客户报的是「文件多了就卡死/未响应」）：
+    ///   `complete_dirty` 在**每一批校验结果写回之后**都会被置起 ⇒ 一次大下载里
+    ///   「每次勾选 ⇒ `get_tree` ⇒ `ensure_complete` ⇒ 全量 plan ⇒ **每个空 crc64 文件一次
+    ///   HEAD**」会**反复发生**，代价 ∝ 文件数。而壳的命令是**同步**的（Tauri 在收 IPC 的
+    ///   那条线程上跑完才回，IPC 走主线程）⇒ 直接表现就是窗口「未响应」。
+    ///
+    /// 判别力（两个方向都会红）：
+    ///   · 把 `adopt_filled_crc64` 的调用从 `ensure_complete` 里删掉 ⇒ 第一条红
+    ///     （清单还是空的 ⇒ 下一轮重发 HEAD）；
+    ///   · 让它把**空的**也写回去（把失败也缓存）⇒ 第二条红 —— 那等于把一次网络抖动
+    ///     **钉成永久的「无法校验」**，客户盘上明明有数据却永远过不了校验。
+    #[test]
+    fn a_filled_crc64_is_written_back_into_the_manifest() {
+        let dir = TempDir::new();
+        let mut k = Kernel::new(dir.join("dl"), dir.join("settings.json"));
+        k.manifest = Some(
+            delivery::parse(
+                br#"{"code":"AbC","base_url":"http://127.0.0.1:1","files":[
+                     {"path":"t/a.bin","size":6,"crc64":""},
+                     {"path":"t/b.bin","size":7,"crc64":""},
+                     {"path":"t/c.bin","size":8,"crc64":"999"}]}"#,
+            )
+            .expect("清单应当解析成功"),
+        );
+
+        let f = |p: &str, s: i64, c: &str| delivery::File {
+            path: p.to_string(),
+            size: s,
+            crc64: c.to_string(),
+            source_mtime: String::new(),
+        };
+        // 这一轮：a 补到了、b 没补到（HEAD 失败）、c 本来就有。
+        let todo = planner::Todo {
+            items: vec![
+                planner::Item {
+                    file: f("t/a.bin", 6, "123"),
+                    kind: planner::Kind::Download,
+                },
+                planner::Item {
+                    file: f("t/b.bin", 7, ""),
+                    kind: planner::Kind::Download,
+                },
+                planner::Item {
+                    file: f("t/c.bin", 8, "999"),
+                    kind: planner::Kind::Skip,
+                },
+            ],
+            unverifiable: vec!["t/b.bin".to_string()],
+        };
+        adopt_filled_crc64(&mut k, &todo);
+
+        let m = k.manifest.as_ref().expect("清单还在");
+        assert_eq!(
+            m.files[0].crc64, "123",
+            "补到的 crc64 必须写回清单 —— 不写回去，下一轮 plan 会为同一个文件重发一次 HEAD"
+        );
+        assert_eq!(
+            m.files[1].crc64, "",
+            "**没补到的**不许缓存：那会把一次网络抖动钉成永久「无法校验」"
+        );
+        assert_eq!(m.files[2].crc64, "999", "本来就有的不许被覆盖");
     }
 }

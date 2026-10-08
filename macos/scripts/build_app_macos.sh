@@ -63,7 +63,7 @@
 #   bash macos/scripts/build_app_macos.sh                 # arm64（默认，调用形态与以前逐字相同）
 #   bash macos/scripts/build_app_macos.sh x86_64           # Intel
 #   BENAGEN_ARCH=x86_64 bash macos/scripts/build_app_macos.sh
-#   VERSION=0.2.1 bash macos/scripts/build_app_macos.sh   # 覆盖版本号
+#   VERSION=0.2.2 bash macos/scripts/build_app_macos.sh   # 覆盖版本号
 #
 # ⚠️ x86_64 那条路要求 `cargo` 解析到 **rustup 那份**（`$HOME/.cargo/bin/cargo`）：
 #       export PATH="$HOME/.cargo/bin:$PATH"
@@ -72,7 +72,7 @@
 set -euo pipefail
 
 ARCH="${1:-${BENAGEN_ARCH:-arm64}}"
-VERSION="${VERSION:-0.2.1}"
+VERSION="${VERSION:-0.2.2}"
 MIN_MACOS="${MIN_MACOS:-13.0}"
 BUNDLE_ID="com.benagen.downloader"
 BIN_NAME="BenagenDownloader"

@@ -77,6 +77,29 @@ impl<'a, T: Transport> Planner<'a, T> {
     /// ⚠️ `opt` 是**逐次**参数（对应 Go 的 `Plan(ctx, m, opt)`）：简报骨架里的签名漏写了它，
     /// 而 `Options` 若无处可传，契约 §6 许诺给客户的「严格校验」就没有入口。
     pub fn plan(&mut self, m: &Manifest, opt: Options) -> Todo {
+        self.plan_with_budget(m, opt, usize::MAX)
+    }
+
+    /// 同 [`Self::plan`]，但**本轮的 HEAD 有上界**。
+    ///
+    /// 🔴 **为什么需要这个帽子**（2026-10-08，客户报的「文件多了就卡死/未响应」）：
+    ///    补齐是**逐文件**的网络 I/O（每次上限 30 秒）。一次交付可能上千个文件，
+    ///    而不设帽子时**单个命令就会挡在那里几分钟甚至更久** —— 壳的命令又是**同步**的
+    ///    （Tauri 的 `ResponseTag::block` 就在收 IPC 的那条线程上回，而 IPC 走主线程）
+    ///    ⇒ 窗口「未响应」，客户只能强杀。
+    ///
+    ///    设了帽子之后每一拍都是**有界**的；剩下的由后台那条补齐线程
+    ///    （`Kernel` 侧的 `spawn_crc_filler`）**一批一批**接着补。这正是客户建议的
+    ///    「少数量、多批次、逐步」——只不过批次落在**核心里**，而不是界面上：
+    ///    界面那一侧实测 3000 行只要 15 ms，根本不需要分批。
+    ///
+    /// ⚠️ **预算跳过的文件不记进 `unverifiable`**：那条记录的语义是"**问了、没问到**"
+    ///    （客户会在 `enqueue` 的回执里看到它），而这是"**还没问**"。
+    ///    `enqueue` / `load_delivery` 走的是**不限预算**的入口，所以客户看到的那张表
+    ///    一个字都不受影响。
+    /// ⚠️ 预算跳过的文件与"HEAD 失败"的**处置完全一样**：`crc64` 为空 ⇒ `classify`
+    ///    判它**仍然要下载**（"本轮仅比对大小"），下一轮补到了就转正。
+    pub fn plan_with_budget(&mut self, m: &Manifest, opt: Options, fill_budget: usize) -> Todo {
         let mut todo = Todo {
             items: Vec::new(),
             unverifiable: Vec::new(),
@@ -88,10 +111,12 @@ impl<'a, T: Transport> Planner<'a, T> {
             st.bind(&m.code);
         }
 
+        let mut budget = fill_budget;
         for f in &m.files {
             // 补齐缺失的 crc64
             let mut f = f.clone();
-            if f.crc64.is_empty() {
+            if f.crc64.is_empty() && budget > 0 {
+                budget -= 1;
                 let url = m.file_url(&f.path);
                 match self.transport.head_crc64(&url) {
                     Some(crc) if !crc.is_empty() => f.crc64 = crc,
@@ -1058,6 +1083,72 @@ mod tests {
             complete.iter().cloned().collect::<Vec<_>>(),
             vec!["t/ok.txt".to_string()],
             "只有「盘上确实完好、且有状态记录作证」的那一个才该留下: {complete:?}"
+        );
+    }
+
+    /// **预算真的管住了 HEAD 的次数**（2026-10-08，客户报的「文件多了就卡死/未响应」）。
+    ///
+    /// 为什么要它：补齐是**逐文件**的网络 I/O。不设帽子时一个命令会替整批文件挡在那里
+    /// （每次上限 30 秒），而壳的命令是**同步**的（Tauri 在收 IPC 的那条线程上跑完才回，
+    /// IPC 走主线程）⇒ 窗口「未响应」。除掉帽子之后每一拍有界，剩下的交给
+    /// `Kernel::spawn_crc_filler` 一批批接着补。
+    ///
+    /// 判别力（两个方向都会红）：
+    ///   · 把 `budget > 0` 写成恒真 / 把 `budget -= 1` 删掉 ⇒ 第一条红（发了 5 次而不是 2 次）；
+    ///   · 把预算跳过的文件当成"不用下" ⇒ 第二条红 —— 那是**静默少交**，
+    ///     而 crc64 为空时的既定处置是「本轮只比大小、**仍然下载**」。
+    #[test]
+    fn the_fill_budget_bounds_how_many_heads_one_plan_makes() {
+        let stub = Stub::head("123");
+        let dir = TempDir::new();
+        let m = Manifest {
+            code: "C".to_string(),
+            base_url: STUB_BASE.to_string(),
+            created_at: String::new(),
+            expires_at: String::new(),
+            total_files: 0,
+            total_bytes: 0,
+            files: (0..5)
+                .map(|i| File {
+                    path: format!("t/f{i}"),
+                    size: 6,
+                    crc64: String::new(),
+                    source_mtime: String::new(),
+                })
+                .collect(),
+        };
+
+        let mut st = State::load(dir.path());
+        st.bind("C");
+        let mut p = Planner {
+            dir: dir.path().to_path_buf(),
+            state: Some(&mut st),
+            transport: &stub,
+        };
+        let todo = p.plan_with_budget(&m, Options { strict: false }, 2);
+
+        assert_eq!(
+            stub.head_calls(),
+            2,
+            "预算给的是 2，就只许为 2 个文件发 HEAD（多发就是「单拍没有上界」）"
+        );
+        assert_eq!(todo.items.len(), 5, "五个文件都得出结论");
+        assert_eq!(
+            todo.items.iter().filter(|i| !i.file.crc64.is_empty()).count(),
+            2,
+            "补到的正好是预算那么多"
+        );
+        assert!(
+            todo.items.iter().all(|i| i.kind == Kind::Download),
+            "预算跳过的文件**仍然要下载**（crc64 为空 ⇒ 本轮只比大小），\
+             把它们当成「不用下」就是静默少交: {:?}",
+            todo.items.iter().map(|i| (&i.file.path, i.kind)).collect::<Vec<_>>()
+        );
+        assert!(
+            todo.unverifiable.is_empty(),
+            "**还没问**的那些不记进 `unverifiable` —— 那条记录的语义是「问了、没问到」，\
+             而它会被写进 `enqueue` 的回执给客户看: {:?}",
+            todo.unverifiable
         );
     }
 }

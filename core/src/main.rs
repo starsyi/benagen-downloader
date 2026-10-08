@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use benagen_core::diagnostics;
 use benagen_core::kernel::{
-    dispatch, read_line_capped, spawn_landing_watcher, spawn_recovery, spawn_verify_worker,
-    write_line, Kernel, LineOutcome, VerifyJob,
+    dispatch, read_line_capped, spawn_crc_filler, spawn_landing_watcher, spawn_recovery,
+    spawn_verify_worker, write_line, Kernel, LineOutcome, VerifyJob,
 };
 use benagen_core::paths;
 use benagen_core::protocol;
@@ -114,6 +114,10 @@ fn main() {
     spawn_verify_worker(Arc::clone(&kernel), rx, tx.clone());
     spawn_landing_watcher(Arc::clone(&kernel), tx.clone());
     spawn_recovery(Arc::clone(&kernel));
+    // **后台分批补齐 crc64**（2026-10-08）：清单里空着的 crc64 由它一小批一小批地补，
+    // 而不是让某一个命令替整批文件挡在那里（那会把壳的主线程堵住 ⇒ 窗口「未响应」）。
+    // 细节与"为什么必须有一条后台线程"见它的文档。
+    spawn_crc_filler(Arc::clone(&kernel));
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());

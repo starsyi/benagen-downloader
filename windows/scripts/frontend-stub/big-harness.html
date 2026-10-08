@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<!--
+  big-harness.html —— **「文件多了就卡死」的复现夹具**（临时，调查用）。
+
+  跑法：bash windows/scripts/check_big_screen.sh [行数]
+  直接打开：/big-harness.html?n=3000（要先起本地静态服务）
+
+  它做什么：把**真 `index.html` + 真模块**装进 iframe，注入一个返回 **N 行**的
+  `invoke` 打桩，然后量三件事的耗时 ——
+    ① 首屏把 N 行画出来（`paintRows`）
+    ② 点「全选」那一下的**同步**部分（`currentLevelPaths()` + `paintSelection()`）
+    ③ 那一下之后到"重新画完 + 整棵树往返回来"的总时长
+
+  ⚠️ 结果走 POST（`serve.py` 的 `/__result`），与 `files-harness.html` 同一个手法：
+     本机的 Edge 在 `--dump-dom` 下会挂住，所以数字必须从浏览器里"寄"出来。
+  ⚠️ 页面卡住也要能说话：下面有看门狗，卡住时把"卡在哪一步"寄回来。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>big tree harness</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; }
+  iframe { border: 0; display: block; width: 1120px; height: 720px; }
+  #out { margin: 0; padding: 8px 12px; font: 12px/1.5 ui-monospace, Menlo, monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<iframe id="f" src="/windows/web/index.html"></iframe>
+<pre id="out">loading…</pre>
+<script type="module">
+const N = Math.max(1, parseInt(new URLSearchParams(location.search).get("n") || "3000", 10));
+const FIX = await (await fetch("/windows/scripts/frontend-stub/wire-fixtures.json")).json();
+
+// ---- 造一棵 N 行的树（字段形状逐字照 wire-fixtures.json 里那一行）------------
+const rows = [];
+for (let i = 0; i < N; i++) {
+  rows.push({
+    children_count: null,
+    detail_text: (100 + (i % 900)) + " MB",
+    icon_name: "doc",
+    kind: "File",
+    name: "sample_" + String(i).padStart(5, "0") + ".fastq.gz",
+    path: "01.RawData/sample_" + String(i).padStart(5, "0") + ".fastq.gz",
+    size: 104857600 + i,
+    source_time_text: "2026-09-01 10:00",
+    state_color: "Secondary",
+    state_label: "未下载",
+  });
+}
+const bigLevel = { ok: true, data: { breadcrumb: { code: FIX.stateLoaded.data.load.summary.code, path: "" }, rows } };
+const bigWhole = JSON.parse(JSON.stringify(FIX.treeWhole));
+bigWhole.data.selected = rows.map((r) => r.path);
+
+const calls = [];
+let treeWholeCalls = 0;
+async function invoke(cmd, args) {
+  calls.push(cmd);
+  if (cmd === "state") return FIX.stateLoaded;
+  if (cmd === "tree") {
+    const path = args && typeof args.path === "string" ? args.path : null;
+    if (path === null) { treeWholeCalls++; return bigWhole; }
+    return bigLevel;                       // "" 与任何一层：都给这 N 行
+  }
+  if (cmd === "enqueue") return FIX.enqueueNothing;
+  return { ok: true, data: {} };
+}
+
+const lines = [];
+let ok = 0, fail = 0;
+function log(s) { lines.push(s); document.getElementById("out").textContent = lines.join("\n"); }
+/**
+ * 判据。**界限给得很松**（比实测宽两个数量级）——它守的**不是**"够快"，
+ * 而是"**有人把这一屏写成随行数超线性的**"：实测 3000 行的同步部分是 **5 ms**，
+ * 下面那条 2000 ms 的线要写坏 400 倍才够得着（O(N²) 的重绘在 N=3000 上必过线）。
+ * ⚠️ 给紧了的后果是它在慢机器上随机红，而随机红的判据会被所有人忽略 —— 比没有更糟。
+ */
+function check(name, cond, detail) {
+  if (cond) { ok++; lines.push("PASS " + name + (detail ? " — " + detail : "")); }
+  else { fail++; lines.push("FAIL " + name + (detail ? " — " + detail : "")); }
+  document.getElementById("out").textContent = lines.join("\n");
+}
+let reported = false;
+async function report(tag) {
+  if (reported) return;
+  reported = true;
+  try {
+    await fetch("/__result", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ scenario: "big", n: N, tag, ok, fail, lines }),
+    });
+  } catch (e) { console.error("POST 失败", e); }
+}
+// 看门狗：页面卡住时至少说出卡在哪一步。
+const started = Date.now();
+setTimeout(() => { if (!reported) { log("WATCHDOG 90s 未跑完"); void report("watchdog"); } }, 90000);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const doc = () => document.getElementById("f").contentDocument;
+const rowsOf = () => [...doc().querySelectorAll(".files__row")];
+const frames = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+document.getElementById("f").addEventListener("load", (e) => {
+  e.target.contentWindow.__TAURI__ = { core: { invoke } };
+  void run();
+});
+
+async function run() {
+  try {
+    // ---- 等首屏把行画出来（这一步本身也是被量的一部分）----------------------
+    const tMount = Date.now();
+    let painted = 0;
+    for (let i = 0; i < 600; i++) {                 // 最多等 60 s
+      painted = rowsOf().length;
+      if (painted >= N) break;
+      await sleep(100);
+    }
+    const tPaintRows = Date.now() - tMount;
+    log(`① 首屏画出 ${painted}/${N} 行：${tPaintRows} ms`);
+    if (painted < N) { log("首屏没画全 ⇒ 后面的读数不作数"); await report("paint-incomplete"); return; }
+
+    // ---- 点「全选」--------------------------------------------------------
+    const btn = doc().getElementById("files-bar-select-all");
+    if (!btn) { log("找不到 #files-bar-select-all"); await report("no-button"); return; }
+
+    const t0 = performance.now();
+    const before = treeWholeCalls;                   // ⚠️ 必须在点之前采：那一拍是微任务链，
+    btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    const t1 = performance.now();                   // 点这一下的**同步**部分
+    await frames();
+    const t2 = performance.now();                   // 到浏览器真的重绘完
+    log(`② 点「全选」同步部分：${(t1 - t0).toFixed(1)} ms`);
+    log(`③ 到重绘完（含两帧）：${(t2 - t0).toFixed(1)} ms`);
+    check(
+      "「全选」的同步部分不随行数超线性（<2000ms；实测 3000 行约 5ms）",
+      (t1 - t0) < 2000,
+      `N=${N}，${(t1 - t0).toFixed(1)} ms`
+    );
+    check(
+      "「全选」之后的重绘不随行数超线性（<3000ms）",
+      (t2 - t0) < 3000,
+      `N=${N}，${(t2 - t0).toFixed(1)} ms`
+    );
+
+    // ---- 等"整棵树"那一次往返回来（refreshSummary 的尾巴）------------------
+    const t3 = Date.now();
+    for (let i = 0; i < 600; i++) {
+      if (treeWholeCalls > before) break;
+      await sleep(50);
+    }
+    await sleep(500);                                // 让它把回执画完
+    log(`④ 点完之后"整棵树"往返次数：${treeWholeCalls - before}，等它回来用了 ${Date.now() - t3} ms`);
+
+    // ---- 勾选面确实生效了吗 -------------------------------------------------
+    const checked = rowsOf().filter((r) => r.querySelector(".files__cb").classList.contains("is-checked")).length;
+    log(`⑤ 行上画着已勾选的：${checked}/${N}`);
+    check("全选之后每一行都画着已勾选", checked === N, `${checked}/${N}`);
+
+    // ---- 再来一次「全不选」当对照（同一数量级的另一拍）---------------------
+    const none = doc().getElementById("files-bar-select-none");
+    if (none) {
+      const u0 = performance.now();
+      none.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      const u1 = performance.now();
+      await frames();
+      log(`⑥ 「全不选」同步部分：${(u1 - u0).toFixed(1)} ms，到重绘完 ${(performance.now() - u0).toFixed(1)} ms`);
+    }
+    log(`总耗时：${Date.now() - started} ms；invoke 调用分布：${JSON.stringify(calls.reduce((a, c) => (a[c] = (a[c] || 0) + 1, a), {}))}`);
+    await report("done");
+  } catch (error) {
+    log("ABORT：" + (error && error.message ? error.message : error));
+    await report("error");
+  }
+}
+</script>
+</body>
+</html>

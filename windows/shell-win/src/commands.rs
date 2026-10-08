@@ -151,7 +151,7 @@ pub fn invoke_handler<R: tauri::Runtime>(
 ///
 /// ⚠️ **它必须在前端第一屏就答得出来**：还没有内核时也一样（那是这条命令的常态，
 ///    不是错误分支）—— 页面的引擎横幅、加载态、诊断区全靠它。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn state(app: tauri::State<'_, Shell>) -> Value {
     let view = app.session.view();
     // ⚠️ 第二个实参是 `view.handshake_reply` 的**那一份**（计划任务 7 的调用点逐字）：
@@ -169,7 +169,7 @@ pub fn state(app: tauri::State<'_, Shell>) -> Value {
 ///    超限的请求内核**不报错**，它只把客户端**静默堵死**（`core/src/main.rs` 的行长上限
 ///    与 `CoreClient` 的 FIFO 队列，见 `DeliveryCodeEntry::MAXIMUM_BYTES` 的文档）。
 ///    判据只有 `DeliveryCodeEntry` 那一份 —— 本层不重写一遍长度判断。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn load(app: tauri::State<'_, Shell>, code: String, base_url: Option<String>) -> Value {
     // ⚠️ 前端不传 `base_url` 时它是 `None`（"高级：自定义下载地址"那一格没填）⇒ 空串，
     //    与第二代 `body.get("base_url").and_then(as_str).unwrap_or("")` 逐字同义。
@@ -230,7 +230,7 @@ pub fn retry(app: tauri::State<'_, Shell>) -> Value {
 ///
 /// 仍然是那一次 `get_tree`（`selection` 只参与**回执怎么算**，不参与请求怎么发）——
 /// 于是它既不额外增加一次内核往返，也不给这一支添一条新的失败路径。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn tree(
     app: tauri::State<'_, Shell>,
     path: Option<String>,
@@ -398,7 +398,7 @@ fn whole_tree(
 ///    函数体里，任务 16 要补的两条用例（"勾选面 == 全集 ⇒ 交给内核的是空数组"、
 ///    "大批次不会把请求撑爆"）**一条都写不出来** —— `kernel.rs` / `session.rs` 里那些
 ///    既有用例都够不到 `State`。拆出来的那一层收同样的东西（`&Session` + 裸 `paths`）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn enqueue(app: tauri::State<'_, Shell>, paths: Vec<String>) -> Value {
     enqueue_with(&app.session, paths)
 }
@@ -491,7 +491,7 @@ fn kernel_paths(batch: &LoadState, selection: &[String]) -> Vec<String> {
 ///
 /// ⚠️ 前端按 **200 ms** 轮询它（`TransferListPoll::INTERVAL_NANOSECONDS`），
 ///    而闸门是 `state().allows_requests`（`EngineGate`，规格 §3.5）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn transfers(app: tauri::State<'_, Shell>) -> Value {
     let Some(client) = app.session.client() else {
         return api::envelope::err(api::NO_KERNEL);
@@ -549,7 +549,7 @@ pub fn transfers(app: tauri::State<'_, Shell>) -> Value {
 /// 校验结果（规格 §3.4 第七行，对齐第二代 `GET /api/verify`）。
 ///
 /// ⚠️ 前端**只在校验页可见时**按 1 s 轮询它（规格 §3.5），否则一发都不发。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn verify(app: tauri::State<'_, Shell>) -> Value {
     let Some(client) = app.session.client() else {
         return api::envelope::err(api::NO_KERNEL);
@@ -607,7 +607,7 @@ pub fn verify(app: tauri::State<'_, Shell>) -> Value {
 ///    内核的 `op_task_action` 走的是 `require_engine_for_action`（它过了才回 `ok`）
 ///    ⇒ 这不是猜测，是内核的结论。少了这一行，引擎徽标会停在「引擎未启动」，
 ///    而**没有任何东西会变红**（图标与文案都是既有判据算的，只是输入那一格过期了）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn task_action(
     app: tauri::State<'_, Shell>,
     action: TaskAction,
@@ -686,7 +686,7 @@ pub fn reveal(path: Option<String>) -> Value {
 ///    手改过 `settings.json` 时两边会分叉，而**没有任何东西会变红**）。
 ///    `-k` 的候选集合是个例外 —— 它在**握手的回执**里（`get_settings` 不回它），
 ///    由 `api::settings::payload` 从 `SessionView.handshake_reply` 那一格解析。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn settings_get(app: tauri::State<'_, Shell>) -> Value {
     let Some(client) = app.session.client() else {
         return api::envelope::err(api::NO_KERNEL);
@@ -719,7 +719,7 @@ pub fn settings_get(app: tauri::State<'_, Shell>) -> Value {
 ///    例如 `-k` 的 `"21m"` 会被归一成 `"21M"`）—— 与 `settings_get` **同一个形状**，
 ///    前端只有一条渲染路径。⚠️ 让它回读一次（再发一条 `get_settings`）是多余的：
 ///    内核这条响应本身就是"现在生效的那一份"。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn settings_set(app: tauri::State<'_, Shell>, settings: Settings) -> Value {
     let Some(client) = app.session.client() else {
         return api::envelope::err(api::NO_KERNEL);
@@ -960,7 +960,7 @@ fn owner_hwnd<R: tauri::Runtime>(_window: &tauri::WebviewWindow<R>) -> *mut std:
 ///   ④ 回执是 `DownloadDirChange` 那四格里的一个 —— **成句在 `api::preferences` 里**，
 ///      本文件一个字都不自己写。⚠️ 失败那一支**不撤销**已经落盘的偏好：
 ///      那是用户的选择，下次启动仍然按它起内核（与 macOS 同一条）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn preferences_set(app: tauri::State<'_, Shell>, dir: String) -> Value {
     let path = match preferences_path() {
         Ok(path) => path,
@@ -1019,7 +1019,7 @@ pub fn preferences_set(app: tauri::State<'_, Shell>, dir: String) -> Value {
 /// **同一组四格**，前端只有一条渲染路径）。但**那三句话没有复用**：
 /// `DownloadDirChange` 的三句把主词写死成"下载目录"，拿它来报一次勾选框的改动
 /// 会让用户在常驻回执上读到一句**假话**。理由写在那个类型的文档里。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn verbose_logging_set(app: tauri::State<'_, Shell>, on: bool) -> Value {
     let path = match preferences_path() {
         Ok(path) => path,
@@ -1889,6 +1889,119 @@ mod tests {
             super::shell_level(&on.setting_verbose_logging(false)),
             Level::Normal,
             "关回去要跟着落回普通档（只认一个方向的实现过不了这一条）"
+        );
+    }
+
+    /// **会阻塞地问内核的命令，一条都不许开在主线程上**（2026-10-08）。
+    ///
+    /// 为什么要有这条：
+    ///   Tauri 的**非 async** 命令在**收 IPC 的那条线程**上跑完才回 ——
+    ///   `tauri::ipc::ResponseTag::block` 就是 `resolver.respond(...)`，
+    ///   而 `Webview::on_message` 里**没有** spawn（都在 vendored 源码里读过）。
+    ///   而 IPC 是走**主线程**的 ⇒ 只要那条命令阻塞，窗口就「未响应」。
+    ///   客户在 0.2.1 上实测到的正是这个形状：**短暂未响应、过一会自己好** ——
+    ///   那是"跑完了"；0.2.0 那条 `df` 是"跑不完"，所以只能强杀。
+    ///
+    /// 判据：**同步（未加 `(async)`）的命令体里不许出现内核调用**。
+    ///   `#[tauri::command(async)]` 加在非 async 函数上，生成的是 `sync_threadpool`
+    ///   （`tauri-macros/src/command/wrapper.rs`：`ExecutionContext::Async
+    ///   if function.sig.asyncness.is_none()`）⇒ 函数体跑在**线程池**上、主线程空着，
+    ///   而**函数签名一个字不用改**。
+    ///   ⚠️ 真把它写成 `async fn` 是**另一回事**：带引用入参的 async 命令有硬约束
+    ///   "must return a `Result`"（同一份宏源码里的 `compile_error!`），那会动到
+    ///   21 条命令的返回类型与前端契约。
+    ///
+    /// 判别力：把任意一条的 `(async)` 摘掉 ⇒ 这条立刻红。
+    #[test]
+    fn every_command_that_talks_to_the_kernel_runs_off_the_main_thread() {
+        let src = include_str!("commands.rs");
+
+        // 逐条命令切：`#[tauri::command…]` 到下一条 `#[tauri::command` 之间就是它的体。
+        //
+        // ⚠️ **必须收紧到"顶格 + 紧跟换行 + `pub fn`"**：本文件里有好几处**在注释与
+        //    断言字符串里提到这个名字**（写这条判据的那段文字自己就提到它），
+        //    `include_str!` 会把它们一并扫进来 —— 第一版就是这么红的（27 条而不是 21 条）。
+        let mut decls: Vec<(bool, &str)> = Vec::new();
+        for (idx, _) in src.match_indices("#[tauri::command") {
+            if idx != 0 && src.as_bytes()[idx - 1] != b'\n' {
+                continue; // 不在行首 ⇒ 引用，不是声明
+            }
+            let head = &src[idx..];
+            let after = match head.strip_prefix("#[tauri::command(async)]\n") {
+                Some(rest) => (true, rest),
+                None => match head.strip_prefix("#[tauri::command]\n") {
+                    Some(rest) => (false, rest),
+                    None => continue, // 带别的参数的形态在这里不存在；真加了要一并想
+                },
+            };
+            let (is_async, after) = after;
+            let Some(rest) = after.strip_prefix("pub fn ") else {
+                continue;
+            };
+            let Some(paren) = rest.find('(') else { continue };
+            decls.push((is_async, &rest[..paren]));
+        }
+        // ⚠️ 命令数写死：改名 / 拆分 / 新增都会让"扫到了几条"这件事本身变成判据
+        //   （同 `ExitCode::ALL` 那条"数组长度是显式的"的纪律）。
+        assert_eq!(
+            decls.len(),
+            21,
+            "命令数变了（期望 21）：{decls:?} —— 新增命令时请一并想清楚它该不该开在主线程上"
+        );
+
+        let mut offenders = Vec::new();
+        let mut scanned_sync = 0;
+        for (is_async, name) in decls.iter() {
+            if *is_async {
+                continue;
+            }
+            scanned_sync += 1;
+            let start = src.find(&format!("pub fn {name}(")).expect("刚切出来的名字");
+            // ⚠️ 体的边界靠**花括号配平**，不靠"下一条命令在哪"。
+            //    第一版用的是后者，结果是**最后那一条命令的体一路罩到文件尾**，
+            //    把 `restart_kernel` 自己的定义与测试模块都算了进去（两轮红都是这么来的）。
+            let Some(brace) = src[start..].find('{') else {
+                continue;
+            };
+            let tail = &src[start + brace..];
+            let mut depth = 0usize;
+            let mut end = src.len();
+            for (off, ch) in tail.char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = start + brace + off + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let body = &src[start..end];
+            // ⚠️ **只查代码行**：注释里提到这些名字是常事（本仓的注释本来就爱点名），
+            //    把它们算进去会让这条判据变成"谁在注释里提一句就红"——那种会被绕开。
+            let code: String = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for marker in ["client()", "restart_client", "restart_kernel"] {
+                if code.contains(marker) {
+                    offenders.push(format!("{name} 里出现了 {marker}"));
+                }
+            }
+        }
+        // 空扫也算不过（万一上面的切法坏了，"一条都没扫到"会被当成通过）。
+        assert!(
+            scanned_sync > 0,
+            "一条同步命令都没扫到 —— 这条判据的切法坏了，不是「通过」"
+        );
+        assert!(
+            offenders.is_empty(),
+            "这些命令是同步的、却会阻塞地问内核 ⇒ 它们跑在主线程上，窗口会「未响应」。\
+             处置：把 `#[tauri::command]` 改成 `#[tauri::command(async)]`（签名不用动）。\n{offenders:#?}"
         );
     }
 }
