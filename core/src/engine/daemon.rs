@@ -833,6 +833,21 @@ impl Daemon {
         self.client.ping()
     }
 
+    /// 引擎子进程**是否已经退出**（收尸完成）。
+    ///
+    /// 为什么要有它（2026-10-09）：现场日志里"RPC 10 秒超时"这一个症状对应两种完全
+    /// 不同的情形 —— **进程没了**（那就该有人把它拉起来）与**进程活着但不吭声**
+    /// （那就该查它为什么卡）。两者此前在日志里**一模一样**，0.2.3 那份 9.4 小时的
+    /// 记录里 33 次「已断开」没有一次能分开。判定的那一刻顺手记下这个比特，
+    /// 下一次导出就能一眼分流。
+    ///
+    /// ⚠️ 语义是「**已经收尸**」而不是「活着」：收尸线程先清 `cmd` 槽位、再置 `done`
+    ///    （见 [`spawn_reaper`]），所以这里为 `false` 只表示"还没被回收"，
+    ///    **不**保证那个进程还能应答 —— 那正是上面要分开的第二类。
+    pub fn process_exited(&self) -> bool {
+        self.inner.done.is_done()
+    }
+
     /// 加一个下载任务，并**记下 GID → manifest 相对路径的映射**。
     ///
     /// 映射必须我们自己维护：aria2 只回 GID，它的 `files[].path` 是落盘路径
@@ -1727,6 +1742,41 @@ fn join_rel(dir: &str, out: &str) -> String {
     }
 }
 
+/// 造一个**没有子进程**的 Daemon（对应 Go 的 `&Daemon{client: ..., byGID: ...}`）。
+/// 只给"不需要真 aria2"的那些用例用（RPC 走 HTTP 桩）。
+///
+/// ⚠️ **`pub(crate)` 是有意的**（2026-10-09）：`kernel` 的用例也要造一个**可控的**引擎
+///    ——"入队到第 K 个文件时引擎开始不应答"这一格，真 aria2 死不到那么刚好，
+///    而没有它，「部分入队之后那份回执还在不在」就只能靠推演。
+///    它`#[cfg(test)]`，不进任何交付产物。
+#[cfg(test)]
+pub(crate) fn stub_daemon(
+    base_url: &str,
+    secret: &str,
+    by_gid: BTreeMap<String, String>,
+) -> Daemon {
+    let url = format!("{base_url}/jsonrpc");
+    // 一次构造出来，不要 `State::default()` 之后再逐字段赋值
+    // （clippy 的 `field_reassign_with_default` 在 `-D warnings` 下不接受那种写法）。
+    let state = State {
+        by_gid,
+        ..Default::default()
+    };
+    Daemon {
+        inner: Arc::new(Inner {
+            cmd: Mutex::new(None),
+            done: Done::new(),
+            state: Mutex::new(state),
+        }),
+        client: Arc::new(RpcClient::new(&url, secret)),
+        url,
+        // 同上：这两个字段只被测试读，告警按 D-4 保留。
+        secret: secret.to_string(),
+        argv: Vec::new(),
+        close_once: Once::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1860,31 +1910,6 @@ mod tests {
         }
     }
 
-    /// 造一个**没有子进程**的 Daemon（对应 Go 的 `&Daemon{client: ..., byGID: ...}`）。
-    /// 只给"不需要真 aria2"的那几条用（RPC 走 HTTP 桩）。
-    fn stub_daemon(base_url: &str, secret: &str, by_gid: BTreeMap<String, String>) -> Daemon {
-        let url = format!("{base_url}/jsonrpc");
-        // 一次构造出来，不要 `State::default()` 之后再逐字段赋值
-        // （clippy 的 `field_reassign_with_default` 在 `-D warnings` 下不接受那种写法）。
-        let state = State {
-            by_gid,
-            ..Default::default()
-        };
-        Daemon {
-            inner: Arc::new(Inner {
-                cmd: Mutex::new(None),
-                done: Done::new(),
-                state: Mutex::new(state),
-            }),
-            client: Arc::new(RpcClient::new(&url, secret)),
-            url,
-            // 同上：这两个字段只被测试读，告警按 D-4 保留。
-            secret: secret.to_string(),
-            argv: Vec::new(),
-            close_once: Once::new(),
-        }
-    }
-
     /// 直接问 aria2 本人：某个任务身上的选项（`aria2.getOption`）。
     ///
     /// ⚠️ 为什么在测试里手写这一趟 RPC，而不是复用 `RpcClient`：`RpcClient::call` 是
@@ -1974,6 +1999,23 @@ mod tests {
         let _g = guard(&d);
         d.close().expect("首次关闭失败");
         d.close().expect("重复关闭不应报错");
+    }
+
+    /// **判「已断开」时必须能分开「进程没了」与「进程活着但不吭声」**（2026-10-09）。
+    ///
+    /// 现场那份 0.2.3 日志（9.4 小时）里，`engine_disconnected_changed` 出现 33 次、
+    /// 每次的 `why` 都是「10 秒超时」，而**没有任何一条读数**能说明那 10 秒里 aria2 还在不在。
+    /// 两种情形要修的方向完全不同（一个是「没人把它拉起来」，一个是「它为什么卡住」）——
+    /// 所以在判定的那一刻把这个比特记下来，是下一次导出**唯一**能分开它们的东西。
+    #[test]
+    fn process_exited_tracks_the_engines_life() {
+        let dir = TempDir::new();
+        let d = Daemon::start(options(dir.path())).expect("启动失败");
+        let _g = guard(&d);
+
+        assert!(!d.process_exited(), "引擎刚起来，不该报「已退出」");
+        d.close().expect("关闭失败");
+        assert!(d.process_exited(), "Close 之后进程应已被回收");
     }
 
     /// 对应 Go `TestDaemonAddTracksGIDToPath`。

@@ -146,6 +146,44 @@ pub struct Kernel {
     engine_disconnected: bool,
 }
 
+/// 起一次引擎要用的**全部输入**（[`Kernel::engine_start`] 的产物）。
+///
+/// 存在的理由只有一个：**把"取输入"与"起引擎"拆到锁的两侧**。起引擎（含等它就绪）
+/// 是网络 I/O、`close` 一个卡死的引擎最坏十几秒 —— 那两段都不许持着内核锁跑
+/// （本仓的既有纪律，见文件头第 4 条）。所以先把输入拷出来，再在锁外起。
+struct EngineStart {
+    download_dir: PathBuf,
+    global: BTreeMap<String, String>,
+    per_task: BTreeMap<String, String>,
+}
+
+/// **锁外**：按 [`EngineStart`] 起一个引擎，并**冗余但承重**地下发一次全局选项。
+///
+/// 那次下发为什么必须在这里、且错误必须可见：`Daemon::start` 内部那一次是**看不见**的
+/// （启动路径上的错误被吞掉），这里是整条启动路径上唯一的观测点（契约 §2.6）。
+///
+/// 引擎就绪留一行**诊断**到 stderr（绝不进协议通道）：引擎出问题时，这行给出的 RPC
+/// 端点就是 `curl` 的入口。secret 不打印。
+fn start_engine_off_lock(start: EngineStart) -> Result<Arc<Daemon>, ErrorBody> {
+    let opts = DaemonOptions {
+        download_dir: start.download_dir,
+        global_opts: start.global.clone(),
+        per_task: start.per_task,
+        binary_path: None,
+        force_port: None,
+    };
+    let d = Daemon::start(opts)
+        .map_err(|e| ErrorBody::new(kcodes::ENGINE_START_FAILED, format!("启动下载引擎失败：{e}")))?;
+    d.apply_global(&start.global).map_err(|e| {
+        ErrorBody::new(
+            kcodes::ENGINE_START_FAILED,
+            format!("引擎已启动，但下发全局选项失败：{e}"),
+        )
+    })?;
+    eprintln!("benagen-core: 下载引擎已就绪（RPC {}）", d.rpc_url());
+    Ok(Arc::new(d))
+}
+
 impl Kernel {
     pub fn new(download_dir: PathBuf, settings_path: PathBuf) -> Kernel {
         let last_code_path = match settings_path.parent() {
@@ -190,6 +228,19 @@ impl Kernel {
         (self.download_dir.clone(), self.state.clone())
     }
 
+    /// **锁内（短）**：拷出起一次引擎要用的全部输入（[`EngineStart`]）。
+    ///
+    /// 纯拷贝、无 I/O —— 为的是让 [`start_engine_off_lock`] 能在锁外跑。
+    /// ⚠️ 不要图省事把 `Daemon::start` 挪进这里：那会让协议循环停摆到引擎起来为止。
+    fn engine_start(&self) -> EngineStart {
+        let global = self.settings.global_options();
+        EngineStart {
+            download_dir: self.download_dir.clone(),
+            per_task: self.settings.per_task_options(),
+            global,
+        }
+    }
+
     /// 取（必要时启动）引擎。
     ///
     /// ⚠️ **契约 §2.6**：`Daemon::start` 内部那次全局选项下发是**看不见**的
@@ -218,27 +269,7 @@ impl Kernel {
             outcome?;
             return Ok(d);
         }
-        let global = self.settings.global_options();
-        let opts = DaemonOptions {
-            download_dir: self.download_dir.clone(),
-            global_opts: global.clone(),
-            per_task: self.settings.per_task_options(),
-            binary_path: None,
-            force_port: None,
-        };
-        let d = Daemon::start(opts)
-            .map_err(|e| ErrorBody::new(kcodes::ENGINE_START_FAILED, format!("启动下载引擎失败：{e}")))?;
-        // 冗余但**承重**的一次下发：启动路径上那一次的错误没人看得到（契约 §2.6）。
-        d.apply_global(&global).map_err(|e| {
-            ErrorBody::new(
-                kcodes::ENGINE_START_FAILED,
-                format!("引擎已启动，但下发全局选项失败：{e}"),
-            )
-        })?;
-        // 引擎就绪留一行**诊断**（stderr，绝不进协议通道）：引擎出问题时，
-        // 这行给出的 RPC 端点就是 `curl` 的入口。secret 不打印。
-        eprintln!("benagen-core: 下载引擎已就绪（RPC {}）", d.rpc_url());
-        let d = Arc::new(d);
+        let d = start_engine_off_lock(self.engine_start())?;
         self.daemon = Some(Arc::clone(&d));
         // 新引擎起来了 ⇒ 一定不是断开态。走同一个口子（而不是直接赋值）是为了让
         // "`engine_disconnected` 只在 `set_engine_disconnected` 里被写"这条不变式
@@ -369,23 +400,64 @@ fn should_recover_probe(disconnected: bool, since_last_probe: Duration) -> bool 
     disconnected && since_last_probe >= RECOVERY_INTERVAL
 }
 
+/// 连续探活失败到多少次就**换掉引擎**（2026-10-09）。
+///
+/// 取值理由：一次失败的探活要耗满 `RPC_TIMEOUT`（10 秒），所以 6 次 ⇔ 大约
+/// **60 秒**的连续不应答。选 60 秒而不是 30 秒，是要留住"引擎只是**忙了一小会儿**"
+/// 这一支——把它误判成"死了"会白关一个正在下的进程，那是**客户的损失**，
+/// 比多等 30 秒严重得多。而现场那两段是 **45 与 60 分钟**，60 秒离它们远得很。
+const RECOVERY_RESTART_AFTER: u32 = 6;
+
+/// 一次断开里最多换几次引擎。
+///
+/// ⚠️ **没有这条就是无限重启循环**：新起来的引擎若照样不应答（现场那台机器上完全可能），
+/// 就会每 60 秒关一个、起一个 —— 日志被刷屏、CPU 白烧，而问题一点没动。
+/// 到顶之后只剩探活（代价是每 10 秒一次 10 秒超时，可以一直挂着），
+/// 并落一条 `engine_restart_gave_up` 把"自动手段用尽了"留在日志里。
+const RECOVERY_MAX_RESTARTS: u32 = 3;
+
+/// 该不该换引擎？纯函数，把阈值判据从线程里择出来，好在宿主上真测。
+fn should_restart_engine(consecutive_failures: u32) -> bool {
+    consecutive_failures >= RECOVERY_RESTART_AFTER
+}
+
 /// **引擎断开之后的后台自愈**（规格 §3 A3）：每 [`RECOVERY_INTERVAL`] 探一次，
 /// 探通了就把「已断开」翻回去——客户不必手点「重试」（那颗按钮会重启整个内核）。
+///
+/// 🔴 **探不通时它会换掉引擎**（2026-10-09）。此前这一支**什么都不做**，只是拿同一个
+///    句柄继续 ping —— 而现场那份 0.2.3 日志里，引擎有两段完全不 应答的时段，
+///    分别 **45 分钟与 60 分钟**，自愈每 10 秒探一次、每次都耗满 10 秒超时，
+///    **一次也没成功**。也就是说"自愈"救得了"闪一下"，救不了"卡死"。
+///    现在连续 [`RECOVERY_RESTART_AFTER`] 次探不通就 [`replace_engine`]（最多
+///    [`RECOVERY_MAX_RESTARTS`] 次，防重启循环）。
+///
+/// ⚠️ **代价要说清楚**：换引擎会把**旧引擎里那些任务一起丢掉** —— 已下载的字节在
+/// 磁盘上（`-c` 断点续传），但队列没了，客户要重新点一次「下载」。这仍然**严格优于**
+/// 今天：今天那两段是"卡 45 分钟后只能点重试，而重试重启的是整个内核"（同时还掐掉
+/// 正在下的活），换引擎只换那一个进程。把队列也一起恢复（记住上次入队的目标集）
+/// 是**另一件事**，本轮不做。
 ///
 /// ⚠️ **`daemon` 句柄每轮从锁里现取**，不当作启动参数传进来：句柄是会变的，
 ///    启动时传进来的那份会**过期**——而过期的句柄上 ping 只会永远失败，
 ///    表现为"自愈永远不生效"，**且没有任何东西会红**。
-///    （今天的写入点只有两处：`ensure_engine` 首次启动、`main()` 收尾的 `take()`
-///    ——所以这一条是**防将来**：一旦有人加上"关掉引擎重建"的路径
-///    （见 `clear_engine_batch` 上方提到而否掉的那个方案），它立刻承重。）
+///    （今天有三处写入点：`ensure_engine` 首次启动、[`replace_engine`]、`main()` 收尾的
+///    `take()` ——最后那一处正是这条纪律承重的地方。）
 ///
 /// ⚠️ **网络 I/O 在锁外**（`d.ping()` 不持 `kernel` 锁），只有翻标志那一下（连同它那条诊断）
 ///    进锁——照抄本仓既有纪律（见校验工作线程那段注释：持锁做网络 I/O 会让协议循环停摆）。
+///    [`replace_engine`] 内部同样把"收旧引擎"与"起新引擎"两段都放在锁外。
 pub fn spawn_recovery(kernel: Arc<Mutex<Kernel>>) {
     std::thread::Builder::new()
         .name("engine-recovery".to_string())
         .spawn(move || {
             let mut last = std::time::Instant::now();
+            // 本轮断开里连续探活失败了几次 / 已经换了几次引擎 / 有没有认过输。
+            // ⚠️ 两个计数都在**探通的那一刻**归零 —— "这一次断开结束了"才是归零点，
+            //    而不是"换过引擎了"：换了之后照样探不通，就该继续往阈值上数，
+            //    数满 `RECOVERY_MAX_RESTARTS` 次才认输。
+            let mut failures: u32 = 0;
+            let mut restarts: u32 = 0;
+            let mut gave_up = false;
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 // 锁里：取当前 daemon 句柄 + 问"到点了吗"，随即放锁。
@@ -403,6 +475,9 @@ pub fn spawn_recovery(kernel: Arc<Mutex<Kernel>>) {
                 last = std::time::Instant::now();
                 // 锁外探活（最坏 RPC_TIMEOUT）。
                 if d.ping().is_ok() {
+                    failures = 0;
+                    restarts = 0;
+                    gave_up = false;
                     let mut k = kernel.lock().unwrap_or_else(PoisonError::into_inner);
                     if k.engine_disconnected {
                         crate::diagnostics::log(
@@ -411,10 +486,99 @@ pub fn spawn_recovery(kernel: Arc<Mutex<Kernel>>) {
                         );
                         k.set_engine_disconnected(false, "recovery_probe");
                     }
+                    continue;
+                }
+
+                // 探不通。数一格，够了才换引擎。
+                failures += 1;
+                if !should_restart_engine(failures) {
+                    continue;
+                }
+                if restarts >= RECOVERY_MAX_RESTARTS {
+                    if !gave_up {
+                        gave_up = true;
+                        crate::diagnostics::log(
+                            "engine_restart_gave_up",
+                            &[("restarts", restarts.to_string())],
+                        );
+                    }
+                    continue;
+                }
+
+                restarts += 1;
+                // `exited` 是**这个比特**：进程没了，还是活着但不吭声。
+                // 现场那份 9.4 小时的日志里 33 次「已断开」一次都分不开这两种，
+                // 而它们要修的方向完全不同（一个是"没人把它拉起来"，一个是"它为什么卡"）。
+                crate::diagnostics::log(
+                    "engine_restart",
+                    &[
+                        ("attempt", restarts.to_string()),
+                        ("consecutive", failures.to_string()),
+                        ("exited", d.process_exited().to_string()),
+                    ],
+                );
+                match replace_engine(&kernel) {
+                    Ok(_) => {
+                        failures = 0;
+                        crate::diagnostics::log(
+                            "engine_restarted",
+                            &[("attempt", restarts.to_string())],
+                        );
+                    }
+                    Err(e) => {
+                        crate::diagnostics::log(
+                            "engine_restart_failed",
+                            &[("attempt", restarts.to_string()), ("err", e.message)],
+                        );
+                    }
                 }
             }
         })
         .expect("起自愈线程失败");
+}
+
+/// **把一个卡死的引擎换掉**：关掉旧的、起一个新的、把句柄换过去。
+///
+/// 与 `ensure_engine` 的分工：那个只在**没有句柄**时启动；这个**明知有句柄也要换**
+/// （句柄还在、端口还占着，但引擎不应答）。
+///
+/// 顺序与锁的边界都是承重的：
+///   1. **锁内（短）**：拷出走启动要用的输入、把旧句柄摘走。纯拷贝，无 I/O。
+///   2. **锁外**：`close()` 旧的。⚠️ 对一个**卡死的**引擎，`close` 最坏要
+///      `RPC_TIMEOUT`(10 s) ＋ `CLOSE_FALLBACK`(5 s) —— 持着锁做它会让协议循环
+///      整整停摆十几秒，那正是本仓反复否掉的那类写法。
+///   3. **锁外**：起新的。起不来就把旧句柄**装回去** —— 宁可退回到"断开"
+///      （自愈下一拍还会再试），也不能让内核手里没有句柄：`read_engine` 在 `None` 上
+///      回的是 `ENGINE_NOT_STARTED`（「先 enqueue 才会起引擎」），那是另一句错话。
+///
+/// ⚠️ **先收旧的、再起新的**（不是反过来）。反过来的话两个 aria2 会同时活着，
+///   而旧的只是"不应答"、不一定"没在下载"——同时写同一批文件是数据损坏级的风险。
+pub fn replace_engine(kernel: &Arc<Mutex<Kernel>>) -> Result<Arc<Daemon>, ErrorBody> {
+    let (start, old) = {
+        let mut k = lock(kernel);
+        let start = k.engine_start();
+        let old = k.take_daemon();
+        (start, old)
+    };
+    if let Some(o) = &old {
+        // 关不掉也往下走：它本来就不应答复，`close` 内部的兜底会 kill 掉它。
+        let _ = o.close();
+    }
+    match start_engine_off_lock(start) {
+        Ok(fresh) => {
+            let mut k = lock(kernel);
+            k.daemon = Some(Arc::clone(&fresh));
+            k.set_engine_disconnected(false, "engine_restarted");
+            Ok(fresh)
+        }
+        Err(e) => {
+            if let Some(o) = old {
+                let mut k = lock(kernel);
+                k.daemon = Some(o);
+            }
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,7 +1833,9 @@ pub fn op_enqueue(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, 
     let t2 = std::time::Instant::now();
     let mut added: Vec<Value> = Vec::new();
     let mut rejected: Vec<Value> = Vec::new();
-    for f in &targets {
+    // 引擎是在**第几个**文件上被判成断开的（`None` = 一路顺利）。见下面那一支的长注释。
+    let mut gave_up_at: Option<(usize, ErrorBody)> = None;
+    for (i, f) in targets.iter().enumerate() {
         // 路径守卫（契约 §3.2）；`dir`/`out` 由 manifest.path 拆出且**不得规范化**（§3.1）
         let Some(pf) = engine::new_planned_file(&m, f) else {
             rejected.push(json!({"path": f.path, "reason": "路径不安全（越界/控制字符/空段）"}));
@@ -1684,12 +1850,36 @@ pub fn op_enqueue(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, 
             Err(e) => {
                 let body = k.on_rpc_failure(&daemon, "aria2.addUri", e.clone());
                 if body.code == kcodes::ENGINE_DISCONNECTED {
-                    return Err(body);
+                    gave_up_at = Some((i, body));
+                    break;
                 }
                 rejected.push(json!({"path": f.path, "reason": e}));
             }
         }
     }
+
+    // 🔴 **引擎中途不应答：停下来，但绝不把剩下那些静默吞掉**（2026-10-09）。
+    //
+    // **为什么停下来**：剩下的每一个 `addUri` 都要烧掉一次 10 秒超时，而失败那一支
+    // （`on_rpc_failure`）还会再打一次 10 秒探活 —— 现场那份日志里剩了 90 个文件，
+    // 一路试下去就是半个多小时，而客户眼前只有一条进度条。
+    //
+    // **为什么不是 `return Err`**（本版之前就是这样）：入队是**逐个生效**的 —— 走到这里时
+    // 前面那些**真的已经在下了**（现场那次是 62 个）。返回一个纯错误会把这份回执一起扔掉，
+    // 客户看到「下载引擎已断开」，完全不知道三分之二的批次已经入队。
+    // 现在按**正常回执**返回：`added` 保留已经加上的，剩下的每一个都进 `rejected`
+    // ——壳早就有一整套部分成功回执（「已加入 N 个下载任务」+ 逐条理由），
+    // **前端一个字都不用改**，而约束 4（不得静默少交）也照旧成立。
+    //
+    // ⚠️ 全局的"引擎已断开"状态**照旧**由 `on_rpc_failure` 置起（上面那一行已经置了），
+    //    横幅与闸门不受影响；壳的下一次调用仍然会拿到断开。
+    if let Some((at, body)) = &gave_up_at {
+        let reason = format!("未提交：{}", short_cause(&body.message));
+        for f in &targets[*at..] {
+            rejected.push(json!({"path": f.path, "reason": reason}));
+        }
+    }
+
     if added.is_empty() && !rejected.is_empty() {
         return Err(ErrorBody::invalid_params(format!(
             "没有任何文件被加入下载：{rejected:?}"
@@ -1701,10 +1891,35 @@ pub fn op_enqueue(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, 
             ("stage", "add_uri".to_string()),
             ("n", targets.len().to_string()),
             ("ok", added.len().to_string()),
+            // 停在哪儿（`n` = 没停）。第 63 个 `addUri` 撞上超时那次，
+            // 这个读数就是"已经入队了多少"的直接证据。
+            (
+                "stopped_at",
+                match gave_up_at {
+                    Some((at, _)) => at.to_string(),
+                    None => targets.len().to_string(),
+                },
+            ),
             ("ms", t2.elapsed().as_millis().to_string()),
         ],
     );
     Ok(json!({"added": added, "rejected": rejected}))
+}
+
+/// 把一条内核错误消息压成**一行短因果**，给"未提交"那类逐条理由用。
+///
+/// 为什么需要它：同一个原因会被挂到**几十条**拒绝理由上（现场那次是 90 条）。
+/// 逐条重复整句「下载引擎已断开：RPC 请求失败：http://… Network Error: … os error 10060」
+/// 会让界面变成一堵墙，而客户要的判断只有"为什么没下上"这一句。
+///
+/// ⚠️ **只截第一个冒号之前那一段，绝不改写内核的措辞**（约束 3：拒绝理由是内核原文，
+///    前面那一句本来就是 `ENGINE_DISCONNECTED` 的固定前缀）。截不出东西时
+///    **原样返回整串**——宁可长，不可空（空理由正是约束 4 明禁的静默失效）。
+fn short_cause(message: &str) -> String {
+    match message.split_once('：') {
+        Some((head, _)) if !head.is_empty() => head.to_string(),
+        _ => message.to_string(),
+    }
 }
 
 /// 用户重新下载一条路径时，把复校验的三道闸门一起打开。
@@ -1922,12 +2137,33 @@ impl Kernel {
     ///     都是定死的，别改成别的形状。
     fn set_engine_disconnected(&mut self, now: bool, why: &str) {
         if now != self.engine_disconnected {
+            // `exited` 是**这个比特**（2026-10-09）：RPC 超时这一个症状对应两种完全不同的
+            // 情形 —— 引擎**进程没了**（该有人把它拉起来）与**进程活着但不吭声**
+            // （该查它为什么卡）。此前两者在日志里长得一模一样，0.2.3 那份 9.4 小时的
+            // 记录里 33 次「已断开」没有一次能分开它们。
+            // 在**判定发生的那一刻**记最准：晚一点记，那个进程可能已经变了。
             crate::diagnostics::log(
                 "engine_disconnected_changed",
-                &[("now", now.to_string()), ("why", why.to_string())],
+                &[
+                    ("now", now.to_string()),
+                    ("why", why.to_string()),
+                    ("exited", self.engine_exited().to_string()),
+                ],
             );
         }
         self.engine_disconnected = now;
+    }
+
+    /// 引擎子进程**是否已经退出**。**还没有引擎**（`None`）时报 `true`。
+    ///
+    /// `None` 报 `true` 的理由：`daemon` 为 `None` 时确实**没有**一个活着的引擎，
+    /// 而这一格要回答的问题正是"还有没有引擎在"。报 `false` 会把"还没起来"
+    /// 与"起来了但不应答"混成同一格 —— 那恰好是这次要分开的两件事。
+    fn engine_exited(&self) -> bool {
+        match &self.daemon {
+            Some(d) => d.process_exited(),
+            None => true,
+        }
     }
 
     pub fn take_daemon(&mut self) -> Option<Arc<Daemon>> {
@@ -2295,6 +2531,179 @@ mod tests {
         // 断开了且到点：探。
         assert!(should_recover_probe(true, RECOVERY_INTERVAL));
         assert!(should_recover_probe(true, Duration::from_secs(30)));
+    }
+
+    /// **探测失败到一定次数就必须换引擎**，而不是永远等一个已经死掉的引擎自己活过来。
+    ///
+    /// 现场证据（0.2.3，2026-10-08）：日志里有两段引擎**完全不应答**的时段，分别
+    /// **45 分钟与 60 分钟**。期间自愈每 10 秒探一次、每次都耗满 10 秒超时，
+    /// **一次也没成功**——因为那时"自愈"成功时只翻一个标志、失败时什么都不做，
+    /// **从不重启引擎**。客户唯一的出路是点「重试」，而那颗按钮会重启**整个内核**、
+    /// 掐掉正在下的活。
+    ///
+    /// ⚠️ 免责声明与上面那条同款：这条守的是**阈值**，不是"线程真的换了引擎"。
+    /// 后者由 `replacing_a_wedged_engine_swaps_in_a_live_one` 守。
+    #[test]
+    fn restart_decision_is_a_table() {
+        // 零次、少一次：继续探，不换引擎（换引擎要关掉旧进程，不是免费的）。
+        assert!(!should_restart_engine(0));
+        assert!(!should_restart_engine(RECOVERY_RESTART_AFTER - 1));
+        // 到阈值：换。
+        assert!(should_restart_engine(RECOVERY_RESTART_AFTER));
+        assert!(should_restart_engine(RECOVERY_RESTART_AFTER + 1));
+    }
+
+    /// **换上的是另一个引擎、且断开标志被清掉**（"自愈真的能自愈"的那一层）。
+    ///
+    /// 为什么需要它：`should_recover_probe` / `should_restart_engine` 都是纯函数，
+    /// 它们绿不代表**真的有一个新进程起来并把句柄换过去**——那是 `replace_engine`
+    /// 的活，只有起真引擎才验得到。这条用例真起两个 aria2。
+    ///
+    /// 三个断言各自钉一件事：
+    ///   · 新引擎 `ping` 得通 ⇒ 换上来的是**活的**，不是又一份死句柄；
+    ///   · `rpc_url` 与旧的不同 ⇒ 确实是**另一个**进程，不是把旧句柄原地还回来；
+    ///   · `engine_disconnected` 被清 ⇒ 壳那边下一次读不会再收到「已断开」。
+    #[test]
+    fn replacing_a_wedged_engine_swaps_in_a_live_one() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), dir.join("s.json"))));
+
+        let old_url = {
+            let mut k = lock(&kernel);
+            k.ensure_engine()
+                .expect("首次启动引擎失败")
+                .rpc_url()
+                .to_string()
+        };
+        // 装作自愈已经探了一整轮都没探通。
+        {
+            let mut k = lock(&kernel);
+            k.set_engine_disconnected(true, "test");
+        }
+
+        let fresh = replace_engine(&kernel).expect("换引擎失败");
+        let ping_ok = fresh.ping().is_ok();
+        let new_url = fresh.rpc_url().to_string();
+        let (installed, disconnected) = {
+            let k = lock(&kernel);
+            (
+                k.daemon.as_ref().map(|d| d.rpc_url().to_string()),
+                k.engine_disconnected,
+            )
+        };
+        // 先收尸再断言：断言失败 panic 时也不会把新引擎留成孤儿。
+        let _ = fresh.close();
+
+        assert!(ping_ok, "换上的新引擎应当能应答");
+        assert_ne!(new_url, old_url, "换上去的必须是另一个引擎（端口不同）");
+        assert_eq!(
+            installed.as_deref(),
+            Some(new_url.as_str()),
+            "内核手里必须拿着新引擎，不是旧的那一份"
+        );
+        assert!(!disconnected, "换成功之后不该还是断开态");
+    }
+
+    /// **引擎中途不应答时，回执必须把每一件没入队的文件都交代清楚**（2026-10-09）。
+    ///
+    /// 现场那份 0.2.3 日志（9.4 小时）里最刺眼的一格：一次 `enqueue` 已经把 **62 个**
+    /// 文件加进了队列（真机上那些确实在下），然后后面某一次 `addUri` 撞上 10 秒超时 ——
+    /// 内核判引擎断开，`return Err` **把整份回执连同那 62 个一起扔掉**。
+    /// 客户看到「下载引擎已断开」，完全不知道三分之二的批次已经入队。
+    ///
+    /// 两条判据各自钉一件事：
+    ///   · 结果是 **`Ok`**（正常回执），不是 `Err`；
+    ///   · **已经加上的仍然在 `added` 里**，而**每一个没入队的文件都在 `rejected` 里**
+    ///     —— 一条不许少（约束 4：不得静默少交），且每条都要有理由。
+    ///
+    /// 为什么用桩引擎：只有**可控地**在"第 K 个文件"之后开始不应答，才能确定性地造出
+    /// "部分成功"这一格；真 aria2 死不到那么刚好。
+    ///
+    /// ⚠️ 探活（`getGlobalStat`）必须**跟 `addUri` 一起挂**：只让 `addUri` 挂的话，
+    ///    `on_rpc_failure` 一探就通，根本判不成断开，这一格走不到。
+    #[test]
+    fn a_mid_batch_disconnect_keeps_the_receipt_and_accounts_for_every_file() {
+        const OK_ADDS: usize = 2;
+        const N: usize = 5;
+
+        let adds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adds_h = Arc::clone(&adds);
+        let srv = StubHttp::start_with(move |req| {
+            let body: serde_json::Value =
+                serde_json::from_str(&req.body).unwrap_or(serde_json::Value::Null);
+            let ok = body["method"].as_str() == Some("aria2.addUri")
+                && adds_h.fetch_add(1, Ordering::SeqCst) < OK_ADDS;
+            let payload = if ok {
+                serde_json::json!({"jsonrpc": "2.0", "id": "1", "result": "gid-x"})
+            } else {
+                serde_json::json!({"jsonrpc": "2.0", "id": "1",
+                                   "error": {"code": 1, "message": "引擎不应答"}})
+            };
+            RawResponse::new(200).body(payload.to_string())
+        });
+
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), dir.join("s.json"))));
+        let paths: Vec<String> = (0..N).map(|i| format!("t/f{i}.bin")).collect();
+        let files: Vec<String> = (0..N)
+            .map(|i| format!(r#"{{"path":"t/f{i}.bin","size":6,"crc64":"9{i}"}}"#))
+            .collect();
+        {
+            let mut k = lock(&kernel);
+            k.manifest = Some(
+                delivery::parse(
+                    format!(
+                        r#"{{"code":"AbC","base_url":"http://127.0.0.1:1","files":[{}]}}"#,
+                        files.join(",")
+                    )
+                    .as_bytes(),
+                )
+                .expect("清单应当解析成功"),
+            );
+            k.daemon = Some(Arc::new(crate::engine::daemon::stub_daemon(
+                &srv.base(),
+                "s",
+                BTreeMap::new(),
+            )));
+        }
+
+        let out = op_enqueue(&kernel, &json!({ "paths": paths }))
+            .expect("引擎在批次中间断开这一格必须回**正常回执**，不是错误");
+
+        let added = out["added"].as_array().expect("added 是个数组");
+        let rejected = out["rejected"].as_array().expect("rejected 是个数组");
+        assert_eq!(added.len(), OK_ADDS, "已经加上的必须留在回执里：{out}");
+        assert_eq!(
+            added.len() + rejected.len(),
+            N,
+            "每一个文件都要有落点（约束 4：不得静默少交）：{out}"
+        );
+        for r in rejected {
+            let reason = r["reason"].as_str().unwrap_or("");
+            assert!(!reason.is_empty(), "每条拒绝都必须有理由：{out}");
+        }
+        assert!(
+            lock(&kernel).engine_disconnected,
+            "判成断开这件事必须照旧落到全局状态上，否则壳连横幅都不会出"
+        );
+    }
+
+    /// [`short_cause`] 的措辞表（纯函数）。
+    ///
+    /// 两个方向都钉：截得出东西时取**第一个冒号之前**那一段；截不出东西时**原样返回**
+    /// —— 宁可长，不可空（空理由正是约束 4 明禁的静默失效）。
+    #[test]
+    fn short_cause_is_a_table() {
+        assert_eq!(
+            short_cause("下载引擎已断开：RPC 请求失败：http://127.0.0.1:1/jsonrpc: Network Error"),
+            "下载引擎已断开"
+        );
+        // 没有冒号：原样。
+        assert_eq!(short_cause("engine gone"), "engine gone");
+        // 冒号在开头（前半段为空）：也必须原样，不能交出一个空理由。
+        assert_eq!(short_cause("：leading colon"), "：leading colon");
     }
 
     /// `engine_rpc_failed` 的消息必须带**出错的调用名**。
