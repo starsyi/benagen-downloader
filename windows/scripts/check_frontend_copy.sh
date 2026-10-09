@@ -343,7 +343,8 @@ WHITELIST = {
                                             "＋ 空态屏失败态那颗「重试」（`empty__retry`）"
                                             "＋ 文件页读失败那格的「重试」（`FileBrowser.swift:208`）"
                                             "＋ **传输列表屏行菜单里的「重试」**（任务 11：`TransferRowView.actionItems` 的 `Button(\"重试\")`，对应 `TaskAction::Retry`）"),
-    ("windows/web/index.html", "收起"): (1, "常驻提示行 `tpl-notice-dismiss` 那颗按钮的无障碍名字（`aria-label`）"),
+    ("windows/web/index.html", "收起"): (2, "常驻提示行 `tpl-notice-dismiss` 那颗按钮的无障碍名字（`aria-label`）"
+                                              "＋ **更新提示那条的「收起」**（规格 §4；`#files-update-dismiss` 的无障碍名字 —— 与常驻提示行那颗是**同一个词、同一个图形**，两处各留一格 `aria-label`）"),
     ("windows/web/index.html", "输入交付码开始下载"): (1, "空态屏的标题（`EmptyState.swift` 逐句）"),
     ("windows/web/index.html", "交付码在交付邮件或交付页链接里（整条链接也可以直接粘进来）"): (1, "空态屏的副标题（同上）"),
     ("windows/web/index.html", "加载"): (2, "空态屏那颗提交按钮的字（同上）＋ 任务 13 换码面板那颗提交按钮（`SwitchDeliverySheet.swift` 的 `Button(\"加载\")`）"),
@@ -430,6 +431,11 @@ WHITELIST = {
     ("windows/web/index.html", "在资源管理器中显示"): (1, "传输列表屏：行菜单里的「在资源管理器中显示」（macOS 是 `Button(\"在访达中显示\")`；Windows 的对位写法见设计规格 §9）。⚠️ 这一项**不是** `TaskAction`（协议里没有 `reveal`，规格 §5.2：那是壳的事）"),
     ("windows/web/index.html", "移除"): (1, "传输列表屏：行菜单最后一项（`TransferRowView.actionItems` 的 `Button(\"移除\", role: .destructive)`）"),
     ("windows/web/index.html", "正在读取传输列表…"): (1, "传输列表屏：**还没有快照**那一档那一句话（`TransfersView.swift:113-121` 的 `Text(\"正在读取传输列表…\")`，逐字）。⚠️ 它与数据无关、任何状态下都一样（转圈那一档永远是这一句），转圈那一颗是纯 CSS ⇒ 按 §3.2 它是**结构文案**，住 HTML、JS 只切 `hidden`"),
+    # ---- 更新提示（规格 §4，本波次）------------------------------------------
+    # 文件：windows/web/index.html
+    ("windows/web/index.html", "有新版本（当前）"): (1, "文件页顶部那条更新提示的**框架句**：静态部分住 HTML，两个版本号由 `files.js:paintUpdate` 把内核给的 `latest` / `current` 摆进两个空 `<span>` —— **JS 一个汉字都不拼**（§3.2）。它为什么不由 Rust 给：可变的两格是**内核数据**（不是壳算的界面值），而「壳一个字符都不拼」（W-2 / R20）在这条上的落点就是「框架句留 HTML、数据由内核给、JS 只摆位置」；macOS 侧那句由 `Presentation/UpdateNotice.swift` 拼，本代刻意不复刻成第二个真相源（那会与「壳不改写内核的话」打架）"),
+    ("windows/web/index.html", "去下载"): (1, "更新提示那条上那颗动作按钮的名字（规格 §4；R15）。**静态按钮名**（任何状态下都一样、与数据无关），与常驻提示行那颗「重试」（`.notice__retry`）同一条：浏览器直接渲染、JS 只克隆与摆放。它为什么不由 Rust 给：按钮名没有 `presentation` 的家（macOS 侧同样住在视图字面量里 —— `RootView` 那颗 `Button(\"去下载\")`）"),
+    ("windows/web/index.html", "启动时检查更新"): (1, "设置窗口里那个勾选框的**静态标签**（规格 §4）。与「下载到」/「应用」同一条：与数据无关、任何状态下都一样，浏览器直接渲染。**勾没勾**来自内核（`update_status.enabled`，`settings.js` 读/写），这两个字本身不变。它为什么不由 Rust 给：macOS 侧同样是 `SettingsView` 的视图字面量（`Toggle(\"启动时检查更新\")`），没有 `presentation` 的家"),
 }
 
 # 缺口清单在报错里最多逐条打印这么多处（再多就把真信息淹了；总数仍写在标题里）。

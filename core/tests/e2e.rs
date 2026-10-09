@@ -413,6 +413,38 @@ fn percent_decode(s: &str) -> String {
 /// 而不是把整个测试套件挂死。
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// **给这次起内核关掉更新检查**：按内核找这个文件的规矩
+/// （`settings_path.parent().join("update.json")`）预置一份 `{"enabled":false}`。
+///
+/// ⚠️ **为什么必须有这一下**：本文件驱动的是**真二进制**，它的 `main()` 会起
+///    `spawn_update_check`，而设置目录是**全新**的 ⇒ `update.json` 不存在 ⇒
+///    "从没查过 ⇒ 立刻查" ⇒ 第一拍就对 `gitee.com` 发一次**真请求**。测试套件
+///    **不该依赖公网**（网断了照样绿，于是"绿"不再等于"这套代码自洽"）。
+///
+/// ⚠️ **为什么是改夹具、不是给生产开洞**：任何"测试期开关"都等于把测试需求漏进
+///    生产 API —— 与本仓既有的判例同源（`UreqFetcher` 那一类 `new_for_test` 已被删掉）。
+///    改夹具只是**安排测试环境**，生产代码一个字节都不动。
+///
+/// ⚠️ **为什么用 `enabled:false` 而不是把 `last_checked_at` 写成"现在"**：前者
+///    **不依赖时钟**、确定性，意图也一目了然（"这些端到端测试不做更新检查"）。
+///    附带还走了一条**真实**路径：`{"enabled":false}` 缺 `last_checked_at`/`last_seen`，
+///    正好由 `update::State` 的 `#[serde(default)]` 补齐。
+///
+/// ⚠️ **写不进去就当场红**，不许 `let _ =` 吞掉：静默失败会让这一下悄悄退回
+///    "每次跑都对 gitee 发请求" —— 那**正是**它要防的事（本仓口径：守卫不许静默）。
+fn disable_update_check(settings_path: &Path) {
+    let parent = settings_path
+        .parent()
+        .expect("`--settings` 必须有父目录，否则 `update.json` 无处可放");
+    let path = parent.join("update.json");
+    std::fs::write(&path, br#"{"enabled":false}"#).unwrap_or_else(|e| {
+        panic!(
+            "写不了 {}（守卫不许静默失败；它挡的是'每次跑都对 gitee 发请求'）：{e}",
+            path.display()
+        )
+    });
+}
+
 struct Core {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -423,6 +455,7 @@ struct Core {
 
 impl Core {
     fn start(download_dir: &Path, settings_path: &Path) -> Core {
+        disable_update_check(settings_path);
         let bin = env!("CARGO_BIN_EXE_benagen-core");
         let mut child = Command::new(bin)
             .arg("--download-dir")
@@ -1471,12 +1504,16 @@ fn engine_disconnect_is_reported_and_landed_files_are_kept() {
 #[test]
 fn stdout_carries_only_protocol_messages() {
     let dir = TempDir::new("stdout");
+    // 这一个起内核的调用**不走 `Core::start`**（它只发一条 hello 就收工），
+    // 所以 `disable_update_check` 要在这里单独再叫一次（理由见它的文档）。
+    let settings = dir.path().join("s.json");
+    disable_update_check(&settings);
     let bin = env!("CARGO_BIN_EXE_benagen-core");
     let mut child = Command::new(bin)
         .arg("--download-dir")
         .arg(dir.path().join("dl"))
         .arg("--settings")
-        .arg(dir.path().join("s.json"))
+        .arg(&settings)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

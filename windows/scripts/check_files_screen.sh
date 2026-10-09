@@ -2,18 +2,23 @@
 #
 # windows/scripts/check_files_screen.sh —— **文件页的无头验收，一条命令跑完**。
 #
-#    bash windows/scripts/check_files_screen.sh            # 跑当前这一版（sub 35 条 + blocked 9 条 + keep 35 条）
+#    bash windows/scripts/check_files_screen.sh            # 跑当前这一版（sub + blocked + keep + update 四场）
 #    bash windows/scripts/check_files_screen.sh --all      # 再跑 fail / switch 两个场景
 #    bash windows/scripts/check_files_screen.sh --ab       # A/B：当前版 vs 修前那一版，给两组数
 #    bash windows/scripts/check_files_screen.sh --all --ab # 两个都要
 #
-# ⚠️ **三场常驻，各有各的"做没做长得不一样"的理由**（R-61：少了哪一场，那条判据就只剩读代码）：
+# ⚠️ **四场常驻，各有各的"做没做长得不一样"的理由**（R-61：少了哪一场，那条判据就只剩读代码）：
 #    · `sub`     —— 默认那一档载荷（四列 / 底栏 / 勾选 / 右键 / enqueue 回执）；
 #    · `blocked` —— 超预算那一档（`action.blocked_reason` 是个字符串）：只有它在场，
 #                   "那个动作按不下去时界面做了什么"才可观测（`sub` 那一档是 `null`）；
 #    · `keep`    —— **换屏**那一档（R.a1b… 那一批：选一个文件 → 去传输列表看一眼 →
 #                   切回来 → 点「下载选中」⇒ 下的是整批）。`sub` 从头到尾没换过屏 ⇒
 #                   那条缺陷在那里与"做对了"一模一样；只有真的切走再切回来它才可观测。
+#    · `update`  —— **更新提示的判据只有 has_newer**（R20 / R26）：喂一格
+#                   `{has_newer:false, url:<非空>}`（内核在"没有新版"时**照样**会给的、
+#                   指向**已装版本**的那条链接）⇒ 提示条必须**藏着**；再加一段换屏正对照
+#                   （`has_newer:true` ⇒ 显示）。`sub`/`keep` 那两档里 `url` 与 `has_newer`
+#                   同涨同落 ⇒ 那两条判据**分不开**，只有这一场分得开。
 #
 # 它做的事（四步，全自动）：起本地静态服务 → 用无头浏览器加载夹具页 →
 #   夹具页跑断言、把结果 **POST 回来** → 打印 `ok=N fail=M` 并据此定退出码。
@@ -240,6 +245,12 @@ run_once "blocked" "$root" "$tmpdir/blocked.json" current || status=3
 #    切回来、点「下载选中」⇒ **下的是整批**（`selection == 全部文件` ⇒ 壳收敛成 `paths: []`）。
 #    少跑这一轮，这条判据就只剩"读代码"这一条路（R-61）。
 run_once "keep" "$root" "$tmpdir/keep.json" current || status=3
+# 🔴 `update`（R20 / R26：更新提示的**判据只有 has_newer**）**同样常驻**，理由与 `blocked`
+#    一字不差：`sub`/`keep` 那两档里 `update_status` 恒回"没有新版、url 为空"，
+#    于是"按 has_newer 判"与"按 url 非空判"长得一模一样 —— 只有喂一格
+#    `{has_newer:false, url:<非空>}`（内核在"没有新版"时**照样**会给的那条**指向已装版本**的
+#    链接）才分得开。少跑这一轮，R20 那条裁决就只剩"读代码"这一条路。
+run_once "update" "$root" "$tmpdir/update.json" current || status=3
 if [ "$run_all" = "1" ]; then
   run_once "fail" "$root" "$tmpdir/fail.json" current || status=3
   run_once "switch" "$root" "$tmpdir/switch.json" current || status=3

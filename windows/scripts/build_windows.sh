@@ -41,7 +41,7 @@
 #   bash windows/scripts/build_windows.sh
 #
 # 环境变量（都可选）：
-#   VERSION=0.2.4   覆盖版本资源里的版本号（默认 0.2.4，与 `macos/scripts/build_app_macos.sh` 同口径）
+#   VERSION=0.2.5   覆盖版本资源里的版本号（默认 0.2.5，与 `macos/scripts/build_app_macos.sh` 同口径）
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -64,10 +64,10 @@ DIST_EXE="${DIST}/${DIST_NAME}"
 #    对不上的表现是"壳内嵌了一个不存在的内核"，而那条会在构建期大声失败（不是静默）。
 CORE_EXE="${REPO}/core/target/${TARGET}/release/benagen-core.exe"
 
-# 版本号（规格 W-7：版本资源里要能看到版本号）。默认 0.2.4 与 macOS 侧同口径。
+# 版本号（规格 W-7：版本资源里要能看到版本号）。默认 0.2.5 与 macOS 侧同口径。
 # ⚠️ 它同时喂给 `shell-win/build.rs`（写进 .rc）与第 5 步的自验（grep 交付形态里的那一串），
 #    两边用的是**同一个**变量 —— 不然"自验"就会变成"拿脚本自己编的数去核自己"。
-BENAGEN_VERSION="${VERSION:-0.2.4}"
+BENAGEN_VERSION="${VERSION:-0.2.5}"
 export BENAGEN_VERSION
 
 # ---- 参数：只认 --check-only，别的**直接报错退出**（exit 2）-------------------
@@ -710,7 +710,7 @@ must_contain "版本资源里的产品名（中文，${#product_name_needle} 字
   "产品名与窗口标题 / macOS 的 CFBundleDisplayName 逐字相同（规格 §9）。⚠️ 这一段是**非 ASCII**：\
    它能查到就同时证明 windres 的 --codepage=65001 生效了（否则会是一片问号，而那是静默的）"
 
-# 版本号的值：四段式（build.rs 把 0.2.4 补成 0.2.4.0）。
+# 版本号的值：四段式（build.rs 把 0.2.5 补成 0.2.5.0）。
 version_quad() {
   IFS='.' read -r -a parts <<< "$1"
   printf '%s.%s.%s.%s' "${parts[0]:-0}" "${parts[1]:-0}" "${parts[2]:-0}" "${parts[3]:-0}"

@@ -113,6 +113,9 @@ export function openSettings(ctx, hooks) {
   const verboseEl = byIdIn(root, "set-verbose");
   const verboseLabelEl = byIdIn(root, "set-verbose-label");
   const verboseNoteEl = byIdIn(root, "set-verbose-note");
+  // 「启动时检查更新」（规格 §4）。标签是**结构文案**（住在 `index.html`，本文件不碰）；
+  // 这里只管那个勾 ——它的值来自**内核**（`update_status.enabled`）。
+  const updateEl = byIdIn(root, "set-update");
   const exportEl = byIdIn(root, "set-export");
   const exportReceiptEl = byIdIn(root, "set-export-receipt");
   const exportReceiptIconEl = byIdIn(root, "set-export-receipt-icon");
@@ -536,6 +539,53 @@ export function openSettings(ctx, hooks) {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // 「启动时检查更新」（规格 §4）
+  // ---------------------------------------------------------------------------
+  //
+  // ⚠️ 与上面那个详细日志开关**不是一回事**：这一格**不重启内核**（开关状态在内核自己的
+  //    `update.json` 里，内核下一次检查时自己读），所以它**不抢 `busy`**、也没有确认框。
+  //    ⚠️ 它也不在 `settings_get` 的七项里（那七项是引擎参数），所以它不走 `payload`。
+
+  /**
+   * 读一次内核手里那个开关，把它落到勾选框上（打开窗口时调一次）。
+   *
+   * ⚠️ **失败静默**（规格 §5）：这一格是"启动时检查更新"，取不到时**保持默认**（勾着）——
+   *    不弹任何东西（那条提示条与它的开关都不许给界面冒错误）。**默认就是开**。
+   */
+  async function loadUpdate() {
+    let data;
+    try {
+      data = await ctx.call(ctx.CMD.updateStatus);
+    } catch (error) {
+      // 取不到 ⇒ 保持 `index.html` 里的默认（`checked`）。不上屏。
+      return;
+    }
+    // 只有内核**明说** `enabled === false` 时才取消勾选；缺格 / 别的形状一律当"开"
+    // （与规格 §5「开关默认开」同一条：拿不准就开）。
+    updateEl.checked = !(data && data.enabled === false);
+  }
+
+  /**
+   * 改那个开关（`update_set_enabled`）。**用返回值刷新界面**（内核回的是写完之后那一份）。
+   *
+   * ⚠️ **失败**：把勾选框退回**内核手里那一份**（重读一次）——否则用户看到"勾上了"、
+   *    而内核根本没记住（E-2 明禁的那种"以为存上了"）。失败原文照登（约束 3）。
+   */
+  async function setUpdateEnabled(on) {
+    let data;
+    try {
+      data = await ctx.call(ctx.CMD.updateSetEnabled, { enabled: on });
+    } catch (error) {
+      showFailure(failureText(error));
+      await loadUpdate();
+      return;
+    }
+    // 回执是"写完之后"那一份 ⇒ 用**它**刷新（不是用我们发出去的那个 `on`：
+    // 万一内核归一化过，界面要跟内核走）。
+    updateEl.checked = !(data && data.enabled === false);
+  }
+
   /** 把一条改目录的回执落到窗口里那一行上（图标是**绘制**，文字全部来自载荷）。 */
   function paintChangeReceipt(change) {
     dirReceiptEl.hidden = false;
@@ -751,6 +801,11 @@ export function openSettings(ctx, hooks) {
   verboseEl.addEventListener("change", () => {
     void setVerboseLogging(verboseEl.checked);
   });
+  // 「启动时检查更新」：**变了才发命令**（`change` 事件本身就是这个语义）。它**不重启内核**
+  // （与上面那个不同），所以没有 `busy` 那道闸。
+  updateEl.addEventListener("change", () => {
+    void setUpdateEnabled(updateEl.checked);
+  });
   // 「导出诊断日志…」：**一次系统对话框 + 一次拷贝**，回执落在本节里那颗按钮下面
   // （与上面那个勾选框同一节 —— 见 `exportDiagnostics` 的文档）。
   exportEl.addEventListener("click", () => {
@@ -792,9 +847,10 @@ export function openSettings(ctx, hooks) {
     }
   }
 
-  // 打开时各读一次（两条并发：它们互不依赖，串起来只会让窗口慢一拍）。
+  // 打开时各读一次（三条并发：它们互不依赖，串起来只会让窗口慢一拍）。
   void loadPreferences();
   void loadSettings();
+  void loadUpdate();
   paintFooter();
 
   return {

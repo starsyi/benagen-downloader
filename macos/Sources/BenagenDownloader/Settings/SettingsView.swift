@@ -63,7 +63,11 @@ struct SettingsView: View {
                 // ② 「诊断」紧挨在下载目录之后、编辑器之前（规格 §2.4 指定的位置）。
                 DiagnosticsSection(model: model)
 
-                // ③ 内核那份参数。⚠️ `Binding($form)` 是 SwiftUI 自带的"可选 Binding 拆包"：
+                // ③ 「启动时检查更新」（规格 §4）。**不重启内核**（开关状态在内核自己的
+                //    `update.json` 里，内核下一次检查时自己读）—— 与上面那个详细日志开关不同。
+                UpdateSection(model: model)
+
+                // ④ 内核那份参数。⚠️ `Binding($form)` 是 SwiftUI 自带的"可选 Binding 拆包"：
                 //    编辑器的 `Stepper` / `Picker` / `TextField` 都要**非可选**的
                 //    `Binding<SettingsForm>`。
                 if let form = Binding($form) {
@@ -514,6 +518,77 @@ private struct DiagnosticsSection: View {
         changing = true
         defer { changing = false }
         _ = await model.changeVerboseLogging(to: on)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 「启动时检查更新」（规格 §4）
+// ---------------------------------------------------------------------------
+
+/// 「启动时检查更新」那一个勾选框（规格 §4）。
+///
+/// ⚠️ 它与上面那个「详细日志」开关**不是一回事**：这一格**不重启内核**（开关状态在内核
+///    自己的 `update.json` 里），所以它既不抢 `busy`、也没有确认框、更不落壳的偏好文件。
+///
+/// ⚠️ **勾没勾来自内核**（`update_status.enabled`）：取值直接绑
+///    `model.updateStatus?.enabled ?? true` —— 那一格**只在内核的 `update_status` 里**
+///    （不在 `settings.json`）。`nil`（还没问到）也当"开"（规格 §5「开关默认开」）。
+/// ⚠️ **打开这一节时拉一次**（`.task`）：主区的更新轮询挂在**文件页**
+///    （`RootView` 里 `shouldPollUpdate = (section == .files)` 那个 `.task(id:)`，
+///    不是 `pollTick` / 传输列表那一拍），用户很可能没经过文件页就打开了设置
+///    —— 不主动拉一次，这个勾选框会在"内核其实是关的"时仍显示默认的"开"
+///    （R22 要的是显示**当前值**）。
+///    拉取失败**静默**（`refreshUpdateStatus` 自己吞），勾选框保持默认。
+///
+/// ⚠️ 改它走 `AppModel.setUpdateEnabled(_:)` —— **用返回值刷新界面**（内核回的是写完之后
+///    那一份）。**失败要说话**（与上面那条"静默"不同）：客户自己勾了框、结果没存进去
+///    却看着像存进去了，那是**界面在撒谎** ⇒ 失败原文照登在下面那一行（约束 3），
+///    同时勾选框退回内核手里那一份（`setUpdateEnabled` 失败时一个字都不改 `updateStatus`）。
+///
+/// ⚠️ 标签是**结构文案**（与数据无关、任何状态下都一样），所以住在**视图**里
+///    （与「下载到」/「保存」同一条），不由载荷给。
+private struct UpdateSection: View {
+    @ObservedObject var model: AppModel
+
+    /// 最近一次改开关的**失败原文**（`nil` = 没有）。**照登内核 / 系统原文**（约束 3）：
+    /// `setUpdateEnabled` 已经把 `CoreError` → 文案的那一步做掉（约束 8：视图不映射错误）。
+    /// ⚠️ 与 `SettingsFooter.failure` 同形的本窗回执（同一扇窗里的同步动作，窗口关掉就别留着）。
+    @State private var failure: String?
+
+    var body: some View {
+        Section {
+            Toggle("启动时检查更新",
+                   isOn: Binding(get: { model.updateStatus?.enabled ?? true },
+                                 set: { on in Task { await apply(on) } }))
+                .help("默认打开。每次启动问一次官方仓库有没有新版本（只提示，不下载、不安装）")
+            if let failure { failureRow(failure) }
+        }
+        .task { await model.refreshUpdateStatus() }
+    }
+
+    /// 勾选框的回调。`nil` = 改成了（清掉上一行失败）；非 `nil` = 失败原文（摆出来）。
+    private func apply(_ on: Bool) async {
+        failure = await model.setUpdateEnabled(on)
+    }
+
+    /// 一行失败原文 + 一个 `×`（形状与 `SettingsFooter.failure` 逐条同款：可选中复制、可收起）。
+    private func failureRow(_ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(.red)
+            Text(text)
+                .font(.caption)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Button {
+                failure = nil
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .help("收起这条提示")
+        }
     }
 }
 

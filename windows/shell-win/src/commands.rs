@@ -70,6 +70,7 @@ use shell_core::storage::history::History;
 use shell_core::storage::preferences::Preferences;
 
 use crate::kernel::{self, TransferPoll};
+use crate::openurl;
 use crate::pickdir;
 use crate::reveal;
 use crate::session::{self, Session};
@@ -119,6 +120,13 @@ pub fn invoke_handler<R: tauri::Runtime>(
         enqueue,
         transfers,
         verify,
+        // 更新提示的三条（规格 §4；R15）。⚠️ 不在规格 §3.4 那张表里 —— 那一张是
+        // "第二代既有端点"的账，而"更新检查"是这一代新加的整件事（内核侧的三条同理）。
+        update_status,
+        update_set_enabled,
+        // ⚠️ **窄语义**的一条（R15）：只放行官方发布页那一个前缀、只做"交给默认浏览器"
+        //    这一件事。它不是通用的 `open_url`（理由写在它自己的文档里）。
+        open_update_url,
         // 任务 8 补的十个（规格 §3.4 那张表里标着"无（新增）"的那些）+ 一个
         // ⚠️ 规格表里没有的 `preferences_check` —— 理由见它自己的文档。
         task_action,
@@ -572,6 +580,96 @@ pub fn verify(app: tauri::State<'_, Shell>) -> Value {
             note_failure(&app.session, &why);
             api::failure(&why)
         }
+    }
+}
+
+// ===========================================================================
+// 更新提示的三条命令（规格 §4；内核侧的三条由 `core/src/kernel.rs` 给）
+// ===========================================================================
+
+/// 更新状态（规格 §4）。**只读**，壳按宽节拍（60 s）轮询它，把结果画成文件页顶部
+/// 那条**独立的**提示条。
+///
+/// ## ⚠️ 这一条**不会给界面冒出错误**（那是内核那一侧的判据）
+///
+/// 内核的 `op_update_status` **任何取不到的情形都回成功**（`has_newer:false`）——
+/// 网络抖动、Gitee 不可达、`update.json` 坏了，全部落到"没有新版"上，**不是错误**
+/// （规格 §5：失败一律静默）。所以壳这一侧**唯一可能**的失败是"没有内核 / 传输断了"，
+/// 而那件事由 `state()` 的节拍在别处说出来。
+///
+/// 🔴 **因此本命令失败时走 `api::failure`（失败信封）但 `note_failure` 一个字都不写**：
+///    `note_failure` 对 `CallFailure::Text` 会写 `session.last_error`，而那一格**会上屏**
+///    （常驻提示行）—— 那就等于把"更新检查"这条静默的后台动作变成一句客户看得见的报错，
+///    正是规格 §5 明禁的形态。内核没了那件事由 `state()` / `transfers()` 的节拍去报，
+///    这一条**只把原文交给那次调用的回执**（前端对它的失败**只记控制台、不上屏**）。
+#[tauri::command(async)]
+pub fn update_status(app: tauri::State<'_, Shell>) -> Value {
+    let Some(client) = app.session.client() else {
+        return api::envelope::err(api::NO_KERNEL);
+    };
+    match kernel::update_status(&client) {
+        Ok(kernel_value) => {
+            // 成功 ⇒ 清掉上一次失败（那一条更新检查恢复了），与其余命令同一条非粘滞口径。
+            app.session.set_last_error(None);
+            api::update::update_status(&kernel_value)
+        }
+        // ⚠️ **不调 `note_failure`**（理由见上）：这一条失败**静默**。
+        Err(why) => api::failure(&why),
+    }
+}
+
+/// 「启动时检查更新」那个开关（规格 §4）。**写内核自己的开关**（`update.json`，
+/// 不塞进 `settings.json`），回执是**写完之后**那一份状态（与 `settings_set` 同口径）。
+///
+/// **对齐 macOS**：`SettingsView` 那个 `Toggle("启动时检查更新")` 的绑定。
+///
+/// ⚠️ 它与 [`update_status`] 不同：**这一条是一次用户动作**（点了勾选框），
+///    失败是"你刚才那一下没成"，该照登（同 `settings_set` 那一档）。⚠️ 但它**不重启内核**
+///    （开关状态在内核的 `update.json` 里，内核下一次检查时自己读）—— 与
+///    `verbose_logging_set` 那种"改了要重启"的开关**不是一回事**。
+#[tauri::command(async)]
+pub fn update_set_enabled(app: tauri::State<'_, Shell>, enabled: bool) -> Value {
+    let Some(client) = app.session.client() else {
+        return api::envelope::err(api::NO_KERNEL);
+    };
+    match kernel::update_set_enabled(&client, enabled) {
+        Ok(kernel_value) => {
+            app.session.set_last_error(None);
+            api::update::update_status(&kernel_value)
+        }
+        Err(why) => {
+            note_failure(&app.session, &why);
+            api::failure(&why)
+        }
+    }
+}
+
+/// 「去下载」：把内核给的那条更新链接交给**系统默认浏览器**（R15）。
+///
+/// ## ⚠️ 为什么是**这一条窄语义**的命令，而不是通用的 `open_url`
+///
+/// 一条"打开任意 URI"的壳命令等于把 webview 变成一台**启动器**（前端一旦被注入，
+/// 就能让壳替它拉起任意协议/站点）。而本功能的安全属性恰恰是**"客户只可能被带到那一个
+/// 官方仓库"**（规格 §1 原话）。⇒ 命令名写死成"更新"这一件事，
+/// **白名单写死在 `shell_win::openurl`**，不接受任何"再放行一个域名"的参数。
+///
+/// ## 🔴 白名单在 **Rust 这一侧**判，前端**一个字都不判**
+///
+/// 前端是**可被注入的那一侧**（承诺它自己会判 = 没有承诺）—— 白名单是那段威胁模型里
+/// 唯一还站得住的位置。判据 `crate::openurl::is_allowed` 是**纯函数**（宿主上可断言），
+/// 而"不匹配 ⇒ 拒绝、一次系统调用都不发"由 `openurl::open` 保证。
+///
+/// ⚠️ **它不碰会话状态**（同 `reveal`：这一次动作**没有经过内核**，不知道该清谁的错、
+///    也不该翻引擎那一格）。失败只走**回执那一格**（`is_failure` 由信封形状决定）。
+/// ⚠️ 实参是**内核给的那条 URL 原文**（`update_status().url`），本层不拼、不改写。
+#[tauri::command]
+pub fn open_update_url(url: String) -> Value {
+    match openurl::open(&url) {
+        openurl::Outcome::Opened => api::update::opened(),
+        // 不在白名单里 ⇒ 壳自己的锁拦下的（R15）：拒绝、什么都不打开。
+        openurl::Outcome::Refused => api::update::refused(),
+        // 在白名单里、但系统那一半没能打开（原样带上原因 + 补救）。
+        openurl::Outcome::Failed(why) => api::update::open_failed(&why),
     }
 }
 
@@ -1941,12 +2039,15 @@ mod tests {
             let Some(paren) = rest.find('(') else { continue };
             decls.push((is_async, &rest[..paren]));
         }
-        // ⚠️ 命令数写死：改名 / 拆分 / 新增都会让"扫到了几条"这件事本身变成判据
+        // ⚠️ **命令数写死：改名 / 拆分 / 新增都会让"扫到了几条"这件事本身变成判据**
         //   （同 `ExitCode::ALL` 那条"数组长度是显式的"的纪律）。
+        //   本波次 +3：`update_status` / `update_set_enabled`（都问内核 ⇒ `(async)`）
+        //   与 `open_update_url`（**不问内核**，只做一次系统调用 ⇒ 保持同步、跑在
+        //   收 IPC 的那条线程上 —— 它不许阻塞，也不该为它开一条线程池线程）。
         assert_eq!(
             decls.len(),
-            21,
-            "命令数变了（期望 21）：{decls:?} —— 新增命令时请一并想清楚它该不该开在主线程上"
+            24,
+            "命令数变了（期望 24）：{decls:?} —— 新增命令时请一并想清楚它该不该开在主线程上"
         );
 
         let mut offenders = Vec::new();

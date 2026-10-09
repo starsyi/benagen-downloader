@@ -79,6 +79,21 @@ const ICON_DIR = "folder";
  *  用命令名当键：`poll.js` 的节拍表就是这么索引的，两处对不上时 `stop` 会静默不生效。 */
 const TICK = "tree";
 
+/** 更新提示那一拍的任务名（**宽节拍**，`INTERVALS_MS.update_status` = 60 s）。
+ *  ⚠️ 与 `TICK` 分开：节拍差 60 倍，共用一个键会让 `stop` 只停掉其中一个。 */
+const UPDATE_TICK = "update_status";
+
+/**
+ * 🔴 **本次运行内客户点过「收起」**（规格 §4：「关掉之后，本次运行内不再出现 ——
+ * 后续的每日检查也不会把它叫回来，直到下次启动」）。
+ *
+ * ⚠️ **模块级**（不是 `mount` 里的 `let`）：换屏（去传输列表看一眼再切回来）不是
+ *    "重启应用"，收起要跨过换屏活着 —— 与 `kept` 那三格同一条理由。
+ * ⚠️ **不落盘、不进 localStorage、不记"被忽略的版本"**（规格 §4 明确否掉了后者）：
+ *    下次启动会再出现一次，那是**有意**的。
+ */
+let dismissedUpdate = false;
+
 // ---------------------------------------------------------------------------
 // 🔴 **活过一次挂载的那三格**（真机上"点「下载选中」却下了整批"那个缺陷的落点）
 // ---------------------------------------------------------------------------
@@ -169,6 +184,12 @@ export function mount(el, ctx) {
   const noticeEl = byIdIn(el, "files-notice");
   const noticeTextEl = byIdIn(el, "files-notice-text");
   const noticeListEl = byIdIn(el, "files-notice-list");
+  // 更新提示（规格 §4）——**独立元素**，与上面那条回执条互不影响。
+  const updateEl = byIdIn(el, "files-update");
+  const updateLatestEl = byIdIn(el, "files-update-latest");
+  const updateCurrentEl = byIdIn(el, "files-update-current");
+  const updateGoEl = byIdIn(el, "files-update-go");
+  const updateDismissEl = byIdIn(el, "files-update-dismiss");
   const hintEl = byIdIn(el, "files-bar-hint");
   const hintSepEl = byIdIn(el, "files-bar-hint-sep");
   const countEl = byIdIn(el, "files-bar-count");
@@ -401,6 +422,34 @@ export function mount(el, ctx) {
     }
   }
 
+  /**
+   * 更新提示（规格 §4）。**独立的元素、独立的可见性**，与回执条互不影响。
+   *
+   * ⚠️ 文案的**静态部分住在 `index.html`**（结构文案），这里只把**内核给的两格版本号**
+   *    摆进那两个空 span —— **本文件一个汉字都不拼**（§3.2）。版本号是网络来的，
+   *    壳无从判断它安不安全，所以它**只当数据**用（内核保证它到这一步必是"三段数字"）。
+   *
+   * 🔴 **判据只有 `has_newer`，不是"`url` 非空"**（R20）：内核在"没有新版"时
+   *    **照样可能给一条非空的 `url`**（一条指向**已装版本**的链接）⇒ 按"`url` 非空"
+   *    渲染会把客户引去下载他自己已经装着的那个版本。这一格是那个判据的**唯一落点**。
+   *
+   * ⚠️ `dismissedUpdate` 为真 ⇒ 本次运行内不再出现（规格 §4），即便后续的每日检查
+   *    又把它带回来（这里**主动隐藏**，而不是等它自己消失）。
+   */
+  function paintUpdate(st) {
+    if (!st || st.has_newer !== true || dismissedUpdate) {
+      updateEl.hidden = true;
+      return;
+    }
+    updateEl.hidden = false;
+    // ⚠️ 两格取值都做 `typeof` 那一步：载荷缺格时**空着**，不编一个占位符出来
+    //    （同本文件其余取值口的口径）。它们**不进任何判据**（判据是 `has_newer`）。
+    setText(updateLatestEl, typeof st.latest === "string" ? st.latest : "");
+    setText(updateCurrentEl, typeof st.current === "string" ? st.current : "");
+    // 「去下载」要用的那条链接**原样**记下来（点击时才取；本文件不拼、不改写）。
+    updateGoEl.dataset.url = typeof st.url === "string" ? st.url : "";
+  }
+
   /** 重画某一层的行。**只在"这一层的行变了"时调**（勾选变化走 `paintSelection`）。 */
   function paintRows() {
     clear(rowsEl);
@@ -450,6 +499,24 @@ export function mount(el, ctx) {
   // ---------------------------------------------------------------------------
   // 取数（**只有这几个入口**：动作进来、不是渲染进来）
   // ---------------------------------------------------------------------------
+
+  /**
+   * 拉一次更新状态（`update_status`，宽节拍 60 s），把它画成那条提示条。
+   *
+   * ⚠️ **失败一律静默**（规格 §5）：内核在"取不到"时本就回成功（`has_newer:false`），
+   *    所以这一支的失败只可能是"没有内核 / IPC 断了"——那是**别处**（`state()` 的节拍）
+   *    已经在说的一件事。这一条**一个字都不上屏**：只把提示条收起来（`paintUpdate(null)`）。
+   */
+  async function fetchUpdate() {
+    let st;
+    try {
+      st = await ctx.call(ctx.CMD.updateStatus);
+    } catch (error) {
+      paintUpdate(null);
+      return;
+    }
+    paintUpdate(st);
+  }
 
   /**
    * 读一层目录。**本屏唯一的 `tree(path)` 调用点之一**。
@@ -727,6 +794,29 @@ export function mount(el, ctx) {
     void load(kept.path);
   });
 
+  // ---- 更新提示（规格 §4）-----------------------------------------------------
+  //
+  // ⚠️ 那颗「收起」的图形由 JS 补（`dom.js:ICONS` 是图形的家）：模板里那颗按钮是**空的**
+  //    ——一颗没有内容的按钮看得见（悬停才有一点底色）、但**点不动**，在客户眼里与
+  //    "这里坏了"分不开（本仓库记过这个形态）。与 `dialogs.js:dismissButton`、
+  //    `shell.js:noticeRow` 用的是**同一个图标名**。
+  updateDismissEl.prepend(icon("notice.dismiss", "notice__icon"));
+  // 「收起」= **本次运行内不再出现**（模块级、不落盘 —— 规格 §4）。
+  updateDismissEl.addEventListener("click", () => {
+    dismissedUpdate = true;
+    updateEl.hidden = true;
+  });
+  // 「去下载」：把**内核给的那条链接**交给系统默认浏览器。
+  // 🔴 **白名单在 Rust 那条命令里判**（`open_update_url`），前端**一个字都不判** ——
+  //    前端是可被注入的那一侧，承诺它自己会判等于没有承诺（R15）。
+  // ⚠️ 失败**静默**：这一条动作与 macOS 那颗 `Button` 一样不把结果告诉用户，而且界面里
+  //    没有可显示它的元素（那条约束是"失败一律静默"）。
+  updateGoEl.addEventListener("click", () => {
+    const url = updateGoEl.dataset.url;
+    if (typeof url !== "string" || url === "") return;
+    void ctx.call(ctx.CMD.openUpdateUrl, { url }).catch(() => {});
+  });
+
   // ---- 行：单击选中 / 复选框勾选 / 双击 / 右键 ---------------------------------
   //
   // ⚠️ 事件挂在**容器**上（委托），不是每建一行挂一次：行是整层重建的，
@@ -903,6 +993,10 @@ export function mount(el, ctx) {
     });
   }
   ctx.poller.start(TICK, INTERVALS_MS.state, batchWatch);
+  // 更新提示那一拍：**宽节拍**（60 s，`INTERVALS_MS.update_status`）。内核自己把它节流到
+  // 24 小时，壳这一拍只是把结果拿回来画 —— 首拍立刻跑（`poll.js:start` 的既有语义），
+  // 所以切到文件页**立刻**就知道有没有新版，不用等一整分钟。
+  ctx.poller.start(UPDATE_TICK, INTERVALS_MS.update_status, fetchUpdate);
 
   // 🔴 **首帧先把"载荷还没到"这件事画出来**（F-2 的另一半）：这一屏刚挂上来的那一段里
   //    底栏那三格**什么都没有**（`summary` / `action` 都还是 `null`），而模板里那颗
@@ -1019,6 +1113,8 @@ export function mount(el, ctx) {
     unmount() {
       // 本屏挂上的那一拍要**立刻**停（第三条线：屏自己的节拍不许在切走之后继续打内核）。
       ctx.poller.stop(TICK);
+      // 更新提示那一拍也要停（它是**本屏**的：那条提示条只长在文件页上）。
+      ctx.poller.stop(UPDATE_TICK);
       document.removeEventListener("pointerdown", onDocumentPointerDown);
       document.removeEventListener("keydown", onDocumentKeyDown);
       clear(el);

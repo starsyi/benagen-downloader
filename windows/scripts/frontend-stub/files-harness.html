@@ -73,6 +73,20 @@ const COLOR_CLASS = { Secondary: "is-secondary", Blue: "is-blue", Green: "is-gre
 
 const invocations = [];
 /**
+ * 更新提示那一场的**正对照开关**（见 `runUpdate`）：场景 `update` 先用 `false` 走
+ * 「内核给了非空 url、但没有新版」那一格，再用 `true` 走「有新版」那一格。
+ * ⚠️ 只被 `SCENARIO === "update"` 读；其余场景 `has_newer` 恒 `false`（提示条恒藏，
+ *    与生产上的默认一致，不会扰动任何既有断言）。
+ */
+let updateHasNewer = false;
+/**
+ * 夹具喂给前端的**那条下载链接**：它**属于已装的那个版本**（v0.2.4）。
+ * ⚠️ 内核在 `has_newer:false` 时**照样**会给这样一条非空 url（R20）—— 就是这一格让
+ * 「按 url 非空渲染」会翻车（把客户引去下载他自己已经装着的版本），所以它必须非空。
+ */
+const STALE_UPDATE_URL =
+  "https://gitee.com/starsyi/benagen-downloader/releases/download/v0.2.4/BenagenDownloader-Windows-x86_64.exe";
+/**
  * 🔴 **F-2 的观测窗**：只把**首挂那一条**「整棵树」读人工拖住一小段。
  *
  * 为什么非拖不可：夹具里的 `invoke` 是**立刻 resolve** 的，从 `mount` 到那一拍回来
@@ -107,6 +121,22 @@ async function invoke(cmd, args) {
   }
   if (cmd === "enqueue") {
     return (args.paths || []).length === 0 ? FIX.enqueueNothing : FIX.enqueuePartial;
+  }
+  if (cmd === "update_status") {
+    // 🔴 R26 那一格：内核在"没有新版"时**照样会给一条非空的 url**（指向**已装版本**）。
+    //    场景 `update` 用它验"判据只有 has_newer"；`updateHasNewer` 翻真之后是**正对照**。
+    return {
+      ok: true,
+      data: {
+        enabled: true,
+        checking: false,
+        current: "0.2.4",
+        latest: SCENARIO === "update" && updateHasNewer ? "0.2.5" : "0.2.4",
+        has_newer: SCENARIO === "update" && updateHasNewer,
+        url: STALE_UPDATE_URL,
+        checked_at: 1,
+      },
+    };
   }
   return { ok: true, data: {} };
 }
@@ -199,6 +229,7 @@ document.getElementById("f").addEventListener("load", (e) => {
   else if (SCENARIO === "fail") void runScenario(runFailure);
   else if (SCENARIO === "switch") void runScenario(runSwitch);
   else if (SCENARIO === "keep") void runScenario(runKept);
+  else if (SCENARIO === "update") void runScenario(runUpdate);
   else void runScenario(runStill);
 });
 
@@ -477,6 +508,53 @@ async function runKept() {
   const enqDir = invocations.filter((i) => i.cmd === "enqueue").pop();
   check("⑦ 目录里勾一个文件 ⇒ 发给内核的是那**一个**（不是刚进来的那个目录、更不是整批）",
     JSON.stringify(enqDir.args.paths) === JSON.stringify([SUB_ROWS[0].path]), JSON.stringify(enqDir.args));
+}
+
+// ---- 场景 update：更新提示的**判据只有 has_newer**（R20 / R26）------------------
+//
+// 🔴 为什么必须存在（R61：一个**专门为某个失效模式立的裁决**，却只有手工断言，等于没落地）：
+//    内核在"没有新版"时**照样会给一条非空的 url**（一条指向**已装版本**的链接）。
+//    前端若写成「`url` 非空就显示」，客户会被引去下载**自己已经装着的**那个版本（R20）。
+//    这一场喂的就是那一格（`{has_newer:false, url:<非空>}`），再借一次**换屏**把
+//    `has_newer` 翻成 true 当**正对照** —— 少了它，"把提示条改成恒隐藏"也能让 ① 绿。
+async function runUpdate() {
+  await sleep(1600);
+
+  // ---- ① 内核给了非空 url、但没有新版 ⇒ 那条提示条**必须藏着** -------------------
+  const bar = doc().querySelector("#files-update");
+  check("① 提示条在场（不然下面那条断言的是空气）", !!bar,
+    bar ? "在场" : "没有 #files-update 这个元素");
+  check("① `has_newer:false` 且 `url` 非空（" + STALE_UPDATE_URL + "）⇒ 提示条**藏着**"
+      + "（判据只有 has_newer，R20）",
+    !!bar && bar.hidden === true, "hidden=" + (bar ? String(bar.hidden) : "（没有这个元素）"));
+
+  // ---- ② 正对照：把 has_newer 翻成 true、换屏重挂 ⇒ 提示条**显示** ---------------
+  //    `switchAwayAndBack` 会让这一屏**重挂** ⇒ files.js 那一拍**再拉一次** update_status。
+  updateHasNewer = true;
+  await switchAwayAndBack();
+  const bar2 = doc().querySelector("#files-update");
+  check("② 正对照：`has_newer:true` ⇒ 提示条**显示**（不是「永远藏着」）",
+    !!bar2 && bar2.hidden === false, "hidden=" + (bar2 ? String(bar2.hidden) : "（没有这个元素）"));
+  check("② 两个版本号逐字来自内核（JS 一个汉字都不拼）",
+    !!bar2
+      && bar2.querySelector("#files-update-latest").textContent === "0.2.5"
+      && bar2.querySelector("#files-update-current").textContent === "0.2.4",
+    "latest=「" + (bar2 ? bar2.querySelector("#files-update-latest").textContent : "?")
+      + "」current=「" + (bar2 ? bar2.querySelector("#files-update-current").textContent : "?") + "」");
+  check("② 「去下载」那颗记下了内核给的那条 url（原文，前端不拼）",
+    !!bar2 && bar2.querySelector("#files-update-go").dataset.url === STALE_UPDATE_URL,
+    bar2 ? bar2.querySelector("#files-update-go").dataset.url : "（没有这个元素）");
+
+  // ---- ③ 「收起」= 本次运行内不再出现（规格 §4）--------------------------------
+  click(bar2.querySelector("#files-update-dismiss"));
+  await sleep(300);
+  check("③ 点「收起」⇒ 立刻藏起来", bar2.hidden === true, "hidden=" + String(bar2.hidden));
+  // ⚠️ 换屏也**不许**把它叫回来（`dismissedUpdate` 是模块级的，活过重挂）——
+  //    这一条同时钉住"收起不是只改一次 DOM、而是本次运行的状态"。
+  await switchAwayAndBack();
+  const bar3 = doc().querySelector("#files-update");
+  check("③ 换屏之后**仍然藏着**（收起活过重挂：本次运行内不再出现）",
+    !!bar3 && bar3.hidden === true, "hidden=" + (bar3 ? String(bar3.hidden) : "（没有这个元素）"));
 }
 
 // ---- 场景 sub：交互脚本（32 条；期望值全部读夹具）----------------------------

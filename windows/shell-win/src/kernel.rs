@@ -299,6 +299,37 @@ pub fn verify_status(client: &CoreClient) -> Result<VerifyStatus, CallFailure> {
         .map_err(|e| CallFailure::shell(shell_cannot_decode("verify_status", "VerifyStatus", &e)))
 }
 
+/// 取一次 `update_status`（无参方法发 `params: null`；内核不读参数）。
+///
+/// ⚠️ **它是"更新提示那条提示条有什么可画"的唯一来源**（规格 §4）：内核的 `op_update_status`
+///    **任何取不到的情形都回成功**（`has_newer:false`）⇒ 这一条**没有"内核报了错"那一档**，
+///    它只可能在"没有内核 / 传输断了"时失败（那是所有 `kernel::*` 共有的那一档）。
+///    ⚠️ 回的是 `serde_json::Value` 而不是一个 `protocol.rs` 里的镜像类型：内核这一条
+///    随更新检查新增、**不在** `protocol.rs` 的既有镜像里，而前端要的键名与内核 `json!`
+///    里逐字相同 ⇒ 透传即可（理由写在 `shell_core::api::update` 的文件头）。
+pub fn update_status(client: &CoreClient) -> Result<serde_json::Value, CallFailure> {
+    client
+        .call("update_status", serde_json::Value::Null)
+        .map_err(|e| CallFailure::of(&e))
+}
+
+/// 写「启动时检查更新」那个开关（`update_set_enabled`，入参 `{"enabled": bool}`）。
+///
+/// ⚠️ **回执是"写完之后"那一份状态**（内核的 `op_update_set_enabled` 落盘后回
+///    `op_update_status` 的那一份）—— 与 `set_settings` 回"归一化之后那一份"同口径：
+///    前端只有一条渲染路径，不必再发一条 `update_status` 去刷新。
+pub fn update_set_enabled(
+    client: &CoreClient,
+    enabled: bool,
+) -> Result<serde_json::Value, CallFailure> {
+    client
+        .call(
+            "update_set_enabled",
+            serde_json::json!({ "enabled": enabled }),
+        )
+        .map_err(|e| CallFailure::of(&e))
+}
+
 /// 「内核**回了**、而壳解不动它的形状」那句话。
 ///
 /// ⚠️ **这不是内核报的错**（内核报的错原文逐字照登）。措辞与
@@ -708,5 +739,32 @@ mod tests {
         //    `last_request()` 返回空串时那条否定形式的断言会**假绿**。
         assert!(sent.contains(r#""method":"verify_status""#), "method 不在请求里：{sent}");
         assert!(sent.contains(r#""params":null"#), "无参方法要发 `params:null`：{sent}");
+    }
+
+    /// `update_status` 发的是 `params: null`（内核的 `op_update_status` 不读参数）。
+    #[test]
+    fn update_status_sends_null_params() {
+        let ch = Scripted::new(&[&ok_reply(1, r#"{"enabled":true,"checking":false,"current":"0.2.4","latest":"0.2.5","has_newer":true,"url":"u","checked_at":1}"#)]);
+        let client = CoreClient::new(Box::new(ch.clone()));
+        expect_ok(update_status(&client), "update_status");
+        let sent = ch.last_request();
+        // ⚠️ 顺序同 `verify_status` 那条（先判 method 在，再判 `params:null`）。
+        assert!(sent.contains(r#""method":"update_status""#), "method 不在请求里：{sent}");
+        assert!(sent.contains(r#""params":null"#), "无参方法要发 `params:null`：{sent}");
+    }
+
+    /// 🔴 `update_set_enabled` 的 `enabled` 是**顶层的布尔**（内核读 `params.get("enabled")`）。
+    ///
+    /// 判别力：把它套进一层（`{"settings":{…}}`，照 `set_settings` 那样）⇒ 内核回
+    /// `invalid_params`，而请求看起来"也有 enabled" —— 一个只有真机才看得见的错。
+    #[test]
+    fn update_set_enabled_sends_a_top_level_bool() {
+        let ch = Scripted::new(&[&ok_reply(1, r#"{"enabled":false,"checking":false,"current":"0.2.4","latest":null,"has_newer":false,"url":null,"checked_at":0}"#)]);
+        let client = CoreClient::new(Box::new(ch.clone()));
+        expect_ok(update_set_enabled(&client, false), "update_set_enabled");
+        let sent = ch.last_request();
+        assert!(sent.contains(r#""method":"update_set_enabled""#), "method 不在请求里：{sent}");
+        assert!(sent.contains(r#""enabled":false"#), "enabled 要在顶层、且是布尔：{sent}");
+        assert!(!sent.contains("settings"), "别套一层 settings：{sent}");
     }
 }

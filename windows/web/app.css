@@ -94,5 +94,5 @@
   font-family: "Noto Sans SC";
   src: url("./fonts/ui-subset.otf") format("opentype");
   font-weight: 400;      /* 子集里只有 Regular 一档，照样张写 */
-  font-display: swap;    /* 字体就 185 KB 且在本地磁盘上；swap 与样张一致 */
+  font-display: swap;    /* 字体就 193 KB 且在本地磁盘上；swap 与样张一致 */
 }

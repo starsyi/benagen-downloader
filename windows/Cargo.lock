@@ -2790,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "shell-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -2798,7 +2798,7 @@ dependencies = [
 
 [[package]]
 name = "shell-win"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "serde_json",
  "shell-core",

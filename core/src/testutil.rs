@@ -92,6 +92,13 @@ impl RawResponse {
 pub struct SeenRequest {
     pub method: String,
     pub path: String,
+    /// 请求头，**按线上原样**（名字保留大小写、值已去首尾空白），按到达顺序。
+    ///
+    /// 为什么要记它（任务 2 的 R8a）：`update::the_request_sends_nothing` 要断言的正是
+    /// **"客户端什么都没发"** —— 没有 `Authorization` / `Cookie` / 任何 `X-` 自定义头
+    /// （规格 §6.3）。只看请求行与请求体**验不到**这件事，所以这个字段是那条判据的载体：
+    /// 加了它就必须真的被断言，否则等于"付了钱不收货"。
+    pub headers: Vec<(String, String)>,
     pub body: String,
 }
 
@@ -202,11 +209,18 @@ fn read_request(s: &mut std::net::TcpStream) -> Option<SeenRequest> {
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
 
-    // 头名大小写不敏感（HTTP 本就如此），逐个找。
-    let content_length = lines
+    // 头名大小写不敏感（HTTP 本就如此）；这里**照线上原样**收集，比较时才转小写 ——
+    // 调用方要断言"线上那条请求到底带了什么头"，所以保留大小写、不做归一。
+    // ⚠️ 只认第一行的请求行之外的 `名字: 值` 行；`filter_map` 顺手丢掉续行与畸形行。
+    let headers: Vec<(String, String)> = lines
         .filter_map(|l| l.split_once(':'))
-        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+
+    let content_length = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.parse::<usize>().ok())
         .unwrap_or(0);
 
     // 与头一起到达的那部分体已经躺在 `buf` 里，别丢。
@@ -223,6 +237,7 @@ fn read_request(s: &mut std::net::TcpStream) -> Option<SeenRequest> {
     Some(SeenRequest {
         method,
         path,
+        headers,
         body: String::from_utf8_lossy(&body).to_string(),
     })
 }

@@ -3,11 +3,12 @@
 // 内核**没有推送**（协议是纯请求/响应，全仓无事件通道）⇒ 前端只能拉。
 // 这张表就是"拉什么、多快拉"的**唯一一份**：
 //
-//   | 数据        | 节拍  | 依据                                             |
-//   | `state()`   | 1 s   | 引擎/加载态的变化远慢于传输                       |
-//   | `transfers()`| 200 ms| `TransferListPoll::INTERVAL_NANOSECONDS`（既有常量）|
-//   | `verify()`  | 1 s   | **仅在校验页可见时**；否则一拍都不发               |
-//   | `tree()`    | 只在用户操作时 | ——（不在本文件里，它没有节拍）                |
+//   | 数据          | 节拍  | 依据                                             |
+//   | `state()`     | 1 s   | 引擎/加载态的变化远慢于传输                       |
+//   | `transfers()` | 200 ms| `TransferListPoll::INTERVAL_NANOSECONDS`（既有常量）|
+//   | `verify()`    | 1 s   | **仅在校验页可见时**；否则一拍都不发               |
+//   | `update_status()` | 60 s | **仅文件页可见时**；内核自己节流到 24 h，这一拍只是取回结果 |
+//   | `tree()`      | 只在用户操作时 | ——（不在本文件里，它没有节拍）                |
 //
 // ⚠️ 200 ms 那个数**不是**在这里定的，它抄自 `shell-core`：
 //    `presentation::transfer_row::TransferListPoll::INTERVAL_NANOSECONDS = 200_000_000`。
@@ -22,6 +23,10 @@ export const INTERVALS_MS = Object.freeze({
   state: 1000,
   transfers: 200,
   verify: 1000,
+  // 更新检查（规格 §4）：**宽节拍**。内核自己把它节流到 24 小时，壳这一拍只是把
+  // 结果拿回来画那条提示条 —— 60 s 足够及时，也不会为一条几乎不变的状态多打内核。
+  // ⚠️ **别用 `transfers` 那个 200 ms**（那是传输进度，秒级以下的量级不一样）。
+  update_status: 60000,
 });
 
 /**

@@ -1,12 +1,13 @@
 import SwiftUI
+import AppKit                   // NSWorkspace：「去下载」把链接交给系统默认浏览器
 import BenagenCoreKit
 
 // ---------------------------------------------------------------------------
 // 🔴 常驻提示行的**高度不许由外部文本 / 外部数据决定**
 //
-// 本文件里挂着**五条常驻提示行**（引擎横幅 / 下载回执 / 换码结果 / 历史写盘失败 /
-// 改下载目录回执）。**第 6 个落点**在 `SettingsView` 里（同一条改目录回执的另一个显示位置，
-// 共用 `DownloadDirChangeNotice`）—— 它是"另一个落点"，**不是**本文件里的第 6 条行。
+// 本文件里挂着**六条常驻提示行**（引擎横幅 / 更新提示 / 下载回执 / 换码结果 / 历史写盘失败 /
+// 改下载目录回执）。**另有第 7 个落点**在 `SettingsView` 里（同一条改目录回执的另一个显示位置，
+// 共用 `DownloadDirChangeNotice`）—— 它是"另一个落点"，**不是**本文件里的第 7 条行。
 // ⚠️ 数"有多少块被上限管着"又是另一个数（引擎横幅一条行里有两块：正文 + 补充说明），
 //    那个数写在 `ResidentNotice.swift` 的 `residentNoticeTextMaxHeight` 上面，**别混**。
 // 它们排布在窗口内容的上方，而窗口内容的下方锚着真正要用的东西
@@ -27,7 +28,7 @@ import BenagenCoreKit
 //   · 新增常驻行时**照抄上面的三条**，别直接摆一个裸 `Text` ——
 //     裸 `Text` + `fixedSize(vertical:)` 就是这次事故的成因。
 //
-// ⚠️ **上面这三条只管常驻提示行**（本文件这 5 条 + `SettingsView` 那个落点），
+// ⚠️ **上面这三条只管常驻提示行**（本文件这 6 条 + `SettingsView` 那个落点），
 //    **不是**一条"`lineLimit` 只许用在数据上"的全局规矩 —— `macos/Sources` 里现在就有
 //    两处**有意**的 `lineLimit(1)`，**都没问题、别去"修"**：
 //    `EngineStatusBadge.swift`（工具栏徽标，恒定一行的徽标 + `.middle` + `.help`）
@@ -106,6 +107,13 @@ struct RootView: View {
             VStack(spacing: 0) {
                 if let banner = EngineBanner.of(engine: model.engine, lastError: model.lastError) {
                     engineBannerBar(banner)
+                }
+                // ⑥ 「有新版本」（规格 §4）—— 🔴 **与下载回执是两条独立元素**（不共用、不互相
+                //    覆盖）：回执是"这一次动作的结果"（几秒后消失），更新提示是"一直在，
+                //    直到客户处理或关掉"。判据全在 `UpdateNotice.of`（只有 `has_newer`、
+                //    版本号要三段纯数字、链接要过白名单）—— 本视图只做渲染分派。
+                if let notice = UpdateNotice.of(model.updateStatus), !model.updateNoticeDismissed {
+                    updateNoticeBar(notice)
                 }
                 if let downloadNotice { downloadFeedbackBar(downloadNotice) }
                 // ③ 换码结果（任务 2 复审重要 ②/③）在最下面：它说的是"你刚才换的那一次
@@ -266,6 +274,23 @@ struct RootView: View {
             guard shouldPollTransfers else { return }
             await pollLoop()
         }
+        // -------------------------------------------------------------------
+        // 更新提示那一拍（R27）：**跟着文件页挂/停**，与上面那条传输轮询是**两条独立的环**。
+        //
+        // ⚠️ **为什么不挂 `pollTick`**：`pollTick` 的前置条件是"传输列表可见 + 有生效批次
+        //    + 引擎在跑"（既有设计，不动它），而更新提示画在**文件页**顶部 —— 客户一打开
+        //    应用停在文件页时根本到不了 `pollTick`（那就是 R27 修的那条）。
+        //    现在由**文件页自己**驱动这一拍，与 Windows 那侧同一个形状
+        //    （`files.js` 把 `update_status: 60000` 挂进调度器、随文件屏挂/停）。
+        //
+        // ⚠️ 条件**只有** `section == .files`：**不含** "传输页可见" / "引擎在跑"。
+        //    开机默认就在文件页（`section` 初始值 = `.files`）⇒ **启动后必然拉一次**，
+        //    不依赖客户去不去传输页；而**离开文件页时 `.task` 被取消**，不留常驻循环。
+        // -------------------------------------------------------------------
+        .task(id: shouldPollUpdate) {
+            guard shouldPollUpdate else { return }
+            await updateLoop()
+        }
         // 规格 §14.2 的定稿。配合 App.swift 的 `.windowResizability(.contentMinSize)`，
         // 这个 frame 就是**窗口拖不小到的下界**：
         //   侧边栏 220–280 + 四列平铺列表（名称/大小/时间/状态）约需 820px + 内边距 20×2 + 工具栏。
@@ -325,6 +350,35 @@ struct RootView: View {
     ///    （传输列表只在 `.loaded` 时存在，没加载时轮询只是白问内核）。
     private var shouldPollTransfers: Bool {
         section == .transfers && hasLoadedManifest
+    }
+
+    /// 更新提示现在该跑吗（⇒ 该起 60 s 那一拍）。
+    ///
+    /// ⚠️ **只有"停在文件页"这一个条件**（R27）—— **不含** `hasLoadedManifest`：
+    ///    更新状态讲的是**应用版本**，与有没有加载交付清单无关；而且"启动时一次"
+    ///    必须**早于** `load_delivery`（那一次实测约 91.5 秒）就发生，否则客户等了一分半
+    ///    才可能看到提示。也**不含** "引擎在跑"（那是传输轮询的准入，与这里无关）。
+    private var shouldPollUpdate: Bool {
+        section == .files
+    }
+
+    /// 60 秒一拍拉更新状态。**只在文件页可见时跑**——离开文件页时 `.task` 会取消它，
+    /// 所以没有"永不取消的循环"（取消在下一次 `Task.sleep` 抛出时立刻生效，与 `pollLoop` 同款）。
+    ///
+    /// ⚠️ **先拉、再睡**：`.task` 一挂上就立刻拉一次（开机即第一次），之后才进入 60 s 的节拍 ——
+    ///    这正是"启动后必然拉一次"那条要求的落点。
+    /// ⚠️ 走 [`AppModel.pollUpdateStatus`]（带"有待显示错误就先不打扰"那道闸），不是
+    ///    `refreshUpdateStatus`（那个是设置页要"立刻拿当前值"用的）。
+    private func updateLoop() async {
+        while !Task.isCancelled {
+            await model.pollUpdateStatus()
+            do {
+                try await Task.sleep(
+                    nanoseconds: UInt64(AppModel.updateCheckInterval * 1_000_000_000))
+            } catch {
+                return      // 取消（离开文件页）⇒ 立刻停，不再拍
+            }
+        }
     }
 
     /// 200 ms 一拍（节拍常量在 `TransferListPoll`，规格 §5.3）。
@@ -397,6 +451,43 @@ struct RootView: View {
                 BoundedNoticeText(text: hint, font: .caption)
                     .foregroundStyle(.secondary)
             }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.4))
+    }
+
+    // MARK: - 更新提示（规格 §4）
+
+    /// 「有新版本」那条提示行。**独立于下载回执**（规格 §4：两条元素的生死周期不同）。
+    ///
+    /// ⚠️ 文案是 `UpdateNotice.text`（版本号**原文照登**、壳不拼），走
+    ///    `BoundedNoticeText`（常驻行的散文一律走它 —— 高度有界，见本文件文件头）。
+    ///    即便 `UpdateNotice.of` 那道"三段纯数字"校验被绕过，这条行的高度也不会被撑开。
+    ///
+    /// ⚠️ 「去下载」那颗按钮**只在 `notice.url != nil` 时**才画：`url` 已经在
+    ///    `UpdateNotice.of` 里过了官方发布路径白名单（R15），不匹配的链接在那里就被
+    ///    当成"没有链接"了 ⇒ 这里看到 `nil` 就不画按钮。
+    /// ⚠️ `NSWorkspace.shared.open` 是**系统调用**，必须落在**视图层** ——
+    ///    `Presentation/` 那层明文规定不 `import AppKit`（见那里的文件头）。
+    private func updateNoticeBar(_ notice: UpdateNotice) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "arrow.down.circle")
+                .foregroundStyle(Color.accentColor)
+            BoundedNoticeText(text: notice.text, font: .callout.weight(.semibold))
+            Spacer(minLength: 8)
+            if let url = notice.url {
+                Button("去下载") { NSWorkspace.shared.open(url) }
+                    .help("在系统默认浏览器里打开官方下载页")
+            }
+            Button {
+                model.dismissUpdateNotice()
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .help("收起这条提示")
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 8)

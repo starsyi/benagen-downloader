@@ -379,6 +379,13 @@ private func percentEncodedPath(_ path: String) -> String {
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
 
+    // ⚠️ **关掉内核的更新检查**：本目录是**全新**的 ⇒ 内核的 `spawn_update_check`
+    //    第一拍就会对 `gitee.com` 发一次**真请求**（它按 `--settings` 的**同目录**找
+    //    `update.json`）。测试套件不该依赖公网。
+    //    ⚠️ 写失败就抛出去，不静默吞掉：静默失败会让这一下悄悄退回"每次跑都打公网"。
+    try Data(#"{"enabled":false}"#.utf8)
+        .write(to: root.appendingPathComponent("update.json"))
+
     let stubRoot = root.appendingPathComponent("stub")
     let downloadDir = root.appendingPathComponent("downloads")
     try FileManager.default.createDirectory(at: stubRoot, withIntermediateDirectories: true)

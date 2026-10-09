@@ -13,13 +13,25 @@ import Foundation
 //
 // 一次性内核：`--settings` 指到临时目录（内核从**它的父目录**读 `last_code`，
 // 所以临时目录同时保证了"上次交付码"是空的），`--download-dir` 也指到临时目录。
-// 这几条都不碰网络、不起 aria2（`hello` / `get_settings` / `get_state` / 未知方法都不需要引擎）。
+// 这几条不起 aria2（`hello` / `get_settings` / `get_state` / 未知方法都不需要引擎）。
+//
+// ⚠️ **别把这句读成"不碰网络"**：内核的 `main()` 会起一条更新检查线程
+//    （`spawn_update_check`），而临时目录是**全新**的 ⇒ `update.json` 不存在 ⇒
+//    第一拍就对 `gitee.com` 发一次**真请求**。所以 `liveClient()` **必须**把
+//    `update.json` 预置成 `{"enabled": false}`（见那里）——"不碰网络"是夹具
+//    **做出来**的，不是内核本来的行为。
 
 /// 起一个一次性内核（临时 settings / 临时下载目录）。
 private func liveClient() throws -> CoreClient {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("benagen-core-smoke-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    // **关掉内核的更新检查**：内核按 `--settings` 的**同目录**找 `update.json`
+    // （`settings_path.parent().join("update.json")`）。不写这一下，本套件每次跑都会
+    // 对 gitee.com 发一次真请求 —— 测试套件不该依赖公网。
+    // ⚠️ **写失败就抛出去**，不静默吞掉：静默失败会让这一下悄悄退回"每次跑都打公网"。
+    try Data(#"{"enabled":false}"#.utf8)
+        .write(to: root.appendingPathComponent("update.json"))
     return try CoreClient.live(settingsPath: root.appendingPathComponent("settings.json").path,
                                downloadDir: root.appendingPathComponent("downloads").path,
                                verboseLogging: false)

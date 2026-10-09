@@ -389,6 +389,23 @@
       </button>
     </div>
 
+    <!-- 更新提示（规格 §4）：**独立元素、独立可见性**，与下面 `files-notice`（回执条）
+         互不影响 —— 两者的生命周期不同（回执条是"你刚才那个动作的结果"，这条是
+         "这个世界有个新版本"），共用一个元素会互相覆盖。
+         ⚠️ 文案的**静态部分住在这里**（结构文案），可变的**版本号来自内核**：
+         `files.js:paintUpdate` 只把 `latest` / `current` 两格摆进下面两个空 span ——
+         **JS 一个汉字都不拼**（§3.2），版本号是 ASCII 也由内核保证是"三段数字"。
+         🔴 判据只有 `has_newer`（R20）：内核的 `url` 在"没有新版"时**照样可能非空**
+            （它带着一条指向**已装版本**的链接）⇒ 按"`url` 非空"渲染会把客户引去下载
+            自己已经装着的版本。判据落在 `files.js`。
+         ⚠️ 那颗「收起」的图形由 JS 补（`dom.js:ICONS` 是图形的家），这里只留按钮
+            与它的无障碍名字 —— 一颗只有 × 的按钮对读屏来说是空的。 -->
+    <div class="files__notice files__notice--update" id="files-update" hidden>
+      <span class="files__notice-text selectable">有新版本 <span id="files-update-latest"></span>（当前 <span id="files-update-current"></span>）</span>
+      <button class="notice__action" id="files-update-go" type="button">去下载</button>
+      <button class="notice__dismiss" id="files-update-dismiss" type="button" aria-label="收起"></button>
+    </div>
+
     <div class="files__head" id="files-head">
       <span class="files__col-name">名称</span>
       <span class="files__col-size">大小</span>
@@ -928,6 +945,21 @@
           <span class="set__spacer"></span>
           <span class="set__dismiss" id="set-export-receipt-dismiss"></span>
         </div>
+      </section>
+
+      <!-- 「启动时检查更新」（规格 §4）。**不重启内核**（与上面那个详细日志开关不同：
+           开关状态在内核自己的 `update.json` 里，内核下一次检查时自己读）。
+           ⚠️ 标签是**结构文案**（与数据无关、任何状态下都一样，浏览器直接渲染）——
+           与「下载到」/「应用」同一条：它不由载荷给（macOS 侧同样住在 `SettingsView` 的
+           视图字面量里）。而**勾没勾**来自内核（`update_status.enabled`，`settings.js`
+           打开时读一次、改了用 `update_set_enabled` 的返回值刷新）。
+           ⚠️ **默认勾上**（`checked`）：内核那一份还没拿回来之前保持勾着 ——
+           开关的默认就是开（本波次全局约束：开关默认开）。 -->
+      <section class="set__section">
+        <label class="set__check" id="set-update-check">
+          <input type="checkbox" id="set-update" checked>
+          <span class="set__check-label" id="set-update-label">启动时检查更新</span>
+        </label>
       </section>
 
       <section class="set__section">

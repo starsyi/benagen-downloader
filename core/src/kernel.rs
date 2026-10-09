@@ -45,7 +45,7 @@ use crate::protocol::{codes, TransferItem};
 use crate::settings::Settings;
 use crate::state::State as FileState;
 use crate::view::FileState as ViewFileState;
-use crate::{delivery, engine, kcodes, planner, protocol, settings, state, verify, view};
+use crate::{delivery, engine, kcodes, planner, protocol, settings, state, update, verify, view};
 
 pub use crate::protocol::{ErrorBody, Request, Response};
 
@@ -122,6 +122,15 @@ pub struct Kernel {
     /// 上次用过的交付码。**单独一个小文件**（简报第 6 条），不进 `settings`。
     last_code: String,
 
+    /// 更新状态文件（`update.json`）的路径。**独立于 `settings.json`** —— 那些是
+    /// 下载参数、面板上一行一项；这个是运行状态（与 `last_code` 同层）。
+    update_path: PathBuf,
+    /// 更新检查的运行状态（开关 / 上次查于 / 上次看到的版本）。
+    update: update::State,
+    /// **手动查那颗按钮唯一的反馈**：正在查时为真。壳在**另一条连接**上轮询
+    /// `update_status` 时看得到它 —— 所以置真/置假必须发生在**锁内**（见 [`run_update_check`]）。
+    update_checking: bool,
+
     /// 已校验文件的记录（跨会话，落盘）。
     state: FileState,
     /// 六类校验结果的累积。
@@ -194,6 +203,11 @@ impl Kernel {
         let last_code = std::fs::read_to_string(&last_code_path)
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
+        let update_path = match settings_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.join("update.json"),
+            _ => PathBuf::from("update.json"),
+        };
+        let update = update::load_state(&update_path);
         let state = FileState::load(&download_dir);
         Kernel {
             download_dir,
@@ -202,6 +216,9 @@ impl Kernel {
             settings,
             manifest: None,
             last_code,
+            update_path,
+            update,
+            update_checking: false,
             state,
             verify: verify::CheckResult::default(),
             complete: BTreeSet::new(),
@@ -334,6 +351,11 @@ impl Kernel {
         if let Err(e) = std::fs::write(&self.last_code_path, code) {
             eprintln!("benagen-core: 记录上次交付码失败（不影响下载）: {e}");
         }
+    }
+
+    /// 落盘更新状态。**返回值丢弃**：落盘失败不该让命令失败（与"失败一律静默"同一条口径）。
+    fn save_update_state(&self) {
+        let _ = update::save_state(&self.update_path, &self.update);
     }
 }
 
@@ -535,6 +557,67 @@ pub fn spawn_recovery(kernel: Arc<Mutex<Kernel>>) {
             }
         })
         .expect("起自愈线程失败");
+}
+
+/// **有新版本就记下来**（规格 §3）：启动即可能查一次，之后每 24 小时一次。
+///
+/// ⚠️ **网络 I/O 在锁外**，与 [`spawn_recovery`] 同一条纪律（见 [`run_update_check`]）。
+/// ⚠️ **手动查（`update_check_now`）不受节流限制**，但也要落盘 —— 于是手动查完
+///    24 小时内不会再自动查一次。这一条由 [`op_check_update_now`] 自己保证。
+///
+/// ⚠️ **tick 取 60 秒而非 1 秒**：节流粒度是 24 小时，60 秒与 1 秒在行为上不可分辨，
+///    而 60 秒是 60× 少的唤醒。
+pub fn spawn_update_check(kernel: Arc<Mutex<Kernel>>) {
+    std::thread::Builder::new()
+        .name("update-check".to_string())
+        .spawn(move || {
+            // 立刻跑第一拍（"启动时一次"）。判据仍然是 `should_check`，
+            // 所以"刚查过又重启"不会被查第二次。
+            loop {
+                let due = {
+                    let k = lock(&kernel);
+                    update::should_check(k.update.enabled, k.update.last_checked_at, now_secs())
+                };
+                if due {
+                    run_update_check(&kernel);
+                }
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        })
+        .expect("起更新检查线程失败");
+}
+
+/// 真查一次并落盘。**锁外做网络**；只有"置标志"与"写结果"这两下进锁。
+///
+/// 两条路径共用它：后台线程（[`spawn_update_check`]）与手动查（[`op_check_update_now`]）。
+fn run_update_check(kernel: &Arc<Mutex<Kernel>>) {
+    {
+        let mut k = lock(kernel);
+        if !k.update.enabled {
+            return; // 开关关掉 ⇒ 不发起任何请求（规格 §5）
+        }
+        // 手动查那颗按钮唯一的反馈：进网络前置真，写完结果置假。
+        // 壳在另一条连接上轮询 `update_status` 时看得到它。
+        k.update_checking = true;
+    }
+    let latest = update::fetch_latest(&update::UreqFetcher::new());
+    let mut k = lock(kernel);
+    k.update_checking = false;
+    k.update.last_checked_at = now_secs();
+    // ⚠️ **失败时不覆盖 `last_seen`**：一次网络抖动不该把"上次看到有新版本"抹掉，
+    //    那会让提示在网络恢复前先消失一下。失败就保持原样。
+    if let Some(v) = latest {
+        k.update.last_seen = Some(v);
+    }
+    k.save_update_state();
+}
+
+/// 现在（unix 秒）。时钟回拨由 `update::should_check` 那一支兜住。
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// **把一个卡死的引擎换掉**：关掉旧的、起一个新的、把句柄换过去。
@@ -1097,6 +1180,12 @@ pub fn dispatch(kernel: &Arc<Mutex<Kernel>>, req: &Request) -> (Response, bool) 
         "get_settings" => with_kernel(kernel, op_get_settings),
         "set_settings" => with_kernel(kernel, |k| op_set_settings(k, &req.params)),
         "get_state" => with_kernel(kernel, op_get_state),
+        "update_status" => with_kernel(kernel, op_update_status),
+        "update_set_enabled" => with_kernel(kernel, |k| op_update_set_enabled(k, &req.params)),
+        // ⚠️ 这一条**刻意不裹 `with_kernel`**（与上面那五个同源）：它最贵的部分是
+        //    网络 I/O（最坏 5 秒），持锁跑会让校验线程与 `transfer_list` 一起停摆。
+        //    末参数是 `kernel` 本身，不是闭包。见 `op_check_update_now` 的注释。
+        "update_check_now" => op_check_update_now(kernel),
         other => Err(ErrorBody::new(
             kcodes::UNKNOWN_METHOD,
             format!("内核不认识方法 {other:?}"),
@@ -2196,6 +2285,60 @@ pub fn op_get_settings(k: &mut Kernel) -> Result<Value, ErrorBody> {
     }))
 }
 
+/// `update_status`：**只读**。壳轮询它，与 `transfer_list` 同一条路子。
+///
+/// ⚠️ **任何取不到的情形都回成功**（`has_newer:false`），不是错误 ——
+///    否则壳那边会冒出一句客户看不懂的报错（规格 §6.6）。
+pub fn op_update_status(k: &mut Kernel) -> Result<Value, ErrorBody> {
+    let current = env!("CARGO_PKG_VERSION");
+    // ⚠️ **现算**，不存。（存的判定会过期；过期的表现是"提示一个已经装上的版本"。）
+    let has_newer = k
+        .update
+        .last_seen
+        .as_deref()
+        .is_some_and(|latest| update::is_newer(latest, current));
+    let url = k
+        .update
+        .last_seen
+        .as_deref()
+        .and_then(update::parse_version)
+        .map(|v| update::download_url(v, update::asset_name(update::platform(), update::arch())));
+    Ok(json!({
+        "enabled": k.update.enabled,
+        "checking": k.update_checking,
+        "current": current,
+        "latest": k.update.last_seen,
+        "has_newer": has_newer,
+        "url": url,
+        "checked_at": k.update.last_checked_at,
+    }))
+}
+
+/// `update_set_enabled`：设置里那个勾选框。
+pub fn op_update_set_enabled(k: &mut Kernel, params: &Value) -> Result<Value, ErrorBody> {
+    let enabled = params
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ErrorBody::invalid_params("缺少 enabled（布尔）".to_string()))?;
+    k.update.enabled = enabled;
+    k.save_update_state();
+    op_update_status(k)
+}
+
+/// `update_check_now`：手动触发一次。**不受节流限制**（规格 §2），但**也要落盘**
+/// —— 于是手动查完 24 小时内不会再自动查一次。
+///
+/// ⚠️ **刻意不用 `with_kernel` 包**：它最贵的部分是网络 I/O（最坏 5 秒），
+///    持着内核锁跑会让校验线程与 `transfer_list` 一起停摆 —— 与 `kernel.rs` 里
+///    [`dispatch`] 上方那条既有纪律、以及 [`op_load_delivery`]/[`op_plan`]/[`op_enqueue`]
+///    的"锁外取数 / 锁内安装"同源。
+///    **dispatch 那一行因此写成 `"update_check_now" => op_check_update_now(kernel),`**
+///    （末参数是 `kernel` 本身，不是 `with_kernel` 的闭包）。
+pub fn op_check_update_now(kernel: &Arc<Mutex<Kernel>>) -> Result<Value, ErrorBody> {
+    run_update_check(kernel);
+    with_kernel(kernel, op_update_status)
+}
+
 /// `set_settings`：参数写入。
 ///
 /// 三道**顺序不能换**：
@@ -2915,5 +3058,89 @@ mod tests {
             "**没补到的**不许缓存：那会把一次网络抖动钉成永久「无法校验」"
         );
         assert_eq!(m.files[2].crc64, "999", "本来就有的不许被覆盖");
+    }
+
+    // -----------------------------------------------------------------------
+    // 任务 4：三条更新命令（接线）
+    // -----------------------------------------------------------------------
+
+    /// 取不到 / 没新版时，`update_status` 回的是**成功**，不是错误。
+    ///
+    /// ⚠️ 这一条守的是一件客户可见的事：接口挂掉时**不许**在界面上冒出一句
+    ///    看不懂的报错。规格 §6.6 点名了它。
+    #[test]
+    fn update_status_is_success_even_when_there_is_nothing_to_report() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).unwrap();
+        let k = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), dir.join("s.json"))));
+        let v = with_kernel(&k, op_update_status).expect("必须成功返回，不是错误");
+        assert_eq!(v["has_newer"], serde_json::json!(false));
+        assert_eq!(v["enabled"], serde_json::json!(true), "默认开");
+        assert!(v["current"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    /// 开关写下去之后读得回来，并且落到了盘上。
+    #[test]
+    fn the_switch_round_trips_and_persists() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).unwrap();
+        let k = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), dir.join("s.json"))));
+        with_kernel(&k, |k| op_update_set_enabled(k, &json!({"enabled": false}))).unwrap();
+        let v = with_kernel(&k, op_update_status).unwrap();
+        assert_eq!(v["enabled"], serde_json::json!(false));
+        // 换一个 Kernel 读同一个目录 ⇒ 读回来还是 false（真的落盘了）
+        let k2 = Kernel::new(dir.join("dl"), dir.join("s.json"));
+        assert!(!k2.update.enabled, "必须落盘，不然重启就回到默认");
+    }
+
+    /// `has_newer` 是**现算的**，不是存的 —— 存的判定会过期，
+    /// 而"过期"在这里的表现是"提示一个已经装上的版本"。
+    #[test]
+    fn has_newer_is_computed_not_stored() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).unwrap();
+        let k = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), dir.join("s.json"))));
+        {
+            let mut kk = lock(&k);
+            // 存一个**比当前版本更旧**的 last_seen
+            kk.update.last_seen = Some("v0.0.1".to_string());
+        }
+        let v = with_kernel(&k, op_update_status).unwrap();
+        assert_eq!(v["has_newer"], serde_json::json!(false), "存的是旧的就不能提示");
+    }
+
+    /// 🔴 **正向**：有新版本 ⇒ `has_newer:true`，**并且给出形状正确的下载链接**。
+    ///
+    /// ⚠️ 这一条守的是**这个功能存在的理由**那一支。上面三条只钉住"不提示"这一侧；
+    ///    少了它，`url` 从响应里掉了、或域名/路径/文件名拼错了，**没有任何东西会红** ——
+    ///    而壳会照着那个 `null`/空串画一个「去下载」，客户点下去什么也拿不到。
+    #[test]
+    fn a_newer_version_yields_the_download_url() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).unwrap();
+        let k = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), dir.join("s.json"))));
+        {
+            let mut kk = lock(&k);
+            // 比当前版本**更高**的 last_seen（当前版本是 `CARGO_PKG_VERSION`）
+            kk.update.last_seen = Some("v999.0.0".to_string());
+        }
+        let v = with_kernel(&k, op_update_status).unwrap();
+        assert_eq!(v["has_newer"], serde_json::json!(true), "更高的版本必须提示");
+        assert_eq!(v["latest"], serde_json::json!("v999.0.0"));
+
+        let url = v["url"].as_str().expect("有新版本就必须给出链接（不是 null）");
+        // 域名与路径**逐字**，版本段是**解析后重新拼回**的三个数（不是 `tag_name` 原文）。
+        assert!(
+            url.starts_with(
+                "https://gitee.com/starsyi/benagen-downloader/releases/download/v999.0.0/"
+            ),
+            "域名与路径必须逐字正确、版本段必须是重新拼回的：{url}"
+        );
+        let file = url.rsplit('/').next().unwrap();
+        assert_eq!(
+            file,
+            update::asset_name(update::platform(), update::arch()),
+            "文件名必须按本平台/架构选（拼错会给客户一个装不上的包）：{url}"
+        );
     }
 }

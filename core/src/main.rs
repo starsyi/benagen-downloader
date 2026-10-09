@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use benagen_core::diagnostics;
 use benagen_core::kernel::{
     dispatch, read_line_capped, spawn_crc_filler, spawn_landing_watcher, spawn_recovery,
-    spawn_verify_worker, write_line, Kernel, LineOutcome, VerifyJob,
+    spawn_update_check, spawn_verify_worker, write_line, Kernel, LineOutcome, VerifyJob,
 };
 use benagen_core::paths;
 use benagen_core::protocol;
@@ -118,6 +118,9 @@ fn main() {
     // 而不是让某一个命令替整批文件挡在那里（那会把壳的主线程堵住 ⇒ 窗口「未响应」）。
     // 细节与"为什么必须有一条后台线程"见它的文档。
     spawn_crc_filler(Arc::clone(&kernel));
+    // **后台查有没有新版本**（规格 §3）：启动即可能查一次，之后每 24 小时一次。
+    // 只提示、不下载 —— 结果落在 `update.json`，经 `update_status` 那条只读命令给壳。
+    spawn_update_check(Arc::clone(&kernel));
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());

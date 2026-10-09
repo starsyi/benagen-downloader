@@ -16,6 +16,7 @@ pub mod planner;
 pub mod protocol;
 pub mod settings;
 pub mod state;
+pub mod update;
 pub mod verify;
 pub mod view;
 

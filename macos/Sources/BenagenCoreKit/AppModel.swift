@@ -256,6 +256,16 @@ public final class AppModel: ObservableObject {
     ///    "下一拍成功就自己消失"（`EngineBanner.transientError`）把一句换码的原文也吞掉。
     @Published public private(set) var lastSwitchOutcome: DeliverySwitch?
 
+    /// 内核的更新检查状态（`update_status` 的快照，规格 §3/§4）。`nil` = 还没问过。
+    ///
+    /// ⚠️ 提示条**只读它**（`UpdateNotice.of(model.updateStatus)`），判据在
+    ///    [`UpdateNotice`] 里（只有 `has_newer`、版本号要三段纯数字、链接要过白名单）。
+    @Published public private(set) var updateStatus: UpdateStatus?
+    /// 本次运行里客户点过「收起」——收起之后**本次运行不再出现**（规格 §4）。
+    /// ⚠️ **不落盘**：下次启动会再出现一次，那是**有意**的（规格 §4 明说不采用
+    ///    "记住忽略的版本"）。真不想看到它的人用设置里那个开关。
+    @Published public private(set) var updateNoticeDismissed: Bool = false
+
     // MARK: - 握手超时（任务 4b）
 
     /// 生产默认的握手超时（秒）。**与 `handshakeTimeoutMessage` 里那句「5 秒」必须一致** ——
@@ -1519,6 +1529,96 @@ public final class AppModel: ObservableObject {
         //    而引擎状态绝大多数时候就是 `.running`。无条件写的话，`RootView` / `Sidebar` /
         //    `TransfersView` 会跟着每一拍全量重算 body。
         if engine != .running { engine = .running }
+    }
+
+    // MARK: - 更新提示（规格 §3/§4）
+
+    /// 更新状态的**宽节拍**（秒）。**文件页那一拍用它**（`RootView` 的 `updateLoop`），
+    /// 与 200 ms 的传输轮询是**两条独立的环**。
+    ///
+    /// 内核已经把真正的检查节流到 24 小时（`core/src/kernel.rs` 的 `run_update_check`），
+    /// 壳这一拍只是把结果取回来 —— 60 s 足够及时，也不会为一条几乎不变的状态多打内核
+    /// （与 Windows 那侧 `INTERVALS_MS.update_status = 60000` 同一个数、同一条理由）。
+    ///
+    /// ⚠️ `nonisolated`：同 `defaultHandshakeTimeout` —— 它是一个常量，且**视图层**
+    ///    （`RootView.updateLoop`）要拿它换算 `Task.sleep` 的纳秒数。
+    public nonisolated static let updateCheckInterval: Double = 60
+
+    /// 收起「有新版本」那条提示（视图上那个 `×` 的唯一出口）。
+    ///
+    /// ⚠️ **只在本次运行内生效**（规格 §4）：它**不落盘**，下次启动会再出现一次 ——
+    ///    那是有意的（不采用"记住忽略的版本"：那会让客户永远停在旧版上却以为没事）。
+    public func dismissUpdateNotice() {
+        updateNoticeDismissed = true
+    }
+
+    /// 拉一次 `update_status`（**只读**），把结果画成文件页顶部那条提示条。
+    ///
+    /// ⚠️ **失败一律静默**（规格 §5）：内核在"取不到"时**本来就回成功**
+    ///    （`has_newer:false`，见 `op_update_status` 的文档），所以这条命令真出错只可能是
+    ///    "内核死了 / 协议坏了"——而那件事**另有落点**（引擎横幅 + `fetchTransfers` 那条路），
+    ///    这一条**一个字都不许上屏**（不碰 `lastError`、不碰 `engine`）。
+    ///    ⇒ 这里**不是** `surfacing`：那条包装会把"没被状态吸收"的错误写进 `lastError`，
+    ///    而本功能的契约是"取不到时界面什么都不说"（§5）。失败时保持上一帧快照。
+    public func refreshUpdateStatus() async {
+        do {
+            updateStatus = try await call("update_status", .null).decoded(UpdateStatus.self)
+        } catch {
+            // 静默：`updateStatus` 原样留着（"数据停在上一次成功的快照上"，与轮询同一条）。
+        }
+    }
+
+    /// **后台那一拍**用的入口（`RootView.updateLoop` 每 60 s 调它一次）。
+    ///
+    /// ⚠️ **`lastError` 非 nil 时先不拉** —— 这一条是承重的，不是优化。
+    ///    每次 `call` **成功**都会清 `lastError`（`call` 里那句"下一次成功的请求会把它清掉"），
+    ///    而 `update_status` 在传输层**几乎总是成功**（内核任何取不到的情形都回成功）⇒
+    ///    一条**后台的、非客户发起**的只读刷新，**不该**把刚刚上屏的一条失败原文顺手抹掉
+    ///    （约束 4：失败原文必须留在界面上，直到它自己过期）。
+    ///    ⇒ 有一个**待显示的错误**时这一拍什么都不做（`refreshUpdateStatus` 也不必调），
+    ///    等下一次成功的请求把 `lastError` 清掉之后自然恢复。
+    ///
+    /// ⚠️ **但对"第一次拉取"必须放行**（`updateStatus == nil`）—— 这是同一个判据的另一头，
+    ///    不是顺手加的一格。文件页是**唯一**周期性拉 `update_status` 的地方；若开机瞬间
+    ///    `lastError` 就非 nil（握手期的协议级告警，或 `load_delivery` 失败留下的原文），
+    ///    这一侧**没有任何周期性成功请求**能去清它 ⇒ 本次会话的提示条**可能一直不出现**，
+    ///    而"开机就该知道有新版本"正是这个功能存在的理由。
+    ///    ⇒ 这里的"两难"取一个折中：**还没拿到过任何状态**时，宁可冒"抹掉一句开机原文"的
+    ///    风险也要拉一次；**已经有过状态**（`updateStatus != nil`）时，失败原文照旧**不被**
+    ///    后台的成功请求抹掉。两头都要保住，所以**不是**简单的 `lastError == nil`
+    ///    （那会让开机那一拍被一句原文永久挡死）。
+    ///
+    /// ⚠️ 这与 [`refreshUpdateStatus`] 的分工要分清：那个是"**现在就去问内核要一份**"
+    ///    （客户打开设置时用，**不带**这道闸 —— 设置里的勾选框必须显示内核的**当前值**，
+    ///    不能被一条待显示的错误挡成默认值）；这个是"**后台那一拍**"，带闸。
+    public func pollUpdateStatus() async {
+        guard lastError == nil || updateStatus == nil else { return }
+        await refreshUpdateStatus()
+    }
+
+    /// 设置页那个「启动时检查更新」勾选框。
+    ///
+    /// ⚠️ **与 [`refreshUpdateStatus`] 的静默不同：这一格失败要说话。**
+    ///    规格 §5 那句"失败一律静默"针对的是**检查取不到**（客户没做任何动作，弹错是骚扰）；
+    ///    而**客户自己勾了那个框、结果没存进去却看着像存进去了**，那是**界面在撒谎**
+    ///    （"以为存上了"的静默失效）。⇒ 返回 `nil` = 改成了；非 `nil` = **失败原文**
+    ///    （内核 / 系统原文照登，约束 3 —— 由调用方直接摆到屏幕上，视图不映射）。
+    ///
+    /// ⚠️ **用返回值刷新界面**：成功时把内核回的（"写完之后"那一份）落进 `updateStatus`；
+    ///    失败时**一个字都不改** ⇒ 勾选框据此退回内核手里那一份，不假装存上了。
+    @discardableResult
+    public func setUpdateEnabled(_ enabled: Bool) async -> String? {
+        do {
+            // 客户发起的动作 ⇒ 走 `absorbing`（transport 失败要像别处一样触发内核崩溃处置）。
+            let fresh = try await absorbing {
+                try await call("update_set_enabled", .object(["enabled": .bool(enabled)]))
+                    .decoded(UpdateStatus.self)
+            }
+            updateStatus = fresh
+            return nil
+        } catch {
+            return Self.message(of: error)
+        }
     }
 
     // MARK: - 下载与任务动作

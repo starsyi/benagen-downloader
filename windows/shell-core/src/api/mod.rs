@@ -109,6 +109,10 @@ pub mod settings;
 pub mod state;
 pub mod transfers;
 pub mod tree;
+// ⚠️ 「更新提示」那一条提示条的载荷（规格 §4）。它与上面那些模块的差别只有一处：
+//    它**没有**一个 `protocol.rs` 里的镜像类型可收（内核这一条是随更新检查新增的），
+//    所以它收 `&Value` 直接透传 —— 理由写在 `update.rs` 的文件头。
+pub mod update;
 pub mod verify;
 
 use serde_json::Value;

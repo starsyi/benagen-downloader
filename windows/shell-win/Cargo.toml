@@ -15,7 +15,7 @@
 # 那是这条拆分的账本。
 [package]
 name = "shell-win"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 # ⚠️ 视图不单测（规格 §4.3）：能被写出断言的逻辑一律搬进 `shell-core`。
 #    本 crate 里的测试都只断言**"平台专属的那个值被传到了应用点"**，

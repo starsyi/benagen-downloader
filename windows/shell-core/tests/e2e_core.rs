@@ -100,11 +100,41 @@ impl Drop for TempDir {
 fn core_argv(tag: &str) -> (PathBuf, Vec<String>, TempDir) {
     let dir = TempDir::new(tag);
     let settings = dir.path().join("settings.json");
+    disable_update_check(settings.as_path());
     // ⚠️ 第三个实参是**详细日志**（任务 3）：这边**显式传 `false`** —— 本套件要的是
     //    "与今天逐字同一条 argv"（它跑的是真内核，`diag-*` 那一档不该被这里悄悄改掉）。
     //    它没有默认值正是为了这个：少传一个实参是编译错误，不是一次静默的 normal。
     let args = core_arguments(Some(dir.path()), Some(settings.as_path()), false);
     (require_core_binary(), args, dir)
+}
+
+/// **给这次起内核关掉更新检查**：按内核找这个文件的规矩（与 `--settings` **同目录**，
+/// 即 `settings_path.parent().join("update.json")`）预置一份 `{"enabled":false}`。
+///
+/// ⚠️ **为什么必须有这一下**：本套件驱动的是**真内核二进制**，它的 `main()` 会起
+///    `spawn_update_check`，而设置目录是**全新**的 ⇒ `update.json` 不存在 ⇒
+///    "从没查过 ⇒ 立刻查" ⇒ 第一拍就对 `gitee.com` 发一次**真请求**。测试套件
+///    **不该依赖公网**（网断了照样绿，于是"绿"不再等于"这套代码自洽"）。
+///    与 `core/tests/e2e.rs` 里那个同名助手同一件事、同一份理由 —— 内核侧的行为变化
+///    要在**每一个驱动真内核的套件**里收口，不能只收一个。
+///
+/// ⚠️ **为什么是改夹具、不是给生产开洞**：任何"测试期开关"都等于把测试需求漏进
+///    生产 API（本仓删掉过 `UreqFetcher::new_for_test` 那一类东西）。
+///    ⚠️ **也不引 `tempfile`**：本 crate 的依赖白名单只有 serde/serde_json（见 `TempDir`）。
+///
+/// ⚠️ **写不进去就当场红**（`expect` / `unwrap_or_else(panic!)`），**不许 `let _ =` 吞掉**：
+///    静默失败会让这一下悄悄退回"每次跑都打公网" —— 那**正是**它要防的事。
+fn disable_update_check(settings_path: &Path) {
+    let path = settings_path
+        .parent()
+        .expect("`--settings` 必须有父目录，否则 `update.json` 无处可放")
+        .join("update.json");
+    std::fs::write(&path, br#"{"enabled":false}"#).unwrap_or_else(|e| {
+        panic!(
+            "写不了 {}（守卫不许静默失败；它挡的是'每次跑都对 gitee 发请求'）：{e}",
+            path.display()
+        )
+    });
 }
 
 /// 起一个真内核的客户端（连同它的临时目录，返回后必须一直持有到测试结束）。

@@ -408,6 +408,35 @@
   padding: var(--pad-bar-y) var(--pad-bar-x);
   background: var(--bg-notice);
 }
+/* 更新提示（规格 §4）：**横排**一条（文案 + 「去下载」 + 「收起」）—— 与上面那条
+   **竖排**的回执条（逐条拒绝理由）共用底色，但布局不同。
+   ⚠️ 它是**独立元素**（`#files-update`），与回执条 `#files-notice` 互不影响。 */
+.files__notice--update {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--sp-8);
+}
+.files__notice--update .files__notice-text {
+  flex: 1;
+  min-width: 0;
+}
+/* 「去下载」那颗：与常驻提示行的 `.notice__retry` 同一套画法（`shell.css`），
+   摆在这里是因为它只出现在本屏。⚠️ 「收起」那颗 × 的画法（`.notice__dismiss`）
+   在 `shell.css` 里、全局生效，这里**不重写**（重写就是第二份画法）。 */
+.notice__action {
+  flex: none;
+  font: inherit;
+  font-size: var(--text-callout);
+  background: transparent;
+  border: 1px solid var(--c-separator);
+  border-radius: var(--r-6);
+  padding: var(--sp-2) var(--sp-8);
+  cursor: pointer;
+  color: var(--c-label);
+}
+.notice__action:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
 .files__notice-text {
   font-size: var(--text-callout);
   font-weight: 600;

@@ -85,7 +85,8 @@ function resolveInvoke() {
  * @param {string} cmd 命令名（`state` / `load` / `retry` / `tree` / `enqueue` /
  *   `transfers` / `verify` / `task_action` / `reveal` / `settings_get` /
  *   `settings_set` / `preferences_get` / `preferences_set` / `history_get` /
- *   `history_put` / `license` / `about` —— 规格 §3.4 的表）。
+ *   `history_put` / `license` / `about` —— 规格 §3.4 的表；
+ *   `update_status` / `update_set_enabled` / `open_update_url` —— 规格 §4 那三条）。
  *   ⚠️ 这几个名字是本文件里**唯一**出现的命令名，别在屏文件里写字符串字面量。
  * @param {object} [args] 参数。Tauri 默认按 camelCase 映射到 Rust 的 snake_case 形参
  *   （`base_url` → `baseUrl`），**这里传的键名以命令层的形参为准**（任务 7 定，
@@ -177,4 +178,12 @@ export const CMD = Object.freeze({
   historyPut: "history_put",
   license: "license",
   about: "about",
+  // ⚠️ **更新提示的三条**（规格 §4），规格 §3.4 那张表里同样没有（同上面几条：那是
+  //    "第二代既有端点"的账，而"更新检查"是这一代新加的整件事）。内核侧的三条由
+  //    `core/src/kernel.rs` 给；壳侧的实现与理由写在 `shell-win/src/commands.rs` 里
+  //    那三条命令的头注（尤其 `open_update_url`：它是一条**窄语义**的命令，
+  //    只放行官方发布页那一个前缀）。
+  updateStatus: "update_status",
+  updateSetEnabled: "update_set_enabled",
+  openUpdateUrl: "open_update_url",
 });
