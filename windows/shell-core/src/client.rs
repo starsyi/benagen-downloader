@@ -901,7 +901,7 @@ impl CoreClient {
     /// ## 取值 600 秒的依据（逐条可核）
     ///
     /// 内核自己对 `load_delivery` 的记账在 `core/src/main.rs:993-998`，三段**顺序执行**：
-    ///   * `delivery::fetch`：30 秒 × 3 次 + 1.5 秒退避 = 最坏 **91.5 秒**；
+    ///   * `delivery::fetch`：15 秒 × 5 次 + 15 秒退避 = 最坏 **90 秒**（2026-10-12 调参；记账仍按 91.5 秒留余量）；
     ///   * `clear_engine_batch`：最坏约 **100 秒**；
     ///   * 全量 `plan`：每个 crc64 为空的文件一次 HEAD，最坏 **30 秒 × N**
     ///     （单次 30 秒：`core/src/delivery.rs:22` 的 `FETCH_TIMEOUT`）。
@@ -2054,6 +2054,81 @@ mod tests {
         assert!(
             took < Duration::from_secs(15),
             "等了 {took:?}：卡住的那次读没有被放出来（close ⇒ kill ⇒ EOF 这条链断了）"
+        );
+    }
+
+    /// 🔴 **源码级判据：`close()` 的孤儿支在放掉读端（第 ④ 步）之前就提前 `return` ——
+    /// 那正是 [`ClientError::CallTimedOut`] 文档里记着的那个洞，本条把它的形状钉住。**
+    ///
+    /// ⚠️ **为什么是源码级而不是行为级（如实记账，别读成"验过了"）**：那一支的进入条件是
+    ///    "kill 之后 2 秒内仍未回收子进程"（`ProcessChannel::close` 第 ② 步的第二次
+    ///    `wait_for_exit`），而**纯 `std` 造不出**一个 SIGKILL / TerminateProcess 收不掉的
+    ///    子进程：不可中断睡眠不可移植也不可靠；`SIGCHLD = SIG_IGN` 确实能让 `waitpid`
+    ///    拿到 `ECHILD` 而走进这一支，但那是**进程级**信号处置，会把同进程里每一条依赖
+    ///    "子进程退出可被 wait 到"的用例一起弄坏（cargo test 共进程跑线程）；
+    ///    不许新增依赖（够不到 `sigaction`）、不许改实现（不能给 `close()` 加注入缝）。
+    ///    ⇒ 行为上这一支**打不到**，与 `free_bytes_has_a_windows_arm_that_shells_out_to_nothing`
+    ///    （`core/src/kernel.rs`，同一处境、同一手法）同形。
+    ///
+    /// **守什么**（就两件）：
+    ///   1. **文档没在说谎**：[`ClientError::CallTimedOut`] 里那段「承诺有一个洞」还在 ——
+    ///      洞还在（见 ②③），删掉文档不算把洞堵上，**不许**把 `call` 说成"保证有界"；
+    ///   2. **洞的形状没被悄悄改掉**：孤儿支走不到第 ④ 步（提前 `return` 在放读端之前）。
+    ///      这一半同时是一条**承重不变量**：读端那把锁正被卡住的读者持着（下面那句注释
+    ///      写的就是这个），孤儿支去碰它，`close()` 自己就没了上界 —— 收尾是既有的唯一
+    ///      逃生口，它一卡，"最坏约 5 秒"就不真了。
+    ///
+    /// **不守**：真 kill 失败时的行为（打不到，见上）；也不守"洞该不该堵上"（那是产品决定，
+    /// 本批不动实现）。**洞仍然在** —— 本条只是让"它在、而且文档说得对"变成会红的事实。
+    ///
+    /// 判别力（可自验）：删掉孤儿支那个 `return;`（让它落到第 ④ 步）⇒ 红；
+    /// 在孤儿支里**先**放读端再 `return`（一个想当然的"修洞"）⇒ 红；
+    /// 把「承诺有一个洞」那段从文档里删掉 ⇒ 红。⇒ 三种改动都会被要求
+    /// **把 [`ClientError::CallTimedOut`] 的文档与本判据一起改**，那正是要的。
+    ///
+    /// ⚠️ 三个锚点都只扫 `mod tests` **之前**的实现区：本判据自己的文字（含上面这段）
+    /// 就提到这些锚点，整文件扫会把"自己提到的"也算上 —— 那就成了从构造上不可能红的判据
+    /// （`shell-win/src/commands.rs` 那条第一版栽的就是这个坑，注释里记着）。
+    #[test]
+    fn the_orphan_branch_of_close_exits_without_touching_the_read_end() {
+        let src = include_str!("client.rs");
+        let impl_end = src.find("\nmod tests {").expect("mod tests 的位置不见了");
+        let impl_src = &src[..impl_end];
+
+        // ① 文档的诚实声明还在（它在实现区的 `ClientError::CallTimedOut` 文档上）。
+        //    ⚠️ 锚点取那句「别以为它不可能发生」而不是标题里的「承诺有一个洞」：**字面量**
+        //    会进字体子集的覆盖判据（`make_font_subset.sh`），而「洞」不在已入库子集里 ——
+        //    拿它当锚点会把字体门再染红 3 个码位（实测过）。注释里随便写，字面量里不写。
+        assert!(
+            impl_src.contains("别以为它不可能发生"),
+            "CallTimedOut 文档里那段「别以为它不可能发生」不见了 —— 那个缺口还在（见②③），\
+             删掉文档不算把缺口堵上；不许把 call 说成「保证有界」"
+        );
+
+        // ② 孤儿支还在：kill 之后的第二次有界等待收不掉时，那句"大声说"的记账语。
+        let warn = impl_src
+            .find("在 kill 之后仍未回收")
+            .expect("孤儿支的记账语不见了 —— 若你在修这个缺口，请把 CallTimedOut 里那段与本判据一起改");
+        // ③ 它后面那个提前 `return`（锚点带上它上面那句承重注释：只搜 `return;` 会
+        //    撞上实现区后面别处同缩进的 `return;`，删掉本处时红在位置断言上、
+        //    而不是红在"不再提前 return"这条更准的话上）。
+        let early = impl_src[warn..]
+            .find(
+                "\n                // 卡在 read 上的那一侧还持着读端的锁——这里**不能**去碰它。\n                return;",
+            )
+            .expect("孤儿支不再提前 return（或它上面那句承重注释改了样）—— 同上，改完请同步文档");
+        // ④ 第 ④ 步：放掉读端那一句。
+        let release = impl_src
+            .find("drop(stdout.take());")
+            .expect("第 4 步（放掉读端）不见了");
+
+        assert!(
+            warn + early < release,
+            "孤儿支的提前 return（偏移 {}）不在放读端（偏移 {}）之前 —— 缺口的形状变了：\
+             要么缺口被堵上了（好，但请同步 CallTimedOut 的文档与本判据），\
+             要么第 4 步被移进了孤儿支（先读那句「卡在 read 上的那一侧还持着读端的锁」）",
+            warn + early,
+            release
         );
     }
 

@@ -3,7 +3,7 @@
 # windows/scripts/check_transfers_screen.sh —— **传输列表屏的无头验收，一条命令跑完**。
 #
 #    bash windows/scripts/check_transfers_screen.sh            # 跑 still（13 格 + 行菜单 + 动作）
-#    bash windows/scripts/check_transfers_screen.sh --all      # 再跑 tick / empty / down / gate / loading 五个场景
+#    bash windows/scripts/check_transfers_screen.sh --all      # 再跑 tick / empty / down / gate / loading / batch 六个场景
 #
 # 它做的事（四步，全自动）：起本地静态服务 → 用无头浏览器加载夹具页 →
 #   夹具页跑断言、把结果 **POST 回来** → 打印 `ok=N fail=M abort=K` 并据此定退出码。
@@ -218,6 +218,8 @@ if [ "$run_all" = "1" ]; then
   run_once "gate" "$root" "$tmpdir/gate.json" || status=3
   note "跑 loading（还没有快照 ⇒ 转圈 + 那一句话，且排在空态之前）"
   run_once "loading" "$root" "$tmpdir/loading.json" || status=3
+  note "跑 batch（换目录之后：搬运进行中 / 搬完有失败 / 空列表但一键开始可用）"
+  run_once "batch" "$root" "$tmpdir/batch.json" || status=3
 fi
 
 if [ "$status" = "0" ]; then

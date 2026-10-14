@@ -6,6 +6,9 @@
 pub mod daemon;
 pub mod rpc;
 pub mod status;
+pub mod supervisor;
+
+use std::collections::BTreeMap;
 
 use crate::delivery::{File, Manifest};
 
@@ -77,9 +80,11 @@ pub fn mtime_secs(t: std::time::SystemTime) -> f64 {
 /// 交给 aria2 的一项任务。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlannedFile {
-    pub url: String,
-    pub dir: String, // 相对目标目录；顶层文件用 "."
+    pub url: String,                   // 域名 URI（回执与日志用，语义不变）
+    pub uris: Vec<String>,             // 全量 URI 表，域名第一（交给 aria2）
+    pub dir: String,                   // 相对目标目录；顶层文件用 "."
     pub out: String,
+    pub opts: BTreeMap<String, String>, // 附加逐任务选项（Host 头等），空表=无附加
 }
 
 /// 由交付文件构造 aria2 任务项。路径不安全时返回 `None`，调用方应把它计入失败并
@@ -89,18 +94,23 @@ pub struct PlannedFile {
 /// 三种下载方式的落盘基准必须一致（阶段 1 裁决）。
 /// ⚠️ **不得规范化**（契约 §3.1）：不调 `Path::clean`、不折叠 `./`、不合并双斜杠。
 ///     `Join`/`clean` 过的路径会与 manifest 对不上，**让整棵树的四态静默错位**。
-pub fn new_planned_file(m: &Manifest, f: &File) -> Option<PlannedFile> {
+pub fn new_planned_file(m: &Manifest, f: &File, ips: &[std::net::IpAddr]) -> Option<PlannedFile> {
     if !safe_rel_path(&f.path) {
         return None;
     }
     // 只做「按最后一个 `/` 切开」这一件事：不 Join、不 clean、不折叠 `./`。
     let (parent, name) = split_path(&f.path);
     let dir = if parent.is_empty() { "." } else { parent };
+    let uris = crate::delivery::uri_list(m, &f.path, ips);
     Some(PlannedFile {
         // URL 用 `manifest.path` **原文**逐段编码，与清单里的 `urls.txt` 同源。
-        url: m.file_url(&f.path),
+        // `url` 永远等于 `uris[0]`（域名 URI）：回执与日志只报域名，语义不变。
+        url: uris[0].clone(),
+        uris,
         dir: dir.to_string(),
         out: name.to_string(),
+        // Host 头等附加选项在任务 6 接上；本任务恒为空表（生产行为不变）。
+        opts: BTreeMap::new(),
     })
 }
 
@@ -181,7 +191,7 @@ mod tests {
     #[test]
     fn planned_file_from_manifest_path() {
         let m = manifest();
-        let pf = new_planned_file(&m, &file("23999-JF-test/a/b/c/deep.txt"))
+        let pf = new_planned_file(&m, &file("23999-JF-test/a/b/c/deep.txt"), &[])
             .expect("正常路径不应被拒");
         assert_eq!(
             (pf.dir.as_str(), pf.out.as_str()),
@@ -195,7 +205,7 @@ mod tests {
         );
 
         // 顶层文件用 "."
-        let pf2 = new_planned_file(&m, &file("top.txt")).expect("顶层文件不应被拒");
+        let pf2 = new_planned_file(&m, &file("top.txt"), &[]).expect("顶层文件不应被拒");
         assert_eq!((pf2.dir.as_str(), pf2.out.as_str()), (".", "top.txt"));
 
         // ⚠️ **不得规范化**（契约 §3.1，承重）：`dir`/`out`/`url` 三个出口都必须用
@@ -204,7 +214,7 @@ mod tests {
         // 只钉其中一个出口会漏掉另外两个，所以三条断言缺一不可。
         // 后果的形状是**静默错位、不报错**：`a/./b.txt` 被折成 `a/b.txt` 后，落盘基准
         // 与清单对不上，整棵树的四态会显示错的状态而没有任何一处报错。
-        let pf3 = new_planned_file(&m, &file("a/./b.txt")).expect("非规范但安全的路径不应被拒");
+        let pf3 = new_planned_file(&m, &file("a/./b.txt"), &[]).expect("非规范但安全的路径不应被拒");
         assert_eq!(
             (pf3.dir.as_str(), pf3.out.as_str()),
             ("a/.", "b.txt"),
@@ -220,7 +230,7 @@ mod tests {
     #[test]
     fn planned_file_url_keeps_code_prefix() {
         let m = manifest();
-        let pf = new_planned_file(&m, &file("23999-JF-test/a/b.txt")).expect("正常路径不应被拒");
+        let pf = new_planned_file(&m, &file("23999-JF-test/a/b.txt"), &[]).expect("正常路径不应被拒");
         assert_eq!(
             pf.url, "http://x/CODE/23999-JF-test/a/b.txt",
             "URL 不对"
@@ -261,7 +271,7 @@ mod tests {
         ];
         for (p, why) in bad {
             assert!(
-                new_planned_file(&m, &file(p)).is_none(),
+                new_planned_file(&m, &file(p), &[]).is_none(),
                 "应当拒绝 {p:?}（{why}）"
             );
         }
@@ -273,7 +283,7 @@ mod tests {
             "top.txt",
         ] {
             assert!(
-                new_planned_file(&m, &file(p)).is_some(),
+                new_planned_file(&m, &file(p), &[]).is_some(),
                 "正常路径 {p:?} 不应被拒"
             );
         }

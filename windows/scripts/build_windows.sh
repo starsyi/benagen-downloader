@@ -5,7 +5,7 @@
 #       bash windows/scripts/build_windows.sh --check-only   → 编内核 + 编壳 + 自验，**不打包**，通过即退出 0
 #       bash windows/scripts/build_windows.sh                → 上面那些 + **打包成单文件交付形态**
 #
-# 交付形态（规格 §7.2 / §11.4 / W-4）：`windows/dist/BenagenDownloader-Windows-x86_64.exe`
+# 交付形态（规格 §7.2 / §11.4 / W-4）：`windows/dist/BenagenDownloader-<版本>-Windows-x86_64.exe`
 # —— **一个** exe，内核在它里面（`shell-win/build.rs` 内嵌 + `src/embed.rs` 释放）。
 #
 # ⚠️ **本脚本是"构建顺序"这件事的**唯一**属主**（任务 22）：壳把内核 exe 内嵌进自己，
@@ -41,7 +41,7 @@
 #   bash windows/scripts/build_windows.sh
 #
 # 环境变量（都可选）：
-#   VERSION=0.2.5   覆盖版本资源里的版本号（默认 0.2.5，与 `macos/scripts/build_app_macos.sh` 同口径）
+#   VERSION=0.2.6   覆盖版本号（默认 0.2.6，与 `macos/scripts/build_app_macos.sh` 同口径）
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -51,8 +51,14 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TARGET="x86_64-pc-windows-gnu"
 # `[[bin]] name`（`shell-win/Cargo.toml`）——cargo 的产物名就是它 + `.exe`。
 BIN_NAME="BenagenDownloader"
-# 交付形态的名字（规格 §11.4：产物名自解释）。
-DIST_NAME="BenagenDownloader-Windows-x86_64.exe"
+# 版本号（规格 W-7：版本资源里要能看到版本号）。默认 0.2.6 与 macOS 侧同口径。
+# ⚠️ 它同时喂给 `shell-win/build.rs`（写进 .rc）、交付形态文件名、与第 5 步的自验
+#    （grep 交付形态里的那一串）——**同一个**变量，不然"自验"就是拿脚本自己编的数核自己。
+BENAGEN_VERSION="${VERSION:-0.2.6}"
+export BENAGEN_VERSION
+# 交付形态的名字（规格 §11.4：产物名自解释；2026-10-14 起带版本段，
+# 与 `core/src/update.rs::asset_name` 同格式——那是「有新版本」下载链接的契约）。
+DIST_NAME="BenagenDownloader-${BENAGEN_VERSION}-Windows-x86_64.exe"
 # 交付形态落在哪儿：与 `macos/scripts/build_app_macos.sh` 同一个口径（`<平台>/dist/`，
 # 且 `dist/` 是可再生产物、不入库）。
 DIST="${REPO}/windows/dist"
@@ -64,11 +70,7 @@ DIST_EXE="${DIST}/${DIST_NAME}"
 #    对不上的表现是"壳内嵌了一个不存在的内核"，而那条会在构建期大声失败（不是静默）。
 CORE_EXE="${REPO}/core/target/${TARGET}/release/benagen-core.exe"
 
-# 版本号（规格 W-7：版本资源里要能看到版本号）。默认 0.2.5 与 macOS 侧同口径。
-# ⚠️ 它同时喂给 `shell-win/build.rs`（写进 .rc）与第 5 步的自验（grep 交付形态里的那一串），
-#    两边用的是**同一个**变量 —— 不然"自验"就会变成"拿脚本自己编的数去核自己"。
-BENAGEN_VERSION="${VERSION:-0.2.5}"
-export BENAGEN_VERSION
+# （BENAGEN_VERSION 已上移到 DIST_NAME 之前——文件名要用它。）
 
 # ---- 参数：只认 --check-only，别的**直接报错退出**（exit 2）-------------------
 # 与 `test.sh` 同一条纪律：未知参数**不透传**。透传会让脚本以一个"看起来像失败"的

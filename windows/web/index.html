@@ -596,7 +596,7 @@
 
      ⚠️ 行菜单那一块里，`data-action` 的五个值（`pause`/`unpause`/`retry`/`remove`）
         是 **`TaskAction` 的线上字面量**（`protocol.rs` 的
-        `task_action_pins_the_five_wire_literals` 逐字钉着），JS 拿它去比对
+        `task_action_pins_the_wire_literals` 逐字钉着），JS 拿它去比对
         `TransferRow.available_actions` 里那一格 —— **动作面由载荷决定，不由本块决定**。
         ⚠️ `reveal` 那一项**不是**线上字面量（协议里没有它，规格 §5.2：那是壳的事），
         它在这里只是一个**本地键**，用来把"这一项对应哪件壳侧的事"说清楚；
@@ -632,6 +632,12 @@
               在 macOS 上为"工具栏只留图标"栽过三次（`RootView.swift:155-158`）。
            图形（`arrow.clockwise`）内联在这里：它是**壳的静态图形**（住 HTML、由浏览器
            直接画），与 `dom.js` 的 `ICONS`（名字从 Rust 的载荷来）不是一回事。 -->
+      <!-- 「暂停全部」「一键开始」：**列表级**动作（没有 gid），典型用法是磁盘快满时
+           先停手、换一个存储目录、再一键开始（换目录时内核会把旧目录里已下载的文件搬过来）。
+           可用性来自载荷里的 `batch.can_pause_all` / `batch.can_resume_all`（Rust 判的，
+           JS 不重算）；搬运进行中两颗都灰着，进度话在下面那一行。 -->
+      <button class="transfers__batch" id="transfers-pause-all" type="button">暂停全部</button>
+      <button class="transfers__batch" id="transfers-resume-all" type="button">一键开始</button>
       <button class="transfers__refresh" id="transfers-refresh" type="button">
         <svg class="transfers__refresh-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M13.3 8a5.3 5.3 0 1 1-1.55-3.75"/>
@@ -644,6 +650,13 @@
            可用性来自 `TransferGlobalSummary.can_clear_finished`（Rust 判的），
            JS 不重算。 -->
       <button class="transfers__clear" id="transfers-clear" type="button">清空已完成</button>
+    </div>
+
+    <!-- ---- 搬运进度 / 搬运结果（换下载目录之后）-----------------------------------
+         正文是 Rust 给的整句话（`batch.migrate_text` 进行中、`batch.migrate_note` 结束后
+         有事要说时），JS 只摆放。两者都没有时整行隐藏。可选中（里面有文件路径）。 -->
+    <div class="transfers__migrate" id="transfers-migrate" hidden>
+      <span class="transfers__migrate-text selectable" id="transfers-migrate-text"></span>
     </div>
 
     <!-- ---- 本屏自己的失败条 ------------------------------------------------

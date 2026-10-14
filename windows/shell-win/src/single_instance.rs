@@ -75,7 +75,7 @@ pub fn verdict(already_exists: bool) -> Verdict {
 ///    （第二条 `--check` 会拦：内嵌字体子集必须覆盖源码里的每一个非 ASCII 字）。
 pub fn already_running_message() -> &'static str {
     "Benagen 数据下载工具已经在运行了。请用已经打开的那个窗口。\
-     这一版不会把那个窗口带到最前面来——它可能被别的窗口盖着。"
+     它可能被别的窗口盖着，或者已经最小化到了任务栏角落的图标里——点一下那个图标就能把窗口叫回来。"
 }
 
 /// 建互斥体、读一次 `GetLastError()`，把结论交回来。

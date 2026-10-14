@@ -172,6 +172,17 @@ impl<'a, T: Transport> Planner<'a, T> {
 /// `plan` 的 crc64 回补那一段，它**不在这里**——所以本函数被谁调都**结构上**不会
 /// 触发那 N×30 秒的 I/O（任务 A 的 D-1）。
 fn classify_with_state(dir: &Path, state: Option<&State>, f: &File, opt: Options) -> Kind {
+    // 规则 0（规格 §4.2）：`.aria2` 控制文件在 = 这个文件没下完。aria2 下载时把断点写在
+    // `<文件>.aria2` 里、数据直接写进最终文件名——半个文件顶着完整名字躺在目录里。
+    // 状态证据链覆盖不了「曾校验过、又在重下」的组合，这一条补上它。
+    // 代价：每文件多一次 stat；方向安全（宁可重下，不可静默少交）。
+    //
+    // ⚠️ 路径拼接用 `f.path` **原文**（含子目录斜杠），与下面 `stat_secs` 的
+    // `dir.join(rel)` 同一手法——不许先拆文件名再拼，否则 `t/a.bin` 会去查 `a.bin.aria2`。
+    if dir.join(format!("{}.aria2", f.path)).is_file() {
+        return Kind::Download;
+    }
+
     // 本地不存在 / 不是普通文件（含目录）→ 下载
     let Some((size, mtime)) = stat_secs(dir, &f.path) else {
         return Kind::Download;
@@ -755,6 +766,108 @@ mod tests {
         );
     }
 
+    /// 规格 §4.2：`.aria2` 控制文件存在 = 未完成，即使状态条目能证明「这个文件曾完整校验过」。
+    /// 场景：完整校验过的文件又被重新下载，`.aria2` 回来了；若 size+mtime 仍与条目相符
+    /// （同一秒重写的稀疏文件），没有这条守卫会被误判 Skip——静默少交。
+    /// 判别力：去掉规则 0 ⇒ 本用例红（state_hit 命中 ⇒ Skip）。
+    #[test]
+    fn control_file_present_means_incomplete_even_with_state_evidence() {
+        let dir = TempDir::new();
+        write_file(dir.path(), "a.bin", &vec![0u8; 3072]);
+        let f = File {
+            path: "a.bin".to_string(),
+            size: 3072,
+            crc64: "5432380796884633278".to_string(),
+            source_mtime: String::new(),
+        };
+        // 状态条目：size+mtime 相符、crc64 与清单一致（构造方式沿用 state_hit 那条用例：
+        // `Entry { size, mtime: mtime_of(...), crc64: 非空 }`，能被 entry_proves_complete 接受）
+        let mut st = State::load(dir.path());
+        st.bind("C");
+        st.put(
+            "a.bin",
+            Entry {
+                size: 3072,
+                mtime: mtime_of(dir.path(), "a.bin"),
+                crc64: "5432380796884633278".to_string(),
+            },
+        );
+        // 关键道具：控制文件回来了
+        std::fs::write(dir.join("a.bin.aria2"), b"ctl").unwrap();
+
+        let got = classify_with_state(dir.path(), Some(&st), &f, Options { strict: false });
+
+        assert_eq!(got, Kind::Download, "有 .aria2 就是未完成，状态证据再好也不许跳过");
+    }
+
+    /// 子目录路径的 `.aria2` 拼接判别用例：`t/a.bin` 的控制文件在 `dir/t/a.bin.aria2`，
+    /// **不是** `dir/a.bin.aria2`。实现注释自己点名「不许先拆文件名再拼」——这条钉住它。
+    /// 判别力：把拼接收成 `file_name()` ⇒ 找的是 `dir/a.bin.aria2`（不存在）⇒ 落回
+    /// 状态证据 ⇒ Skip ⇒ 红。同构造删掉控制文件的配对由 `no_control_file_state_evidence_still_skips`
+    /// 覆盖（根级）；本条只补子目录拼接这一格。
+    #[test]
+    fn control_file_join_keeps_the_subdirectory() {
+        let dir = TempDir::new();
+        write_file(dir.path(), "t/a.bin", &vec![0u8; 3072]);
+        let f = File {
+            path: "t/a.bin".to_string(),
+            size: 3072,
+            crc64: "5432380796884633278".to_string(),
+            source_mtime: String::new(),
+        };
+        let mut st = State::load(dir.path());
+        st.bind("C");
+        st.put(
+            "t/a.bin",
+            Entry {
+                size: 3072,
+                mtime: mtime_of(dir.path(), "t/a.bin"),
+                crc64: "5432380796884633278".to_string(),
+            },
+        );
+        // 关键道具：控制文件在**子目录**里，与文件同路径 + `.aria2`。
+        std::fs::write(dir.join("t/a.bin.aria2"), b"ctl").unwrap();
+
+        let got = classify_with_state(dir.path(), Some(&st), &f, Options { strict: false });
+
+        assert_eq!(
+            got,
+            Kind::Download,
+            "子目录文件的 .aria2 必须被认出（拼接用 f.path 原文，不许先拆文件名）"
+        );
+    }
+
+    /// 配对用例：同一构造、删掉 `.aria2` ⇒ 必须仍是 Skip。
+    /// 钉住「守卫只认控制文件，不误伤」——只写上一条的话，一个恒返回 Download 的
+    /// 坏实现也能绿；这一条保证状态证据在没有控制文件时照常成立。
+    /// 判别力：把规则 0 写成恒真 ⇒ 本用例红（不该 Download 的被误判 Download）。
+    #[test]
+    fn no_control_file_state_evidence_still_skips() {
+        let dir = TempDir::new();
+        write_file(dir.path(), "a.bin", &vec![0u8; 3072]);
+        let f = File {
+            path: "a.bin".to_string(),
+            size: 3072,
+            crc64: "5432380796884633278".to_string(),
+            source_mtime: String::new(),
+        };
+        // 与上一条唯一差别：没有控制文件
+        let mut st = State::load(dir.path());
+        st.bind("C");
+        st.put(
+            "a.bin",
+            Entry {
+                size: 3072,
+                mtime: mtime_of(dir.path(), "a.bin"),
+                crc64: "5432380796884633278".to_string(),
+            },
+        );
+
+        let got = classify_with_state(dir.path(), Some(&st), &f, Options { strict: false });
+
+        assert_eq!(got, Kind::Skip, "没有 .aria2 时状态证据必须照常成立（守卫不许误伤）");
+    }
+
     /// 对应 Go `TestSkipRequiresEvidenceInState`。
     ///
     /// D14 允许「清单 crc64 为空 + HEAD 失败 + 状态命中 → 跳过」，
@@ -1083,6 +1196,62 @@ mod tests {
             complete.iter().cloned().collect::<Vec<_>>(),
             vec!["t/ok.txt".to_string()],
             "只有「盘上确实完好、且有状态记录作证」的那一个才该留下: {complete:?}"
+        );
+    }
+
+    /// recheck 与 plan 共用判定链：complete 里已有的路径，`.aria2` 一出现就必须被摘掉。
+    /// 判别力：去掉规则 0 ⇒ 后半段红（recheck 认 state 命中 ⇒ 留下）。
+    #[test]
+    fn recheck_drops_paths_that_gained_a_control_file() {
+        let dir = TempDir::new();
+        let data = vec![0u8; 3072];
+        write_file(dir.path(), "a.bin", &data);
+
+        let f = File {
+            path: "a.bin".to_string(),
+            size: 3072,
+            crc64: "5432380796884633278".to_string(),
+            source_mtime: String::new(),
+        };
+        let m = Manifest {
+            code: "C".to_string(),
+            base_url: STUB_BASE.to_string(),
+            created_at: String::new(),
+            expires_at: String::new(),
+            total_files: 1,
+            total_bytes: 0,
+            files: vec![f],
+        };
+
+        // 状态证据齐全（构造沿用 state_hit 那条用例）
+        let mut st = State::load(dir.path());
+        st.bind("C");
+        st.put(
+            "a.bin",
+            Entry {
+                size: 3072,
+                mtime: mtime_of(dir.path(), "a.bin"),
+                crc64: "5432380796884633278".to_string(),
+            },
+        );
+
+        // 对照组：没有控制文件时，complete 里的路径必须留着
+        // （否则下面「被摘掉」可能是别的原因导致的，钉不住联动）
+        let mut complete: BTreeSet<String> = ["a.bin".to_string()].into_iter().collect();
+        recheck_complete(dir.path(), Some(&st), &m, &mut complete);
+        assert_eq!(
+            complete.iter().cloned().collect::<Vec<_>>(),
+            vec!["a.bin".to_string()],
+            "没有 .aria2 时完整文件必须留在 complete 里（对照组）: {complete:?}"
+        );
+
+        // 关键道具：控制文件出现了 ⇒ 同一条判定链必须把它摘掉
+        std::fs::write(dir.join("a.bin.aria2"), b"ctl").unwrap();
+        complete.insert("a.bin".to_string());
+        recheck_complete(dir.path(), Some(&st), &m, &mut complete);
+        assert!(
+            complete.is_empty(),
+            "complete 里已有的路径一旦长出 .aria2 就必须被摘掉: {complete:?}"
         );
     }
 

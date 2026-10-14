@@ -14,9 +14,9 @@
 
 | 文件名 | 给哪种机器 | 怎么确认 |
 | --- | --- | --- |
-| `benagen-dl-macos-arm64` | Apple 芯片的 Mac（M 系列） | `uname -s` 是 `Darwin`，`uname -m` 是 `arm64` |
-| `benagen-dl-macos-x86_64` | Intel 芯片的 Mac | `uname -s` 是 `Darwin`，`uname -m` 是 `x86_64` |
-| `benagen-dl-linux-x86_64` | Linux x86_64 服务器 | `uname -s` 是 `Linux`，`uname -m` 是 `x86_64` |
+| `benagen-dl-0.2.6-macos-arm64` | Apple 芯片的 Mac（M 系列） | `uname -s` 是 `Darwin`，`uname -m` 是 `arm64` |
+| `benagen-dl-0.2.6-macos-x86_64` | Intel 芯片的 Mac | `uname -s` 是 `Darwin`，`uname -m` 是 `x86_64` |
+| `benagen-dl-0.2.6-linux-x86_64` | Linux x86_64 服务器 | `uname -s` 是 `Linux`，`uname -m` 是 `x86_64` |
 
 不知道自己是哪种机器，就跑这两条命令，把输出对照上表：
 
@@ -30,7 +30,7 @@ uname -m    # arm64 或 x86_64
 - macOS 需要 **13.0 或更新**的版本。
 - Linux 版是**静态链接的单个文件**，不依赖系统里装了什么库。
 - 目前**没有** Linux ARM（`uname -m` 出 `aarch64`）的版本。机器如果是这一类，请联系我们。
-- Linux 上拿到文件之后，同样要给它执行权限：`chmod +x ./benagen-dl-linux-x86_64`。经浏览器
+- Linux 上拿到文件之后，同样要给它执行权限：`chmod +x ./benagen-dl-0.2.6-linux-x86_64`。经浏览器
   下载、或从 Windows 上中转过来的文件常常会丢掉执行位，一跑就报 `Permission denied`。
 
 ---
@@ -55,7 +55,7 @@ chmod +x ./benagen-dl                          # 如果提示 Permission denied�
 ```
 
 上面把文件当作 `./benagen-dl` 来用；实际文件名如果带着平台后缀（例如
-`benagen-dl-macos-arm64`），把命令里对应的文件名换掉即可，也可以自己重命名成 `benagen-dl`。
+`benagen-dl-0.2.6-macos-arm64`），把命令里对应的文件名换掉即可，也可以自己重命名成 `benagen-dl`。
 
 **办法二：在访达里放行**
 
@@ -126,8 +126,8 @@ benagen-dl —— 把一批交付数据完整下载到本地
 选项：
   -o <目录>     下载到哪（默认 $HOME/Downloads/Benagen）
   -j <N>        并行文件数，1–64（默认 5）
-  -x <N>        单文件连接数，1–16（默认 8）
-  -s <N>        分片数，1–16（默认 8）
+  -x <N>        单文件连接数，1–16（默认 4）
+  -s <N>        分片数，1–16（默认 4）
   --quiet       只打印错误与最终结论
   --license     打印内嵌组件（aria2）的 GPLv2 全文
   --version     打印版本与内嵌 aria2c 的摘要

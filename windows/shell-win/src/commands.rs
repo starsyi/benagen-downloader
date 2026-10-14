@@ -69,6 +69,7 @@ use shell_core::protocol::{EngineState, LoadState, Settings, TaskAction};
 use shell_core::storage::history::History;
 use shell_core::storage::preferences::Preferences;
 
+use crate::batch;
 use crate::kernel::{self, TransferPoll};
 use crate::openurl;
 use crate::pickdir;
@@ -179,6 +180,7 @@ pub fn state(app: tauri::State<'_, Shell>) -> Value {
 ///    判据只有 `DeliveryCodeEntry` 那一份 —— 本层不重写一遍长度判断。
 #[tauri::command(async)]
 pub fn load(app: tauri::State<'_, Shell>, code: String, base_url: Option<String>) -> Value {
+    app.session.reset_auto_restart();
     // ⚠️ 前端不传 `base_url` 时它是 `None`（"高级：自定义下载地址"那一格没填）⇒ 空串，
     //    与第二代 `body.get("base_url").and_then(as_str).unwrap_or("")` 逐字同义。
     let base_url = base_url.unwrap_or_default();
@@ -214,6 +216,7 @@ pub fn load(app: tauri::State<'_, Shell>, code: String, base_url: Option<String>
 ///    它每次都真的问一遍注入的连接器（`session::spawn_connect` 的文档记着这条）。
 #[tauri::command]
 pub fn retry(app: tauri::State<'_, Shell>) -> Value {
+    app.session.reset_auto_restart();
     session::spawn_connect(&app.session);
     api::envelope::ok(serde_json::json!({ "status": "connecting" }))
 }
@@ -324,12 +327,8 @@ fn whole_tree(
         None => tree.default_selected.iter().cloned().collect(),
     };
     let sizes = SelectionSummary::size_index(&tree.flat);
-    // 🔴 "此刻能不能按"：判据**只有一处实现**（`DownloadTargets::blocked_reason`），
-    //    入参是**真正要发出去的那一串**（与 `enqueue_with` 那条路同一个算式）。
-    //    ⚠️ 别把 `selected` 直接喂进去：整批全选会被 `paths` 收敛成空数组，
-    //    而那条路**必须**永远走得通（它是超大批次唯一的出路 —— 那句论证在
-    //    `DownloadTargets::blocked_reason` 的文档里，入参那一条同理）。
-    let outgoing = DownloadTargets::paths(&selected, &BrowserSelection::all_files(&tree.flat));
+    // 大批量不再拦截（2026-10-12）：超预算的路径串在 `enqueue_with` 里切块依次发送，
+    // 所以这里不再需要算"真正要发出去的那一串"来判能不能按。
     // ⚠️ 底栏那颗按钮的文案与它旁边那句「明说」：**同一个勾选面**（`selected`，
     //    也就是下面 `SelectionSummary::of` 吃的那一个）—— 几格说的必须是同一件事。
     //    这些字符串都由 `DownloadTargets` 算（`presentation` 的既有纯函数，有单测），
@@ -343,7 +342,7 @@ fn whole_tree(
         } else {
             None
         },
-        blocked_reason: DownloadTargets::blocked_reason(&outgoing).map(str::to_string),
+        blocked_reason: None, // 大批量改为分批入队，不再拦截（2026-10-12）
     };
     api::tree::whole(
         &Breadcrumb::new(""),
@@ -415,42 +414,71 @@ pub fn enqueue(app: tauri::State<'_, Shell>, paths: Vec<String>) -> Value {
 ///
 /// 三步（规格 §5.3）：取数据（**会话快照**里那一批的全部文件）→ 判据（`kernel_paths`
 /// 里那一次 `DownloadTargets::paths`）→ 交给内核。
-fn enqueue_with(session: &Session, paths: Vec<String>) -> Value {
+fn enqueue_with(session: &Arc<Session>, paths: Vec<String>) -> Value {
     let Some(client) = session.client() else {
         return api::envelope::err(api::NO_KERNEL);
     };
     // ⚠️ 锁的纪律：`client()` 与 `view()` 都是"读一次就放锁"，两次临界区都在这一行之内，
     //    之后的 `kernel::enqueue` 手里没有会话锁（见文件头那条）。
     let paths = kernel_paths(&session.view().load, &paths);
-    // 🔴 **兜底闸**（任务 17 的 C-3 另一半，判据仍是同一个 `DownloadTargets::blocked_reason`）：
-    //    超过安全预算的请求**一个字节都不发出去**，并且把理由当作这一发的回执交给用户。
-    //    ⚠️ 它为什么还需要（界面那一格不是已经禁用了吗）：那一格是**异步**取回来的
-    //    （勾选面一变、载荷要过一小会儿才回来），而用户在那一小段里**点得下去** ——
-    //    没有这道闸，落到用户眼前的就是 `client.rs` 里那句"…补救：…分批发"
-    //    （**界面根本没有"分批"这个动作**，等于教用户做一件他做不到的事）。
-    //    ⚠️ 闸门在 `kernel::enqueue` **之外**：不发、不排队、不碰内核
-    //    （同 macOS 侧 `AppModel.enqueue` 那道守卫的纪律：点一下下载不该换掉用户的内核）。
-    if let Some(why) = DownloadTargets::blocked_reason(&paths) {
-        // ⚠️ **不碰 `last_error`**：被挡下不是"上一次失败过去了"—— 清掉那一格会让常驻提示行
-        //    上那条（可能是在说"内核没了"）凭空消失，而这一发根本没跟内核说过话
-        //    （同 `transfers` 那条"`Absorbed` 不碰 `last_error`"的纪律）。
-        // ⚠️ 那句话住在 `shell-core`（`DownloadTargets::blocked_reason`），本层**一个字都不写**
-        //    （R-24：命令层里不许出现面向用户的字符串）——这里只把它交给既有的回执形状。
-        return api::enqueue::enqueue(&EnqueueFeedback::blocked(why));
-    }
-    match kernel::enqueue(&client, &paths) {
-        Ok(result) => {
-            session.set_last_error(None);
-            // ⚠️ `added` 与 `rejected` 怎么成句全在 `EnqueueFeedback::of` 里（约束 4：
-            //    两边都要有落点）；本层只把它交给 `api::enqueue::enqueue` 装信封。
-            api::enqueue::enqueue(&EnqueueFeedback::of(&result))
+    // 🔴 大批量不再被拒（2026-10-12）：超出单条请求预算的路径串被切成若干块**依次**发给内核；
+    //    内核对每块只同步提交前 100 个、其余后台陆续加入（`pending`），所以每一块都很快返回。
+    //    · 单条就超预算的路径不进任何一块（它发出去也只会让内核不回话），逐条作为 rejected 交代；
+    //    · 整批全选的 `paths` 为空：仍发一条空的（= 全部待下载）；
+    //    · 第一块失败 ⇒ 照旧走失败信封（什么都没加进去）；
+    //    · 后面的块失败 ⇒ 前面已经入队的**保留**，没发出去的合成一条汇总（不静默少交）。
+    let mut merged = shell_core::protocol::EnqueueResult {
+        added: Vec::new(),
+        rejected: DownloadTargets::oversized(&paths)
+            .into_iter()
+            .map(|path| shell_core::protocol::RejectedTask {
+                path,
+                reason: OVERSIZED_PATH_REASON.to_string(),
+            })
+            .collect(),
+        pending: 0,
+    };
+    let chunks = if paths.is_empty() {
+        vec![Vec::new()]
+    } else {
+        DownloadTargets::chunks(&paths)
+    };
+    for (i, chunk) in chunks.iter().enumerate() {
+        match kernel::enqueue(&client, chunk) {
+            Ok(mut r) => {
+                merged.added.append(&mut r.added);
+                merged.rejected.append(&mut r.rejected);
+                merged.pending += r.pending;
+            }
+            Err(why) if i == 0 => {
+                note_failure(session, &why);
+                return api::failure(&why);
+            }
+            Err(why) => {
+                // 中途失败：这一次动作的死活照常记（引擎徽标要翻、错误要上屏），没发出去的剩余
+                // 合成**一条**汇总——逐条展开会把界面撑爆（十几万行）。内核死了的话，它此前答应
+                // 后台陆续加入的那些也不会再加了，计入「未提交」，不许再说"正在后台加入"。
+                note_failure(session, &why);
+                let rest: usize = chunks[i..].iter().map(Vec::len).sum();
+                let orphaned = if matches!(why, CallFailure::KernelGone { .. }) {
+                    std::mem::take(&mut merged.pending)
+                } else {
+                    0
+                };
+                merged.rejected.push(shell_core::protocol::RejectedTask {
+                    path: format!("未提交 {} 个", rest + orphaned),
+                    reason: why.text().to_string(),
+                });
+                return api::enqueue::enqueue(&EnqueueFeedback::of(&merged));
+            }
         }
-        Err(why) => {
-            note_failure(session, &why);
-            api::failure(&why)
-        }
     }
+    session.set_last_error(None);
+    api::enqueue::enqueue(&EnqueueFeedback::of(&merged))
 }
+
+/// 单条路径超过单次请求上限、没有发送时的那句话（与 macOS `AppModel` 逐字相同）。
+const OVERSIZED_PATH_REASON: &str = "这一项路径太长，超过单次请求上限，没有发送";
 
 /// 勾选面 → **交给内核的 `paths`**：C-3 那条判据（`DownloadTargets::paths`）在本 crate 的
 /// **唯一生产调用点**（`kernel::enqueue` 只负责把它发出去，**不碰那个判据** ——
@@ -495,6 +523,16 @@ fn kernel_paths(batch: &LoadState, selection: &[String]) -> Vec<String> {
     DownloadTargets::paths(&selection, &all_paths)
 }
 
+/// 「暂停全部 / 一键开始」两颗按钮的状态（判据在 `BatchControl::of`，本层只喂它输入）。
+fn batch_control(rows: &[TransferRow]) -> shell_core::presentation::batch_control::BatchControl {
+    shell_core::presentation::batch_control::BatchControl::of(
+        rows,
+        batch::resume_pending(),
+        batch::migrate().as_ref(),
+    )
+    .with_migrate_failure(batch::migrate_failure().as_ref())
+}
+
 /// 传输列表（规格 §3.4 第六行，对齐第二代 `GET /api/transfers`）。
 ///
 /// ⚠️ 前端按 **200 ms** 轮询它（`TransferListPoll::INTERVAL_NANOSECONDS`），
@@ -517,6 +555,7 @@ pub fn transfers(app: tauri::State<'_, Shell>) -> Value {
                 &rows,
                 Some(&TransferGlobalSummary::of(&result.global)),
                 TransferListEmpty::of(&engine),
+                &batch_control(&rows),
             )
         }
         // ⚠️ 内核亲口说的**正常态**（还没添加过任务 / 这一批没了）⇒ 发 `global: null` 的
@@ -534,7 +573,7 @@ pub fn transfers(app: tauri::State<'_, Shell>) -> Value {
             if poll.flips_engine_to_not_started() {
                 app.session.note_engine_not_started();
             }
-            api::transfers::transfers(&[], None, TransferListEmpty::of(&engine))
+            api::transfers::transfers(&[], None, TransferListEmpty::of(&engine), &batch_control(&[]))
         }
         // 🔴 **内核亲口说"这一批没了"**（`no_delivery`）：除了发空快照，还要**作废当前批次**
         //    （清掉 `load_request` —— 对齐 macOS 的 `resetToEmptyState()`）。
@@ -545,7 +584,7 @@ pub fn transfers(app: tauri::State<'_, Shell>) -> Value {
         //    （正常态、不显示那句话），我们照办 —— 界面上的表现就是**空态**，不是红横幅。
         TransferPoll::NoDelivery => {
             app.session.reset_to_empty_state();
-            api::transfers::transfers(&[], None, TransferListEmpty::of(&engine))
+            api::transfers::transfers(&[], None, TransferListEmpty::of(&engine), &batch_control(&[]))
         }
         TransferPoll::Failed(why) => {
             note_failure(&app.session, &why);
@@ -716,6 +755,10 @@ pub fn task_action(
     };
     match kernel::task_action(&client, action, gid) {
         Ok(()) => {
+            // 一键开始成功 ⇒ 「刚换过目录、队列还没补回来」这件事办完了；搬运的结果话也不用再留。
+            if action == TaskAction::ResumeAll {
+                batch::clear_after_resume();
+            }
             app.session.set_last_error(None);
             app.session.set_engine(EngineState::Running);
             // ⚠️ `status` 是**状态令牌**（与 `load` 的 `loading` / `no_kernel` 同一个口径）：
@@ -1074,11 +1117,39 @@ pub fn preferences_set(app: tauri::State<'_, Shell>, dir: String) -> Value {
             dir: updated.download_dir,
         });
     }
+    // ①½ **先停手，再记旧目录**（规格 2026-10-12 §6）。尽力而为：问不到就当没有——
+    //    换目录本身不能因为这两步失败而失败。
+    //    · 强制暂停：磁盘快满正是换目录的主场景，要立刻停写；也不让旧引擎在被掐掉之前
+    //      又往旧盘写几个 GB。暂停失败要说出来（错误上屏），不然界面以为停了、引擎其实还在写；
+    //    · 旧目录：偏好里「未配置」时落盘根是内核的默认值，只有内核知道它是哪儿。
+    let (paused, old_dir) = match app.session.client() {
+        Some(client) => {
+            let paused = match kernel::task_action(&client, TaskAction::PauseAll, None) {
+                Ok(()) => true,
+                Err(why) => {
+                    note_failure(&app.session, &why);
+                    false
+                }
+            };
+            (paused, kernel::download_dir(&client).ok())
+        }
+        None => (false, None),
+    };
     if let Err(cause) = updated.save(&path) {
-        return api::preferences::change(&DownloadDirChange::Failed {
-            message: api::preferences::save_failed(&cause.to_string()),
-        });
+        let cause = cause.to_string();
+        let message = if paused {
+            api::preferences::save_failed_after_pause(&cause)
+        } else {
+            api::preferences::save_failed(&cause)
+        };
+        return api::preferences::change(&DownloadDirChange::Failed { message });
     }
+    // 待搬的旧目录先记下：批次加载好、内核在线的那一刻交接（见 `Session::take_handover`）。
+    // 这一次重启失败的话，它留给之后的重试。
+    app.session.defer_handover(old_dir);
+    // ⚠️ 这是**用户的显式动作** ⇒ 复位自动重启预算（对齐 macOS `AppModel.swift:1244`）：
+    //    否则"自动重启已经用掉预算"会让改目录变成一件按下去没有回音的事。
+    app.session.reset_auto_restart();
     match restart_kernel(&app.session, ChangedSetting::DownloadDir.restart_timeout_message()) {
         Ok(()) => api::preferences::change(&DownloadDirChange::Changed {
             dir: updated.download_dir,
@@ -1139,6 +1210,8 @@ pub fn verbose_logging_set(app: tauri::State<'_, Shell>, on: bool) -> Value {
     //    （内核正在被换掉）。它与重启成不成功**无关** —— 内核起不来也不该让壳的
     //    日志继续停在旧档上（回执会把"没改成"如实说出来）。
     apply_shell_log_level(&updated);
+    // ⚠️ 这是**用户的显式动作** ⇒ 复位自动重启预算（同 [`preferences_set`]）。
+    app.session.reset_auto_restart();
     match restart_kernel(
         &app.session,
         ChangedSetting::VerboseLogging.restart_timeout_message(),
@@ -1468,10 +1541,13 @@ fn wait_for_the_kernel(session: &Session, on_timeout: &str) -> Result<(), String
 /// ⚠️ **判据只有 `KernelDeath` 那一份**（在 `shell-core` 里，纯函数、有单测）：
 ///    本函数只做"认出来并交回去"，**不在这里判**"什么算内核死亡"。
 ///    `note_kernel_death` 自己保证"至多一次"（先到的那句原因就是事实）。
-fn note_failure(session: &Session, why: &CallFailure) {
+fn note_failure(session: &Arc<Session>, why: &CallFailure) {
     match why {
         CallFailure::KernelGone { reason, .. } => {
-            session.note_kernel_death(reason.clone());
+            if session.note_kernel_death(reason.clone()) && session.claim_auto_restart() {
+                // 第一次死亡、且这一轮还没自动重启过 ⇒ 给它一次。
+                session::spawn_connect(session);
+            }
         }
         // 🔴 **内核亲口说"这一批没了"** ⇒ **作废当前批次**（清掉 `load_request`，
         //    对齐 macOS 的 `resetToEmptyState()`）—— 否则那个死码会在下一次内核重启时
@@ -1539,6 +1615,11 @@ mod tests {
             self.written.lock().unwrap().last().cloned().unwrap_or_default()
         }
 
+        /// 全部写出去的请求（按顺序）。
+        fn all_requests(&self) -> Vec<String> {
+            self.written.lock().unwrap().clone()
+        }
+
         /// 已经写给内核的请求**条数**（"一条都没有"是任务 17 那条兜底闸要钉的事）。
         fn written_len(&self) -> usize {
             self.written.lock().unwrap().len()
@@ -1556,18 +1637,21 @@ mod tests {
         /// ⚠️ `id` 必须是这一条请求的 id（`CoreClient` 从 1 起编号，首条就是 1）：
         ///    对不上会被判成 `Desync`，那是"把一条无关的 result 当成自己的"。
         fn read_line(&self) -> Result<Option<String>, ClientError> {
-            Ok(Some(
-                r#"{"id":1,"ok":true,"result":{"added":[],"rejected":[]}}"#.to_string(),
-            ))
+            // id = 到目前为止写出去的请求条数（`CoreClient` 从 1 起编号，逐条递增）：
+            // 大批量会被切成多块依次发送，每一块的回执都要对得上自己的 id。
+            let id = self.written.lock().unwrap().len();
+            Ok(Some(format!(
+                r#"{{"id":{id},"ok":true,"result":{{"added":[],"rejected":[]}}}}"#
+            )))
         }
 
         fn close(&self) {}
     }
 
     /// 一个**装上了内核连接**的会话 + 那条通道的记账句柄。
-    fn a_session_with(load: LoadState) -> (Session, Recording) {
+    fn a_session_with(load: LoadState) -> (Arc<Session>, Recording) {
         let channel = Recording::new();
-        let session = Session::new();
+        let session = Arc::new(Session::new());
         session.install_client(
             Arc::new(CoreClient::new(Box::new(channel.clone()))),
             r#"{"protocol":1}"#.to_string(),
@@ -1830,83 +1914,205 @@ mod tests {
         }
     }
 
-    /// 🔴 **部分勾选一个超大批次：不许碰内核，而且要说得出话**（任务 17 的兜底闸）。
+    /// 🔴 **部分勾选一个超大批次：切块依次发给内核，一条不少**（2026-10-12 取代原来的"拦下来"）。
     ///
-    /// 判别力（**两条断言各挡一种写法**）：
-    ///   · 去掉 `enqueue_with` 里那道 `if let Some(why)` ⇒ 第一条红：20 万条路径的请求体
-    ///     约 9.8 MB，`CoreClient::call` 在写出去之前把它拒了（`RequestTooLong`），
-    ///     落到用户眼前的是 `client.rs` 那句"…补救：…分批发"——**界面没有"分批"这个动作**；
-    ///   · 把 `EnqueueFeedback::blocked` 的 `summary` 换成空串 ⇒ 第二条红：用户点了下载，
-    ///     界面一个字都不说（约束 4 明禁的静默失效）。
+    /// 以前超预算就回「请少选一些」——客户选的是整个目录，文件数多是常态，不是错误，
+    /// 而且那句话让他做一件他不想做的事。现在按预算切块、每块一条 `enqueue`。
+    ///
+    /// 判别力：改回"超预算就拦"⇒ 写出去的条数为 0 ⇒ 红；切块时丢一条 ⇒ 拼回去不等 ⇒ 红；
+    /// 有任何一块超预算 ⇒ 红（那会把客户端永久堵死）。
     #[test]
-    fn a_partial_selection_of_a_huge_batch_never_reaches_the_kernel() {
+    fn a_partial_selection_of_a_huge_batch_is_sent_in_chunks_without_losing_any() {
         let huge = an_over_budget_set();
-        // ⚠️ 先钉**夹具的判别力**：这一串**作为显式列表**发出去必须是超预算的
-        //    （夹具搭小了的话，下面的断言会退化成"一条本来就合法的请求也合法"）。
         assert!(
             DownloadTargets::exceeds_request_budget(&huge),
             "夹具没搭准：这一串单独发出去必须真的超预算"
         );
-        // 勾选面 = 前 199999 项（**差一项**：不构成"整批全选"）。
         let selection = huge[..huge.len() - 1].to_vec();
-        // ⚠️ 先钉**这条夹具走的是哪一支**：差一项 ⇒ 判据走的是**显式列表**那一支，
-        //    不是"整批全选 ⇒ 发 `[]`"那一支（后者永远不超预算，那是任务 16 那条触发器，
-        //    两条不能混）。少一项都不行的判据由 `a_real_subset_goes_out_one_by_one` 钉着。
-        assert_eq!(
-            kernel_paths(&LoadState::Loaded(a_batch_of(&huge)), &selection).len(),
-            selection.len(),
-            "夹具没搭准：这一条必须走显式列表那一支（逐条发出去）"
-        );
         let (session, channel) = a_session_with(LoadState::Loaded(a_batch_of(&huge)));
 
-        let value = enqueue_with(&session, selection);
+        let value = enqueue_with(&session, selection.clone());
 
-        assert_eq!(value["ok"], serde_json::json!(true), "这一发是一个**回执**，不是错误信封：{value}");
+        assert_eq!(value["ok"], serde_json::json!(true), "{value}");
+        let written = channel.all_requests();
+        assert!(written.len() > 1, "必须被切成多块：{} 条", written.len());
+        let mut sent: Vec<String> = Vec::new();
+        for line in &written {
+            assert!(
+                line.len() <= DownloadTargets::REQUEST_BUDGET_BYTES + 1024,
+                "每一块都必须在预算内：{} 字节",
+                line.len()
+            );
+            let v: serde_json::Value = serde_json::from_str(line).expect("请求是 JSON");
+            for p in v["params"]["paths"].as_array().expect("paths 数组") {
+                sent.push(p.as_str().expect("字符串").to_string());
+            }
+        }
+        // 勾选面是个有序集合，`kernel_paths` 按字节序发出（见 `DownloadTargets::paths`）——
+        // 所以期望的是**排序后的**勾选面：块与块之间顺序不变、一条不少。
+        let mut want = selection;
+        want.sort();
+        assert!(sent == want, "切块之后必须一条不少、顺序不变（发出 {} 条，期望 {} 条）", sent.len(), want.len());
+    }
+
+    /// 🔴 **单条超预算的路径不进请求体**，而是逐条交代为 rejected；其余照发、顺序不变。
+    ///
+    /// 判别力：去掉 `enqueue_with` 里 `oversized` 那段 ⇒ 超大路径被写进请求 ⇒ 红。
+    #[test]
+    fn an_oversized_path_is_never_sent_and_is_named_in_the_receipt() {
+        let huge = "y".repeat(DownloadTargets::REQUEST_BUDGET_BYTES);
+        let batch = vec!["a.bin".to_string(), "b.bin".to_string(), huge.clone(), "c.bin".to_string()];
+        let (session, channel) = a_session_with(LoadState::Loaded(a_batch_of(&batch)));
+
+        let value = enqueue_with(&session, vec!["a.bin".to_string(), "b.bin".to_string(), huge.clone()]);
+
+        let sent = channel.last_request();
+        assert!(sent.contains(r#""paths":["a.bin","b.bin"]"#), "其余路径照发：{}", sent.len());
+        assert!(!sent.contains(&huge), "超预算的那条不许出现在请求里");
+        let rejections = value["data"]["rejections"].as_array().expect("rejections 是数组");
+        assert_eq!(rejections.len(), 1, "{value}");
+        assert_eq!(rejections[0]["path"].as_str(), Some(huge.as_str()));
         assert_eq!(
-            channel.written_len(),
-            0,
-            "被挡下的请求**一个字节都不许写给内核**（写出去只会换来报错或挂死）"
-        );
-        assert_eq!(
-            value["data"]["summary"],
-            serde_json::json!("选中的项太多，超过一次能发出的上限：请少选一些"),
-            "用户必须看到**壳写的**那句理由（不是 client.rs 原文）：{value}"
-        );
-        assert_eq!(
-            value["data"]["switches_to_transfers"],
-            serde_json::json!(false),
-            "一件都没加进去，不许切走（切走会把这句话吞掉）：{value}"
+            rejections[0]["reason"],
+            serde_json::json!("这一项路径太长，超过单次请求上限，没有发送"),
+            "{value}"
         );
     }
 
-    /// 🔴 **界面那一格：超预算的部分勾选 ⇒ 那个动作是禁用的、并带着理由**（任务 17）。
+    /// 第 `fails_at` 条请求（从 1 起）失败：`dies` 时是内核管道结束，否则是内核的一条错误。
+    /// 其余请求照常成功，且每一块都说"还有 1 个在后台陆续加入"。
+    #[derive(Clone)]
+    struct FailingAt {
+        written: Arc<Mutex<Vec<String>>>,
+        fails_at: usize,
+        dies: bool,
+    }
+
+    impl LineChannel for FailingAt {
+        fn write_line(&self, line: &str) -> Result<(), ClientError> {
+            self.written.lock().unwrap().push(line.to_string());
+            Ok(())
+        }
+
+        fn read_line(&self) -> Result<Option<String>, ClientError> {
+            let id = self.written.lock().unwrap().len();
+            if id == self.fails_at && self.dies {
+                return Ok(None);
+            }
+            if id == self.fails_at {
+                return Ok(Some(format!(
+                    r#"{{"id":{id},"ok":false,"error":{{"code":"invalid_params","message":"磁盘已满"}}}}"#
+                )));
+            }
+            Ok(Some(format!(
+                r#"{{"id":{id},"ok":true,"result":{{"added":[],"rejected":[],"pending":1}}}}"#
+            )))
+        }
+
+        fn close(&self) {}
+    }
+
+    /// 发出去的顺序是勾选面的 `BTreeSet` 顺序（见 `kernel_paths`），分块要按它算。
+    fn in_send_order(paths: &[String]) -> Vec<String> {
+        paths.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect()
+    }
+
+    fn a_session_failing_at_the_second_chunk(dies: bool, huge: &[String]) -> (Arc<Session>, FailingAt) {
+        let channel = FailingAt {
+            written: Arc::new(Mutex::new(Vec::new())),
+            fails_at: 2,
+            dies,
+        };
+        let session = Arc::new(Session::new());
+        session.install_client(
+            Arc::new(CoreClient::new(Box::new(channel.clone()))),
+            r#"{"protocol":1}"#.to_string(),
+        );
+        session.set_load(LoadState::Loaded(a_batch_of(huge)));
+        (session, channel)
+    }
+
+    /// 🔴 **块与块之间失败**：这一次动作的死活照记（错误上屏），没发出去的剩余**合成一条**汇总。
     ///
-    /// 判别力：把 `whole_tree` 里 `blocked_reason:` 那一行改成恒 `None` ⇒ 这一条红 ——
-    /// 而真机上那是**界面永远不拦**：用户勾了大半个超大批次，按钮亮着，
-    /// 点下去撞上一句他看不懂的错（界面从头到尾没告诉他门槛在哪）。
-    ///
-    /// ⚠️ 期望值是**手写的字面量**（不从 `DownloadTargets` 现取）：现取的话，
-    ///    改了那句话两边会一起变，这条断言就恒真了。
+    /// 判别力（改动前的代码都会红）：
+    ///   · 不调 `note_failure` 并 `set_last_error(None)` ⇒ 错误被抹掉，界面说"没有错误" ⇒ 红；
+    ///   · 逐条展开剩余路径 ⇒ `rejections` 不是一条 ⇒ 红（那就是十几万行的界面卡死）；
+    ///   · 失败之后还接着发剩下的块 ⇒ 写出去的条数不是 2 ⇒ 红。
     #[test]
-    fn the_tree_payload_carries_the_reason_when_the_action_is_unavailable() {
+    fn a_chunk_failing_midway_is_recorded_and_the_rest_is_one_line() {
+        let huge = an_over_budget_set();
+        let selection = huge[..huge.len() - 1].to_vec();
+        let sorted = in_send_order(&selection);
+        assert!(
+            DownloadTargets::chunks(&sorted).len() >= 3,
+            "夹具没搭准：要证明'第二块失败、第三块没发'，至少三块"
+        );
+        let (session, channel) = a_session_failing_at_the_second_chunk(false, &huge);
+
+        let value = enqueue_with(&session, selection.clone());
+
+        let sent = channel.written.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "第二块失败之后不许再发第三块");
+        assert_eq!(value["ok"], serde_json::json!(true), "前面已入队的保留，这一发不算整体失败：{value}");
+        let rejections = value["data"]["rejections"].as_array().expect("rejections 是数组");
+        assert_eq!(rejections.len(), 1, "剩余路径必须合成一条汇总，不许逐条展开：{}", rejections.len());
+        let first: serde_json::Value = serde_json::from_str(&sent[0]).expect("请求是 JSON");
+        let done = first["params"]["paths"].as_array().expect("paths 数组").len();
+        let rest = selection.len() - done;
+        assert_eq!(rejections[0]["path"], serde_json::json!(format!("未提交 {rest} 个")));
+        assert!(
+            rejections[0]["reason"].as_str().unwrap_or_default().contains("磁盘已满"),
+            "{value}"
+        );
+        assert!(
+            session.view().last_error.unwrap_or_default().contains("磁盘已满"),
+            "失败必须记进错误格（不许被后面的 set_last_error(None) 抹掉）"
+        );
+    }
+
+    /// 🔴 **内核在块与块之间死掉**：引擎那一格要翻；此前答应"后台陆续加入"的个数已经没有人加了，
+    /// 必须并进「未提交」，话里不许再说"正在后台继续加入"（那是一句假话）。
+    ///
+    /// 判别力：不清零 `pending`（或不把它并进未提交）⇒ 后两条红。
+    #[test]
+    fn a_kernel_dying_midway_does_not_promise_the_background_ones() {
+        let huge = an_over_budget_set();
+        let selection = huge[..huge.len() - 1].to_vec();
+        let sorted = in_send_order(&selection);
+        let (session, _channel) = a_session_failing_at_the_second_chunk(true, &huge);
+
+        let value = enqueue_with(&session, selection.clone());
+
+        assert!(
+            matches!(session.view().engine, EngineState::Unavailable(_)),
+            "内核死了，引擎那一格必须翻过来：{:?}",
+            session.view().engine
+        );
+        let summary = value["data"]["summary"].as_str().unwrap_or_default();
+        assert!(!summary.contains("后台"), "内核已经死了，不许说还在后台加入：{summary}");
+        let rejections = value["data"]["rejections"].as_array().expect("rejections 是数组");
+        assert_eq!(rejections.len(), 1, "{value}");
+        // 第一块那 1 个后台待加入 + 第二块起的剩余，全部算作未提交。
+        let first_done = DownloadTargets::chunks(&sorted)[0].len();
+        let rest = selection.len() - first_done + 1;
+        assert_eq!(rejections[0]["path"], serde_json::json!(format!("未提交 {rest} 个")), "{value}");
+    }
+
+    /// 界面那一格：超大的部分勾选**不再**被禁用（不带 `blocked_reason`）。
+    /// 判据：恢复拦截 ⇒ 这里变成字符串 ⇒ 红。
+    #[test]
+    fn a_huge_partial_selection_is_never_reported_as_blocked() {
         let huge = an_over_budget_set();
         let (session, _) = a_session_with(LoadState::Loaded(a_batch_of(&huge)));
 
-        // 勾选面 = 差一项（真子集）⇒ 发出去的是显式列表 ⇒ 超预算 ⇒ 挡下。
         let value = whole_tree(&session, &a_tree_of(&huge, &huge), Some(&huge[..huge.len() - 1]));
 
         assert_eq!(
             value["data"]["action"]["blocked_reason"],
-            serde_json::json!("选中的项太多，超过一次能发出的上限：请少选一些"),
-            "超预算的勾选面必须把理由带回去（前端靠它禁用那个动作）：{value}"
-        );
-        // ⚠️ 同一组里那两格仍然按**同一个面**算（"按钮叫什么"与"能不能按"是两件事）。
-        assert_eq!(value["data"]["action"]["button_title"], serde_json::json!("下载选中"), "{value}");
-        assert_eq!(
-            value["data"]["action"]["empty_selection_hint"],
             serde_json::Value::Null,
-            "{value}"
+            "大批量改为分批入队，不再拦截：{value}"
         );
+        assert_eq!(value["data"]["action"]["button_title"], serde_json::json!("下载选中"), "{value}");
     }
 
     /// ⚠️ **整批全选（哪怕是 20 万条）永远不被挡** —— 那是超大批次**唯一**的出路。

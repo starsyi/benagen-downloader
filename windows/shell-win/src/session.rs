@@ -20,6 +20,7 @@
 //! let tree = kernel::get_tree(&client);      // 锁已经放掉了
 //! ```
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use shell_core::client::CoreClient;
@@ -66,6 +67,12 @@ struct Inner {
     ///    一条"`Loaded` 但这里没有"的状态在今天**构造不出来**，而那正是重启之后
     ///    "该不该重放"的判据能只看这一格的原因。
     load_request: Option<(String, String)>,
+    /// 换下载目录时**待搬的旧目录**（外层 `Some` = 有待办；内层 = 旧目录，问不到则 `None`）。
+    ///
+    /// 新内核没能起来（或换目录之后又没连上）时，旧目录里的文件仍然要搬过来 ——
+    /// 所以它不随那一次失败丢掉，而是留到**批次加载好、内核在线**的那一刻由
+    /// [`Session::take_handover`] 取走（连接成功与批次加载成功两处都会问它）。
+    handover: Option<Option<String>>,
 }
 
 /// 会话状态。由 `Arc<Session>` 共享给所有命令线程与连接线程。
@@ -77,11 +84,16 @@ struct Inner {
 ///    `heartbeat.rs` 与这一格一起删除。**留在这里是记账，不是"以后可能还要"**。
 pub struct Session {
     inner: Mutex<Inner>,
+    /// 自动重启的预算。**置位即花掉**，只有用户动作才复位 —— 与 macOS 的
+    /// `restartIfAllowed`/`retryEngine` 同一套语义（`AppModel.swift:1948-1970`）。
+    /// ⚠️ **成功的重启不复位**：那会在"重启也失败"时变成自我续命循环。
+    auto_restart_attempted: AtomicBool,
 }
 
 impl Session {
     pub fn new() -> Session {
         Session {
+            auto_restart_attempted: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 client: None,
                 engine: EngineState::Connecting,
@@ -91,6 +103,7 @@ impl Session {
                 handshake_reply: None,
                 connector: None,
                 load_request: None,
+                handover: None,
             }),
         }
     }
@@ -138,6 +151,16 @@ impl Session {
         }
         inner.engine = EngineState::Unavailable(reason);
         true
+    }
+
+    /// 领一次自动重启的预算。第一次 `true`，之后 `false`，直到 [`Self::reset_auto_restart`]。
+    pub fn claim_auto_restart(&self) -> bool {
+        !self.auto_restart_attempted.swap(true, Ordering::SeqCst)
+    }
+
+    /// 复位预算。**只在用户显式开始新一轮时调**：换交付码 / 重新加载、以及点「重试」。
+    pub fn reset_auto_restart(&self) {
+        self.auto_restart_attempted.store(false, Ordering::SeqCst);
     }
 
     pub fn set_engine(&self, engine: EngineState) {
@@ -263,6 +286,25 @@ impl Session {
         self.inner.lock().expect("会话锁中毒").load_request.clone()
     }
 
+    /// 记下换目录时待搬的旧目录。已经有待办时**保留已知的那一个**：文件还在最早问到的那个目录里，
+    /// 中间又换了一次（新内核一直没起来，问不到旧目录）不能把它覆盖掉。
+    pub fn defer_handover(&self, old_dir: Option<String>) {
+        let mut inner = self.inner.lock().expect("会话锁中毒");
+        let earliest = inner.handover.take().flatten().or(old_dir);
+        inner.handover = Some(earliest);
+    }
+
+    /// 取走待搬的旧目录（`None` = 没有待办，或者**还没有加载过批次**——没有清单就没有东西可搬，
+    /// 待办留着，等批次加载好、内核在线的那一刻再办）。
+    pub fn take_handover(&self) -> Option<Option<String>> {
+        let mut inner = self.inner.lock().expect("会话锁中毒");
+        if inner.load_request.is_some() {
+            inner.handover.take()
+        } else {
+            None
+        }
+    }
+
     /// 装上一条刚握完手的连接（`spawn_connect` 成功那一支）。
     ///
     /// ⚠️ **它是 `handshake_reply` 与 `client` 的唯一写入者**：内核回执的**原文**
@@ -350,13 +392,23 @@ pub fn spawn_load(session: &Arc<Session>, client: Arc<CoreClient>, code: String,
                     //    但**必须一起写** —— 落了 `Loaded` 而没有记请求，重启之后就静默不重放了。
                     worker.remember_load_request(code, base_url);
                     worker.set_load(LoadState::Loaded(info));
+                    // 换目录的交接若还在等一份清单，现在清单到了：就办。
+                    if let Some(old_dir) = worker.take_handover() {
+                        crate::batch::mark_handover(&worker, old_dir);
+                    }
                 }
                 Err(why) => match why {
                     shell_core::presentation::kernel_death::CallFailure::KernelGone {
                         reason, text,
                     } => {
-                        worker.note_kernel_death(reason);
+                        // ⚠️ **先落 `Failed`、再可能起重启**（顺序承重）：`spawn_connect` 成功会
+                        //    `set_load(Loading)` 并重放 `spawn_load` ⇒ 若重放的落定晚于这句
+                        //    `Failed`（写后写竞态），`Loaded` 会被盖成 `Failed`。
                         worker.set_load(LoadState::Failed(text));
+                        if worker.note_kernel_death(reason) && worker.claim_auto_restart() {
+                            // 第一次死亡、且这一轮还没自动重启过 ⇒ 给它一次。
+                            spawn_connect(&worker);
+                        }
                     }
                     shell_core::presentation::kernel_death::CallFailure::Text(t) => {
                         worker.set_load(LoadState::Failed(t));
@@ -462,6 +514,11 @@ pub fn spawn_connect(session: &Arc<Session>) {
                 if let Some((code, base_url)) = replay {
                     worker.set_load(LoadState::Loading);
                     spawn_load(&worker, client, code, base_url);
+                }
+                // ⚠️ 放在重放**之后**：交接的线程要等"批次重新加载"的结论，而那一格在上面刚被置成
+                //    `Loading`；放在前面的话它会读到换目录之前残留的 `Loaded`，抢先去搬。
+                if let Some(old_dir) = worker.take_handover() {
+                    crate::batch::mark_handover(&worker, old_dir);
                 }
             }
             Err(why) => worker.set_engine(EngineState::Unavailable(why)),
@@ -575,6 +632,30 @@ mod tests {
         );
     }
 
+    /// 待搬的旧目录只能是**最初那一个**：中间又换一次（新内核一直没起来，问不到旧目录）
+    /// 不许把它覆盖成 `None`，否则文件就永远搬不过来了。
+    /// 判别力：把 `defer_handover` 改成直接覆盖 ⇒ 第二段红。
+    #[test]
+    fn a_deferred_old_dir_survives_a_second_change_that_cannot_ask_for_it() {
+        let s = Session::new();
+        s.remember_load_request("C24-8".to_string(), "https://user.example".to_string());
+        s.defer_handover(Some("D:/old".to_string()));
+        s.defer_handover(None);
+        assert_eq!(s.take_handover(), Some(Some("D:/old".to_string())));
+        assert_eq!(s.take_handover(), None, "取走之后就没有待办了");
+    }
+
+    /// 没有批次就没有清单可搬：待办必须留着，等批次来了再办（不许在启动那一拍被当成"办完了"丢掉）。
+    /// 判别力：把 `take_handover` 改回无条件取走 ⇒ 这一条红。
+    #[test]
+    fn a_pending_handover_waits_for_a_loaded_batch() {
+        let s = Session::new();
+        s.defer_handover(Some("D:/old".to_string()));
+        assert_eq!(s.take_handover(), None, "没有批次时不许取走");
+        s.remember_load_request("C24-8".to_string(), "https://user.example".to_string());
+        assert_eq!(s.take_handover(), Some(Some("D:/old".to_string())));
+    }
+
     /// ⚠️ **"至多一次"**：已经是 `Unavailable` 时不再覆盖 —— 先到的那句原因就是事实，
     ///    后到的只是一次附带观测，盖上它等于让横幅在两句话之间跳。
     #[test]
@@ -617,6 +698,51 @@ mod tests {
         s.set_last_error(None); // 下一个成功请求清掉瞬时错误
         assert!(s.view().fallback_notice.is_some(), "粘滞披露被清掉了");
         assert!(s.view().last_error.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // 自动重启的预算（对齐 macOS 的 `restartIfAllowed`/`retryEngine`，F20）
+    // -----------------------------------------------------------------------
+
+    /// 预算只给一次。判别力：把 `claim_auto_restart` 改成恒 `true` ⇒ 第二条断言红，
+    /// 而那正是「崩 → 重启 → 崩」的自我续命循环。
+    #[test]
+    fn the_auto_restart_budget_is_spent_once() {
+        let s = Session::new();
+        assert!(s.claim_auto_restart(), "第一次给一次预算");
+        assert!(!s.claim_auto_restart(), "第二次不给");
+    }
+
+    /// 证明 `reset_auto_restart` 方法会把预算填回去。判别力：去掉 `reset_auto_restart`
+    /// 的这一条用法 ⇒ 红。
+    ///
+    /// ⚠️ 它**不**证明"谁调了 `reset_auto_restart`" —— 那件事的真守卫是 grep
+    ///    （生产复位点只有用户显式动作命令的入口，见报告里的判定表）。
+    #[test]
+    fn only_a_user_action_refills_the_budget() {
+        let s = Session::new();
+        assert!(s.claim_auto_restart());
+        assert!(!s.claim_auto_restart());
+        s.reset_auto_restart();
+        assert!(s.claim_auto_restart(), "复位后应当又拿到一次");
+    }
+
+    /// 钉的是"引擎状态变化（`set_engine` / `note_kernel_death`）不碰预算"这个**子集**。
+    ///
+    /// ⚠️ 判别力**有限**（`set_engine` 本来就不碰预算）—— 它**不**覆盖第 2 条语义
+    ///    的全貌（"成功的自动重启不复位"）。那条的真守卫是 grep（生产复位点不在
+    ///    `spawn_connect` 里）。留着它是为了把"引擎状态不碰预算"写成可执行的断言。
+    #[test]
+    fn the_budget_is_independent_of_engine_state() {
+        let s = Session::new();
+        assert!(s.claim_auto_restart());
+        // 引擎状态翻来翻去、内核又死一次 —— 都不该把预算填回来。
+        s.set_engine(EngineState::Running);
+        s.note_kernel_death("又死了".to_string());
+        assert!(!s.claim_auto_restart(), "预算不该被引擎状态的变化复位");
+        // 只有用户动作能复位它（这里直接调那个方法）。
+        s.reset_auto_restart();
+        assert!(s.claim_auto_restart(), "复位后应当又拿到一次");
     }
 
     // ⚠️ 这里**故意没有**"`handshake_reply` 是 `None`"那条用例（初稿写过，被复审拿下）：

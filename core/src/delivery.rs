@@ -19,10 +19,31 @@ pub const PAGE_NAME: &str = "index.html";
 const CODE_LEN: usize = 20;
 
 /// 规格 §4 约束的清单请求参数
-const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
-/// **总尝试次数**（含首次）：为 3 时实际只重试 2 次
-const FETCH_RETRIES: usize = 3;
-const FETCH_BASE_DELAY: Duration = Duration::from_millis(500);
+///
+/// ## 2026-10-12 调参（现场：客户机上 `拉取清单失败（已尝试 3 次）…os error 10060`）
+///
+/// 旧值是「每次 30 秒、共 3 次、退避 0.5 / 1 秒」。10060 是**连接阶段**超时：对端不回 SYN，
+/// 一次尝试就白等 30 秒，三次下来 90 秒全花在等一个不会来的回音上，而重试之间几乎没有间隔——
+/// 网络恢复需要的是**时间**，不是更多次紧挨着的敲门。新值：
+///   * 连接阶段单独设 [`FETCH_CONNECT_TIMEOUT`]（8 秒）：连不上就尽早换下一次；
+///   * 单次总时限 15 秒（清单是几十 KB～几 MB 的 JSON，15 秒绰绰有余）；
+///   * 共 5 次，退避 1 / 2 / 4 / 8 秒（比旧的拉长一个量级，给网络一个喘息）。
+///
+/// 最坏耗时 = 5 × 15 + (1+2+4+8) = **90 秒**，仍在原先 91.5 秒的记账之内
+/// （`kernel.rs` / `client.rs` 里「三段顺序执行」的预算账不用改；由
+/// `fetch_worst_case_stays_inside_the_booked_91_5_seconds` 钉住）。
+const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+/// 连接阶段的上限（见上）。
+const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// **总尝试次数**（含首次）：为 5 时实际重试 4 次
+const FETCH_RETRIES: usize = 5;
+/// 退避的基数：第 n 次重试前等 `基数 × 2^(n-1)`。
+const FETCH_BASE_DELAY_PROD: Duration = Duration::from_secs(1);
+/// 测试里退避压到毫秒级（逻辑不变，只是别让「5 次全失败」的用例真睡 15 秒）。
+#[cfg(not(test))]
+const FETCH_BASE_DELAY: Duration = FETCH_BASE_DELAY_PROD;
+#[cfg(test)]
+const FETCH_BASE_DELAY: Duration = Duration::from_millis(2);
 /// 清单响应体上限（Go 侧 `io.LimitReader(resp.Body, 64<<20)`）
 const MAX_MANIFEST_BYTES: u64 = 64 << 20;
 
@@ -76,8 +97,7 @@ impl Manifest {
     /// 注意 Go 的 `url.PathEscape` 会保留子分隔符（`& ' ( ) * + , ; =`），与 Python 不同，
     /// 因此不能用它。
     pub fn file_url(&self, path: &str) -> String {
-        let segs: Vec<String> = path.split('/').map(escape_segment).collect();
-        format!("{}/{}/{}", base(&self.base_url), self.code, segs.join("/"))
+        file_url_on(&base(&self.base_url), &self.code, path)
     }
 
     /// 交付是否已过期。`now` 显式传入——Go 的 `Expired(now time.Time)` 同形，
@@ -107,6 +127,179 @@ fn base(base_url: &str) -> String {
     } else {
         base_url.trim_end_matches('/').to_string()
     }
+}
+
+/// 把 `file_url` 的公共段抽出来：base + code + 逐段转义的 path。三处（域名 URI、IP URI、
+/// urls.txt）必须同一份转义，任何一份另写都会与清单对不上。
+pub(crate) fn file_url_on(base: &str, code: &str, path: &str) -> String {
+    let segs: Vec<String> = path.split('/').map(escape_segment).collect();
+    format!("{}/{}/{}", base, code, segs.join("/"))
+}
+
+/// 域名 URI 打头 + IP 备胎（规格 §5.1）。`ips` 为空 ⇒ 只有域名 URI。
+/// 每个 IP 的 URI 形如 `http://<ip>[:端口][/base路径]/<code>/<path>`；
+/// **只接受 http 的 base**，https 的 base 在上一层就被掐掉（resolve_for_base 返回空），
+/// 这里再兜一道。备胎**上限 5 个**（预检裁决 5）。
+pub fn uri_list(m: &Manifest, path: &str, ips: &[std::net::IpAddr]) -> Vec<String> {
+    let base = base(&m.base_url); // 空 ⇒ DEFAULT_BASE_URL，与 file_url 同一回退
+    let primary = file_url_on(&base, &m.code, path);
+    if !base.starts_with("http://") || ips.is_empty() {
+        return vec![primary];
+    }
+    // 把 base 切成 `(host[:port], /base路径…)`：与 `authority_of`/`host_header_for`
+    // 共用 `split_base` 这同一份切分（不许写第二份）。base 路径原样保留
+    // （不 Join、不规范化，与落盘路径同一纪律）。
+    let (authority, base_path) = split_base(&base);
+    // 端口后缀：只在 `:` 后**非空且全数字**时保留（堵 `http://host:` 的尾冒号）。
+    let port_suffix = match authority.rfind(':') {
+        Some(i) if is_port_digits(&authority[i + 1..]) => &authority[i..],
+        _ => "",
+    };
+    let mut out = Vec::with_capacity(1 + ips.len().min(5));
+    out.push(primary);
+    for ip in ips.iter().take(5) {
+        // IPv6 的 Display 不带方括号，必须手动包——否则拼出 `http://2001:db8::1/…` 是畸形 URI。
+        let host = match ip {
+            std::net::IpAddr::V4(v4) => v4.to_string(),
+            std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+        };
+        let backup_base = format!("http://{host}{port_suffix}{base_path}");
+        out.push(file_url_on(&backup_base, &m.code, path));
+    }
+    out
+}
+
+/// 把 base 切成 `(authority, base路径)`：scheme（`://`）后第一个 `/` 之前是 authority
+/// （`host[:port]`），从 `/` 起是 base 路径（可能为空）。
+/// **`uri_list` 的备胎构造与 `authority_of`/`host_header_for`/`resolve_for_base`
+/// 共用这同一份切分**——不许写第二份。
+fn split_base(base: &str) -> (&str, &str) {
+    let after_scheme = match base.find("://") {
+        Some(i) => &base[i + 3..],
+        None => base,
+    };
+    match after_scheme.find('/') {
+        Some(i) => (&after_scheme[..i], &after_scheme[i..]),
+        None => (after_scheme, ""),
+    }
+}
+
+/// base 的 authority（`host[:port]`）——[`split_base`] 的左半。
+/// `host_header_for` 与 `resolve_for_base` 共用这同一份切分。
+fn authority_of(base: &str) -> &str {
+    split_base(base).0
+}
+
+/// `:` 后的串是否是**合法端口号**（非空且全数字）。`uri_list` 的 `port_suffix` 与
+/// `host_port_of` 的两处端口识别共用**这一份判据**——写第二份就会漂移。
+/// 空 `all()` 为真，不加 `!is_empty()` 会把 `:` 的尾冒号当合法端口。
+fn is_port_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 从 authority 拆出 `(host, port)`。端口只在 `:` 后**非空且全数字**时认
+/// （与 `uri_list` 的 `port_suffix` 同一判据）；缺省端口 80（http 默认）。
+/// IPv6 方括号形态（`[::1]`、`[::1]:8080`）的 host 保留方括号。
+fn host_port_of(authority: &str) -> (&str, u16) {
+    // [::1]:8080 或 [::1]
+    if authority.starts_with('[') {
+        if let Some(end) = authority.find(']') {
+            let host = &authority[..=end];
+            let rest = &authority[end + 1..];
+            let port = match rest.strip_prefix(':') {
+                Some(p) if is_port_digits(p) => p.parse().unwrap_or(80),
+                _ => 80,
+            };
+            return (host, port);
+        }
+    }
+    // 裸 IPv4 / 域名：`host` 或 `host:port`
+    match authority.rfind(':') {
+        Some(i) if is_port_digits(&authority[i + 1..]) => {
+            let port = authority[i + 1..].parse().unwrap_or(80);
+            (&authority[..i], port)
+        }
+        _ => (authority, 80),
+    }
+}
+
+/// host 是否是 IP 字面量（含 `[::1]` 方括号形态）。
+fn is_ip_literal(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// lookup 可注入：真解析是 ToSocketAddrs（网络 I/O，单测不碰）；测试给假 lookup。
+pub fn resolve_for_base(base_url: &str) -> Vec<std::net::IpAddr> {
+    resolve_for_base_with(system_lookup, base_url)
+}
+
+/// 规格 §5.3 的多 IP 解析与三道门：
+/// 1. base 为空 ⇒ 按 [`DEFAULT_BASE_URL`] 处理（与 [`base`] 同一回退）；
+/// 2. scheme 非 `http://` ⇒ `[]`（https 整体关闭——裸 IP 破坏 SNI 与证书校验，R3）；
+/// 3. host 是 IP 字面量（含 `[::1]` 形态）⇒ `[]`（造备胎只是自重复）；
+/// 4. `lookup(host, port)`：只留 IPv4、去重保序、**截 5 个**；lookup 失败/空 ⇒ `[]`
+///    （优雅降级为域名-only——容错机制自己不许变成新的故障源）。
+pub(crate) fn resolve_for_base_with(
+    lookup: impl Fn(&str, u16) -> Vec<std::net::IpAddr>,
+    base_url: &str,
+) -> Vec<std::net::IpAddr> {
+    let base = base(base_url); // 规则 1：空 ⇒ DEFAULT_BASE_URL
+    if !base.starts_with("http://") {
+        return Vec::new(); // 规则 2：scheme 门
+    }
+    let (host, port) = host_port_of(authority_of(&base));
+    if is_ip_literal(host) {
+        return Vec::new(); // 规则 3：IP 字面量门
+    }
+    // 规则 4：只留 IPv4、去重保序、截 5 个
+    let mut out: Vec<std::net::IpAddr> = Vec::new();
+    for ip in lookup(host, port) {
+        if !matches!(ip, std::net::IpAddr::V4(_)) {
+            continue;
+        }
+        if out.contains(&ip) {
+            continue;
+        }
+        out.push(ip);
+        if out.len() >= 5 {
+            break;
+        }
+    }
+    out
+}
+
+/// 真解析：`ToSocketAddrs`。**单一转用点**，真解析薄壳不测网络。
+/// 失败 ⇒ 空表（优雅降级为域名-only）。内部也滤一道 IPv4（`resolve_for_base_with`
+/// 再滤一道是给假 lookup 兜底，两道都无害）。
+fn system_lookup(host: &str, port: u16) -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match (bare, port).to_socket_addrs() {
+        Ok(addrs) => addrs
+            .filter_map(|a| match a.ip() {
+                std::net::IpAddr::V4(v4) => Some(std::net::IpAddr::V4(v4)),
+                std::net::IpAddr::V6(_) => None,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Host 头（规格 §5.3 规则 6）：http ⇒ `Some("Host: {authority}")`，非 http ⇒ `None`
+///（整机制关着，不该出现 Host 头）。authority 取法与 `uri_list` 同源（[`authority_of`]）。
+pub fn host_header_for(base_url: &str) -> Option<String> {
+    let base = base(base_url);
+    if !base.starts_with("http://") {
+        return None;
+    }
+    Some(format!("Host: {}", authority_of(&base)))
 }
 
 /// 从整条链接或裸随机码中提取交付码。
@@ -273,13 +466,13 @@ pub struct UreqTransport {
 impl UreqTransport {
     pub fn new() -> Self {
         Self {
-            // ⚠️ **这里不设 `timeout_connect` 是刻意的**（别来"顺手补齐"）：这条路径的整体
-            //    超时就是 `FETCH_TIMEOUT`（30 秒），而 ureq 的连接默认值也是 30 秒 ⇒ **两者同量级**，
-            //    A4 要修的那种"声明一个数、连接阶段实际 30 秒"的不一致**在它身上不存在**。
-            //    （`rpc.rs` 那两处**必须**显式写，是因为那里的整体超时是 10 秒 ——
-            //     比连接默认值**小**，不写就等于声明 10 秒、实际 30 秒。）
-            //    ⇒ 改了 `FETCH_TIMEOUT` 才需要回来看这一句。
-            agent: ureq::AgentBuilder::new().timeout(FETCH_TIMEOUT).build(),
+            // 连接阶段单独设上限（2026-10-12）：整体超时已降到 15 秒，ureq 的连接默认值是 30 秒，
+            // 不写就是「声明 15 秒、连接阶段实际 30 秒」（与 `rpc.rs` 那两处同一类不一致）。
+            // 现场的 10060 正是连接阶段超时，所以这里取得比整体更短：连不上就早点换下一次。
+            agent: ureq::AgentBuilder::new()
+                .timeout(FETCH_TIMEOUT)
+                .timeout_connect(FETCH_CONNECT_TIMEOUT)
+                .build(),
         }
     }
 }
@@ -372,6 +565,17 @@ impl Transport for UreqTransport {
 ///
 /// 重试覆盖网络错误与 5xx；4xx 是确定性失败，不重试——重试一个 404 只是浪费客户时间。
 pub fn fetch<T: Transport>(t: &T, base_url: &str, code: &str) -> Result<Manifest, String> {
+    fetch_with(t, base_url, code, FETCH_BASE_DELAY, std::thread::sleep)
+}
+
+/// [`fetch`] 的本体：退避基数与睡眠函数由调用方给，测试借此跑真实循环而不真睡。
+fn fetch_with<T: Transport>(
+    t: &T,
+    base_url: &str,
+    code: &str,
+    base_delay: Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<Manifest, String> {
     // 调用方给的基址同样会被拼进下载 URL，所以和清单里带的一样不可信——
     // 在入口处一并校验，别留第二条路径（审阅记录 D21）。
     // （这条校验在 Rust 侧的理由见 `parse` 的注释：我们**不生成 `-i` 文件**，
@@ -383,7 +587,7 @@ pub fn fetch<T: Transport>(t: &T, base_url: &str, code: &str) -> Result<Manifest
     for attempt in 0..FETCH_RETRIES {
         if attempt > 0 {
             // Go 侧是 `time.After(baseDelay * 1<<(attempt-1))`，指数退避
-            std::thread::sleep(FETCH_BASE_DELAY * (1u32 << (attempt - 1)));
+            sleep(base_delay * (1u32 << (attempt - 1)));
         }
         match t.get(&url) {
             Ok(raw) => {
@@ -749,6 +953,251 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // `uri_list`（规格 §5.1）：域名 URI 打头 + IP 备胎。
+    // 域名是 CDN 分发域名（用户约束：不换连接），IP 只做备胎；
+    // `--uri-selector=inorder` 保证先用第一个、坏了才轮到下一个。
+    // -------------------------------------------------------------------
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().expect("测试里的 IP 字面量必须合法")
+    }
+
+    /// 域名 URI 必须排第一，IP 备胎按传入顺序跟在后面。
+    ///
+    /// 转义判据与 `file_url_escapes_like_server` 同源（`file_url_on` 抽出来后那条用例
+    /// 必须仍然绿）：备胎 URI 与域名 URI **同一份转义**，任何一份另写都会与清单对不上。
+    #[test]
+    fn uri_list_puts_the_domain_first_and_ip_backups_after() {
+        let m = manifest("23999-JF", "http://download.benagen.com");
+        let got = uri_list(&m, "a/b c.txt", &[ip("1.2.3.4"), ip("5.6.7.8")]);
+        assert_eq!(
+            got,
+            vec![
+                "http://download.benagen.com/23999-JF/a/b%20c.txt".to_string(),
+                "http://1.2.3.4/23999-JF/a/b%20c.txt".to_string(),
+                "http://5.6.7.8/23999-JF/a/b%20c.txt".to_string(),
+            ],
+            "域名必须打头、IP 备胎按序跟上，且三者同一份转义"
+        );
+    }
+
+    /// `ips` 为空 ⇒ 只有域名 URI（本任务的生产形态：四个调用点都传空 `ips`）。
+    #[test]
+    fn uri_list_is_domain_only_when_ips_empty() {
+        let m = manifest("23999-JF", "http://download.benagen.com");
+        let got = uri_list(&m, "a.txt", &[]);
+        assert_eq!(got.len(), 1, "ips 为空时应当只有域名 URI，实际 {got:?}");
+        assert_eq!(got[0], "http://download.benagen.com/23999-JF/a.txt");
+    }
+
+    /// 备胎**上限 5 个**（预检裁决 5）：7 个 IP ⇒ 域名 + 5 = 6 条。
+    #[test]
+    fn uri_list_caps_backups_at_five() {
+        let m = manifest("C", "http://download.benagen.com");
+        let ips: Vec<std::net::IpAddr> =
+            (1..=7).map(|i| ip(&format!("10.0.0.{i}"))).collect();
+        let got = uri_list(&m, "f.txt", &ips);
+        assert_eq!(got.len(), 6, "备胎上限 5：7 个 IP 应得 1+5=6 条，实际 {got:?}");
+        // 裁掉的是**尾部**，不是头部——排在前面的备胎优先级更高
+        assert_eq!(got[1], "http://10.0.0.1/C/f.txt");
+        assert_eq!(got[5], "http://10.0.0.5/C/f.txt");
+    }
+
+    /// authority 有端口则备胎保留端口（IP 换掉 host，端口不动）。
+    #[test]
+    fn uri_list_keeps_the_port_in_backup_authority() {
+        let m = manifest("C", "http://mirror.local:8080");
+        let got = uri_list(&m, "f.txt", &[ip("1.2.3.4")]);
+        assert_eq!(
+            got,
+            vec![
+                "http://mirror.local:8080/C/f.txt".to_string(),
+                "http://1.2.3.4:8080/C/f.txt".to_string(),
+            ],
+            "备胎必须保留 base 的端口"
+        );
+    }
+
+    /// base 非 `http://` ⇒ 只回域名 URI（规格 §5.1 只给 http 场景配 IP 备胎；
+    /// https 的 base 在上一层就被掐掉——`resolve_for_base` 返回空——这里再兜一道）。
+    #[test]
+    fn uri_list_is_domain_only_when_base_is_not_http() {
+        let m = manifest("C", "https://download.benagen.com");
+        let got = uri_list(&m, "f.txt", &[ip("1.2.3.4")]);
+        assert_eq!(
+            got,
+            vec!["https://download.benagen.com/C/f.txt".to_string()],
+            "https 的 base 不该配 IP 备胎（备胎是 http 直连，与 https 的证书校验不兼容）"
+        );
+    }
+
+    /// base 带路径带端口 ⇒ 备胎保留端口和 base 路径（审查缺陷 2：`rfind(':')` 粗切把
+    /// `8080/subdir` 当端口尾巴 ⇒ 全数字判不过 ⇒ 端口和路径全丢）。
+    #[test]
+    fn uri_list_keeps_base_path_and_port_in_backup() {
+        let m = manifest("CODE", "http://mirror.local:8080/subdir");
+        let got = uri_list(&m, "f.txt", &[ip("1.2.3.4")]);
+        assert_eq!(
+            got,
+            vec![
+                "http://mirror.local:8080/subdir/CODE/f.txt".to_string(),
+                "http://1.2.3.4:8080/subdir/CODE/f.txt".to_string(),
+            ],
+            "备胎必须保留 base 的端口和路径"
+        );
+    }
+
+    /// base 带路径无端口 ⇒ 备胎保留 base 路径（路径原样，不 Join 不规范化）。
+    #[test]
+    fn uri_list_keeps_base_path_in_backup() {
+        let m = manifest("CODE", "http://mirror.local/subdir");
+        let got = uri_list(&m, "f.txt", &[ip("1.2.3.4")]);
+        assert_eq!(
+            got,
+            vec![
+                "http://mirror.local/subdir/CODE/f.txt".to_string(),
+                "http://1.2.3.4/subdir/CODE/f.txt".to_string(),
+            ],
+            "备胎必须保留 base 的路径"
+        );
+    }
+
+    /// IPv6 地址进备胎 authority 时必须加方括号（审查缺陷 1：`IpAddr::V6` 的
+    /// Display 不带方括号，拼出 `http://2001:db8::1/…` 是畸形 URI）。
+    #[test]
+    fn uri_list_brackets_ipv6_in_backup_authority() {
+        let m = manifest("C", "http://download.benagen.com");
+        let v6: std::net::IpAddr = "2001:db8::1".parse().expect("合法 V6");
+        let got = uri_list(&m, "f.txt", &[v6]);
+        assert_eq!(
+            got,
+            vec![
+                "http://download.benagen.com/C/f.txt".to_string(),
+                "http://[2001:db8::1]/C/f.txt".to_string(),
+            ],
+            "IPv6 备胎 authority 必须是方括号形态"
+        );
+    }
+
+    /// `http://host:` 边角（空端口）⇒ 备胎不带尾冒号。
+    /// 容忍而非拒绝：空端口等价于「未指定端口」，备胎同样不指定。
+    #[test]
+    fn uri_list_drops_empty_port_in_backup() {
+        let m = manifest("C", "http://mirror.local:");
+        let got = uri_list(&m, "f.txt", &[ip("1.2.3.4")]);
+        assert_eq!(
+            got,
+            vec![
+                "http://mirror.local:/C/f.txt".to_string(),
+                "http://1.2.3.4/C/f.txt".to_string(),
+            ],
+            "空端口不得带进备胎（尾冒号会让 URI 非法）"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `resolve_for_base` / `host_header_for`（规格 §5.3）：scheme 门、IP 字面量门、
+    // lookup 注入。lookup 是**唯一**的网络 I/O 点，单测给假 lookup，不碰网络。
+    // -------------------------------------------------------------------
+
+    /// lookup 可注入：真解析是 ToSocketAddrs（网络 I/O，单测不碰）；测试给假 lookup。
+    fn fake_lookup(ips: Vec<std::net::IpAddr>) -> impl Fn(&str, u16) -> Vec<std::net::IpAddr> {
+        move |_, _| ips.clone()
+    }
+
+    /// base 为空 ⇒ 按 DEFAULT_BASE_URL 处理（与 `base()` 同一回退）——
+    /// 但 scheme 门先于 lookup，空 base 回退后是 http ⇒ 不会因为空 base 而误关。
+    #[test]
+    fn resolve_for_base_falls_back_to_default_for_empty_base() {
+        let got = resolve_for_base_with(fake_lookup(vec![ip("1.2.3.4")]), "");
+        // DEFAULT_BASE_URL 是 http + 域名 ⇒ 应当拿到 lookup 的结果
+        assert_eq!(got, vec![ip("1.2.3.4")], "空 base 应回退到 DEFAULT_BASE_URL 再走 lookup");
+    }
+
+    /// scheme 门：https ⇒ []（哪怕 lookup 会给出 IP）。
+    /// 判别力：去掉 scheme 门 ⇒ https 批次会带上 IP 备胎 ⇒ 裸 IP 破坏 SNI 与证书校验。
+    #[test]
+    fn resolve_for_base_is_empty_for_https() {
+        let got = resolve_for_base_with(fake_lookup(vec![ip("1.2.3.4")]), "https://download.benagen.com");
+        assert_eq!(got, Vec::<std::net::IpAddr>::new(), "https 必须整体关闭多 IP 机制（R3）");
+    }
+
+    /// IP 字面量门：host 是 IP ⇒ []（造备胎只是自重复）。
+    /// 判别力：去掉 IP 字面量门 ⇒ 自身 IP 被当备胎 ⇒ URI 列表里出现重复主机。
+    #[test]
+    fn resolve_for_base_is_empty_when_host_is_an_ip_literal() {
+        let got = resolve_for_base_with(fake_lookup(vec![ip("1.2.3.4")]), "http://1.2.3.4/path/file");
+        assert_eq!(got, Vec::<std::net::IpAddr>::new(), "IP 字面量主机不该造备胎（自重复）");
+    }
+
+    /// IPv6 方括号形态也是 IP 字面量。
+    #[test]
+    fn resolve_for_base_is_empty_for_bracketed_ipv6_literal() {
+        let got = resolve_for_base_with(fake_lookup(vec![ip("1.2.3.4")]), "http://[::1]/p/f");
+        assert_eq!(got, Vec::<std::net::IpAddr>::new(), "[::1] 方括号形态也是 IP 字面量，不该造备胎");
+    }
+
+    /// lookup 失败/空 ⇒ []（优雅降级为域名-only——容错机制自己不许变成新的故障源）。
+    #[test]
+    fn resolve_for_base_falls_back_to_domain_only_when_lookup_fails() {
+        let got = resolve_for_base_with(fake_lookup(vec![]), "http://download.benagen.com");
+        assert_eq!(got, Vec::<std::net::IpAddr>::new(), "lookup 空 ⇒ 优雅降级域名-only");
+    }
+
+    /// 只留 IPv4、去重保序、截 5 个。
+    /// 判别力：去掉 IPv4 过滤 ⇒ V6 进备胎 ⇒ aria2 恒 --disable-ipv6 连不上；
+    ///         去掉截断 ⇒ 7 个全进 ⇒ 超过预检裁决的 5 个上限。
+    #[test]
+    fn resolve_for_base_takes_ipv4_only_and_caps_at_five() {
+        let v6: std::net::IpAddr = "2001:db8::1".parse().expect("合法 V6");
+        let mixed = vec![
+            ip("10.0.0.1"),
+            v6,
+            ip("10.0.0.2"),
+            ip("10.0.0.1"), // 重复
+            ip("10.0.0.3"),
+            ip("10.0.0.4"),
+            ip("10.0.0.5"),
+            ip("10.0.0.6"), // 第 6 个 v4，应被截掉
+        ];
+        let got = resolve_for_base_with(fake_lookup(mixed), "http://download.benagen.com");
+        assert_eq!(
+            got,
+            vec![ip("10.0.0.1"), ip("10.0.0.2"), ip("10.0.0.3"), ip("10.0.0.4"), ip("10.0.0.5")],
+            "只留 IPv4、去重保序、截 5 个"
+        );
+    }
+
+    /// host_header_for：http ⇒ Some("Host: {authority}")，非 http ⇒ None。
+    /// authority = scheme 后第一个 `/` 之前（与 `uri_list` 的切分同一取法）。
+    #[test]
+    fn host_header_for_is_the_authority_of_the_base() {
+        assert_eq!(
+            host_header_for("http://download.benagen.com"),
+            Some("Host: download.benagen.com".to_string()),
+            "http 域名 base 的 Host 头就是 authority"
+        );
+        assert_eq!(
+            host_header_for("http://mirror.local:8080"),
+            Some("Host: mirror.local:8080".to_string()),
+            "authority 必须保留端口"
+        );
+        assert_eq!(
+            host_header_for("https://download.benagen.com"),
+            None,
+            "https 整机制关着，不该出现 Host 头"
+        );
+    }
+
+    /// authority_of：scheme 后第一个 `/` 之前，与 uri_list 的切分同一取法。
+    #[test]
+    fn authority_of_splits_at_the_first_slash_after_scheme() {
+        assert_eq!(authority_of("http://download.benagen.com"), "download.benagen.com");
+        assert_eq!(authority_of("http://mirror.local:8080/subdir"), "mirror.local:8080");
+        assert_eq!(authority_of("http://mirror.local/subdir/a"), "mirror.local");
+    }
+
     #[test]
     fn expired() {
         // 固定时刻：2026-10-14T12:00:00Z。
@@ -876,6 +1325,32 @@ mod tests {
         }
     }
 
+    /// 调参后的最坏耗时必须仍在原先记账的 91.5 秒之内——`load_delivery` 的「三段顺序执行」
+    /// 预算（`client.rs` 的 `LONG_CALL_TIMEOUT` 注释）是按这个数算的。
+    /// 最坏耗时 = 循环实际发出的 get 次数 × 单次时限 + 循环实际睡过的退避之和。跑的是真实的
+    /// `fetch_with` 循环（退避用生产值，睡眠只记账不真睡），所以循环次数或退避形状一改，
+    /// 这里的次数与序列就跟着变，记账即超 ⇒ 红。
+    #[test]
+    fn fetch_worst_case_stays_inside_the_booked_91_5_seconds() {
+        let t = Stub::always(network_error("connection refused"));
+        let mut slept: Vec<Duration> = Vec::new();
+        let r = fetch_with(&t, STUB_BASE, "X", FETCH_BASE_DELAY_PROD, |d| slept.push(d));
+        assert!(r.is_err(), "持续失败时应当报错");
+        let worst = t.calls() as f64 * FETCH_TIMEOUT.as_secs_f64()
+            + slept.iter().map(Duration::as_secs_f64).sum::<f64>();
+        assert!(
+            worst <= 91.5,
+            "最坏 {worst} 秒，超出了 91.5 秒的记账（get {} 次，睡眠 {slept:?}）",
+            t.calls()
+        );
+        assert_eq!(
+            slept,
+            [1, 2, 4, 8].map(Duration::from_secs).to_vec(),
+            "退避序列应为 1/2/4/8 秒"
+        );
+        assert!(FETCH_CONNECT_TIMEOUT < FETCH_TIMEOUT, "连接阶段应当比整体更早放弃");
+    }
+
     #[test]
     fn fetch_success() {
         let t = Stub::new(vec![Ok(r#"{"code":"AbC123","files":[]}"#)]);
@@ -958,7 +1433,7 @@ mod tests {
             fetch(&always_fail, STUB_BASE, "X").is_err(),
             "网络错误且重试耗尽后应当报错"
         );
-        assert_eq!(always_fail.calls(), 3, "重试耗尽时 get 次数");
+        assert_eq!(always_fail.calls(), FETCH_RETRIES, "重试耗尽时 get 次数");
     }
 
     #[test]

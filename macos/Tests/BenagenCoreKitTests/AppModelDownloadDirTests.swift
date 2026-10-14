@@ -421,8 +421,8 @@ private func aKernelThatCanReload(withTree tree: String) -> FakeCore {
     #expect(factory.downloadDirs == [nil], "那一刻壳还没配过目录（E-5）")
 
     let change = Task { await model.changeDownloadDir(to: "/Volumes/新") }
-    // 等新值落到内存：此刻它要么正在等那次重启落地，要么已经带着失败返回了。
-    _ = await waitUntil("新目录已经落到内存里") { model.downloadDir == "/Volumes/新" }
+    // 让改目录走到「等在飞的重启落地」那一步（它在重启落地之前不会写 `downloadDir`，所以不能等那个值）。
+    try await Task.sleep(nanoseconds: 50_000_000)
     gate.release()
 
     let outcome = await change.value
@@ -456,4 +456,191 @@ private func aKernelThatCanReload(withTree tree: String) -> FakeCore {
     #expect(temp.store.load() == AppPreferences(downloadDir: "/Volumes/Data/交付", verboseLogging: false),
             "偏好仍然留在盘上（用户的选择不该被一次失败悄悄撤销）")
     #expect(model.downloadDir == "/Volumes/Data/交付")
+}
+
+// ---------------------------------------------------------------------------
+// 换目录的搬运交接（`startDownloadDirHandover`，第 2 / 3 / 4 / 6 条）
+// ---------------------------------------------------------------------------
+
+private let migrationRunningWire = #"{"running":true,"finished":false,"files_done":1,"files_total":5,"bytes_done":10,"bytes_total":50,"skipped":[],"errors":[]}"#
+private let migrationFinishedWire = #"{"running":false,"finished":true,"files_done":1,"files_total":1,"bytes_done":10,"bytes_total":10,"skipped":[],"errors":[]}"#
+/// 内核**没有**这次搬运的记录（重启过、或从没搬过）：全零、`finished: false`。
+private let migrationNeverHappenedWire = #"{"running":false,"finished":false,"files_done":0,"files_total":0,"bytes_done":0,"bytes_total":0,"skipped":[],"errors":[]}"#
+
+/// 旧目录是 `/Volumes/旧`（`get_download_dir` 答它），搬运一下子就能完成。
+private func aKernelThatCanMigrate(withTree tree: String) -> FakeCore {
+    let fake = aKernelThatCanReload(withTree: tree)
+    fake.stub("get_download_dir", #"{"dir":"/Volumes/旧"}"#)
+    fake.stub("migrate_start", #"{"started":true}"#)
+    fake.stub("migrate_status", migrationFinishedWire)
+    return fake
+}
+
+@MainActor
+@Test func changingTheDirectoryHandsTheOldFilesToTheRestartedKernel() async throws {
+    let temp = try TempPrefs()
+    defer { temp.cleanUp() }
+
+    let old = aKernelThatCanMigrate(withTree: Wire.treeA)
+    let new = aKernelThatCanMigrate(withTree: treeInTheNewDirectory)
+    let factory = ClientFactory([new])
+    let model = AppModel(client: old, makeClient: factory.factory, preferencesStore: temp.store)
+    await model.loadDelivery(code: "AAA-1", baseURL: nil)
+
+    _ = await model.changeDownloadDir(to: "/Volumes/新")
+
+    _ = await waitUntil("搬运请求已经发给新内核") { new.callCount("migrate_start") == 1 }
+    #expect(new.params("migrate_start") == .object(["from": .string("/Volumes/旧")]),
+            "要搬的是**换之前**的旧目录（壳在改之前问的那一个）")
+    #expect(model.resumePending, "队列要补回来 ⇒ 「一键开始」可用")
+    _ = await waitUntil("搬运结束") { model.migrate?.finished == true }
+    #expect(model.migrateFailure == nil)
+    #expect(model.batchControl.migrateNote == nil, "干净搬完不说话（按钮能点了就是答案）")
+}
+
+@MainActor
+@Test func aRejectedMigrationSaysSoAndKeepsTheBatch() async throws {
+    // 内核 `migrate_start` 因 `require_manifest` 被拒（`no_delivery`）：一句话要说出来，
+    // 而且**批次不能被清空**（`no_delivery` 在 `absorb` 里会回空态，那是这条路不能走的理由）。
+    let temp = try TempPrefs()
+    defer { temp.cleanUp() }
+
+    let old = aKernelThatCanMigrate(withTree: Wire.treeA)
+    let new = aKernelThatCanMigrate(withTree: treeInTheNewDirectory)
+    new.stub("migrate_start", throwing: .rpc(code: "no_delivery", message: "还没有加载交付清单（先调 load_delivery）"))
+    let factory = ClientFactory([new])
+    let model = AppModel(client: old, makeClient: factory.factory, preferencesStore: temp.store)
+    await model.loadDelivery(code: "AAA-1", baseURL: nil)
+
+    _ = await model.changeDownloadDir(to: "/Volumes/新")
+
+    let expected = "旧目录里已下载的文件没能搬到新目录，会从头下载（旧文件仍在原目录）。原因：还没有加载交付清单（先调 load_delivery）"
+    _ = await waitUntil("失败的那一句已经落到界面") { model.migrateFailure != nil }
+    #expect(model.migrateFailure == expected)
+    #expect(model.batchControl.migrateNote == expected, "传输页上要看得见")
+    #expect(model.migrate == nil)
+    #expect(model.treeCode == "AAA-1", "搬运被拒不得把批次清掉")
+    #expect(model.resumePending, "队列照样没了，「一键开始」照样要可用")
+}
+
+@MainActor
+@Test func aMigrationWhoseProgressCannotBeFoundSaysSoInsteadOfClaimingDone() async throws {
+    // 内核说「没有这次搬运的记录」：既不在跑也没完成 ⇒ 不得说「搬完了」，也不得当作「没有搬运」悄悄收掉。
+    let temp = try TempPrefs()
+    defer { temp.cleanUp() }
+
+    let old = aKernelThatCanMigrate(withTree: Wire.treeA)
+    let new = aKernelThatCanMigrate(withTree: treeInTheNewDirectory)
+    new.stub("migrate_status", migrationNeverHappenedWire)
+    let factory = ClientFactory([new])
+    let model = AppModel(client: old, makeClient: factory.factory, preferencesStore: temp.store)
+    await model.loadDelivery(code: "AAA-1", baseURL: nil)
+
+    _ = await model.changeDownloadDir(to: "/Volumes/新")
+
+    _ = await waitUntil("进度丢失的那一句已经落到界面") { model.migrateFailure != nil }
+    #expect(model.migrateFailure == BatchControl.migrateProgressLostNote)
+    #expect(model.migrate == nil)
+}
+
+@MainActor
+@Test func aTransientPollErrorKeepsTheLastProgressInsteadOfClearingIt() async throws {
+    // 一次瞬时失败（内核忙）不是「没有搬运」：上一拍的进度要留着，下一拍再问（约束 4）。
+    let temp = try TempPrefs()
+    defer { temp.cleanUp() }
+
+    let old = aKernelThatCanMigrate(withTree: Wire.treeA)
+    let new = aKernelThatCanMigrate(withTree: treeInTheNewDirectory)
+    new.stub("migrate_status", migrationRunningWire)
+    new.stub("migrate_status", throwing: .rpc(code: "engine_rpc_failed", message: "内核忙，请稍后再试"), fromCall: 2)
+    let factory = ClientFactory([new])
+    let model = AppModel(client: old, makeClient: factory.factory, preferencesStore: temp.store)
+    await model.loadDelivery(code: "AAA-1", baseURL: nil)
+
+    _ = await model.changeDownloadDir(to: "/Volumes/新")
+
+    _ = await waitUntil("瞬时失败已经发生过") { new.callCount("migrate_status") >= 2 }
+    #expect(model.migrate?.running == true, "进度不得被清成「没有搬运」")
+    #expect(model.migrateFailure == nil, "瞬时失败不是搬运的结论")
+}
+
+@MainActor
+@Test func aDirectoryChangeDuringAnAutomaticRestartHandsOverFromTheOldDirectory() async throws {
+    // 第 2 条：自动重启在飞时改目录。旧实现直接跳过搬运，旧目录的半截文件就留在原地。
+    // 新实现先等那次重启落地，再问旧目录 —— 所以搬运请求必须带着 `/Volumes/旧` 发出去。
+    let temp = try TempPrefs()
+    defer { temp.cleanUp() }
+
+    let gate = TestGate()
+    let dying = aKernelThatCanMigrate(withTree: Wire.treeA)
+    let blocked = aKernelThatCanMigrate(withTree: Wire.treeA)
+    blocked.gate = gate
+    let later = aKernelThatCanMigrate(withTree: treeInTheNewDirectory)
+    let factory = ClientFactory([blocked, later])
+    let model = AppModel(client: dying, makeClient: factory.factory, preferencesStore: temp.store)
+    await model.loadDelivery(code: "AAA-1", baseURL: nil)
+
+    dying.stub("transfer_list", throwing: .transport(Wire.transportEnded))
+    let refresh = Task { await model.refreshTransfers() }
+    _ = await waitUntil("自动重启已经用上替身（此时它正卡在握手）") { factory.madeCount == 1 }
+
+    let change = Task { await model.changeDownloadDir(to: "/Volumes/新") }
+    try await Task.sleep(nanoseconds: 50_000_000)   // 让改目录走到「等重启」那一步
+    gate.release()
+
+    let outcome = await change.value
+    await refresh.value
+
+    #expect(outcome == .changed(dir: "/Volumes/新"))
+    _ = await waitUntil("搬运请求已经发给新内核") { later.callCount("migrate_start") == 1 }
+    #expect(later.params("migrate_start") == .object(["from": .string("/Volumes/旧")]),
+            "⚠️ 旧实现在这里会跳过搬运（oldDir 为 nil），旧目录的文件就留在原地")
+}
+
+@MainActor
+@Test func aBatchSwitchClearsTheHandoverLeftoversButASameBatchReloadKeepsThem() async throws {
+    // 第 6 条：换批要清；同一批重载（重启恢复走的就是它）不得清 —— `resumePending` 要活过重启。
+    let temp = try TempPrefs()
+    defer { temp.cleanUp() }
+
+    let old = aKernelThatCanMigrate(withTree: Wire.treeA)
+    let new = aKernelThatCanMigrate(withTree: treeInTheNewDirectory)
+    new.stub("migrate_start", throwing: .rpc(code: "no_delivery", message: "还没有加载交付清单（先调 load_delivery）"))
+    let factory = ClientFactory([new])
+    let model = AppModel(client: old, makeClient: factory.factory, preferencesStore: temp.store)
+    await model.loadDelivery(code: "AAA-1", baseURL: nil)
+    _ = await model.changeDownloadDir(to: "/Volumes/新")
+    _ = await waitUntil("失败的那一句已经落到界面") { model.migrateFailure != nil }
+
+    await model.loadDelivery(code: "AAA-1", baseURL: nil)
+    #expect(model.resumePending, "同一批重载：`resumePending` 必须保留")
+    #expect(model.migrateFailure != nil, "同一批重载：搬运结论必须保留")
+
+    new.stub("load_delivery", Wire.deliveryB)
+    await model.loadDelivery(code: "BBB-2", baseURL: nil)
+    #expect(model.treeCode == "BBB-2")
+    #expect(!model.resumePending, "换批：上一批的「队列没补回来」不属于新批次")
+    #expect(model.migrateFailure == nil, "换批：不得在新批次的传输页上显示旧批次的搬运结论")
+    #expect(model.migrate == nil)
+    #expect(model.batchControl.migrateNote == nil)
+}
+
+@MainActor
+@Test func resumingAllClearsTheHandoverLeftovers() async throws {
+    let temp = try TempPrefs()
+    defer { temp.cleanUp() }
+
+    let old = aKernelThatCanMigrate(withTree: Wire.treeA)
+    let new = aKernelThatCanMigrate(withTree: treeInTheNewDirectory)
+    new.stub("migrate_start", throwing: .rpc(code: "no_delivery", message: "还没有加载交付清单（先调 load_delivery）"))
+    let factory = ClientFactory([new])
+    let model = AppModel(client: old, makeClient: factory.factory, preferencesStore: temp.store)
+    await model.loadDelivery(code: "AAA-1", baseURL: nil)
+    _ = await model.changeDownloadDir(to: "/Volumes/新")
+    _ = await waitUntil("失败的那一句已经落到界面") { model.migrateFailure != nil }
+
+    try await model.taskAction(.resumeAll, gid: nil)
+
+    #expect(!model.resumePending, "一键开始成功 ⇒ 「队列还没补回来」办完了")
+    #expect(model.migrateFailure == nil, "搬运的结果话也不用再留")
 }

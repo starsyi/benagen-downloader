@@ -1934,3 +1934,34 @@ Intel 那份直接复用了 `dist/` 里已经修过 minOS 的 x86_64 包。
 - **客户真机上的那一下**：本次所有调用都是 `bash <路径>`，**不是访达里的双击**。
 - **修复脚本自身被隔离**的情形：兜底逻辑写了（贴进终端照样能跑），但**没有**在真被隔离的
   条件下行使过 —— 同上，本机 Gatekeeper 关着，造不出那个条件。
+
+---
+
+## 附 H. 本批未验项（**真机验收入口**，逐条如实写）
+
+以下改动**只过了自动化测试**，**没有在真 macOS 机器上验过**。真机验收时照着判据走；
+做不到或看不出来的，**如实写「未验证」**。
+
+* **恢复阶梯（档 0–3）**：挂起 `aria2c`（`kill -STOP`），看 `diag-kernel.log` 里
+  `rung_reconnect` → `rung_pause_all` → `rung_swap` 的档位递进。
+  档 1 的 `active()` 复查（不撤客户单独暂停）：先单独暂停一个任务，
+  等它停滞 180 秒以上，确认档 1 **不会**动它。
+* **T12 macOS 有界读**：`aria2c` 输出到管道时，内核侧的读取是否有界（不会因缓冲区满卡死）。
+  判据：让引擎输出大量日志后观察内核 CPU / 线程状态。
+* **T14 连接级参数**（三个值 + max-tries=1）：让网络抖动，验证瞬时失败不再触发断开判定。
+* **T15 自动重启**：杀掉内核进程，验证自动重启只试一次、成功不复位、用户动作才复位。
+* **T11 aria2 日志**：确认 `~/Library/Application Support/BenagenDownloader/engine.log` 有内容且轮转正常。
+* **§9.1 计数器基线口径变化**：T14 把 `max_tries` 从 3 改成 1，`rpc_calls` / `rpc_failures`
+  **比上一版偏高**。发版前后对比时别把口径变化误读成劣化。
+
+### 计划二（2026-10-14）验收登记
+
+- [ ] 并发优化器收敛性：观察 aria2 日志 `optimized at N` 在上百任务时的稳态（见上）。**部分已验（2026-10-14，p4-probe A 段，真实 CDN）**：4 路并发 208 秒共 212 行决策，N 恒为起始值 5、零振荡——但 4 路 ≤ 起始值属无压力样本，「上百任务收敛到多少」仍待 ≥2×起始值的大样本。⚠️ 该行是 **DEBUG 级**（`RequestGroupMan.cc:1106`，实测 info 级 0 行）——生产 `--log-level=info` 看不到，观察时须临时 debug。未验（大样本）。**用户裁定（2026-10-14）：并发优化器与多 IP 按现状上线；大样本收敛转生产自然观察（本地 WiFi 带宽受限，测不出真效）。**
+- [x] P3：falloc 在 NTFS 上是否瞬时、Windows 产物是否接受（探路包 p3-probe.zip）——**已验（2026-10-14，管理员态）**：512 MiB 分配 1 ms、1.1 GB 真实流量 0 µs（aria2 自报 `0 seconds to allocate`），MinGW 产物接受、走 `SetFileValidData()`、无写零回退。⚠️ 两跑皆管理员权限；非管理员态 falloc 未验。MinGW 的 falloc **不占簇**（不防碎片、不预留空间、未写区间透视旧数据）。
+  回退注：若 P3 结果否定，翻 `allocation_for_fs` 的 NTFS 行为 trunc（一行 + 一条测试）。**（已执行翻表，2026-10-14：一律 trunc，按卷探测 `volume_fs_name` 连同裸 extern 一并删除。依据：trunc 真实流量 1.1 GB 无特权即时、读作零、字节与 falloc 一致；MinGW falloc 不占簇，且非管理员拿不到 `SeManageVolumePrivilege` 时 aria2 自述「filling zero, which blocks whole aria2 execution」——整引擎写零阻塞正是本规格要修的形态。要恢复按卷选择从 git 历史 559dd542 取回。）**
+- [x] 多 IP 回落：第一版可能一次都用不到（价值全在「万一」）；真回落时从 aria2 日志确认用的是哪个 URI——**被切换次数 RPC 取不到**（tellStatus 无 URI 归属），不作数字承诺。**已验（2026-10-14，p4-probe B 段）**：死 URI→域名、死 URI→IP 备胎（`223.108.8.135` + `Host: download.benagen.com`）各一次真回落，下载完成且 SHA256 与域名基线逐字节一致（基线走 .150、备胎走 .135，跨边缘）。
+- [ ] 行为变化（R7）：补 `--no-conf` 后，客户机上曾有 ~/.aria2/aria2.conf 时行为会变（旧配置不再生效）——这正是目的。
+- [ ] 行为变化：`--file-allocation` 从 none 变为**一律 trunc**（2026-10-14 翻表；NTFS→falloc 已废弃——见回退注）；`--summary-interval=1` 已移除；`--optimize-concurrent-downloads=true`、`--uri-selector=inorder` 新增。（2026-10-14 p4-probe C 段真实流量对照：falloc/trunc 各 1.1 GB 字节一致；falloc 需特权 + 未初始化空间 WARN，trunc 无特权即时。）
+- [ ] 「并行文件数」旋钮语义变化：从硬上限变为**起始值**（优化器会自适应加减档）。UI 文案未改。
+- [ ] R9 存量债：`retry` 分支在内核锁内做 DNS + remove/add RPC，DNS 无超时上界会冻协议循环——已登记，随「锁内取输入、锁外做 RPC」一并搬出锁外。
+- [x] Windows 编译：`cargo check --target x86_64-pc-windows-gnu` 对 master 树 **0 error**（2026-10-14；含 `volume_fs_name` 裸 extern 与全部 cfg(windows) 代码）。链接与真机运行归发版流程。

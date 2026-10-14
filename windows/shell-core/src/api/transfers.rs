@@ -15,6 +15,7 @@
 use serde_json::Value;
 
 use crate::api::{envelope, to_wire};
+use crate::presentation::batch_control::BatchControl;
 use crate::presentation::transfer_row::{TransferGlobalSummary, TransferRow};
 use crate::presentation::verify_summary::SidebarBadge;
 
@@ -50,13 +51,21 @@ use crate::presentation::verify_summary::SidebarBadge;
 ///    **只在传输列表分区可见时**被刷新（`RootView.pollLoop` 的闸就是
 ///    `section == .transfers`）⇒ 徽标反映的本来就是"最后一次看到它时的样子"。
 ///    这一格走同一条口径：随这一屏的载荷下来，不额外起一条轮询。
+///
+/// ## 🔴 `batch`：「暂停全部 / 一键开始」两颗按钮的可用性 + 搬运进度（2026-10-12 补的第六格）
+///
+/// 与 `global` 同一条纪律：**判据在 Rust**（`BatchControl::of`），前端只读不算。
+/// 它**恒在**（不是 `null`）：引擎不可用 / 还没有快照时两颗按钮是「不可用」，
+/// 不是「不存在」——一个会凭空消失的控件比一个灰着的更难让人明白发生了什么。
 pub fn transfers(
     rows: &[TransferRow],
     global: Option<&TransferGlobalSummary>,
     empty: Option<&str>,
+    batch: &BatchControl,
 ) -> Value {
     envelope::ok(serde_json::json!({
         "rows": to_wire(rows),
+        "batch": to_wire(batch),
         "global": to_wire(&global),
         // ⚠️ `empty` 是 `&str` 那一份的原文（`TransferListEmpty::of` 的产物），
         //    壳不再加工它一个字（约束 3 的同一条纪律：交给前端的就是最终显示的那句话）。
@@ -71,6 +80,10 @@ pub fn transfers(
 mod tests {
     use super::*;
     use crate::presentation::RowColor;
+
+    fn no_batch() -> BatchControl {
+        BatchControl::of(&[], false, None)
+    }
 
     fn a_row(gid: &str) -> TransferRow {
         TransferRow {
@@ -108,7 +121,7 @@ mod tests {
             activity_text: "1 个任务进行中".to_string(),
             can_clear_finished: false,
         };
-        let v = transfers(&[a_row("g1")], Some(&global), None);
+        let v = transfers(&[a_row("g1")], Some(&global), None, &no_batch());
         assert_eq!(v["ok"], serde_json::json!(true));
         assert_eq!(v["data"]["rows"][0]["gid"], serde_json::json!("g1"));
         assert_eq!(v["data"]["global"]["speed_text"], serde_json::json!("1.2 MB/s"));
@@ -127,7 +140,7 @@ mod tests {
     #[test]
     fn the_sidebar_badge_count_reaches_the_client() {
         let rows = [a_row("g1"), a_finished_row("g2"), a_row("g3")];
-        let v = transfers(&rows, None, None);
+        let v = transfers(&rows, None, None, &no_batch());
         assert!(
             v["data"]["badge_count"].is_u64(),
             "badge_count 那一格没有发出来（侧栏那一格会永远是 hidden）：{v}"
@@ -138,7 +151,7 @@ mod tests {
             "未落定的行数是 2（g1 / g3；g2 是已落定的那一行）：{v}"
         );
         // ⚠️ 空列表也是 `0`，不是"这一格不见了"（键恒在，值由数表达）。
-        assert_eq!(transfers(&[], None, None)["data"]["badge_count"], serde_json::json!(0));
+        assert_eq!(transfers(&[], None, None, &no_batch())["data"]["badge_count"], serde_json::json!(0));
     }
 
     /// ⚠️ **`global: null` 不是"0 / 0 / 0"**（上游 `routes.rs:411` 那条注释的判据）。
@@ -147,7 +160,7 @@ mod tests {
     /// 底栏显示一个**内核从没说过的**速度/活动量（静默失效，且没人查得出来）。
     #[test]
     fn a_missing_global_is_null_and_never_a_made_up_zero_row() {
-        let v = transfers(&[], None, Some("没有正在传输的任务"));
+        let v = transfers(&[], None, Some("没有正在传输的任务"), &no_batch());
         assert_eq!(v["data"]["rows"], serde_json::json!([]));
         assert_eq!(v["data"]["global"], serde_json::Value::Null, "缺 global 就是 null：{v}");
         assert_eq!(v["data"]["empty_text"], serde_json::json!("没有正在传输的任务"));
@@ -157,22 +170,22 @@ mod tests {
     #[test]
     fn the_empty_text_is_passed_through_verbatim() {
         let raw = "下载引擎尚未启动（还没有添加过任务）";
-        let v = transfers(&[], None, Some(raw));
+        let v = transfers(&[], None, Some(raw), &no_batch());
         assert_eq!(v["data"]["empty_text"], serde_json::json!(raw));
     }
 
-    /// **四格恒在**，哪怕四样都是空的（形状固定 ⇒ 前端只有一条读法）。
+    /// **五格恒在**，哪怕五样都是空的（形状固定 ⇒ 前端只有一条读法）。
     ///
     /// ⚠️ 键名**逐字**列在这里（不是"长度是 4"）：那样才挡得住"少一格、多一格长得一样"
-    ///    —— `badge_count` 就是这么补进来的（它曾经整格不存在，而前端只会把徽标永远藏着）。
+    ///    —— `badge_count`、`batch` 就是这么补进来的（它曾经整格不存在，而前端只会把徽标永远藏着）。
     #[test]
-    fn the_four_keys_are_always_present() {
-        let v = transfers(&[], None, None);
+    fn the_five_keys_are_always_present() {
+        let v = transfers(&[], None, None, &no_batch());
         let keys: Vec<&String> = v["data"].as_object().expect("data 是个对象").keys().collect();
         assert_eq!(
             keys,
-            vec!["badge_count", "empty_text", "global", "rows"],
-            "四格恒在：{v}"
+            vec!["badge_count", "batch", "empty_text", "global", "rows"],
+            "五格恒在：{v}"
         );
     }
 }

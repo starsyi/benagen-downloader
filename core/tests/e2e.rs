@@ -1387,7 +1387,12 @@ fn transfer_list_carries_the_raw_aria2_status() {
     ];
     let mut env = Env::new("rawstatus", &files, Faults::default());
 
-    // 先限并发、限速，再入队——这样第二个一定会停在 waiting 上
+    // ⚠️ 判据改过一次（2026-10-14）：旧造法靠「parallel=1 硬上限把第二个压在 waiting」，
+    //    但 0.2.6 起并行数是**起始值**（规格 §4.1，`--optimize-concurrent-downloads=true`
+    //    自适应加减档）——优化器放开并发后 6 字节的文件秒完，等不到 waiting。
+    //    变异实测：去掉那面旗标本用例 5.5s 绿，带着则 60s 超时。
+    //    改用「暂停全部按住期间入队」：任务一诞生就被暂停，零竞态地得到
+    //    raw=paused / 领域=waiting 的背离——这才是本用例要钉的契约。
     env.core.ok(
         "set_settings",
         json!({"settings": {
@@ -1396,31 +1401,25 @@ fn transfer_list_carries_the_raw_aria2_status() {
         }}),
     );
     env.load();
+    env.core.ok("task_action", json!({"action": "pause_all"}));
     env.core.ok(
         "enqueue",
         json!({"paths": ["t/first.bin", "t/second.txt", "t/third.txt"]}),
     );
 
-    let t = env.wait_task("第二个文件停在等待/暂停上", |i| {
-        i["path"] == json!("t/second.txt") && (i["raw_status"] == json!("waiting") || i["raw_status"] == json!("paused"))
+    let t = env.wait_task("入队即被暂停的第二个文件", |i| {
+        i["path"] == json!("t/second.txt") && i["raw_status"] == json!("paused")
     });
     let gid = t["gid"].as_str().unwrap().to_string();
-    assert_eq!(t["raw_status"], json!("waiting"), "先入队时是 waiting: {t}");
-
-    env.core.ok("task_action", json!({"action": "pause", "gid": gid}));
-
-    let paused = env.wait_task("任务变成 paused", |i| {
-        i["gid"] == json!(gid) && i["raw_status"] == json!("paused")
-    });
     assert_eq!(
-        paused["state"],
+        t["state"],
         json!("waiting"),
-        "领域状态照旧是 waiting——这正是 raw_status 必须存在的原因: {paused}"
+        "领域状态是 waiting、raw 却是 paused——这正是 raw_status 必须存在的原因: {t}"
     );
     assert_eq!(
-        paused["raw_status"],
+        t["raw_status"],
         json!("paused"),
-        "原始状态串必须逐字来自 aria2（从 state 反推会得到 waiting）: {paused}"
+        "原始状态串必须逐字来自 aria2（从 state 反推会得到 waiting）: {t}"
     );
 
     // 继续 → 回到 waiting 或 active

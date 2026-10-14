@@ -111,6 +111,30 @@
   height: 14px;
 }
 
+/* 「暂停全部」「一键开始」：与「清空已完成」同款的文字按钮（列表级动作，同一族）。 */
+.transfers__batch {
+  flex: none;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  font-size: var(--text-callout);
+  color: var(--c-accent);
+  cursor: pointer;
+}
+.transfers__batch:disabled {
+  color: var(--c-tertiary);
+  cursor: default;
+}
+
+/* 搬运进度 / 结果那一行：次要色小字，贴在摘要栏下面；可换行（失败话里有路径与原因）。 */
+.transfers__migrate {
+  padding: var(--sp-4) var(--pad-bar-x);
+  font-size: var(--text-caption);
+  color: var(--c-secondary);
+  overflow-wrap: anywhere;
+}
+
 .transfers__clear {
   flex: none;
   border: 0;

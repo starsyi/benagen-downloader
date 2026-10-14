@@ -119,6 +119,17 @@ public final class AppModel: ObservableObject {
     ///    也不是单调递增的世代号意义上的"版本"—— 它只是"这一批被内核重新规划过几次"。
     @Published public private(set) var loadGeneration: Int = 0
     @Published public private(set) var transfers: TransferListResult?
+    /// 换完下载目录、引擎是空的、队列还没补回来 ⇒ 「一键开始」要可用（列表里没有任何一行能证明这一点）。
+    @Published public private(set) var resumePending: Bool = false
+    /// 换目录后搬运旧文件的进度（上一次轮询到的值；权威在内核的 `migrate_status`）。
+    @Published public private(set) var migrate: MigrateStatus?
+    /// 搬运没能开始、或中途再也取不到进度时，客户要知道的那一句（壳写的；只在换目录时写，换批/回空即清）。
+    @Published public private(set) var migrateFailure: String?
+    /// 「暂停全部 / 一键开始」两颗按钮的状态（判据在 `BatchControl.of`，视图只读）。
+    public var batchControl: BatchControl {
+        BatchControl.of(rows: (transfers?.items ?? []).map(TransferRow.init),
+                        resumePending: resumePending, migrate: migrate, migrateFailure: migrateFailure)
+    }
     /// `verify_status` 的快照。
     ///
     /// ⚠️ 它是**按批次**的，而且"这份结果属于哪一批"只有壳记着（`VerifyStatus` 自己没有
@@ -1004,6 +1015,9 @@ public final class AppModel: ObservableObject {
     ///    抄第二份的结局是"下次改其中一处规矩时只改了一半"。
     private func performDownloadDirChange(to path: String) async -> DownloadDirChange {
         let updated = AppPreferences(downloadDir: path, verboseLogging: verboseLogging)
+        // ①½ 先停手、再记旧目录（规格 2026-10-12 §6）。同值 ⇒ 什么都不做，所以只在真的要改时才做。
+        //    尽力而为：问不到就当没有——换目录本身不能因为这两步失败而失败。
+        let oldDir: String? = updated.downloadDir == downloadDir ? nil : await prepareDownloadDirHandover()
         let result = await performPreferenceChange(
             to: updated,
             unchanged: updated.downloadDir == downloadDir,
@@ -1027,10 +1041,100 @@ public final class AppModel: ObservableObject {
             })
         switch result {
         case .unchanged: return .unchanged(dir: downloadDir)
-        case .changed: return .changed(dir: updated.downloadDir)
+        case .changed:
+            // 新内核起来了、批次也已重放（`restartKernel` 等过它）：把旧目录里的文件搬过来。
+            startDownloadDirHandover(oldDir: oldDir)
+            return .changed(dir: updated.downloadDir)
         case .failed(let message): return .failed(message: message)
         }
     }
+
+    /// 换目录之前：强制暂停全部（磁盘快满正是换目录的主场景，要立刻停写），并向（旧）内核
+    /// 问一句它此刻用的下载目录——偏好里「未配置」时落盘根是内核的默认值，只有内核知道。
+    private func prepareDownloadDirHandover() async -> String? {
+        // 崩溃后的自动重启可能还在飞：要等它落地，新内核拿着的仍是**旧**偏好、答的就是旧目录。
+        // 直接跳过会让旧目录里的半截文件留在原地，新目录从头下，而界面什么都不说（约束 4）。
+        await waitForTheRestartInFlightToFinish()
+        // 等满上界仍在重启 ⇒ 问不到旧目录，返回 nil。外层 `performPreferenceChange` 会因同一道重启闸
+        // 报出「内核还在重启中，这一次没有改成」，所以这一次不会静默换目录。
+        guard client != nil, !restarting else { return nil }
+        try? await taskAction(.pauseAll, gid: nil)
+        return try? await call("get_download_dir", .null).decoded(DownloadDirResult.self).dir
+    }
+
+    /// 换完目录之后：置 `resumePending`，并（有旧目录、有批次时）让新内核把旧文件搬过来，
+    /// 后台轮询进度灌进 `migrate`。立刻返回。
+    ///
+    /// 搬运只是「少重下几十 GB」的优化，不是下载的前提，所以它失败**不阻断**换目录；
+    /// 但失败必须说出来（约束 4）：`migrate_start` 被拒 ⇒ `migrateFailure` 写原文一句话。
+    /// 没有批次 ⇒ 没东西可搬也没东西可补；`resumePending` 留着（引擎照样被重启过，队列照样没了）。
+    private func startDownloadDirHandover(oldDir: String?) {
+        migrateFailure = nil
+        guard loadedCode != nil else {
+            resumePending = false
+            migrate = nil
+            return
+        }
+        resumePending = true
+        migrate = nil
+        guard let oldDir else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.migrate = MigrateStatus(running: true)
+            do {
+                _ = try await self.call("migrate_start", .object(["from": .string(oldDir)]))
+            } catch {
+                // 传输断了 ⇒ 与别处一样走 `absorb`（横幅 + 自动重启）。其余错误**不**走 `absorb`：
+                // `no_delivery` 会把 `loadState` 回空，连重放失败的原因一起抹掉。
+                if let coreError = error as? CoreError, case .transport = coreError {
+                    await self.absorb(coreError)
+                }
+                self.migrate = nil
+                self.migrateFailure = BatchControl.migrateStartFailedNote(reason: Self.message(of: error))
+                return
+            }
+            var failures = 0
+            while true {
+                do {
+                    let status = try await self.call("migrate_status", .null).decoded(MigrateStatus.self)
+                    failures = 0
+                    // 启动时已同步置 `running`：轮询到「既不在跑也没完成」⇒ 任务已随内核丢失（内核重启过）。
+                    guard status.running || status.finished else {
+                        self.migrate = nil
+                        self.migrateFailure = BatchControl.migrateProgressLostNote
+                        return
+                    }
+                    self.migrate = status
+                    if status.finished && !status.running { return }
+                } catch {
+                    // 传输断了：搬运线程随内核一起没了。走 `absorb`（横幅 + 自动重启），然后收场。
+                    if let coreError = error as? CoreError, case .transport = coreError {
+                        await self.absorb(coreError)
+                        self.migrate = nil
+                        return
+                    }
+                    // 瞬时失败：保留上一次的进度，原文照登（约束 3），下一拍再问。
+                    // 不清成「没有搬运」 —— 那是把一次抖动说成了事实（约束 4）。只有连续失败到上界才放弃。
+                    if let coreError = error as? CoreError {
+                        if case .verbatim(let text) = await self.absorb(coreError) { self.surface(text) }
+                    } else {
+                        self.surface("\(error)")
+                    }
+                    failures += 1
+                    if failures >= Self.migrateGiveUpAfterFailures {
+                        self.migrate = nil
+                        self.migrateFailure = BatchControl.migrateProgressLostNote
+                        return
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+    }
+
+    /// 连续失败的上界：0.5 s 一拍 × 40 = 20 s，与 `waitForTheRestartInFlightToFinish` 同量级
+    /// （一次内核重启落地的时间上界内，轮询应当能再次拿到回话）。
+    private static let migrateGiveUpAfterFailures = 40
 
     // MARK: - 详细日志（规格 §2.4）
 
@@ -1311,7 +1415,14 @@ public final class AppModel: ObservableObject {
             // ⚠️ **这一行必须与 `loadState` 同帧落**（下面三行之间没有 `await`）：否则会出现
             //    "新批次已经上屏、徽标还挂着上一批的数"的中间帧 —— 那正是要修的东西。
             //    比较用的 `loadedCode` 是**上一批**的码，所以它必须在下面被改写**之前**读。
-            if let previous = loadedCode, previous != info.code { verify = nil }
+            if let previous = loadedCode, previous != info.code {
+                verify = nil
+                // 换批即作废：上一批的「刚换过目录、队列没补回来」与搬运结论都说的是上一批（第 6 条）。
+                // 同码重载（重启恢复）不走这里，`resumePending` 必须活过重启。
+                resumePending = false
+                migrate = nil
+                migrateFailure = nil
+            }
             // ③ 成功分支：这几行**两种模式都要走** —— 换码成功就是"提交"，它与首次加载
             //    没有区别（界面进新批次、记住的码换了、换批作废校验快照、拉新树）。
             loadState = .loaded(info)
@@ -1669,25 +1780,47 @@ public final class AppModel: ObservableObject {
     ///    钉住它的是 `anOversizedEnqueueNeverReachesTheKernel` 里的 `factory.madeCount == 0`。
     public func enqueue(paths: [String]) async throws -> EnqueueResult {
         try requireUsableEngine()
-        guard !DownloadTargets.exceedsRequestBudget(paths) else {
-            // ⚠️ 措辞**必须与事实一致**（复审顺手修 ②）：触发这条守卫的是**壳自己的安全预算**
-            //    （`DownloadTargets.requestBudgetBytes` = 4 MiB），不是内核那 8 MiB 上限 ——
-            //    说"超过内核的 8 MiB 上限"会让 5 MiB 的请求（它并不超限）读到一句假话，
-            //    对着日志排障的人会得出错误的结论。所以：说"超过安全预算"，
-            //    同时把内核的真实上界（8 MiB）括起来给出，人才对得上"大概多少项会超"。
-            throw CoreError.transport(
-                "勾选了 \(paths.count) 项，这一条请求已超过安全预算（内核上限 8 MiB）。"
-                + "超限的请求不会报错，只会一直等下去——请改用「全选」下载整批，或分批下载。")
-        }
         busyReason = "正在添加下载任务…"
         defer { busyReason = nil }
-        let result = try await absorbing {
-            try await call("enqueue", .object(["paths": .array(paths.map { .string($0) })]))
-                .decoded(EnqueueResult.self)
+        // 大批量不再被拒（2026-10-12）：超出单条请求预算的路径串切成若干块**依次**发给内核；
+        // 内核对每块只同步提交前 100 个、其余后台陆续加入（`pending`），所以每块都很快返回。
+        //   · 第一块失败 ⇒ 照旧抛错（什么都没加进去）；
+        //   · 后面的块失败 ⇒ 前面已入队的保留，没发出去的每一条都作为 rejected 交代（不静默少交）；
+        //   · 单条就超预算的路径不进任何一块，同样作为 rejected 交代（发出去内核也只会不回话）。
+        // 整批全选的 `paths` 为空：发一条空的（= 全部待下载），见 `DownloadTargets.paths(for:allPaths:)`。
+        let chunks = paths.isEmpty ? [[]] : DownloadTargets.chunks(paths)
+        let oversizedWhy = "这一项路径太长，超过单次请求上限，没有发送"
+        var merged = EnqueueResult(
+            added: [],
+            rejected: DownloadTargets.oversized(in: paths).map { RejectedTask(path: $0, reason: oversizedWhy) },
+            pending: 0)
+        var first = true
+        var allSent = !chunks.isEmpty
+        for (i, chunk) in chunks.enumerated() {
+            do {
+                let r = try await absorbing {
+                    try await call("enqueue", .object(["paths": .array(chunk.map { .string($0) })]))
+                        .decoded(EnqueueResult.self)
+                }
+                merged = EnqueueResult(added: merged.added + r.added,
+                                       rejected: merged.rejected + r.rejected,
+                                       pending: merged.pending + r.pending)
+                first = false
+            } catch {
+                if first { throw error }
+                allSent = false
+                let why = "未提交：\(AppModel.message(of: error))"
+                let rest = chunks[i...].flatMap { $0 }
+                merged = EnqueueResult(added: merged.added,
+                                       rejected: merged.rejected + rest.map { RejectedTask(path: $0, reason: why) },
+                                       pending: merged.pending)
+                break
+            }
         }
-        // 成功 ⇒ 内核在 `op_enqueue` 里已经 `ensure_engine` 过了。
-        engine = .running
-        return result
+        // 只有**全部**块都成功，才能断言引擎可用（成功 ⇒ 内核在 `op_enqueue` 里已经 `ensure_engine` 过了）。
+        // 部分失败时 `absorb` 刚写入的 `.unavailable` / `.notStarted` 是这次失败的结论，不能被覆盖。
+        if allSent { engine = .running }
+        return merged
     }
 
     /// 暂停 / 继续 / 重试 / 移除 / 清空已完成。`action` 需要 gid 时由调用方给。
@@ -1714,6 +1847,12 @@ public final class AppModel: ObservableObject {
         _ = try await absorbing { try await call("task_action", .object(params)) }
         // 同上：动作成功 ⇔ `require_engine_for_action` 过了。
         engine = .running
+        // 一键开始成功 ⇒ 「刚换过目录、队列还没补回来」办完了；搬运的结果话也不用再留。
+        if a == .resumeAll {
+            resumePending = false
+            migrate = nil
+            migrateFailure = nil
+        }
     }
 
     // MARK: - 参数面板
@@ -1976,6 +2115,11 @@ public final class AppModel: ObservableObject {
         case .transport(let why):
             await onKernelDeath(why)
             return .absorbed
+        case .timedOut:
+            // 超时 ≠ 内核死亡：内核可能只是慢/卡住，进程还活着。
+            // 不走 `onKernelDeath`（自动重启）——那会杀掉一个可能健康的内核。
+            // 通道若已判死，下一次调用会以 transport（内核没了那类）失败并触发重启。
+            return .verbatim("内核响应超时")
         case .malformedResponse(let why):
             // 内核还在，但它发来的东西不是一条合法响应 —— 这是壳/内核之间的契约问题，
             // 不是引擎状态，原文照样得让人看见。
@@ -2032,6 +2176,9 @@ public final class AppModel: ObservableObject {
         verify = nil
         loadedCode = nil
         loadedBaseURL = nil
+        resumePending = false
+        migrate = nil
+        migrateFailure = nil
     }
 
     /// `EngineState` → 一句人话（"内核没有起来"那条 transport 错误用它）。
@@ -2055,6 +2202,7 @@ public final class AppModel: ObservableObject {
         switch e {
         case .transport(let m), .malformedResponse(let m): return m
         case .rpc(_, let m): return m
+        case .timedOut: return "内核响应超时"
         }
     }
 }

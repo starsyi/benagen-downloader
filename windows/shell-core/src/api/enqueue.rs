@@ -73,6 +73,7 @@ mod tests {
                 path: "01.RawData/b.fq.gz".to_string(),
                 reason: "已经下载过了".to_string(),
             }],
+            pending: 0,
         }
     }
 
@@ -109,7 +110,7 @@ mod tests {
     #[test]
     fn an_empty_added_list_still_says_so_in_words() {
         // ⚠️ 夹具是**空回执**：`added` 与 `rejected` 都空（D-2 那条真实回执）。
-        let fb = EnqueueFeedback::of(&EnqueueResult { added: vec![], rejected: vec![] });
+        let fb = EnqueueFeedback::of(&EnqueueResult { added: vec![], rejected: vec![], pending: 0 });
         let v = enqueue(&fb);
         assert_eq!(v["data"]["summary"], serde_json::json!("没有需要下载的文件"), "{v}");
         assert_eq!(v["data"]["rejections"], serde_json::json!([]));

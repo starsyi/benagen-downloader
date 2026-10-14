@@ -44,6 +44,7 @@ struct TransfersView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            migrateBar
             if let failure { failureBar(failure) }
             content
         }
@@ -52,6 +53,21 @@ struct TransfersView: View {
     }
 
     // MARK: - 顶部：全局速度与活动数 + 列表级动作
+
+    /// 搬运那一行：进行中画进度话，结束后有事要说就画结果话，都没有就不占地方。
+    /// ⚠️ 两句话都是 `BatchControl` 成好的整句，视图一个字都不拼；可选中（里面有文件路径）。
+    @ViewBuilder private var migrateBar: some View {
+        let batch = model.batchControl
+        if let text = batch.migrateText ?? batch.migrateNote {
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 4)
+        }
+    }
 
     private var header: some View {
         HStack(spacing: 12) {
@@ -74,6 +90,30 @@ struct TransfersView: View {
             }
 
             Spacer(minLength: 8)
+
+            // 「暂停全部」「一键开始」：**列表级**动作（没有 gid）。典型用法是磁盘快满时先停手、
+            // 换一个存储目录、再一键开始（换目录时内核会把旧目录里已下载的文件搬过来）。
+            // 可用性是 `BatchControl.of` 算的（与 Windows 侧同判据），视图只读；搬运进行中两颗都灰。
+            let batch = model.batchControl
+            Button {
+                run(.pauseAll, gid: nil)
+            } label: {
+                Label("暂停全部", systemImage: "pause.circle")
+            }
+            .buttonStyle(.borderless)
+            .labelStyle(.titleAndIcon)
+            .disabled(!engineAllowsActions || !batch.canPauseAll)
+            .help(engineAllowsActions ? "立刻暂停全部任务（已下载的部分保留，可随时一键开始）" : EngineGate.unavailableHelp)
+
+            Button {
+                run(.resumeAll, gid: nil)
+            } label: {
+                Label("一键开始", systemImage: "play.circle")
+            }
+            .buttonStyle(.borderless)
+            .labelStyle(.titleAndIcon)
+            .disabled(!engineAllowsActions || !batch.canResumeAll)
+            .help(engineAllowsActions ? "继续全部已暂停的任务，并把还没下完的补回队列" : EngineGate.unavailableHelp)
 
             Button {
                 Task { await model.refreshTransfers() }

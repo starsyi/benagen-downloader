@@ -51,8 +51,8 @@ use shell_core::presentation::settings_form::SettingsForm;
 use shell_core::presentation::transfer_row::TransferActionFailure;
 use shell_core::protocol::codes;
 use shell_core::protocol::{
-    DeliveryInfo, EnqueueResult, ListDirResult, Settings, SettingsResult, TaskAction,
-    TransferListResult, TreeResult, VerifyStatus,
+    DeliveryInfo, DownloadDirResult, EnqueueResult, ListDirResult, MigrateStatus, Settings,
+    SettingsResult, TaskAction, TransferListResult, TreeResult, VerifyStatus,
 };
 
 /// 一次 `load_delivery`。
@@ -230,6 +230,39 @@ pub fn task_action(
         .call("task_action", serde_json::Value::Object(params))
         .map(|_| ())
         .map_err(|e| CallFailure::of(&e))
+}
+
+/// 内核此刻使用的下载目录（`get_download_dir`）。
+///
+/// 换下载目录之前要记下旧目录：偏好里「未配置」时落盘根是**内核的默认值**，
+/// 壳不知道它是哪儿——只有内核知道。
+pub fn download_dir(client: &CoreClient) -> Result<String, CallFailure> {
+    let value = client
+        .call("get_download_dir", serde_json::Value::Null)
+        .map_err(|e| CallFailure::of(&e))?;
+    serde_json::from_value::<DownloadDirResult>(value)
+        .map(|r| r.dir)
+        .map_err(|e| {
+            CallFailure::shell(shell_cannot_decode("get_download_dir", "DownloadDirResult", &e))
+        })
+}
+
+/// 让（新）内核把 `from` 目录里已下载的文件搬进当前下载目录（`migrate_start`）。
+/// 立刻返回，进度走 [`migrate_status`]。
+pub fn migrate_start(client: &CoreClient, from: &str) -> Result<(), CallFailure> {
+    client
+        .call("migrate_start", serde_json::json!({ "from": from }))
+        .map(|_| ())
+        .map_err(|e| CallFailure::of(&e))
+}
+
+/// 搬运进度（`migrate_status`）。
+pub fn migrate_status(client: &CoreClient) -> Result<MigrateStatus, CallFailure> {
+    let value = client
+        .call("migrate_status", serde_json::Value::Null)
+        .map_err(|e| CallFailure::of(&e))?;
+    serde_json::from_value(value)
+        .map_err(|e| CallFailure::shell(shell_cannot_decode("migrate_status", "MigrateStatus", &e)))
 }
 
 /// 取内核手里那一份设置（`get_settings`，无参方法发 `params: null`）。

@@ -68,6 +68,50 @@ public enum DownloadTargets {
         requestBytes(paths) > requestBudgetBytes
     }
 
+    /// 单条路径自己就超预算（连一个人单独发都会超，内核不回话）。
+    public static func isOversized(_ path: String) -> Bool {
+        exceedsRequestBudget([path])
+    }
+
+    /// `paths` 里单条就超预算的那些（它们不进 `chunks` 的任何一块，调用方要把它们交代出去）。
+    /// 每条只编码一次：与 `chunks` 同一套增量口径（单元素请求 = 基底 + 这一条的编码长度）。
+    public static func oversized(in paths: [String]) -> [String] {
+        let base = requestBytes([])
+        return paths.filter { base + encodedBytes($0) > requestBudgetBytes }
+    }
+
+    /// 单条路径在线上的编码长度（含两侧引号）。编码失败按"超大"计（同 `requestBytes`）。
+    private static func encodedBytes(_ path: String) -> Int {
+        (try? CoreJSON.encoder.encode(JSONValue.string(path)).count) ?? (Int.max / 4)
+    }
+
+    /// 把一长串路径按请求预算切成若干块，**每块单独发一条 `enqueue`**。以前超预算就拒绝并让客户
+    /// 「少选一些」——客户选的是整个目录，文件数多是常态，不是错误。增量计字节（O(n)）：不能每加一条
+    /// 就整串重新序列化。
+    ///
+    /// ⚠️ 单条就超预算的路径**不进任何一块**：单独发出去也会超，内核不回话、队列永久堵死。
+    ///    这一条目前只在 macOS 侧；Windows 侧 `DownloadTargets::chunks` 尚未同步。
+    public static func chunks(_ paths: [String]) -> [[String]] {
+        let base = requestBytes([])
+        var out: [[String]] = []
+        var cur: [String] = []
+        var bytes = base
+        for p in paths {
+            let own = encodedBytes(p)
+            if base + own > requestBudgetBytes { continue }
+            let step = own + 1
+            if !cur.isEmpty && bytes + step > requestBudgetBytes {
+                out.append(cur)
+                cur = []
+                bytes = base
+            }
+            cur.append(p)
+            bytes += step
+        }
+        if !cur.isEmpty { out.append(cur) }
+        return out
+    }
+
     /// 一项都没勾时，底栏那一行要说的话（**明说**会发生什么，不让用户猜）。
     public static let emptySelectionHint = "未勾选任何项，将下载全部待下载文件"
 
@@ -152,11 +196,18 @@ public struct EnqueueFeedback: Equatable, Sendable {
     ///    一句内核随时会改的措辞 —— 而"壳不解析内核文案"（约束 2/3）与"不改 `core/`"（约束 10）
     ///    是底线；宁可整条原文照登（约束 4 的"不静默少交"已经满足：用户看得到全部信息）。
     public static func of(_ result: EnqueueResult) -> EnqueueFeedback {
-        EnqueueFeedback(summary: result.added.isEmpty
-                            ? "没有需要下载的文件"
-                            : "已加入 \(result.added.count) 个下载任务",
-                        rejections: result.rejected.map { Rejection(path: $0.path, reason: $0.reason) },
-                        switchesToTransfers: !result.added.isEmpty)
+        let summary: String
+        if result.added.isEmpty && result.pending == 0 {
+            summary = "没有需要下载的文件"
+        } else if result.pending > 0 {
+            // 大批量是分批加入的：先让客户看到任务开始，其余的在下载的同时陆续加入。
+            summary = "已加入 \(result.added.count) 个下载任务，另有 \(result.pending) 个正在后台继续加入"
+        } else {
+            summary = "已加入 \(result.added.count) 个下载任务"
+        }
+        return EnqueueFeedback(summary: summary,
+                               rejections: result.rejected.map { Rejection(path: $0.path, reason: $0.reason) },
+                               switchesToTransfers: !result.added.isEmpty || result.pending > 0)
     }
 
     /// 失败（`engine_start_failed` / `preflight_failed` / 引擎不可用时那条闸门）：

@@ -15,7 +15,7 @@
 # 那是这条拆分的账本。
 [package]
 name = "shell-win"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 # ⚠️ 视图不单测（规格 §4.3）：能被写出断言的逻辑一律搬进 `shell-core`。
 #    本 crate 里的测试都只断言**"平台专属的那个值被传到了应用点"**，
@@ -72,7 +72,7 @@ serde_json = "1"
 #     的价钱（第二代那套 HTTP + 系统浏览器正是为了躲开它，而规格 §1.2 废掉了那条路）；
 #   · **它的默认 feature 是空集**（不需要 `devtools` / `protocol-asset` / 各种 bundle 能力），
 #     本代用不到的一个都不开 —— 与本 crate 其余依赖同一条口径。
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 # ⚠️ 这里**没有** `eframe`/`egui`（阶段 A 删的），也**没有** `tiny_http`/`getrandom`
 #    （本任务删的第二代传输层：HTTP 服务、一次性 token 的熵源）。
 #    字体不由壳加载，而是页面的 CSS（规格 §6.3）；本代**不监听任何端口**（规格 §3.3）。
@@ -103,6 +103,7 @@ windows-sys = { version = "0.59", features = [
     # ⚠️ `Win32_Security` 是**跟着来的**：`CreateMutexW` 的签名里有
     #    `*const SECURITY_ATTRIBUTES`（我们传 `null`，但那个类型要在作用域里才编得过）。
     "Win32_System_Threading",
+    "Win32_System_Power",
     "Win32_Security",
     # `GetLastError` / `ERROR_ALREADY_EXISTS` / `HWND` / `HINSTANCE` / `BOOL`
     # （单实例的判据读的就是那个错误码；`HWND` 与 `HINSTANCE` 是上面两个 API 的参数类型）。

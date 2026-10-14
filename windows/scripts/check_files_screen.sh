@@ -2,15 +2,13 @@
 #
 # windows/scripts/check_files_screen.sh —— **文件页的无头验收，一条命令跑完**。
 #
-#    bash windows/scripts/check_files_screen.sh            # 跑当前这一版（sub + blocked + keep + update 四场）
+#    bash windows/scripts/check_files_screen.sh            # 跑当前这一版（sub + keep + update 三场）
 #    bash windows/scripts/check_files_screen.sh --all      # 再跑 fail / switch 两个场景
 #    bash windows/scripts/check_files_screen.sh --ab       # A/B：当前版 vs 修前那一版，给两组数
 #    bash windows/scripts/check_files_screen.sh --all --ab # 两个都要
 #
-# ⚠️ **四场常驻，各有各的"做没做长得不一样"的理由**（R-61：少了哪一场，那条判据就只剩读代码）：
+# ⚠️ **三场常驻，各有各的"做没做长得不一样"的理由**（R-61：少了哪一场，那条判据就只剩读代码）：
 #    · `sub`     —— 默认那一档载荷（四列 / 底栏 / 勾选 / 右键 / enqueue 回执）；
-#    · `blocked` —— 超预算那一档（`action.blocked_reason` 是个字符串）：只有它在场，
-#                   "那个动作按不下去时界面做了什么"才可观测（`sub` 那一档是 `null`）；
 #    · `keep`    —— **换屏**那一档（R.a1b… 那一批：选一个文件 → 去传输列表看一眼 →
 #                   切回来 → 点「下载选中」⇒ 下的是整批）。`sub` 从头到尾没换过屏 ⇒
 #                   那条缺陷在那里与"做对了"一模一样；只有真的切走再切回来它才可观测。
@@ -233,19 +231,14 @@ status=0
 #    当成变量名的一部分 ⇒ `unbound variable`（本脚本自己踩过一次）。
 note "跑当前这一版（$(basename "$browser")，端口 ${PORT}）"
 run_once "sub" "$root" "$tmpdir/sub.json" current || status=3
-# ⚠️ `blocked`（任务 17）**与 `sub` 一样常驻**（不在 `--all` 里面）：它验的是"勾选面大到
-#    发不出去时那个动作**真的按不下去**"（载荷里的 `action.blocked_reason`），而 `sub`
-#    那一档的 `blocked_reason` 是 `null` ⇒ **做没做在那里长得一模一样**（R-61）。
-#    少跑这一轮，这条判据就只剩"读代码"这一条路。
-run_once "blocked" "$root" "$tmpdir/blocked.json" current || status=3
-# 🔴 `keep`（真机缺陷：**换屏把勾选面打回默认面**）**同样常驻**，理由与 `blocked` 一字不差：
+# 🔴 `keep`（真机缺陷：**换屏把勾选面打回默认面**）**同样常驻**：
 #    它验的是"**切到「传输列表」再切回来**之后，用户攒的勾选面与所在的那一层还在不在"
 #    —— 而那件事**只在真的换过一次屏之后**才可观测（`sub` 那一场从头到尾没换过屏，
 #    做没做在那里长得一模一样）。真机上它的表现是：选一个文件、去看一眼传输列表、
 #    切回来、点「下载选中」⇒ **下的是整批**（`selection == 全部文件` ⇒ 壳收敛成 `paths: []`）。
 #    少跑这一轮，这条判据就只剩"读代码"这一条路（R-61）。
 run_once "keep" "$root" "$tmpdir/keep.json" current || status=3
-# 🔴 `update`（R20 / R26：更新提示的**判据只有 has_newer**）**同样常驻**，理由与 `blocked`
+# 🔴 `update`（R20 / R26：更新提示的**判据只有 has_newer**）**同样常驻**，理由与 `keep`
 #    一字不差：`sub`/`keep` 那两档里 `update_status` 恒回"没有新版、url 为空"，
 #    于是"按 has_newer 判"与"按 url 非空判"长得一模一样 —— 只有喂一格
 #    `{has_newer:false, url:<非空>}`（内核在"没有新版"时**照样**会给的那条**指向已装版本**的

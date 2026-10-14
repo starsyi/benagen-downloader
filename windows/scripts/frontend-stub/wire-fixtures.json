@@ -801,6 +801,13 @@
   "transfersAfterRemove": {
     "data": {
       "badge_count": 4,
+      "batch": {
+        "can_pause_all": true,
+        "can_resume_all": true,
+        "migrate_note": null,
+        "migrate_running": false,
+        "migrate_text": null
+      },
       "empty_text": "没有正在传输的任务",
       "global": {
         "activity_text": "活动 1 · 等待 2 · 已停止 3",
@@ -902,6 +909,13 @@
   "transfersEmpty": {
     "data": {
       "badge_count": 0,
+      "batch": {
+        "can_pause_all": false,
+        "can_resume_all": false,
+        "migrate_note": null,
+        "migrate_running": false,
+        "migrate_text": null
+      },
       "empty_text": "没有正在传输的任务",
       "global": null,
       "rows": []
@@ -911,15 +925,187 @@
   "transfersEngineDown": {
     "data": {
       "badge_count": 0,
+      "batch": {
+        "can_pause_all": false,
+        "can_resume_all": false,
+        "migrate_note": null,
+        "migrate_running": false,
+        "migrate_text": null
+      },
       "empty_text": null,
       "global": null,
       "rows": []
     },
     "ok": true
   },
+  "transfersHandover": {
+    "data": {
+      "badge_count": 0,
+      "batch": {
+        "can_pause_all": false,
+        "can_resume_all": true,
+        "migrate_note": null,
+        "migrate_running": false,
+        "migrate_text": null
+      },
+      "empty_text": "没有正在传输的任务",
+      "global": null,
+      "rows": []
+    },
+    "ok": true
+  },
+  "transfersMigratedWithErrors": {
+    "data": {
+      "badge_count": 0,
+      "batch": {
+        "can_pause_all": false,
+        "can_resume_all": true,
+        "migrate_note": "有 1 个文件没能搬到新目录，会从头下载（旧文件仍在原目录）。第一个：01.RawData/a.fastq.gz：写入目标失败：磁盘已满",
+        "migrate_running": false,
+        "migrate_text": null
+      },
+      "empty_text": "没有正在传输的任务",
+      "global": null,
+      "rows": []
+    },
+    "ok": true
+  },
+  "transfersMigrating": {
+    "data": {
+      "badge_count": 4,
+      "batch": {
+        "can_pause_all": false,
+        "can_resume_all": false,
+        "migrate_note": null,
+        "migrate_running": true,
+        "migrate_text": "正在搬运已下载的文件：2/5 个（3.0 MB / 9.0 MB）"
+      },
+      "empty_text": "没有正在传输的任务",
+      "global": {
+        "activity_text": "活动 1 · 等待 2 · 已停止 3",
+        "can_clear_finished": true,
+        "speed_text": "1.5 MB/s"
+      },
+      "rows": [
+        {
+          "available_actions": [
+            "pause",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-active",
+          "manifest_path": "01.RawData/C24-8_×_25WS024_L01_R1.fastq.gz",
+          "percent_text": "26%",
+          "progress_fraction": 0.2660921642230544,
+          "progress_text": "1.1 GB / 4.2 GB",
+          "shows_paused_badge": false,
+          "speed_text": "1.0 MB/s",
+          "state_color": "Blue",
+          "state_icon_name": "arrow.down.circle",
+          "state_label": "下载中",
+          "title": "01.RawData/C24-8_×_25WS024_L01_R1.fastq.gz"
+        },
+        {
+          "available_actions": [
+            "unpause",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-paused",
+          "manifest_path": "01.RawData/C24-8_×_25WS024_L01_R2.fastq.gz",
+          "percent_text": "20%",
+          "progress_fraction": 0.20443666273904615,
+          "progress_text": "858.3 MB / 4.1 GB",
+          "shows_paused_badge": true,
+          "speed_text": "—",
+          "state_color": "Secondary",
+          "state_icon_name": "clock",
+          "state_label": "等待中",
+          "title": "01.RawData/C24-8_×_25WS024_L01_R2.fastq.gz"
+        },
+        {
+          "available_actions": [
+            "pause",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-queued",
+          "manifest_path": "01.RawData/C24-8_×_25WS024_L02_R1.fastq.gz",
+          "percent_text": "0%",
+          "progress_fraction": 0.0,
+          "progress_text": "0 B / 3.9 GB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Secondary",
+          "state_icon_name": "clock",
+          "state_label": "等待中",
+          "title": "01.RawData/C24-8_×_25WS024_L02_R1.fastq.gz"
+        },
+        {
+          "available_actions": [
+            "retry",
+            "remove"
+          ],
+          "error_text": "连接超时（第 3 次重试）\n原因：Connection reset by peer",
+          "gid": "g-error",
+          "manifest_path": "01.RawData/QC 图.png",
+          "percent_text": "4%",
+          "progress_fraction": 0.041174261195544654,
+          "progress_text": "160.2 MB / 3.8 GB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Red",
+          "state_icon_name": "exclamationmark.triangle",
+          "state_label": "失败",
+          "title": "01.RawData/QC 图.png"
+        },
+        {
+          "available_actions": [
+            "retry",
+            "remove"
+          ],
+          "error_text": null,
+          "gid": "g-done",
+          "manifest_path": "交付说明.pdf",
+          "percent_text": "100%",
+          "progress_fraction": 1.0,
+          "progress_text": "1.2 MB / 1.2 MB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Green",
+          "state_icon_name": "checkmark.circle",
+          "state_label": "已完成",
+          "title": "交付说明.pdf"
+        },
+        {
+          "available_actions": [],
+          "error_text": null,
+          "gid": "g-removed",
+          "manifest_path": null,
+          "percent_text": "0%",
+          "progress_fraction": 0.0,
+          "progress_text": "0 B / 1.0 MB",
+          "shows_paused_badge": false,
+          "speed_text": "—",
+          "state_color": "Orange",
+          "state_icon_name": "trash",
+          "state_label": "已移除",
+          "title": "（未知路径）"
+        }
+      ]
+    },
+    "ok": true
+  },
   "transfersSnapshot": {
     "data": {
       "badge_count": 4,
+      "batch": {
+        "can_pause_all": true,
+        "can_resume_all": true,
+        "migrate_note": null,
+        "migrate_running": false,
+        "migrate_text": null
+      },
       "empty_text": "没有正在传输的任务",
       "global": {
         "activity_text": "活动 1 · 等待 2 · 已停止 3",
@@ -1039,6 +1225,13 @@
   "transfersTick": {
     "data": {
       "badge_count": 4,
+      "batch": {
+        "can_pause_all": true,
+        "can_resume_all": true,
+        "migrate_note": null,
+        "migrate_running": false,
+        "migrate_text": null
+      },
       "empty_text": "没有正在传输的任务",
       "global": {
         "activity_text": "活动 1 · 等待 2 · 已停止 3",
@@ -1328,34 +1521,6 @@
       "selection": {
         "count_text": "已选 2 项",
         "size_text": "合计 7.7 GB"
-      }
-    },
-    "ok": true
-  },
-  "treeWholeBlocked": {
-    "data": {
-      "action": {
-        "blocked_reason": "选中的项太多，超过一次能发出的上限：请少选一些",
-        "button_title": "下载选中",
-        "empty_selection_hint": null
-      },
-      "breadcrumb": {
-        "path": "",
-        "segments": []
-      },
-      "progress": {
-        "bytes_text": "3.9 GB / 7.8 GB",
-        "fraction": 0.5,
-        "percent_text": "50%",
-        "speed_text": "1.0 MB/s"
-      },
-      "selected": [
-        "C24-8_×_25WS024_L02_R1.fastq.gz",
-        "C24-8_×_25WS024_L02_R2.fastq.gz"
-      ],
-      "selection": {
-        "count_text": "已选 200000 项",
-        "size_text": "合计 195.3 GB"
       }
     },
     "ok": true

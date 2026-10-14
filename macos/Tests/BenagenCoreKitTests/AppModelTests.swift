@@ -75,6 +75,8 @@ final class FakeCore: CoreCalling, @unchecked Sendable {
     private let lock = NSLock()
     private var stubs: [String: Result<JSONValue, CoreError>] = [:]
     private var fallback: Result<JSONValue, CoreError> = .success(.object([:]))
+    private var failFrom: [String: (call: Int, error: CoreError)] = [:]
+    private var callsPerMethod: [String: Int] = [:]
     private var log: [(method: String, params: JSONValue)] = []
     private var inflight = 0
     private var peak = 0
@@ -107,6 +109,11 @@ final class FakeCore: CoreCalling, @unchecked Sendable {
 
     func stub(_ method: String, throwing error: CoreError) {
         lock.lock(); stubs[method] = .failure(error); lock.unlock()
+    }
+
+    /// 该方法第 `call` 次（含）起统一抛 `error`；之前的调用仍走打桩。
+    func stub(_ method: String, throwing error: CoreError, fromCall call: Int) {
+        lock.lock(); failFrom[method] = (call, error); lock.unlock()
     }
 
     /// 所有没有单独打桩的方法都失败（模拟"内核整个没了"）。
@@ -155,6 +162,16 @@ final class FakeCore: CoreCalling, @unchecked Sendable {
 
     // MARK: CoreCalling
 
+    /// 调用方持有 `lock` 时调用（账本已经把这一次记进去了，所以次数含本次）。
+    /// ⚠️ 用逐方法计数而不是 `log.filter`：大批量测试会让账本长到数万条，每次调用都扫一遍会
+    ///    在持锁期间拖慢并行的其它测试（握手那条 5 秒上界就是这样被撑爆的）。
+    private func outcome(for method: String) -> Result<JSONValue, CoreError> {
+        let calls = callsPerMethod[method, default: 0] + 1
+        callsPerMethod[method] = calls
+        if let f = failFrom[method], calls >= f.call { return .failure(f.error) }
+        return stubs[method] ?? fallback
+    }
+
     /// ⚠️ **故意不挂闸门**：壳一旦（违反裁定 ①）在主 actor 上同步调它，测试会**记账**
     /// 而不是把自己焊死——`syncCallCount` 就是那条断言的落点。
     @discardableResult
@@ -162,7 +179,7 @@ final class FakeCore: CoreCalling, @unchecked Sendable {
         lock.lock()
         syncCalls += 1
         log.append((method, params))
-        let r = stubs[method] ?? fallback
+        let r = outcome(for: method)
         lock.unlock()
         return try r.get()
     }
@@ -176,7 +193,7 @@ final class FakeCore: CoreCalling, @unchecked Sendable {
             log.append((method, params))
             inflight += 1
             peak = max(peak, inflight)
-            return (stubs[method] ?? fallback, gate)
+            return (outcome(for: method), gate)
         }
 
         if let g { await g.wait() }
@@ -1117,49 +1134,106 @@ private func runningModel(_ fake: FakeCore,
 }
 
 @MainActor
-@Test func anOversizedEnqueueNeverReachesTheKernel() async {
-    // ⚠️ 全局约束 C-3：内核的行长上限是 8 MiB（`core/src/main.rs:113`），超限的**处置不是报错** ——
-    //    `:1657-1661` 只回一条 `id == 0` 的协议告警，那条请求**永远等不到响应**，
-    //    `CoreClient` 那条 FIFO **串行**队列于**被永久堵死**（约束 15），界面上一个字都不说。
-    //    所以壳必须在**发出去之前**就拒绝，并且把"该怎么做"说出来。
+@Test func anOversizedEnqueueIsSentInChunksWithoutLosingAny() async throws {
+    // 2026-10-12：以前超预算就拒绝并让客户「少选一些」。客户选的是整个目录，文件多是常态，
+    // 不是错误——现在按预算切块、每块一条 `enqueue`；内核对每块只同步提交前 100 个，其余后台陆续加入。
     let fake = FakeCore()
     fake.stub("enqueue", Wire.enqueue)
-    // 重启工厂备好一个替身：**一旦它被调用，就说明这条壳自己造的错漏进了 `absorb`**。
-    let factory = ClientFactory([FakeCore()])
-    let model = AppModel(client: fake, makeClient: factory.factory)
+    let model = AppModel(client: fake)
 
-    // 20 万条、每条约 50 字节 ⇒ 约 10 MB，远超 4 MiB 的预算（也远超内核那 8 MiB 的上界）。
+    // 20 万条、每条约 50 字节 ⇒ 约 10 MB，远超 4 MiB 的预算。
+    let many = (0..<200_000).map { "dir\($0)/file-with-a-fairly-long-name-\($0).bin" }
+    #expect(DownloadTargets.exceedsRequestBudget(many), "夹具没搭准：必须真的超预算")
+
+    let merged = try await model.enqueue(paths: many)
+
+    let sent = fake.callCount("enqueue")
+    #expect(sent > 1, "必须被切成多块")
+    // 判据落在**线上**：每一条真正发出去的请求都在预算内（不是切块函数自己说它在预算内）。
+    for i in 0..<sent {
+        let body = try #require(fake.params("enqueue", occurrence: i))
+        let bytes = try CoreJSON.encoder.encode(body).count
+        #expect(bytes <= DownloadTargets.requestBudgetBytes, "第 \(i + 1) 条请求 \(bytes) 字节，超了预算")
+    }
+    // 拼回去一条不少、顺序不变。
+    let chunks = DownloadTargets.chunks(many)
+    #expect(chunks.flatMap { $0 } == many)
+    #expect(sent == chunks.count)
+    // 聚合：`Wire.enqueue` 每一块都回同一份（1 个加入、1 个被拒），所以合并后数量恰是块数的倍数。
+    #expect(merged.added.count == sent, "每块的 added 都要进合并结果")
+    #expect(merged.rejected.count == sent, "每块的 rejected 都要进合并结果")
+    #expect(model.engine == .running, "全部块成功 ⇒ 引擎确认可用")
+}
+
+@MainActor
+@Test func aSinglePathOverTheBudgetIsRejectedAndNeverSent() async throws {
+    // 单条就超预算：内核连它一条都收不下（发出去不回话、队列堵死），所以不发，且交代原因。
+    let fake = FakeCore()
+    fake.stub("enqueue", Wire.enqueue)
+    let model = AppModel(client: fake)
+    let huge = String(repeating: "x", count: DownloadTargets.requestBudgetBytes)
+    #expect(DownloadTargets.isOversized(huge), "夹具没搭准：单条必须真的超预算")
+
+    let merged = try await model.enqueue(paths: ["ok.bin", huge])
+
+    #expect(fake.callCount("enqueue") == 1, "只有能发的那一块被发出去")
+    #expect(fake.params("enqueue") == .object(["paths": .array([.string("ok.bin")])]),
+            "超预算的那条不得出现在请求里")
+    let rejected = try #require(merged.rejected.first { $0.path == huge }, "超预算的那条必须交代为 rejected")
+    #expect(!rejected.reason.isEmpty)
+}
+
+@MainActor
+@Test func anEnqueueWhereEveryPathIsOversizedSendsNothingAndNeverSendsTheEmptySelection() async throws {
+    // ⚠️ `paths: []` 的意思是「全部待下载」。若把"全部超预算被剔光"的结果当成空数组发出去，
+    //    会变成下载整批 —— 这条用例就是钉住这一点。
+    let fake = FakeCore()
+    fake.stub("enqueue", Wire.enqueue)
+    let model = AppModel(client: fake)
+    let huge = String(repeating: "x", count: DownloadTargets.requestBudgetBytes)
+
+    let merged = try await model.enqueue(paths: [huge])
+
+    #expect(fake.callCount("enqueue") == 0, "全部超预算 ⇒ 一条都不发（尤其不能发 `paths: []`）")
+    #expect(merged.rejected.map(\.path) == [huge])
+    #expect(merged.added.isEmpty)
+}
+
+@MainActor
+@Test func aPartialEnqueueFailureKeepsTheBannerTheFailureWrote() async throws {
+    // 第一块成功、第二块内核断开且重启失败：横幅（`.unavailable`）是这次失败的结论，
+    // 成功路径上那句 `engine = .running` 不得把它抹掉（约束 4）。
+    let fake = FakeCore()
+    fake.stub("enqueue", Wire.enqueue)
+    fake.stub("enqueue", throwing: .transport("内核进程已退出（管道结束）"), fromCall: 2)
+    let factory = ClientFactory([])          // 没有替身 ⇒ 重启必失败
+    let model = AppModel(client: fake, makeClient: factory.factory)
     let many = (0..<200_000).map { "dir\($0)/file-with-a-fairly-long-name-\($0).bin" }
 
-    var thrown: (any Error)?
-    do {
-        _ = try await model.enqueue(paths: many)
-    } catch {
-        thrown = error
-    }
+    let merged = try await model.enqueue(paths: many)
 
-    // 是**这条**守卫的错，不是别的路：形状是 `transport`（壳自己造的，内核一个字没说），
-    // 且把"超了多少 / 该怎么做"说出来了。**不逐字抄整句文案** —— 那等于把实现抄一遍；
-    // 这里只钉住它在讲这件事（内核上界、项数、出路）而非别的错。
-    guard case .transport(let why)? = thrown as? CoreError else {
-        Issue.record("超预算的 enqueue 必须抛 CoreError.transport，实际：\(String(describing: thrown))")
+    guard case .unavailable = model.engine else {
+        Issue.record("部分失败后引擎必须保持 .unavailable，实际 \(model.engine)")
         return
     }
-    // ⚠️ 措辞的事实基础（复审顺手修 ②）：**触发这条守卫的是壳自己的预算（4 MiB）**，
-    //    不是内核那 8 MiB 上限 —— 5 MiB 的请求并不超限。所以说"超过内核的 8 MiB 上限"
-    //    是一句假话，而排障的人会照着它得出错误结论。下面两条一起钉住"说法与事实一致"：
-    //    ① 说清楚是**安全预算**触发的；② 内核的真实上界照样给出来，人才对得上量。
-    #expect(why.contains("预算"),
-            "必须说清楚触发它的是壳的**安全预算**（4 MiB），不是内核那 8 MiB 上限 —— 5 MiB 的请求并不超限")
-    #expect(why.contains("8 MiB"), "内核的真实上界（8 MiB）照样要给出，人才对得上'大概多少项会超'")
-    #expect(why.contains("\(many.count) 项"), "必须说清楚超了多少项")
-    #expect(why.contains("全选"), "必须给出出路（全选 / 分批），不是光说'不行'")
+    #expect(merged.added.count == 1, "第一块已经入队的保留")
+    let unsent = merged.rejected.filter { $0.reason.hasPrefix("未提交：") }
+    let chunks = DownloadTargets.chunks(many)
+    let expectedUnsent = chunks[1...].reduce(0) { $0 + $1.count }
+    #expect(unsent.count == expectedUnsent, "没发出去的每一条都要交代为「未提交」（第二块起的全部）")
+}
 
-    // ⚠️ 下面四条才是这条测试的重点。
-    #expect(fake.callCount("enqueue") == 0, "不得发出那条永不返回的请求（它会把 FIFO 队列永久堵死）")
-    #expect(fake.shutdownCount == 0, "旧客户端也不该被收掉")
-    #expect(factory.madeCount == 0, "壳自己造的错误不得触发重启 —— 用户只是勾多了几项")
-    #expect(model.busyReason == nil, "闸门在忙指示之前：不得留下一个没有任何请求在飞的忙指示")
+@MainActor
+@Test func aPartialEnqueueThatFoundTheEngineStoppedKeepsNotStarted() async throws {
+    let fake = FakeCore()
+    fake.stub("enqueue", Wire.enqueue)
+    fake.stub("enqueue", throwing: .rpc(code: "engine_not_started", message: "下载引擎尚未启动"), fromCall: 2)
+    let model = AppModel(client: fake)
+    let many = (0..<200_000).map { "dir\($0)/file-with-a-fairly-long-name-\($0).bin" }
+
+    _ = try await model.enqueue(paths: many)
+
+    #expect(model.engine == .notStarted, "`.notStarted` 同理不得被成功路径覆盖")
 }
 
 @MainActor

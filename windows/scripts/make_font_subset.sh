@@ -83,8 +83,8 @@
 # ---------------------------------------------------------------------------
 # 字符集：哪些字必须有（判据 fail-closed）
 # ---------------------------------------------------------------------------
-#   要求集 = 下面 `SOURCE_ROOTS` 三棵树里**字符串/字符字面量**的非 ASCII 字符
-#            ∪ 常用标点与全角区（见 helper 里的 `EXTRA_RANGES`）。
+#   要求集 = 下面 `SOURCE_ROOTS` 各树里**字符串/字符字面量**（`.rs`）或**非注释文本**（`.swift`）
+#            的非 ASCII 字符 ∪ 常用标点与全角区（见 helper 里的 `EXTRA_RANGES`）。
 #   取样、生成、校验三者用的是**同一份**抽取代码（helper 里的 `lex()`）。
 #
 #   ⚠️ **为什么是"字面量"而不是"源码里全部非 ASCII 字符"**（这是一次**有意收窄**，
@@ -99,14 +99,16 @@
 #     · 收窄**不放过任何真风险**：字面量里出现的新字仍然会红（那才会豆腐）；
 #       注释里的新字不会。判据判的是**会被渲染的字**，不是"源码里的所有字节"。
 #
-#   ⚠️ 三棵树里**包括 `core/src`**：内核的话是**原样显示在界面上**的（规格 §10：壳不改写
+#   ⚠️ 源码树里**包括 `core/src`**：内核的话是**原样显示在界面上**的（规格 §10：壳不改写
 #      内核的话）—— 内核报错文案里的字一样会豆腐，所以一样要在要求集里。
 #
 #   ⚠️ 抽取用的是一个**最小的 Rust 词法**（行注释 `//`、可嵌套块注释 `/* */`、
 #      `"…"`（含 `\"` 转义与跨行）、`r#"…"#`、`b"…"`、字符字面量 `'c'`），
-#      并且 **fail-closed**：注释与字面量**之外**不允许出现任何非 ASCII 字符 ——
+#      并且对 `.rs` **fail-closed**：注释与字面量**之外**不允许出现任何非 ASCII 字符 ——
 #      出现了就**硬失败**（那说明词法过期了，或有人写了非 ASCII 标识符；两种都要人来判，
 #      **绝不能**悄悄少抽几个字）。今天这条检查的读数是 0（`outside_nonascii=0`）。
+#      （`.swift` 不走硬失败：它的"外部"字符直接计入要求集，见 helper 里
+#       `required_chars()` 的说明。）
 #
 #   附加要求集（`EXTRA_RANGES` / `EXTRA_CODEPOINTS`）：界面上**可能被代码拼出来**、
 #   且**这份字体确实全部覆盖**的标点（ASCII、CJK 标点、全角形式、Latin-1 补充区，
@@ -173,7 +175,7 @@ FONT_RELEASE_API="https://api.github.com/repos/notofonts/noto-cjk/releases/tags/
 #    同样覆盖这些字形**的子集"就能**全绿**过去 —— 而"不许打包不可再分发字体"（W-5）
 #    就**没有任何自动化在守**。第 8/9 步在生成模式里做同样的闭环（对不上就退出 3 并打印
 #    该抄的那一行，与 `fetch_windows_aria2c.sh` 第 9 步同一手法）。
-SUBSET_SHA256="6a9056fea15a8fa68939e7269315a26fb113eba70e389970350121d25303c892"
+SUBSET_SHA256="e8c6043c650631e45132208d81a28e1415035fb9347ff8e17cf1588455bc47ed"
 
 # 那条硬线：**超过 1 MB 就停下来重新权衡**（口径出自 2026-09-18 规格 §14.1，那份文件
 # 已随那一代方案删除；数字没变，见文件头"登记闭环"与规格 §6.3 末尾的遗留记账）。
@@ -192,8 +194,15 @@ WEB_LICENSE="$REPO/windows/web/fonts/OFL-1.1.txt"
 # ⚠️ 缓存**不是**真相：命中的缓存仍要过第 2 步的 sha256 核对，不符即弃用并重下。
 CACHE_DIR="${BENAGEN_FONT_CACHE:-${TMPDIR:-/tmp}/benagen-font-cache}"
 
-# 要抽字的三棵源码树（相对 REPO）。见文件头"字符集"一节的取舍说明。
-SOURCE_ROOTS="windows/shell-core/src windows/shell-win/src core/src"
+# 要抽字的源码树（相对 REPO）。见文件头"字符集"一节的取舍说明。
+# ⚠️ 2026-10-13 起收进 `macos/Sources`（用户表态，任务 16）：macOS 壳的中文文案
+#    此前**一次都没被扫到**，新字不会被字体门拦下来。实测该树有 50 个 `.swift`
+#    文件；收进后要求集净增 **11 个**码位（与重生成前后 Δ 一致）——
+#    盲区是真实的，不是理论上的。
+#    `.swift` 的抽取走 `lex()` + 把"注释与字面量之外"的非 ASCII **一并计入**
+#    （Swift 字符串插值 `\(… "x" …)` 里的嵌套引号会让 Rust 词法把它认成"外部"，
+#    那些字**会渲染**，必须收进来）。
+SOURCE_ROOTS="windows/shell-core/src windows/shell-win/src core/src macos/Sources"
 
 # 前端文件的两棵目录（相对 REPO）：**它们里面的字也是会被渲染的字**（HTML/CSS/JS 不在
 # 任何 `.rs` 字面量里 ⇒ 不并进来的话，那些字永远进不了子集，而判据会一直要它们）。
@@ -485,10 +494,15 @@ def lex(src):
 
 
 def required_chars(repo, roots, frontend_dirs):
-    """要求集 = 三棵源码树的**字面量**里的非 ASCII 字符 ∪ 前端文件的字 ∪ EXTRA_RANGES。
+    """要求集 = 源码树里 `.rs` 字面量 + `.swift` 非注释文本里的非 ASCII ∪ 前端文件的字 ∪ EXTRA_RANGES。
 
-    见文件头"字符集"一节：为什么是字面量而不是"全部源码字符"（有意收窄，W-6 那类决定）；
+    见文件头"字符集"一节：为什么 `.rs` 是字面量而不是"全部源码字符"（有意收窄，W-6 那类决定）；
     以及为什么**前端文件也必须算进来**（它们不在任何 `.rs` 字面量里，而它们会被渲染）。
+
+    ⚠️ `.swift`（macOS 壳）的抽取与 `.rs` 不同：**注释之外的非 ASCII 全收**（字面量 +
+    词法归入"外部"的零散字符）。理由：Swift 字符串插值 `\\(… "x" …)` 的嵌套引号
+    会让 Rust 词法把插值里的内容归入"外部"——那些字**会渲染**，必须进要求集。
+    多抽（例如把插值里的标识符也算了）是安全方向；少抽才会出豆腐块。
 
     ⚠️ `frontend_dirs` 由**调用方**给（本脚本 bash 侧的 `FRONTEND_DIRS`，
     经命令行 `--frontend` 传进来）—— 本函数**不再自带一份常量**。
@@ -497,32 +511,55 @@ def required_chars(repo, roots, frontend_dirs):
     files = 0
     literals = 0
     outside_nonascii = {}
+    swift_files = 0
     for root in roots:
         base = os.path.join(repo, root)
         if not os.path.isdir(base):
             sys.exit(f"错误：源码树不存在：{base}（本脚本期望一个完整 checkout）")
         for dirpath, _dirnames, filenames in os.walk(base):
             for fn in filenames:
-                if not fn.endswith(".rs"):
-                    continue
-                files += 1
-                with open(os.path.join(dirpath, fn), encoding="utf-8") as fh:
-                    source = fh.read()
-                lits, outside = lex(source)
-                literals += len(lits)
-                for text in lits:
-                    for ch in text:
+                if fn.endswith(".rs"):
+                    files += 1
+                    with open(os.path.join(dirpath, fn), encoding="utf-8") as fh:
+                        source = fh.read()
+                    lits, outside = lex(source)
+                    literals += len(lits)
+                    for text in lits:
+                        for ch in text:
+                            if ord(ch) > 127:
+                                chars.add(ord(ch))
+                    for ch in outside:
+                        if ord(ch) > 127:
+                            outside_nonascii[ch] = outside_nonascii.get(ch, 0) + 1
+                elif fn.endswith(".swift"):
+                    swift_files += 1
+                    with open(os.path.join(dirpath, fn), encoding="utf-8") as fh:
+                        source = fh.read()
+                    lits, outside = lex(source)
+                    literals += len(lits)
+                    # 字面量里的非 ASCII（与 .rs 相同）
+                    for text in lits:
+                        for ch in text:
+                            if ord(ch) > 127:
+                                chars.add(ord(ch))
+                    # "外部"的非 ASCII **也收**（与 .rs 不同）：Swift 插值里的嵌套
+                    # 引号会让词法把可渲染文本归到"外部"，少收就是豆腐块。
+                    for ch in outside:
                         if ord(ch) > 127:
                             chars.add(ord(ch))
-                for ch in outside:
-                    if ord(ch) > 127:
-                        outside_nonascii[ch] = outside_nonascii.get(ch, 0) + 1
-    # fail-closed 自检：注释与字面量之外**不该**有非 ASCII。有 ⇒ 词法过期或有人在写
-    # 非 ASCII 标识符，两种都要人来判，**绝不能**悄悄少抽几个字。
+                else:
+                    continue
+    # fail-closed 自检（**仅对 .rs**）：注释与字面量之外**不该**有非 ASCII。
+    # 有 ⇒ 词法过期或有人在写非 ASCII 标识符，两种都要人来判，**绝不能**悄悄少抽几个字。
+    # ⚠️ `.swift` 不在此列：它的"外部"字符已直接计入 chars（见上方说明）。
+    #    但这是**多抽方向的近似**，不是"结构上不可能漏"：Swift 插值嵌套引号可能让
+    #    词法把字符串里的 `//` 当注释起点、把后续中文吞掉（例如
+    #    `"\(x ?? "https://")中文"`）；`\u{…}` 转义也从不解码。今天实测未触发，
+    #    但若加新 Swift 文案含插值+`//`，人工扫一眼。
     if outside_nonascii:
         shown = " ".join(f"U+{ord(c):04X}×{n}" for c, n in sorted(outside_nonascii.items(),
                                                                  key=lambda kv: ord(kv[0])))
-        sys.exit(f"错误：注释与字面量之外出现了非 ASCII 字符（{shown}）——\n"
+        sys.exit(f"错误：Rust 源码的注释与字面量之外出现了非 ASCII 字符（{shown}）——\n"
                  f"      这说明本脚本的 Rust 词法已经与代码的实际写法脱节（或者有人写了\n"
                  f"      非 ASCII 标识符）。**不要**把这条检查关掉：它一关，抽取就可能\n"
                  f"      悄悄少抽几个字，而那正是界面豆腐块、且没有任何东西会变红的来源。\n"
@@ -564,7 +601,7 @@ def required_chars(repo, roots, frontend_dirs):
     # ⚠️ 报的是**并集**的大小，不是"字面量 + 标点"的和：两者有重叠（字面量里本来就有
     #    全角标点），而"合计"写成和数会让后面比对里那个数字对不上账（本项目对
     #    "报出来的数就是真的那个数"有纪律）。
-    print(f"源码树：{files} 个 .rs 文件、{literals} 段字面量；"
+    print(f"源码树：{files} 个 .rs + {swift_files} 个 .swift 文件、{literals} 段字面量；"
           f"前端文件 {len(frontend)} 个（{' '.join(frontend_dirs)}）里的非 ASCII 字符 "
           f"{len(frontend_only)} 个；两类并集 {literal_chars} 个非 ASCII 字符，"
           f"∪ 附加标点集（区间 {sum(hi - lo + 1 for lo, hi in EXTRA_RANGES)} 个 + 逐码位 "

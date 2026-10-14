@@ -86,6 +86,12 @@ public enum CoreError: Error, Equatable {
     case transport(String)
     /// 收到的字节不是一条合法响应（或 `result` 的形状与请求的方法对不上）。
     case malformedResponse(String)
+    /// 一次读在允许的时间内没等到应答：**我们**等够了，不是内核进程没了。
+    ///
+    /// ⚠️ 它与 [`transport`]（"内核没了"那一类）**不是同一件事**：内核可能只是慢或卡住，
+    ///    进程还活着。所以不许把它混进"内核没了"那类处理（自动重启等）——
+    ///    Windows 壳的 `ClientError::CallTimedOut` 与 `KernelGone` 把这条差别写得很清楚。
+    case timedOut
 }
 
 /// 十三种结构化错误码，**逐字**对齐内核。
@@ -168,6 +174,54 @@ public enum PlanKind: String, CaseIterable, Codable, Sendable {
 public enum TaskAction: String, CaseIterable, Sendable {
     case pause, unpause, retry, remove
     case clearFinished = "clear_finished"
+    /// 暂停全部（列表级，没有 gid；内核用 `forcePauseAll`，立刻停写）。
+    case pauseAll = "pause_all"
+    /// 一键开始（列表级，没有 gid）：继续全部暂停的，并把引擎里缺的补回队列。
+    case resumeAll = "resume_all"
+}
+
+/// `migrate_status` 里的一条问题（跳过 / 失败）。
+public struct MigrateProblem: Decodable, Equatable, Sendable {
+    public let path: String
+    public let reason: String
+
+    public init(path: String, reason: String) {
+        self.path = path
+        self.reason = reason
+    }
+}
+
+/// `migrate_status` 的结果（`core/src/migrate.rs` 的 `Status`）：换下载目录时
+/// 把旧目录里已下载的文件搬到新目录的进度。线上键 snake_case，由
+/// `CoreJSON.decoder` 的 `.convertFromSnakeCase` 消化，所以这里的属性名直接是 camelCase。
+public struct MigrateStatus: Decodable, Equatable, Sendable {
+    public let running: Bool
+    public let finished: Bool
+    public let filesDone: Int
+    public let filesTotal: Int
+    public let bytesDone: Int64
+    public let bytesTotal: Int64
+    public let skipped: [MigrateProblem]
+    public let errors: [MigrateProblem]
+
+    public init(running: Bool = false, finished: Bool = false,
+                filesDone: Int = 0, filesTotal: Int = 0,
+                bytesDone: Int64 = 0, bytesTotal: Int64 = 0,
+                skipped: [MigrateProblem] = [], errors: [MigrateProblem] = []) {
+        self.running = running
+        self.finished = finished
+        self.filesDone = filesDone
+        self.filesTotal = filesTotal
+        self.bytesDone = bytesDone
+        self.bytesTotal = bytesTotal
+        self.skipped = skipped
+        self.errors = errors
+    }
+}
+
+/// `get_download_dir` 的结果。
+public struct DownloadDirResult: Decodable, Equatable, Sendable {
+    public let dir: String
 }
 
 // ---------------------------------------------------------------------------
@@ -382,16 +436,43 @@ public struct PlanResult: Decodable, Sendable {
 public struct AddedTask: Decodable, Sendable {
     public let gid: String
     public let path: String
+
+    public init(gid: String, path: String) {
+        self.gid = gid
+        self.path = path
+    }
 }
 
 public struct RejectedTask: Decodable, Sendable {
     public let path: String
     public let reason: String
+
+    public init(path: String, reason: String) {
+        self.path = path
+        self.reason = reason
+    }
 }
 
 public struct EnqueueResult: Decodable, Sendable {
     public let added: [AddedTask]
     public let rejected: [RejectedTask]
+    /// 还没提交给引擎、正由内核后台陆续加入的个数（2026-10-12 起；旧内核没有这一格 ⇒ 0）。
+    public let pending: Int
+
+    public init(added: [AddedTask], rejected: [RejectedTask], pending: Int = 0) {
+        self.added = added
+        self.rejected = rejected
+        self.pending = pending
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        added = try c.decode([AddedTask].self, forKey: .added)
+        rejected = try c.decode([RejectedTask].self, forKey: .rejected)
+        pending = try c.decodeIfPresent(Int.self, forKey: .pending) ?? 0
+    }
+
+    private enum CodingKeys: String, CodingKey { case added, rejected, pending }
 }
 
 /// `transfer_list` 的一项（`core/src/protocol.rs` 的 `TransferItem`）。

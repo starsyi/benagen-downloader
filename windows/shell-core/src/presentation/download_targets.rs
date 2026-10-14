@@ -118,6 +118,46 @@ impl DownloadTargets {
         Self::request_bytes(paths) > Self::REQUEST_BUDGET_BYTES
     }
 
+    /// 单条路径自己就超预算（连一个人单独发都会超，内核不回话）。
+    pub fn is_oversized(path: &str) -> bool {
+        Self::request_bytes(&[path.to_string()]) > Self::REQUEST_BUDGET_BYTES
+    }
+
+    /// `paths` 里单条就超预算的那些：它们不进 [`Self::chunks`] 的任何一块，调用方要把它们交代出去。
+    pub fn oversized(paths: &[String]) -> Vec<String> {
+        paths.iter().filter(|p| Self::is_oversized(p)).cloned().collect()
+    }
+
+    /// 把一长串路径按请求预算切成若干块，**每块单独发一条 `enqueue`**（大批量入队的壳侧一半）。
+    ///
+    /// 以前超预算就拒绝并让客户「少选一些」——客户选的是整个目录，文件数多是常态，不是错误。
+    /// 现在切块顺序发送；内核对每块只同步提交前 100 个、其余后台陆续加入，所以每块都很快返回。
+    /// 单条就超预算的路径**不进任何一块**（见 [`Self::oversized`]）：单独发出去也会超，内核不回话、队列永久堵死。
+    pub fn chunks(paths: &[String]) -> Vec<Vec<String>> {
+        // 增量计字节（O(n)）：不能每加一条就整串重新序列化——20 万条时是平方级，会卡死。
+        // 基底 = 空数组那一发的字节数（`{"paths":[]}`）；每条路径 = 它自己的 JSON 编码 + 一个逗号。
+        let base = Self::request_bytes(&[]);
+        let mut out: Vec<Vec<String>> = Vec::new();
+        let mut cur: Vec<String> = Vec::new();
+        let mut bytes = base;
+        for p in paths {
+            if Self::is_oversized(p) {
+                continue;
+            }
+            let own = serde_json::to_string(p).map_or(usize::MAX / 4, |t| t.len()) + 1;
+            if !cur.is_empty() && bytes + own > Self::REQUEST_BUDGET_BYTES {
+                out.push(std::mem::take(&mut cur));
+                bytes = base;
+            }
+            cur.push(p.clone());
+            bytes += own;
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
     /// 这个动作此刻**按不下去**的理由（`None` = 可以按）。
     ///
     /// ## ⚠️ 入参是"真正要发出去的那一串"，**不是**用户的勾选面
@@ -264,8 +304,15 @@ impl EnqueueFeedback {
     ///    用户看得到全部信息）。
     pub fn of(result: &EnqueueResult) -> EnqueueFeedback {
         EnqueueFeedback {
-            summary: if result.added.is_empty() {
+            summary: if result.added.is_empty() && result.pending == 0 {
                 "没有需要下载的文件".to_string()
+            } else if result.pending > 0 {
+                // 大批量是分批加入的：先让客户看到任务开始，其余的在下载的同时陆续加入。
+                format!(
+                    "已加入 {} 个下载任务，另有 {} 个正在后台继续加入",
+                    result.added.len(),
+                    result.pending
+                )
             } else {
                 format!("已加入 {} 个下载任务", result.added.len())
             },
@@ -277,7 +324,7 @@ impl EnqueueFeedback {
                     reason: r.reason.clone(),
                 })
                 .collect(),
-            switches_to_transfers: !result.added.is_empty(),
+            switches_to_transfers: !result.added.is_empty() || result.pending > 0,
         }
     }
 
@@ -601,6 +648,29 @@ mod tests {
         assert!(DownloadTargets::exceeds_request_budget(&many));
     }
 
+    /// 单条就超预算的路径不进任何一块；其余照样发、顺序不变；全部超预算 ⇒ 没有块（不得变成 `[[]]`）。
+    /// 判别力：把 `continue` 去掉 ⇒ 超大的那条独占一块（内核不回话）⇒ 第一、二条红。
+    #[test]
+    fn a_single_path_over_the_budget_is_split_out_of_every_chunk() {
+        let huge = "y".repeat(DownloadTargets::REQUEST_BUDGET_BYTES);
+        let paths = v(&["a.bin"]).into_iter().chain([huge.clone()]).chain(v(&["b.bin"])).collect::<Vec<_>>();
+
+        assert_eq!(DownloadTargets::oversized(&paths), vec![huge.clone()]);
+        assert_eq!(DownloadTargets::chunks(&paths), vec![v(&["a.bin", "b.bin"])]);
+        assert!(DownloadTargets::chunks(&[huge]).is_empty());
+    }
+
+    /// 恰好等于预算的单条仍可发（与 `exceeds_request_budget` 的 `>` 同口径）。
+    /// 判别力：把 `is_oversized` 改成 `>=` ⇒ 这一条红。
+    #[test]
+    fn a_path_exactly_at_the_budget_is_not_oversized() {
+        let base = DownloadTargets::request_bytes(&[]);
+        let fits = "z".repeat(DownloadTargets::REQUEST_BUDGET_BYTES - base - 2);
+        assert_eq!(DownloadTargets::request_bytes(std::slice::from_ref(&fits)), DownloadTargets::REQUEST_BUDGET_BYTES);
+        assert!(!DownloadTargets::is_oversized(&fits));
+        assert!(DownloadTargets::oversized(std::slice::from_ref(&fits)).is_empty());
+    }
+
     /// 上游 `aNormalRequestIsWithinBudget`（正常规模不误伤）。
     #[test]
     fn a_normal_request_is_within_budget() {
@@ -608,6 +678,22 @@ mod tests {
     }
 
     /// 上游 `theBudgetKeepsHalfTheKernelLimit`（预算是内核上限的一半）。
+    /// 超预算的一长串被切成多块，每块都在预算内，拼回去一条不少、顺序不变。
+    /// 判别力：改成不切 ⇒ 块数为 1 ⇒ 红；切丢一条 ⇒ 拼回去不等 ⇒ 红。
+    #[test]
+    fn chunks_split_by_budget_and_lose_nothing() {
+        let many: Vec<String> = (0..200_000)
+            .map(|i| format!("dir/file-with-a-fairly-long-name-{i}.bin"))
+            .collect();
+        let chunks = DownloadTargets::chunks(&many);
+        assert!(chunks.len() > 1, "20 万条必须被切开");
+        assert!(chunks.iter().all(|c| !DownloadTargets::exceeds_request_budget(c)));
+        let rejoined: Vec<String> = chunks.concat();
+        assert_eq!(rejoined, many);
+        assert!(DownloadTargets::chunks(&[]).is_empty());
+        assert_eq!(DownloadTargets::chunks(&v(&["a", "b"])).len(), 1);
+    }
+
     #[test]
     fn the_budget_keeps_half_the_kernel_limit() {
         // 内核的行长上限是 8 MiB（`core/src/main.rs:113`）。守卫**宁可早一点拒绝**，
@@ -824,6 +910,17 @@ mod tests {
         );
         assert_eq!(nothing.summary, "没有需要下载的文件");
         assert!(nothing.rejections.is_empty());
+    }
+
+    /// 大批量分批加入：先提交的那些 + 后台还在陆续加入的个数，两句都要在话里。
+    /// 判别力：把 `pending > 0` 那一支删掉 ⇒ 第一条红（客户看不到"还在加"）。
+    #[test]
+    fn a_partly_queued_batch_says_how_many_are_still_coming() {
+        let f = EnqueueFeedback::of(&enqueued(
+            r#"{"added":[{"gid":"g1","path":"a.bin"}],"rejected":[],"pending":3}"#,
+        ));
+        assert_eq!(f.summary, "已加入 1 个下载任务，另有 3 个正在后台继续加入");
+        assert!(f.switches_to_transfers, "已经有任务在加了，就要切到传输列表");
     }
 
     /// 上游 `anAllRejectedEnqueueArrivesAsAnErrorAndIsShownWhole`。

@@ -28,6 +28,7 @@ pub mod embedded_core;
 /// ⚠️ 它**一件 IO 都没有**（字节数 / sha256 / 覆盖范围都是量好之后传进来的事实）——
 ///    真正去拷文件的那一半在 `shell-win/src/export.rs`（平台那一侧）。
 pub mod export;
+pub mod lifecycle;
 pub mod platform;
 pub mod presentation;
 pub mod protocol;

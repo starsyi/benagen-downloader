@@ -519,12 +519,11 @@
   filter: brightness(1.06);
 }
 
-/* ---- 禁用态（任务 17）：勾选面大到一次发不出去时，这两颗**真的禁用** -------------
+/* ---- 禁用态：载荷还没到时，底栏与右键菜单那两颗**真的禁用** ----------------------
    ⚠️ 为什么必须补这一段：`.is-primary` 自带的 accent 底色会**盖住**浏览器默认的禁用观感，
    而上面那两条 `:hover` 原来没有 `:not(:disabled)` —— 禁用了反而看不出禁用、悬停还更亮，
    那就是"看起来能用、点下去没反应"（本项目最恨的静默失效的形态）。
-   ✅ **判据（什么时候禁用）不在这里**：它在 Rust（`DownloadAction.blocked_reason`，
-   由 `api::tree::whole` 发下来），而"为什么按不动"那句话也由载荷给（`files.js` 只摆位置）。
+   ✅ **判据（什么时候禁用）不在这里**：它是 `files.js` 的 `paintBar`（`action === null`），
    这里**只管让它看得出来**。写法照 `panels.css` 里 `.panel__btn.is-primary:disabled`（同一套 token）。 */
 .files__bar-btn:disabled {
   color: var(--c-tertiary);

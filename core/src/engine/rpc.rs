@@ -40,6 +40,10 @@ const TASK_KEYS: [&str; 7] = [
     "errorMessage",
 ];
 
+fn task_keys() -> serde_json::Value {
+    serde_json::Value::Array(TASK_KEYS.iter().map(|k| serde_json::Value::from(*k)).collect())
+}
+
 /// `tellWaiting` / `tellStopped` 一次拉多少条。
 ///
 /// ⚠️ **沿用 Go 的 1000，本轮不动它**：它决定传输列表里能看到多少条"已完成"，
@@ -60,15 +64,35 @@ const TELL_RANGE: u64 = 1000;
 struct RpcFailure {
     msg: String,
     transport: bool,
+    /// 引擎**明确应答**并报了 `error` 对象。只有这一种失败能证明动作没有发生。
+    explicit: bool,
 }
 
 impl RpcFailure {
     fn protocol(msg: String) -> Self {
-        Self { msg, transport: false }
+        Self { msg, transport: false, explicit: false }
     }
     fn transport(msg: String) -> Self {
-        Self { msg, transport: true }
+        Self { msg, transport: true, explicit: false }
     }
+    fn rejected(msg: String) -> Self {
+        Self { msg, transport: false, explicit: true }
+    }
+}
+
+/// 一次**写**调用的结局。
+///
+/// ⚠️ **"引擎拒绝了"与"引擎没回话"必须分开**：前者能证明动作没有发生；后者**不能**——
+/// 读超时（规格 F1 的形态）时，请求很可能已经被 aria2 执行了，我们只是没等到应答。
+/// 所以只有 `error` 对象才算 `Rejected`；body 读不完、解析不了、状态码异常，一律是 `NoAnswer`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// 引擎明确应答且接受了。
+    Applied,
+    /// 引擎明确应答并拒绝（如 "GID not found" / "not paused"）。动作确定没有发生。
+    Rejected(String),
+    /// 没拿到可靠的应答。动作可能已经发生，也可能没有。
+    NoAnswer(String),
 }
 
 /// **可以安全重试**的读方法白名单（规格 §3 A1）。
@@ -116,6 +140,9 @@ pub struct RpcClient {
     next_id: AtomicU64,
     /// 详细档那一行的出口（见 [`VerboseSink`]）。生产恒为 `diagnostics::log_verbose`。
     verbose_sink: VerboseSink,
+    /// 可选的计数器句柄。`None` = 不记账。
+    /// ⚠️ 它不参与任何判据，只被读去写日志 —— 记账失败不许影响一次下载。
+    counters: Option<std::sync::Arc<crate::diag_counters::Counters>>,
 }
 
 /// `getGlobalStat` 的结果。
@@ -195,7 +222,15 @@ impl RpcClient {
             next_id: AtomicU64::new(1),
             // 生产路径**恒为**它；`mod tests` 才会换成记账替身（见 [`VerboseSink`]）。
             verbose_sink: std::sync::Arc::new(crate::diagnostics::log_verbose),
+            counters: None,
         }
+    }
+
+    /// 挂上计数器。消费自身再返回，接在构造链后面写。
+    #[must_use]
+    pub fn with_counters(mut self, c: std::sync::Arc<crate::diag_counters::Counters>) -> Self {
+        self.counters = Some(c);
+        self
     }
 
     /// 一次性 Agent —— **保证一条全新的 TCP 连接**。
@@ -234,9 +269,13 @@ impl RpcClient {
     ) -> Result<serde_json::Value, RpcFailure> {
         let started = std::time::Instant::now();
         let outcome = self.send_inner(agent, method, params);
+        let took = started.elapsed();
+        if let Some(c) = &self.counters {
+            c.record_call(took, outcome.is_ok());
+        }
         let mut fields = vec![
             ("method", method.to_string()),
-            ("ms", started.elapsed().as_millis().to_string()),
+            ("ms", took.as_millis().to_string()),
             ("ok", outcome.is_ok().to_string()),
         ];
         // ⚠️ **只有失败时才带 `why`**：成功时补一个空字段会让"这一行有几个字段"
@@ -316,7 +355,7 @@ impl RpcClient {
         let parsed: RpcResponse = serde_json::from_str(&text)
             .map_err(|e| RpcFailure::protocol(format!("RPC 响应无法解析（HTTP {status}）: {e}")))?;
         if let Some(err) = parsed.error {
-            return Err(RpcFailure::protocol(format!(
+            return Err(RpcFailure::rejected(format!(
                 "aria2 报错: {} (code {})",
                 err.message, err.code
             )));
@@ -418,6 +457,9 @@ impl RpcClient {
     ///
     /// `dir`/`out` 的语义与 `-i` 输入文件完全一致（含非 ASCII 与空格）。
     ///
+    /// `uris` 是**全量 URI 列表**（规格 §5.1）：域名 URI 打头，IP 备胎跟在后面。
+    /// aria2 的 `--uri-selector=inorder` 保证先用第一个、坏了才轮到下一个。
+    ///
     /// `extra` 是**逐任务**选项（`max-connection-per-server`、`split`、`min-split-size`、
     /// `max-tries`、`retry-wait`）。它们随任务一次性交付，而不是走全局默认：
     /// 要么在每次 `add_uri` 前先 `change_global_option`（与界面并发加任务是竞态），
@@ -432,7 +474,7 @@ impl RpcClient {
     /// 断言"合并语义坏了"，其实是测试自己没看到请求。改这里时先看那条请求体断言。
     pub fn add_uri(
         &self,
-        url: &str,
+        uris: &[String],
         dir: &str,
         out: &str,
         extra: &BTreeMap<String, String>,
@@ -448,7 +490,9 @@ impl RpcClient {
         // `call` 会在前面补上 token，所以这里只给 `[uris, options]` —— 线上就是
         // `[token, uris, options]`，options 落在索引 2。
         let params = [
-            serde_json::Value::Array(vec![serde_json::Value::String(url.to_string())]),
+            serde_json::Value::Array(
+                uris.iter().map(|u| serde_json::Value::String(u.clone())).collect(),
+            ),
             serde_json::Value::Object(opts),
         ];
         let raw = self.call("aria2.addUri", &params)?;
@@ -460,6 +504,15 @@ impl RpcClient {
             return Err("addUri 未返回 GID".to_string());
         }
         Ok(gid.to_string())
+    }
+
+    /// 只取**活跃**的任务（一条 `tellActive`）。
+    ///
+    /// 停滞采样只用它：`list()` 还要 `tellWaiting` / `tellStopped`（各最多 1000 条），
+    /// 而采样一条都用不到。
+    pub fn active(&self) -> Result<Vec<RawTask>, String> {
+        let raw = self.call("aria2.tellActive", &[task_keys()])?;
+        serde_json::from_value(raw).map_err(|e| format!("解析 aria2.tellActive 失败: {e}"))
     }
 
     /// 读三个列表方法（而不是按 GID 的 `tellStatus`）。
@@ -512,12 +565,7 @@ impl RpcClient {
         //    排在同一循环里的所有请求（包括那几次只有几个数字的）一起等
         //    ⇒ 撞满 10 秒的 `RPC_TIMEOUT` ⇒ 内核判「引擎已断开」。
         //    整场 41% 的调用失败、`transfer_list` 撞壳的 30 秒超时。
-        let keys = serde_json::Value::Array(
-            TASK_KEYS
-                .iter()
-                .map(|k| serde_json::Value::from(*k))
-                .collect(),
-        );
+        let keys = task_keys();
         for (method, with_range) in [
             ("aria2.tellActive", false),
             ("aria2.tellWaiting", true),
@@ -597,6 +645,51 @@ impl RpcClient {
     pub fn unpause(&self, gid: &str) -> Result<(), String> {
         self.call("aria2.unpause", &[serde_json::Value::String(gid.to_string())])
             .map(|_| ())
+    }
+
+    /// 与 [`Self::pause`] 同一条线，但保留"拒绝 / 没回话"的区别（见 [`WriteOutcome`]）。
+    pub fn pause_detailed(&self, gid: &str) -> WriteOutcome {
+        self.write_outcome("aria2.pause", gid)
+    }
+
+    /// `aria2.forcePause` —— 单个任务的**强制**暂停：不等它收尾，直接掐连接。
+    ///
+    /// 档 2 用它而不用 [`Self::pause_detailed`]：优雅暂停要等数据收尾，连接多时可以拖很久，
+    /// 而档 2 要的正是把卡住的连接丢掉。拒绝 / 没回话的区别照旧保留。
+    pub fn force_pause_detailed(&self, gid: &str) -> WriteOutcome {
+        self.write_outcome("aria2.forcePause", gid)
+    }
+
+    /// 与 [`Self::unpause`] 同一条线，但保留"拒绝 / 没回话"的区别（见 [`WriteOutcome`]）。
+    pub fn unpause_detailed(&self, gid: &str) -> WriteOutcome {
+        self.write_outcome("aria2.unpause", gid)
+    }
+
+    /// 写方法不重试（见 [`Self::call`]），所以这里只做一次 `send`，并按 `explicit` 分类。
+    fn write_outcome(&self, method: &str, gid: &str) -> WriteOutcome {
+        match self.send(&self.agent, method, &[serde_json::Value::String(gid.to_string())]) {
+            Ok(_) => WriteOutcome::Applied,
+            Err(f) if f.explicit => WriteOutcome::Rejected(f.msg),
+            Err(f) => WriteOutcome::NoAnswer(f.msg),
+        }
+    }
+
+    /// `aria2.forcePauseAll` —— **强制**暂停全部任务（传输页的「暂停全部」）。
+    ///
+    /// 为什么是 force 而不是 `aria2.pauseAll`：后者是**优雅**暂停——要等各任务把手上
+    /// 的数据收尾，连接多时可以拖很久。这个动作的主场景是**磁盘快满了、要立刻停写**，
+    /// 等不起。代价是对端连接被直接掐断；`-c` 恒开，续传不受影响。
+    ///
+    /// 无参数（线上形态就是 `[token]`）。写操作，**不在**重试白名单里（见 `call`）。
+    pub fn force_pause_all(&self) -> Result<(), String> {
+        self.call("aria2.forcePauseAll", &[]).map(|_| ())
+    }
+
+    /// `aria2.unpauseAll` —— 把所有被暂停的任务放回等待队列（传输页的「一键开始」）。
+    ///
+    /// 无参数。对「没有暂停任务」的引擎也成功（返回 `OK`），所以调用方不必先问。
+    pub fn unpause_all(&self) -> Result<(), String> {
+        self.call("aria2.unpauseAll", &[]).map(|_| ())
     }
 
     /// `aria2.remove` —— 移除一个**活动/等待中**的任务。
@@ -922,7 +1015,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        c.add_uri("http://x/f", "PFX/sub", "a.txt", &extra)
+        c.add_uri(&["http://x/f".to_string()], "PFX/sub", "a.txt", &extra)
             .expect("add_uri 不应失败");
 
         let (n, opts) = add_uri_options(&srv.requests()[0].body);
@@ -936,7 +1029,7 @@ mod tests {
         assert_eq!(opts["out"], "a.txt", "out 必须压过 extra 里的同名键");
 
         // extra 为空：退化为只有 dir/out
-        c.add_uri("http://x/f", "PFX/sub", "b.txt", &BTreeMap::new())
+        c.add_uri(&["http://x/f".to_string()], "PFX/sub", "b.txt", &BTreeMap::new())
             .expect("extra 为空不应失败");
         let (n, opts) = add_uri_options(&srv.requests()[1].body);
         assert_eq!(
@@ -948,6 +1041,33 @@ mod tests {
             opts.len() == 2 && opts["dir"] == "PFX/sub" && opts["out"] == "b.txt",
             "extra 为空时选项应恰好只有 dir/out，实际 {opts:?}"
         );
+    }
+
+    /// 多 URI 必须原样进 `params[1]`（规格 §5.1 的 add 链路）。
+    ///
+    /// 判别力：只发 `uris[0]` 或把列表拼成一个字符串 ⇒ 红。
+    /// `params` 形状仍是 `[uris, options]`（线上 `[token, uris, options]`），
+    /// 变的只是 `uris` 从单元素变多元素。
+    #[test]
+    fn add_uri_sends_all_uris_in_params_1() {
+        let srv = new_stub_rpc(|_m, _p| Ok(json!("gid-1")));
+        let c = RpcClient::new(&rpc_url(&srv), "s");
+
+        let uris = vec![
+            "http://download.benagen.com/C/a.txt".to_string(),
+            "http://1.2.3.4/C/a.txt".to_string(),
+            "http://5.6.7.8/C/a.txt".to_string(),
+        ];
+        c.add_uri(&uris, ".", "a.txt", &BTreeMap::new())
+            .expect("add_uri 不应失败");
+
+        let body: Value = serde_json::from_str(&srv.requests()[0].body).expect("请求体是 JSON");
+        let params = body["params"].as_array().expect("params 必须是数组");
+        assert_eq!(params.len(), 3, "线上形态 [token, uris, options]");
+        let sent = params[1].as_array().expect("params[1] 必须是 URI 数组");
+        let sent: Vec<&str> = sent.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(sent, ["http://download.benagen.com/C/a.txt", "http://1.2.3.4/C/a.txt", "http://5.6.7.8/C/a.txt"],
+            "params[1] 必须原样携带全部 URI（顺序不许动）");
     }
 
     /// 对应 Go `TestRPCRejectsGarbageBody`。
@@ -1262,6 +1382,40 @@ mod tests {
         assert_error_surfaces(c.unpause("abc"), "unpause", "GID abc is not found");
     }
 
+    /// `forcePauseAll` / `unpauseAll` 打在精确的方法名上，且**没有**位置参数
+    /// （`params` 里只有 `RpcClient` 补的 `token:<secret>`）。
+    #[test]
+    fn rpc_pause_all_and_unpause_all_send_exact_method_names_without_args() {
+        let srv = new_stub_rpc(|_m, _p| Ok(json!("OK")));
+        let c = RpcClient::new(&rpc_url(&srv), "s");
+
+        c.force_pause_all().expect("force_pause_all 不应失败");
+        c.unpause_all().expect("unpause_all 不应失败");
+
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2, "两个动作各发一次，实际 {}", reqs.len());
+        for (req, want) in reqs.iter().zip(["aria2.forcePauseAll", "aria2.unpauseAll"]) {
+            let v: serde_json::Value = serde_json::from_str(&req.body).expect("请求体应是 JSON");
+            assert_eq!(v["method"], want, "方法名不对: {v}");
+            assert_eq!(
+                v["params"].as_array().map(Vec::len),
+                Some(1),
+                "只该有 token 一个参数: {v}"
+            );
+        }
+    }
+
+    /// 暂停全部是写操作：**失败不许被自动重试**（重试白名单只有四个读方法）。
+    /// 判别力：把 `aria2.forcePauseAll` 加进白名单 ⇒ 桩会收到两次 ⇒ 本条红。
+    #[test]
+    fn rpc_pause_all_failure_is_not_retried() {
+        let srv = new_stub_rpc(|_m, _p| Err((1, "boom".to_string())));
+        let c = RpcClient::new(&rpc_url(&srv), "s");
+
+        assert!(c.force_pause_all().is_err());
+        assert_eq!(srv.requests().len(), 1, "写操作失败不得重试");
+    }
+
     /// `aria2.remove` 打在精确的方法名上，GID 落在 `params[1]`。
     ///
     /// 判据里**不含**"已完成的任务该走哪个方法"——那是 `Daemon::remove` 的分派责任，
@@ -1540,7 +1694,7 @@ mod tests {
 
         let c = RpcClient::new(&format!("http://127.0.0.1:{port}/jsonrpc"), "s3cr3t");
         let e = c
-            .add_uri("http://127.0.0.1:1/x", "/tmp", "x.bin", &BTreeMap::new())
+            .add_uri(&["http://127.0.0.1:1/x".to_string()], "/tmp", "x.bin", &BTreeMap::new())
             .expect_err("掐断的连接上 addUri 必须失败");
         assert!(e.contains("RPC 请求失败"), "错误文案变了：{e}");
         assert_eq!(
@@ -1657,7 +1811,7 @@ mod tests {
         for _ in 0..3 {
             c.global().expect("读方法这三拍都应当成功");
         }
-        c.add_uri("http://x/f", "PFX/sub", "a.txt", &BTreeMap::new())
+        c.add_uri(&["http://x/f".to_string()], "PFX/sub", "a.txt", &BTreeMap::new())
             .expect_err("写方法这一拍必须失败");
 
         let lines = got
@@ -1809,5 +1963,77 @@ mod tests {
             }
         }
         out
+    }
+
+    /// 每一次往返都要落进计数器，**成功的也要记** —— "慢"本身就是信号（规格 §3.1 信号 A）。
+    #[test]
+    fn every_round_trip_is_recorded_in_the_counters() {
+        let srv = StubHttp::start_with(|_| {
+            // ⚠️ 这一睡是判据的一部分，不许删：`rpc_worst` 是毫秒精度（`record_call` 写
+            //    `took.as_millis()`，`snapshot()` 用 `from_millis` 读回，`diag_counters.rs:106-109`/`:152`）。
+            //    回环往返常常不到 1ms，正确的实现也会读回 0，断言会在快机器上假红。
+            std::thread::sleep(Duration::from_millis(20));
+            RawResponse::new(200).body(r#"{"jsonrpc":"2.0","id":"1","result":{}}"#.to_string())
+        });
+        let c = std::sync::Arc::new(crate::diag_counters::Counters::default());
+        let client =
+            RpcClient::new(&rpc_url(&srv), "s3cr3t").with_counters(std::sync::Arc::clone(&c));
+        let _ = client.call("aria2.getGlobalStat", &[]);
+        let s = c.snapshot();
+        assert_eq!(s.rpc_calls, 1, "成功的那一次也要记");
+        assert_eq!(s.rpc_failures, 0);
+        // 钉住"记的是真实耗时"：若改记 `Duration::ZERO`，下面 `rpc_worst` 那一条会红。
+        // 分桶那条抓不到这个变异（`bucket_of(Duration::ZERO)` 也落在第 0 桶），它守的是分桶映射本身。
+        assert!(
+            s.rpc_worst >= Duration::from_millis(20),
+            "耗时必须真量过：垫了 20ms，读回的却只有 {:?}",
+            s.rpc_worst
+        );
+        assert_eq!(
+            s.rpc_buckets,
+            [1, 0, 0, 0],
+            "回环上一次成功往返必然落在 <1s 那一桶"
+        );
+    }
+
+    /// 失败的也要记，且记在 `rpc_failures` 里。
+    #[test]
+    fn a_failed_round_trip_is_recorded_as_a_failure() {
+        // 指向没人监听的端口：连接立刻被拒（不是超时），用例跑得快，也不依赖任何桩。
+        let c = std::sync::Arc::new(crate::diag_counters::Counters::default());
+        let client = RpcClient::new("http://127.0.0.1:1/jsonrpc", "s")
+            .with_counters(std::sync::Arc::clone(&c));
+        let _ = client.call("aria2.getGlobalStat", &[]);
+        let s = c.snapshot();
+        // 读方法在传输层失败后会换新连接重试一次，两次都经过 `send`，所以是 2 而不是 1。
+        assert_eq!(s.rpc_calls, 2, "读方法失败会重试一次，两次往返都要记");
+        assert_eq!(s.rpc_failures, 2);
+    }
+
+    /// ⚠️ 钉住"收口在 `send`"：`ping` 不走 `call`（直接调 `self.send`），
+    /// 所以它也记上了，就证明记账点在 `send` 里而不在 `call` 的分支里。
+    #[test]
+    fn ping_is_counted_too_proving_the_chokepoint_is_send() {
+        let srv = StubHttp::start_with(|_| {
+            RawResponse::new(200).body(r#"{"jsonrpc":"2.0","id":"1","result":{}}"#.to_string())
+        });
+        let c = std::sync::Arc::new(crate::diag_counters::Counters::default());
+        let client =
+            RpcClient::new(&rpc_url(&srv), "s3cr3t").with_counters(std::sync::Arc::clone(&c));
+        client.ping().expect("桩会正常应答");
+        assert_eq!(c.snapshot().rpc_calls, 1, "ping 也经过 send ⇒ 也记账");
+    }
+
+    /// 写方法不在 `is_retryable_read` 白名单里，从不重试 ⇒ 恒记 1 次。
+    /// 与上面那条失败用例解耦：白名单变了只会让那条红，不会让这条红。
+    #[test]
+    fn a_non_retryable_write_is_counted_exactly_once() {
+        let c = std::sync::Arc::new(crate::diag_counters::Counters::default());
+        let client = RpcClient::new("http://127.0.0.1:1/jsonrpc", "s")
+            .with_counters(std::sync::Arc::clone(&c));
+        let _ = client.call("aria2.addUri", &[]);
+        let s = c.snapshot();
+        assert_eq!(s.rpc_calls, 1, "写方法不重试 ⇒ 只有一次往返");
+        assert_eq!(s.rpc_failures, 1);
     }
 }

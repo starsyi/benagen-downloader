@@ -37,9 +37,14 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
+use crate::autoretry;
 use crate::delivery::{Manifest, UreqTransport};
 use crate::engine::daemon::{Daemon, DaemonOptions};
-use crate::engine::status::Task;
+use crate::engine::rpc::WriteOutcome;
+use crate::engine::status::{Task, TaskState};
+use crate::engine::supervisor::{Ladder, Liveness, Progress, Rung, TaskProgress, Thresholds};
+use crate::intent::{self, Intent};
+use crate::migrate;
 use crate::planner::{Kind, Options as PlanOptions, Planner};
 use crate::protocol::{codes, TransferItem};
 use crate::settings::Settings;
@@ -153,6 +158,36 @@ pub struct Kernel {
     daemon: Option<Arc<Daemon>>,
     /// 引擎是否已被判定断开（设计规格 §9）。判定之后每次读都会试一次重连。
     engine_disconnected: bool,
+    /// §6 的量化证据。挂在 Kernel 上而不是线程局部：它跨换引擎存活（换的只是 `daemon` 字段），
+    /// 而 RPC 的耗时是在协议循环里量的，够不到线程局部。用原子量，不占内核锁。
+    counters: Arc<crate::diag_counters::Counters>,
+
+    /// 「用户想下的文件集」（规格 2026-10-12 §3）：换引擎 / 重启内核后据此补回队列。
+    intent: Intent,
+    /// 上一次给引擎进程采的资源读数（做差用，规格 §4）。
+    stall_prev: Option<crate::procstat::Counters>,
+    /// 换目录时搬运旧文件的进度（规格 §6）。`Arc` 是因为后台线程要自己持有一份。
+    migrate: Arc<Mutex<migrate::Status>>,
+    /// 用户按了「暂停全部」且还没「一键开始」：自动重试必须**按住不动**——
+    /// 否则被暂停期间失败的任务会被它悄悄重新拉起来，等于没暂停。
+    /// 入队**不**解除它：暂停期间新加入的文件一律以暂停态加入（见 [`submit_off_lock`]）。
+    hold_auto_retry: bool,
+    /// 我们自己 `pause` 了、但 `unpause` 没还上的 gid（档 1）。
+    ///
+    /// 写方法从不重试，而暂停态属于 `Waiting`、被 `active_tasks` 滤掉 ⇒ 不补的话，那个任务会永远停在
+    /// 「已暂停」，且客户看得见。由恢复线程在后续拍里补发（见 [`retry_pending_unpause`]）。
+    pending_unpause: BTreeSet<String>,
+    /// 还没提交给引擎的目标（大批量入队的"后台陆续加入"队列，见 [`spawn_feeder`]）。
+    /// 提交完成后才出队，所以「下载全部」能据此排除正在飞的那一批；换码时整体登记为拒绝。
+    feed_queue: std::collections::VecDeque<delivery::File>,
+    /// 批次代数：每次换码 +1（见 [`Kernel::discard_feed_queue`]）。一批提交在飞时凭它发现自己已经作废。
+    batch_epoch: u64,
+    /// 后台加入过程中被拒绝的（路径、理由）。壳通过 `enqueue_status` 取走。
+    feed_rejected: Vec<Value>,
+    /// 后台已经成功加入的个数（同上，取走即清零）。
+    feed_added: usize,
+    /// 后台线程是否在跑。
+    feeder_running: bool,
 }
 
 /// 起一次引擎要用的**全部输入**（[`Kernel::engine_start`] 的产物）。
@@ -164,6 +199,7 @@ struct EngineStart {
     download_dir: PathBuf,
     global: BTreeMap<String, String>,
     per_task: BTreeMap<String, String>,
+    counters: Arc<crate::diag_counters::Counters>,
 }
 
 /// **锁外**：按 [`EngineStart`] 起一个引擎，并**冗余但承重**地下发一次全局选项。
@@ -180,6 +216,7 @@ fn start_engine_off_lock(start: EngineStart) -> Result<Arc<Daemon>, ErrorBody> {
         per_task: start.per_task,
         binary_path: None,
         force_port: None,
+        counters: Some(start.counters),
     };
     let d = Daemon::start(opts)
         .map_err(|e| ErrorBody::new(kcodes::ENGINE_START_FAILED, format!("启动下载引擎失败：{e}")))?;
@@ -209,6 +246,11 @@ impl Kernel {
         };
         let update = update::load_state(&update_path);
         let state = FileState::load(&download_dir);
+        let intent_path = match settings_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.join(intent::FILE_NAME),
+            _ => PathBuf::from(intent::FILE_NAME),
+        };
+        let intent = Intent::load(&intent_path);
         Kernel {
             download_dir,
             settings_path,
@@ -228,6 +270,17 @@ impl Kernel {
             retried: BTreeSet::new(),
             daemon: None,
             engine_disconnected: false,
+            counters: Arc::new(crate::diag_counters::Counters::default()),
+            intent,
+            stall_prev: None,
+            migrate: Arc::new(Mutex::new(migrate::Status::default())),
+            hold_auto_retry: false,
+            pending_unpause: BTreeSet::new(),
+            feed_queue: std::collections::VecDeque::new(),
+            feed_rejected: Vec::new(),
+            feed_added: 0,
+            feeder_running: false,
+            batch_epoch: 0,
         }
     }
 
@@ -255,6 +308,7 @@ impl Kernel {
             download_dir: self.download_dir.clone(),
             per_task: self.settings.per_task_options(),
             global,
+            counters: Arc::clone(&self.counters),
         }
     }
 
@@ -318,9 +372,13 @@ impl Kernel {
     /// ⇔ `ping.err()` 是 `None`——**`cause` 恒为空串**，客户看到的消息以 `（探活：）` 结尾。
     /// 已换成出错的调用名（那才是有信息量的东西）。
     fn on_rpc_failure(&mut self, d: &Arc<Daemon>, op: &str, err: String) -> ErrorBody {
-        let ping = d.ping();
-        let ok = ping.is_ok();
-        let (disconnected, outcome) = reconnect_outcome(ok, &err);
+        let ping_ok = d.ping().is_ok();
+        self.settle_rpc_failure(ping_ok, op, err)
+    }
+
+    /// [`Kernel::on_rpc_failure`] 的判定段。探活结果由调用方给，好让探活本身可以在锁外做。
+    fn settle_rpc_failure(&mut self, ping_ok: bool, op: &str, err: String) -> ErrorBody {
+        let (disconnected, outcome) = reconnect_outcome(ping_ok, &err);
         // `why` 带上**出错的调用名**：那是客户在壳里唯一能看到的定位信息，
         // 只记 `err` 的话日志里会有一堆看不出发生在哪一步的失败。
         // （探活自己的错误已经由 `ping()` 以 `ping_failed` 单独记过一条，不在这里重复。）
@@ -350,6 +408,13 @@ impl Kernel {
         // 写失败不致命（记不住上次的码只影响体验），但也别静默——记一行日志。
         if let Err(e) = std::fs::write(&self.last_code_path, code) {
             eprintln!("benagen-core: 记录上次交付码失败（不影响下载）: {e}");
+        }
+    }
+
+    /// 落盘「想下的文件集」。失败只记一行：它只影响「自动补回队列」，不影响任何下载。
+    fn save_intent(&self) {
+        if let Err(e) = self.intent.save() {
+            crate::diagnostics::log("intent_save_failed", &[("err", e.to_string())]);
         }
     }
 
@@ -404,154 +469,467 @@ fn reconnect_outcome(ping_ok: bool, cause: &str) -> (bool, Result<(), ErrorBody>
 }
 
 // ---------------------------------------------------------------------------
-// 自愈线程：断开之后**自己**定期探活（规格 §3 A3）
+// 自愈线程：每秒判活，两个信号分开判（规格 §3.1），阶梯决定动作（规格 §3.2）
 // ---------------------------------------------------------------------------
 
-/// 断开之后重新探活的节拍（规格 §3 A3）。
+/// 一段持续健康之前，最多换几次引擎。
 ///
-/// 取值理由：一次失败的探活最坏要花 `RPC_TIMEOUT`（10 秒），所以节拍**不能**比它短——
-/// 短了就是"探活永远在做，别的什么也做不了"。10 秒是两次探活**发起**之间的下限
-/// （`last` 在探活**之前**更新，见 [`spawn_recovery`]），探活自己最坏能填满一整个窗口；
-/// 恢复的发现延迟也在节拍量级——一次正在飞的探活最长还能再吃掉 10 秒。
-///
-/// ⚠️ 它替代的是**客户手点「重试」**——而那一颗按钮会把**整个内核重启一遍**。
-const RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
-
-/// 该不该探一次？纯函数，把节拍判据从线程里择出来，好在宿主上真测。
-fn should_recover_probe(disconnected: bool, since_last_probe: Duration) -> bool {
-    disconnected && since_last_probe >= RECOVERY_INTERVAL
-}
-
-/// 连续探活失败到多少次就**换掉引擎**（2026-10-09）。
-///
-/// 取值理由：一次失败的探活要耗满 `RPC_TIMEOUT`（10 秒），所以 6 次 ⇔ 大约
-/// **60 秒**的连续不应答。选 60 秒而不是 30 秒，是要留住"引擎只是**忙了一小会儿**"
-/// 这一支——把它误判成"死了"会白关一个正在下的进程，那是**客户的损失**，
-/// 比多等 30 秒严重得多。而现场那两段是 **45 与 60 分钟**，60 秒离它们远得很。
-const RECOVERY_RESTART_AFTER: u32 = 6;
-
-/// 一次断开里最多换几次引擎。
-///
-/// ⚠️ **没有这条就是无限重启循环**：新起来的引擎若照样不应答（现场那台机器上完全可能），
-/// 就会每 60 秒关一个、起一个 —— 日志被刷屏、CPU 白烧，而问题一点没动。
-/// 到顶之后只剩探活（代价是每 10 秒一次 10 秒超时，可以一直挂着），
-/// 并落一条 `engine_restart_gave_up` 把"自动手段用尽了"留在日志里。
+/// ⚠️ 没有这条就是无限重启循环：新起来的引擎若照样不应答，就会一直关一个、起一个，
+/// 日志被刷屏、CPU 白烧，而问题一点没动。到顶之后只剩判活本身，并落一条
+/// `engine_restart_gave_up` 把"自动手段用尽了"留在日志里。
 const RECOVERY_MAX_RESTARTS: u32 = 3;
 
-/// 该不该换引擎？纯函数，把阈值判据从线程里择出来，好在宿主上真测。
-fn should_restart_engine(consecutive_failures: u32) -> bool {
-    consecutive_failures >= RECOVERY_RESTART_AFTER
+/// 停滞期间"是哪一个任务卡住了"的采样间隔。
+///
+/// 这是**我们自己的采样**开销，不是引擎的开销：每拍都取一次任务列表，会叠加 `tellActive` 的最坏耗时
+/// （规格 F2/F3，单次可达约 10 秒），把判活节拍拖慢，恰好在最需要看清的时候。停滞阈值是 180 秒，
+/// 5 秒一次仍有 36 个采样点，够用。
+const TASK_SAMPLE_EVERY: Duration = Duration::from_secs(5);
+
+/// 从一次采样的任务表里取出**应当正在动的那些**，形如 `(gid, completedLength)`。
+///
+/// ⚠️ `Daemon::active()` 只发 `tellActive`，表里本就只有活跃任务；这里仍滤一遍，让"应当正在动"的定义只有这一处。
+///    不滤的话，传完、出错、被移除的任务（`completedLength` 永远不再动）会被永远判成停滞。
+/// ⚠️ `Waiting` 也不收：它既含真排队，也含客户手动暂停的；卡在并发上限后面的不算"卡住"。
+fn active_tasks(tasks: &[Task]) -> Vec<(String, u64)> {
+    tasks
+        .iter()
+        .filter(|t| t.state == TaskState::Active)
+        .map(|t| (t.gid.clone(), t.completed.max(0) as u64))
+        .collect()
 }
 
-/// **引擎断开之后的后台自愈**（规格 §3 A3）：每 [`RECOVERY_INTERVAL`] 探一次，
-/// 探通了就把「已断开」翻回去——客户不必手点「重试」（那颗按钮会重启整个内核）。
+/// 该记哪些停滞：对照 `already`（已记过的 gid），只返回**新**达到阈值的 `(gid, 停滞时长)`。
+/// 纯函数，好在宿主上真测。
+fn stalls_to_record(
+    stalled: &[(String, Duration)],
+    already: &BTreeSet<String>,
+) -> Vec<(String, Duration)> {
+    stalled
+        .iter()
+        .filter(|(gid, _)| !already.contains(gid))
+        .cloned()
+        .collect()
+}
+
+/// 把这一拍新识别出的停滞记进计数器。返回本次新记的条数。
+/// 纯决策在 [`stalls_to_record`]；这里只多做"记账"与维护 `already` 那一步。
+/// 判别力：删掉本函数里的 `record_stall` ⇒ [`new_stalls_are_recorded_in_the_counters`] 红。
+fn record_new_stalls(
+    counters: &crate::diag_counters::Counters,
+    stalled: &[(String, Duration)],
+    already: &mut BTreeSet<String>,
+) -> usize {
+    let fresh = stalls_to_record(stalled, already);
+    for (gid, how_long) in &fresh {
+        counters.record_stall(*how_long);
+        already.insert(gid.clone());
+    }
+    // 不再停滞的 gid 从 already 清掉，下次再停滞才重记。
+    let current: BTreeSet<&str> = stalled.iter().map(|(g, _)| g.as_str()).collect();
+    already.retain(|g| current.contains(g.as_str()));
+    fresh.len()
+}
+
+/// 「停 → 起」一个 gid 的结局。
+enum Relaunch {
+    /// 没有要还的。
+    Clean,
+    /// 欠一次 unpause。
+    Owed,
+    /// 停与起都没回话：欠账，而且引擎答不了这个 gid 的 pause/unpause，同一批后面的 gid 大概率也一样。
+    Silent,
+}
+
+/// 停掉再拉起一个 gid。`stop` 是调用方选定的停法的结果（档 1 用 `pause`，档 2 用 `forcePause`）。
 ///
-/// 🔴 **探不通时它会换掉引擎**（2026-10-09）。此前这一支**什么都不做**，只是拿同一个
-///    句柄继续 ping —— 而现场那份 0.2.3 日志里，引擎有两段完全不 应答的时段，
-///    分别 **45 分钟与 60 分钟**，自愈每 10 秒探一次、每次都耗满 10 秒超时，
-///    **一次也没成功**。也就是说"自愈"救得了"闪一下"，救不了"卡死"。
-///    现在连续 [`RECOVERY_RESTART_AFTER`] 次探不通就 [`replace_engine`]（最多
-///    [`RECOVERY_MAX_RESTARTS`] 次，防重启循环）。
+/// pause 被引擎**明确拒绝** ⇒ 任务根本没被暂停，不欠账，也不发 unpause（会打到不该碰的任务上）。
+/// pause **没回话** ⇒ 它可能已经生效了，我们赌不起：照样补 unpause。
+/// unpause 被拒 ⇒ 已经是未暂停态，不欠账；没回话 ⇒ 欠账。
 ///
-/// ⚠️ **代价要说清楚**：换引擎会把**旧引擎里那些任务一起丢掉** —— 已下载的字节在
-/// 磁盘上（`-c` 断点续传），但队列没了，客户要重新点一次「下载」。这仍然**严格优于**
-/// 今天：今天那两段是"卡 45 分钟后只能点重试，而重试重启的是整个内核"（同时还掐掉
-/// 正在下的活），换引擎只换那一个进程。把队列也一起恢复（记住上次入队的目标集）
-/// 是**另一件事**，本轮不做。
+/// `held` 在发 unpause **之前**再读一次：客户可能在 `stop` 进行期间按下「暂停全部」（`stop` 没回话时要等满
+/// `RPC_TIMEOUT`，约 10 秒）。读到就不发 unpause，也不记欠账——那一格要么被我们的停住、要么被客户的暂停全部停着，
+/// 两种都是客户要的"停着"，之后「一键开始」自会拉起。
+/// ⚠️ 窗口只是收窄，没有消除：残留在"重读"与"unpause 被引擎处理"之间（正常毫秒级；引擎慢时，
+/// unpause 在途期间若客户按下暂停全部，仍可能被它盖过）。
+fn relaunch(d: &Daemon, gid: &str, stop: WriteOutcome, held: &dyn Fn() -> bool) -> Relaunch {
+    let stop_silent = matches!(stop, WriteOutcome::NoAnswer(_));
+    match stop {
+        WriteOutcome::Rejected(_) => Relaunch::Clean,
+        WriteOutcome::Applied | WriteOutcome::NoAnswer(_) => {
+            if held() {
+                return Relaunch::Clean;
+            }
+            match d.unpause_detailed(gid) {
+                WriteOutcome::NoAnswer(_) if stop_silent => Relaunch::Silent,
+                WriteOutcome::NoAnswer(_) => Relaunch::Owed,
+                WriteOutcome::Applied | WriteOutcome::Rejected(_) => Relaunch::Clean,
+            }
+        }
+    }
+}
+
+/// 档 1 的动作：把**一个**任务停掉再拉起来，丢它的在途连接，从 `.aria2` 偏移续下。
 ///
-/// ⚠️ **`daemon` 句柄每轮从锁里现取**，不当作启动参数传进来：句柄是会变的，
-///    启动时传进来的那份会**过期**——而过期的句柄上 ping 只会永远失败，
-///    表现为"自愈永远不生效"，**且没有任何东西会红**。
-///    （今天有三处写入点：`ensure_engine` 首次启动、[`replace_engine`]、`main()` 收尾的
-///    `take()` ——最后那一处正是这条纪律承重的地方。）
+/// 返回 `Some(gid)` = **欠一次 unpause**；`None` = 不欠账。
+fn reconnect_one(d: &Daemon, gid: &str, held: &dyn Fn() -> bool) -> Option<String> {
+    match relaunch(d, gid, d.pause_detailed(gid), held) {
+        Relaunch::Clean => None,
+        Relaunch::Owed | Relaunch::Silent => Some(gid.to_string()),
+    }
+}
+
+/// 挑出停滞最久（且最久没被照顾过）的那个任务重连它。欠账的 gid 记进 `owed`。没有停滞任务时什么都不做。
 ///
-/// ⚠️ **网络 I/O 在锁外**（`d.ping()` 不持 `kernel` 锁），只有翻标志那一下（连同它那条诊断）
-///    进锁——照抄本仓既有纪律（见校验工作线程那段注释：持锁做网络 I/O 会让协议循环停摆）。
+/// `held`：客户按过「暂停全部」时一条 RPC 都不发（理由见 [`retry_pending_unpause`]）。
+/// 它是闭包而非布尔：动作前读一次，`relaunch` 发 unpause 前再读一次。
+///
+/// 与档 2 的 [`pause_then_resume_each`] 同一道保护：动作前重新取一次 `tellActive`，
+/// 候选 gid 不在活跃表里（已被客户单独暂停 / 完成 / 移除）⇒ 本拍不动它。
+/// `active()` 取不到 ⇒ 本拍不动。没有这道保护的话，`pause`（对已暂停是空操作）→ `unpause`
+/// 会把客户的单独暂停撤掉。
+///
+/// 调用方须在锁外调用（内部是 RPC）。
+fn reconnect_most_stalled(
+    d: &Daemon,
+    progress: &mut TaskProgress,
+    t: &Thresholds,
+    now: std::time::Instant,
+    owed: &mut BTreeSet<String>,
+    held: &dyn Fn() -> bool,
+) -> Option<String> {
+    if held() {
+        return None;
+    }
+    let gid = progress.most_stalled(now, t)?;
+    // 与档 2 的 `pause_then_resume_each` 同一道保护（见上方注释）。
+    let Ok(live) = d.active() else {
+        return None;
+    };
+    let live: BTreeSet<String> = live.into_iter().map(|t| t.gid).collect();
+    if !live.contains(&gid) {
+        return None;
+    }
+    if let Some(debt) = reconnect_one(d, &gid, held) {
+        owed.insert(debt);
+    }
+    progress.mark_attempted(&gid, now);
+    Some(gid)
+}
+
+/// 补发欠着的 `unpause`：没回话的留到下一拍；引擎明确应答（接受或拒绝）的都移出，
+/// 因为拒绝意味着"已经没有要还的了"（如任务已被移除或已经是未暂停态）。
+///
+/// 客户按过「暂停全部」时整段跳过：那时"暂停"正是客户要的，补发 unpause 等于违背客户意图。
+fn retry_pending_unpause(d: &Daemon, pending: &mut BTreeSet<String>, hold: bool) {
+    if hold {
+        return;
+    }
+    pending.retain(|gid| matches!(d.unpause_detailed(gid), WriteOutcome::NoAnswer(_)));
+}
+
+fn persist_pending(kernel: &Arc<Mutex<Kernel>>, owed: &BTreeSet<String>) {
+    lock(kernel).pending_unpause = owed.clone();
+}
+
+/// 重启预算能不能复位？纯函数，好在宿主上真测。
+///
+/// ⚠️ **两个条件缺一不可**：只要求"健康"，那么"引擎应答、下载全停"也算健康，
+///    F6 现场那种形态就能靠它无限续命。`stalled` 为零，才说明下载真的在动。
+fn restart_budget_is_refilled(healthy: Option<Duration>, stalled: Duration, t: &Thresholds) -> bool {
+    healthy.is_some_and(|h| h >= t.pre_swap_wait) && stalled.is_zero()
+}
+
+/// 记一次档位的**决策**（判定它要这一拍去做）：计数，并落一条快照日志。
+/// 档 1、档 2 接入动作之后仍是一决策一记录，语义不变。`rung_swap` 的计数在认输检查之后，认输的拍不计入。
+fn note_rung(counters: &crate::diag_counters::Counters, rung: Rung) {
+    counters.record_rung(rung);
+    counters.snapshot().log(match rung {
+        Rung::ReconnectOne => "rung_reconnect",
+        Rung::PauseAllThenResumeAll => "rung_pause_all",
+        Rung::ReplaceEngine => "rung_swap",
+        Rung::Observe => unreachable!(),
+    });
+}
+
+/// 档 2 的动作：把**卡住的那些** gid 逐个用 `forcePause` 停掉再拉起来，返回欠了 `unpause` 的 gid（与档 1 同一套语义）。
+///
+/// 🔴 用 `forcePause`，不用优雅的 `pause`：优雅暂停要等各任务收尾，连接多时可以拖很久，
+///    而档 2 要的正是把卡住的连接丢掉。用 `pause` 的话，停启之后连接可能根本没断，整个动作空转。
+/// 🔴 不用 `Daemon::pause_all` / `unpause_all`：`unpauseAll` 会把**客户单独暂停**的任务也解开，那是撤掉客户的显式动作。
+///    （对已暂停的任务再发 `forcePause` 是空操作，所以"它会再停一次客户的任务"不是理由。）
+/// `held`：客户按过「暂停全部」时一条 RPC 都不发。它是闭包而不是布尔：整批可能跑几十秒，
+/// 客户可能在中途按下「暂停全部」，所以**每个 gid 动作之前都重读一次**（一次锁读，不是 RPC），读到就收手。
+/// `answered`：本拍探活没拿到应答时整批不发。引擎不应答时那些调用必然失败，整批是纯浪费，
+/// 而且会白占掉这一拍（探活、采样、档位判定都排在它后面）。跳过不是为了让档 3 提前：
+/// 档 3 的时点以决策时刻起算（`Ladder::next` 的 `last_pause_all`），与动作成败无关。
+///
+/// 动作前重新取一次 `tellActive`，与名单取交集：名单来自上一次成功采样，客户可能在那之后单独暂停了其中某个
+/// （暂停中的任务不在 `tellActive` 里）。取不到就整批不动，宁可这一拍不做。
+/// ⚠️ **仍有窗口**：取快照与每个 gid 的动作之间，客户仍可能暂停它。窗口从采样节拍（5 秒）缩到
+///    "一次 `tellActive` 往返，加上排在前面的那些 gid 的耗时"；慢引擎（逼近 10 秒超时）下，靠后的 gid 窗口可达几十秒。
+///
+/// 某个 gid 的停与起都没回话（[`Relaunch::Silent`]）⇒ 立即收手：引擎答不了这个 gid，后面的 gid
+/// 只会同样各赔一次超时。剩下的 gid 没被动过、也不欠账，跳过无害。
+///
+/// ⚠️ 只吃 `&Daemon` ⇒ 结构上够不到 `Kernel::engine_disconnected`。
+/// 本动作本身不置断开标志；任何路径在"发现引擎真的不通"时都可以置位
+/// （例如档 3 之后新引擎的 `addUri` 失败且 ping 也不通，经 `settle_rpc_failure`），那与恢复动作无关。
+/// 组装 `ladder_pause_each` 那一行的字段（顺序是契约：读日志的人按位找）。
+/// 出口由调用方给 —— 生产路径传 `&crate::diagnostics::log`。
+/// （先例：`diag_counters.rs` 的 `Snapshot::log_with`，为同一类困难开的同一道缝。）
+///
+/// 判读（配合 `n`、`held`、`answered` 读出"这一档为什么没动手"）：
+///   · n=0, held=true  ⇒ 被客户的「暂停全部」挡住；
+///   · n=0, held=false ⇒ 四种：`answered=false`（探活无应答，整批不发）、`active()` 失败、
+///     名单为空、名单里的 gid 都不在 `tellActive` 里（客户单独暂停了它们，或已不在活动表）；
+///   · n>0, held=true  ⇒ 中途被按下，剩下的 gid 没动。
+/// `held` 是**最终**那次读数，不是入场快照。
+fn log_pause_each(
+    sink: &dyn Fn(&str, &[(&str, String)]),
+    n: usize,
+    held: bool,
+    answered: bool,
+    owed: usize,
+) {
+    sink(
+        "ladder_pause_each",
+        &[
+            ("n", n.to_string()),
+            ("held", held.to_string()),
+            ("answered", answered.to_string()),
+            ("owed", owed.to_string()),
+        ],
+    );
+}
+
+fn pause_then_resume_each(d: &Daemon, gids: &[String], held: &dyn Fn() -> bool, answered: bool) -> Vec<String> {
+    let mut owed = Vec::new();
+    let mut attempted = 0usize;
+    let mut held_last = held();
+    'batch: {
+        if held_last {
+            break 'batch;
+        }
+        if !answered {
+            break 'batch;
+        }
+        let Ok(live) = d.active() else {
+            break 'batch;
+        };
+        let live: BTreeSet<String> = live.into_iter().map(|t| t.gid).collect();
+        for gid in gids.iter().filter(|g| live.contains(*g)) {
+            held_last = held();
+            if held_last {
+                break 'batch;
+            }
+            attempted += 1;
+            match relaunch(d, gid, d.force_pause_detailed(gid), held) {
+                Relaunch::Clean => {}
+                Relaunch::Owed => owed.push(gid.clone()),
+                Relaunch::Silent => {
+                    owed.push(gid.clone());
+                    break 'batch;
+                }
+            }
+        }
+    }
+    // `held_last` 是最终那次读数（不是入场快照）；四个字段怎么读出"为什么没动手"，见 [`log_pause_each`]。
+    log_pause_each(
+        &crate::diagnostics::log,
+        attempted,
+        held_last,
+        answered,
+        owed.len(),
+    );
+    owed
+}
+
+/// **引擎的后台自愈**（规格 §3）：每秒判一次引擎是否还应答、下载是否还在走，
+/// 由 [`Ladder`] 决定这一拍要不要动手。
+///
+/// 两个信号互相独立（见 `engine::supervisor`）：
+///   · 信号 A（应答性）：每拍一条 `getGlobalStat`，记下它的成败与耗时；
+///   · 信号 B（进展）：同一条响应里的速率与活跃数。全局速率只用来决定重启预算能否复位。
+///     任务级的停滞按自己的节拍采样（[`TASK_SAMPLE_EVERY`]），与全局速率解耦：
+///     全局速率大于 0 时，卡住的那一个任务照样要被认出来。
+///
+/// 重启计数与认输标记只在**持续健康**且**下载在动**之后才复位（见 [`restart_budget_is_refilled`]）；
+/// 单次探通不复位。
+///
+/// ⚠️ **不用 `Daemon::snapshot()` 判活**：它的 `tellActive` 正是现场卡住的那一条（规格 F2/F3）。
+///    判活只用 `probe()`；任务级的 `active()` 只按 [`TASK_SAMPLE_EVERY`] 的节拍、且本拍探通时才调。
+///
+/// ⚠️ **`daemon` 句柄每拍从锁里现取**，不当作参数传进来：换引擎之后句柄会变，启动时的那份会过期。
+///
+/// ⚠️ **网络 I/O 在锁外**：锁内只取句柄与计数器，以及翻断开标志那一下（连同它的诊断）。
 ///    [`replace_engine`] 内部同样把"收旧引擎"与"起新引擎"两段都放在锁外。
 pub fn spawn_recovery(kernel: Arc<Mutex<Kernel>>) {
     std::thread::Builder::new()
         .name("engine-recovery".to_string())
         .spawn(move || {
-            let mut last = std::time::Instant::now();
-            // 本轮断开里连续探活失败了几次 / 已经换了几次引擎 / 有没有认过输。
-            // ⚠️ 两个计数都在**探通的那一刻**归零 —— "这一次断开结束了"才是归零点，
-            //    而不是"换过引擎了"：换了之后照样探不通，就该继续往阈值上数，
-            //    数满 `RECOVERY_MAX_RESTARTS` 次才认输。
-            let mut failures: u32 = 0;
+            let mut ladder = Ladder::new(Thresholds::default());
+            let mut liveness = Liveness::default();
+            let mut progress = Progress::default();
+            let mut task_progress = TaskProgress::default();
             let mut restarts: u32 = 0;
             let mut gave_up = false;
+            let mut stall_prev: Option<crate::procstat::Counters> = None;
+            let mut last_counters = std::time::Instant::now();
+            let mut last_task_sample = std::time::Instant::now();
+            let mut recorded_stalls: BTreeSet<String> = BTreeSet::new();
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                // 锁里：取当前 daemon 句柄 + 问"到点了吗"，随即放锁。
-                let (due, d) = {
+                let (d, counters, disconnected, mut owed, dir) = {
                     let k = kernel.lock().unwrap_or_else(PoisonError::into_inner);
                     let Some(d) = k.daemon.clone() else { continue };
                     (
-                        should_recover_probe(k.engine_disconnected, last.elapsed()),
                         d,
+                        Arc::clone(&k.counters),
+                        k.engine_disconnected,
+                        k.pending_unpause.clone(),
+                        k.download_dir.clone(),
                     )
                 };
-                if !due {
-                    continue;
+                let now = std::time::Instant::now();
+
+                let started = std::time::Instant::now();
+                let probe = d.probe();
+                let answered = probe.is_ok();
+                match probe {
+                    Ok(stat) => {
+                        liveness.record_ok(started.elapsed());
+                        progress.observe(
+                            now,
+                            stat.download_speed.max(0) as u64,
+                            stat.num_active.max(0) as u64,
+                        );
+                        if disconnected {
+                            let mut k = kernel.lock().unwrap_or_else(PoisonError::into_inner);
+                            if k.engine_disconnected {
+                                crate::diagnostics::log(
+                                    "engine_recovered",
+                                    &[("by", "recovery_probe".to_string())],
+                                );
+                                k.set_engine_disconnected(false, "recovery_probe");
+                            }
+                        }
+                    }
+                    Err(_) => liveness.record_fail(),
                 }
-                last = std::time::Instant::now();
-                // 锁外探活（最坏 RPC_TIMEOUT）。
-                if d.ping().is_ok() {
-                    failures = 0;
+
+                // 本拍没应答就不采样：那一拍 tellActive 多半也拿不到应答。取不到就保留上次的记录，
+                // 记录自带时刻，一次抖动不该把一段真实的停滞抹掉。
+                if answered && now.saturating_duration_since(last_task_sample) >= TASK_SAMPLE_EVERY {
+                    last_task_sample = now;
+                    if let Ok(tasks) = d.active() {
+                        task_progress.observe(now, &active_tasks(&tasks));
+                    }
+                }
+                let stalled_tasks = task_progress.stalled_count(now, &ladder.thresholds());
+                let stalled = task_progress.stalled_with_durations(now, &ladder.thresholds());
+                record_new_stalls(&counters, &stalled, &mut recorded_stalls);
+
+                if now.saturating_duration_since(last_counters) >= Duration::from_secs(60) {
+                    last_counters = now;
+                    counters.snapshot().log("periodic");
+                    // 轮转路径与启动的 `--log=` **同一个绝对形式**（`absolute_dir`）：
+                    // 不经它的话，`download_dir` 是相对路径时（`paths::download_dir` 在 `$HOME`
+                    // 缺失时回退 `benagen-downloads`）轮转会指到别处。解析失败就跳过这一拍
+                    // （日志轮转不许打断下载）。⚠️ 这个调用点活在循环里，运行时钉不到
+                    // （同本计划其他「运行时钉不到」）；推导一致性由 [`crate::engine::daemon::absolute_dir`]
+                    // 的既有行为测试与 `start_on_port` 的同一调用保证。
+                    if let Ok(abs) = crate::engine::daemon::absolute_dir(&dir) {
+                        crate::engine::daemon::rotate_engine_log(
+                            &abs.join(crate::engine::daemon::ENGINE_LOG_FILE),
+                        );
+                    }
+                }
+
+                if answered && !owed.is_empty() {
+                    let owed_before = owed.clone();
+                    // 拍首取的 hold 快照可能已过时（探活与 active() 最长约 20 秒，客户可能在此期间按下「暂停全部」），
+                    // 所以补发前于锁内重读一次。
+                    let hold = lock(&kernel).hold_auto_retry;
+                    retry_pending_unpause(&d, &mut owed, hold);
+                    if owed != owed_before {
+                        persist_pending(&kernel, &owed);
+                    }
+                }
+
+                let engine_moving = progress.stalled_for(now) < ladder.thresholds().stall;
+                let rung = ladder.next(now, &liveness, stalled_tasks, engine_moving);
+                if restart_budget_is_refilled(
+                    ladder.healthy_for(now),
+                    progress.stalled_for(now),
+                    &ladder.thresholds(),
+                ) {
                     restarts = 0;
                     gave_up = false;
-                    let mut k = kernel.lock().unwrap_or_else(PoisonError::into_inner);
-                    if k.engine_disconnected {
-                        crate::diagnostics::log(
-                            "engine_recovered",
-                            &[("by", "recovery_probe".to_string())],
-                        );
-                        k.set_engine_disconnected(false, "recovery_probe");
-                    }
-                    continue;
                 }
-
-                // 探不通。数一格，够了才换引擎。
-                failures += 1;
-                if !should_restart_engine(failures) {
-                    continue;
-                }
-                if restarts >= RECOVERY_MAX_RESTARTS {
-                    if !gave_up {
-                        gave_up = true;
-                        crate::diagnostics::log(
-                            "engine_restart_gave_up",
-                            &[("restarts", restarts.to_string())],
-                        );
+                match rung {
+                    Rung::Observe => {}
+                    Rung::ReconnectOne => {
+                        note_rung(&counters, rung);
+                        // 在动作前一刻读，不用拍首快照（快照可能已经过时）。
+                        // 循环里的这处调用点（以及档 2 的同型调用）运行时钉不到：没有可注入的桩去造"客户恰好在此刻按下暂停全部"，
+                        // 复查的行为由 `relaunch` 的单测守着。
+                        let hold = || lock(&kernel).hold_auto_retry;
+                        if reconnect_most_stalled(&d, &mut task_progress, &ladder.thresholds(), now, &mut owed, &hold)
+                            .is_some()
+                        {
+                            crate::diagnostics::log("ladder_reconnect", &[("did", "1".to_string())]);
+                        }
+                        persist_pending(&kernel, &owed);
                     }
-                    continue;
-                }
-
-                restarts += 1;
-                // `exited` 是**这个比特**：进程没了，还是活着但不吭声。
-                // 现场那份 9.4 小时的日志里 33 次「已断开」一次都分不开这两种，
-                // 而它们要修的方向完全不同（一个是"没人把它拉起来"，一个是"它为什么卡"）。
-                crate::diagnostics::log(
-                    "engine_restart",
-                    &[
-                        ("attempt", restarts.to_string()),
-                        ("consecutive", failures.to_string()),
-                        ("exited", d.process_exited().to_string()),
-                    ],
-                );
-                match replace_engine(&kernel) {
-                    Ok(_) => {
-                        failures = 0;
-                        crate::diagnostics::log(
-                            "engine_restarted",
-                            &[("attempt", restarts.to_string())],
-                        );
+                    Rung::PauseAllThenResumeAll => {
+                        note_rung(&counters, rung);
+                        // `unresponsive` 分支不要求 `!engine_moving`，所以客户按过「暂停全部」时这里必须挡。
+                        // 名单只取卡住的：档 2 是来救它们的，健康任务不该被停一下。
+                        // 恢复动作本身不置断开标志（见 `pause_then_resume_each`）。
+                        let hold = || lock(&kernel).hold_auto_retry;
+                        let gids = task_progress.stalled_gids(now, &ladder.thresholds());
+                        owed.extend(pause_then_resume_each(&d, &gids, &hold, answered));
+                        persist_pending(&kernel, &owed);
                     }
-                    Err(e) => {
+                    Rung::ReplaceEngine => {
+                        if restarts >= RECOVERY_MAX_RESTARTS {
+                            if !gave_up {
+                                gave_up = true;
+                                crate::diagnostics::log(
+                                    "engine_restart_gave_up",
+                                    &[("restarts", restarts.to_string())],
+                                );
+                            }
+                            continue;
+                        }
+                        restarts += 1;
+                        note_rung(&counters, rung);
+                        crate::procstat::log_sample(d.pid(), &mut stall_prev, "before_restart");
+                        // `exited` 区分"进程没了"与"活着但不吭声"，两者要修的方向完全不同。
                         crate::diagnostics::log(
-                            "engine_restart_failed",
-                            &[("attempt", restarts.to_string()), ("err", e.message)],
+                            "engine_restart",
+                            &[
+                                ("attempt", restarts.to_string()),
+                                ("exited", d.process_exited().to_string()),
+                            ],
                         );
+                        match replace_engine(&kernel) {
+                            Ok(_) => {
+                                // 欠账的 gid 属于旧引擎，换过去之后补发只会永远报"找不到"。
+                                owed.clear();
+                                persist_pending(&kernel, &owed);
+                                counters.record_engine_restart();
+                                crate::diagnostics::log(
+                                    "engine_restarted",
+                                    &[("attempt", restarts.to_string())],
+                                );
+                            }
+                            Err(e) => crate::diagnostics::log(
+                                "engine_restart_failed",
+                                &[("attempt", restarts.to_string()), ("err", e.message)],
+                            ),
+                        }
                     }
                 }
             }
@@ -612,6 +990,118 @@ fn run_update_check(kernel: &Arc<Mutex<Kernel>>) {
     k.save_update_state();
 }
 
+// ---------------------------------------------------------------------------
+// 失败任务的自动重试（规格 2026-10-12 §7；纯判据在 `autoretry.rs`）
+// ---------------------------------------------------------------------------
+
+/// 自动重试的节拍。5 秒足够：真正的间隔由 [`autoretry::backoff`] 决定（30 秒起步）。
+const AUTO_RETRY_TICK: Duration = Duration::from_secs(5);
+
+/// 跑一拍自动重试，返回这一拍重新入队了几个文件。
+///
+/// 只重试：**瞬时性**失败（`is_transient`）、**用户想下的**（在 `intent` 里）、
+/// **没有被暂停全部按住**、**引擎没被判断开**、**没在搬运**。其余一律不碰。
+///
+/// 网络 I/O（快照与逐个 `remove`/`add`/`pause`）都在**锁外**。进锁只有三处：取输入、
+/// add 之后复查「暂停全部」、`reopen_for_download`。
+/// `scale` 把退避按比例缩放（生产 1.0；测试 0.0 让间隔归零）。
+fn auto_retry_tick(
+    kernel: &Arc<Mutex<Kernel>>,
+    tracker: &mut autoretry::Tracker,
+    now: std::time::Instant,
+    scale: f64,
+) -> usize {
+    let (d, m, wanted, complete, counters) = {
+        let k = lock(kernel);
+        let migrating = k.migrate.lock().unwrap_or_else(PoisonError::into_inner).running;
+        if k.hold_auto_retry || k.engine_disconnected || migrating {
+            return 0;
+        }
+        let (Some(d), Some(m)) = (k.daemon.clone(), k.manifest.clone()) else {
+            return 0;
+        };
+        let wanted: BTreeSet<String> = k.intent.paths().cloned().collect();
+        (d, m, wanted, k.complete.clone(), Arc::clone(&k.counters))
+    };
+    let Ok(snap) = d.snapshot() else { return 0 };
+    let failing: Vec<(String, String)> = snap
+        .tasks
+        .iter()
+        .filter(|t| t.state == engine::status::TaskState::Error && autoretry::is_transient(&t.err))
+        .filter_map(|t| snap.path_map.get(&t.gid).map(|p| (t.gid.clone(), p.clone())))
+        .filter(|(_, p)| wanted.contains(p))
+        .collect();
+    // 记账只在路径不再需要时清（已移出引擎 / 已完成 / 已从 intent 删掉）。活跃、等待中的重试
+    // 必须保留它的次数：否则源端不回数据时每次都要活满超时才报错，计数每拍清零，上限形同虚设。
+    let live: BTreeSet<String> = snap
+        .path_map
+        .values()
+        .filter(|p| wanted.contains(*p) && !complete.contains(*p))
+        .cloned()
+        .collect();
+    tracker.retain_failing(&live);
+
+    let mut requeued: Vec<String> = Vec::new();
+    // 每个提交操作解析一次、整批复用（规格 §5.3）。**惰性**：`failing` 为空是常态，
+    // 循环外无条件 `resolve_ips` 会让每拍（5 秒）都做一次 DNS——解析慢时 tick 自己被阻塞。
+    // 只在真要重试时才解析。
+    let mut ips: Option<Vec<std::net::IpAddr>> = None;
+    for (gid, path) in &failing {
+        if !tracker.should_retry(path, now, scale) {
+            continue;
+        }
+        let Some(f) = m.files.iter().find(|f| &f.path == path) else { continue };
+        let ips = ips.get_or_insert_with(|| resolve_ips(&m.base_url));
+        let Some(pf) = plan_file(&m, f, ips.as_slice(), &counters) else { continue };
+        // 先记一次再动手：哪怕下面失败，也按退避排下一次，不会每拍都敲。
+        tracker.record_attempt(path, now, scale);
+        if d.remove(gid).is_err() {
+            continue;
+        }
+        let Ok(new_gid) = d.add(&pf.uris, &pf.dir, &pf.out, &pf.opts) else {
+            continue;
+        };
+        // 开工时看到的「暂停全部」已经过时了（三段 RPC 之间用户随时可以按）：进锁复查，
+        // 按住就立刻暂停这个新任务。暂停不成功则摘掉——宁可不重试，也不让它在按住期间写盘。
+        let held = lock(kernel).hold_auto_retry;
+        if held && d.pause(&new_gid).is_err() {
+            let _ = d.remove(&new_gid);
+            continue;
+        }
+        requeued.push(path.clone());
+    }
+    if !requeued.is_empty() {
+        let mut k = lock(kernel);
+        for p in &requeued {
+            reopen_for_download(&mut k, p);
+        }
+        // 日志只记数量与最大次数，不记路径（诊断日志不落文件名）。
+        let max_attempt = requeued.iter().map(|p| tracker.attempts(p)).max().unwrap_or(0);
+        crate::diagnostics::log(
+            "auto_retry",
+            &[
+                ("files", requeued.len().to_string()),
+                ("max_attempt", max_attempt.to_string()),
+            ],
+        );
+    }
+    requeued.len()
+}
+
+/// 起自动重试线程（图形客户端的内核用；命令行工具自有一套收尾语义，不起）。
+pub fn spawn_auto_retry(kernel: Arc<Mutex<Kernel>>) {
+    thread::Builder::new()
+        .name("auto-retry".to_string())
+        .spawn(move || {
+            let mut tracker = autoretry::Tracker::default();
+            loop {
+                thread::sleep(AUTO_RETRY_TICK);
+                auto_retry_tick(&kernel, &mut tracker, std::time::Instant::now(), 1.0);
+            }
+        })
+        .expect("起自动重试线程失败");
+}
+
 /// 现在（unix 秒）。时钟回拨由 `update::should_check` 那一支兜住。
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -652,6 +1142,9 @@ pub fn replace_engine(kernel: &Arc<Mutex<Kernel>>) -> Result<Arc<Daemon>, ErrorB
             let mut k = lock(kernel);
             k.daemon = Some(Arc::clone(&fresh));
             k.set_engine_disconnected(false, "engine_restarted");
+            drop(k);
+            // 旧引擎里的队列已经没了：据 `intent` 补回（`-c` 续传）。
+            restore_queue_after_replace(kernel);
             Ok(fresh)
         }
         Err(e) => {
@@ -756,17 +1249,19 @@ pub fn spawn_verify_worker(kernel: Arc<Mutex<Kernel>>, rx: Receiver<VerifyJob>, 
                     k.manifest.clone()
                 };
                 if let Some(m) = manifest {
-                    let daemon = {
+                    let (daemon, counters) = {
                         let mut k = kernel.lock().unwrap_or_else(PoisonError::into_inner);
-                        k.read_engine().ok()
+                        (k.read_engine().ok(), Arc::clone(&k.counters))
                     };
                     if let Some(d) = daemon {
+                        // 每个提交操作解析一次、整批复用（规格 §5.3）。
+                        let ips = resolve_ips(&m.base_url);
                         for f in &retry_files {
                             // 落盘路径 = manifest.path 原文（契约 §3.1）
-                            let Some(pf) = engine::new_planned_file(&m, f) else {
+                            let Some(pf) = plan_file(&m, f, &ips, &counters) else {
                                 continue;
                             };
-                            if let Err(e) = d.add(&pf.url, &pf.dir, &pf.out) {
+                            if let Err(e) = d.add(&pf.uris, &pf.dir, &pf.out, &pf.opts) {
                                 eprintln!(
                                     "benagen-core: 校验不符后重新入队失败（{}）: {e}",
                                     f.path
@@ -907,6 +1402,11 @@ pub fn spawn_landing_watcher(kernel: Arc<Mutex<Kernel>>, tx: Sender<VerifyJob>) 
 /// （客户看到的是"点了没反应"，比一条结构化错误差得多）。
 fn lock(kernel: &Arc<Mutex<Kernel>>) -> MutexGuard<'_, Kernel> {
     kernel.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 搬运是否在跑（与 `op_enqueue` / 后台入队 / 自愈补回共用一个判据）。
+fn migrating(k: &Kernel) -> bool {
+    k.migrate.lock().unwrap_or_else(PoisonError::into_inner).running
 }
 
 fn with_kernel<T>(
@@ -1175,11 +1675,22 @@ pub fn dispatch(kernel: &Arc<Mutex<Kernel>>, req: &Request) -> (Response, bool) 
         "plan" => op_plan(kernel, &req.params),
         "enqueue" => op_enqueue(kernel, &req.params),
         "transfer_list" => with_kernel(kernel, op_transfer_list),
-        "task_action" => with_kernel(kernel, |k| op_task_action(k, &req.params)),
+        // `resume_all` 要在锁外算 `complete`（内含 HEAD），所以不能裹 `with_kernel`；
+        // 其余动作照旧在锁内。分流点就这一处。
+        "task_action" => match req.params.get("action").and_then(Value::as_str) {
+            Some("resume_all") => op_resume_all(kernel),
+            _ => with_kernel(kernel, |k| op_task_action(k, &req.params)),
+        },
         "verify_status" => with_kernel(kernel, op_verify_status),
         "get_settings" => with_kernel(kernel, op_get_settings),
         "set_settings" => with_kernel(kernel, |k| op_set_settings(k, &req.params)),
         "get_state" => with_kernel(kernel, op_get_state),
+        // `migrate_start` 不裹 `with_kernel`：它要把 `kernel` 交给后台线程（搬完后让
+        // `complete` 过期）。真正的搬运在线程里，这条请求本身立刻返回。
+        "migrate_start" => op_migrate_start(kernel, &req.params),
+        "migrate_status" => with_kernel(kernel, op_migrate_status),
+        "get_download_dir" => with_kernel(kernel, op_get_download_dir),
+        "enqueue_status" => with_kernel(kernel, op_enqueue_status),
         "update_status" => with_kernel(kernel, op_update_status),
         "update_set_enabled" => with_kernel(kernel, |k| op_update_set_enabled(k, &req.params)),
         // ⚠️ 这一条**刻意不裹 `with_kernel`**（与上面那五个同源）：它最贵的部分是
@@ -1282,7 +1793,7 @@ fn clear_engine_batch(d: &Daemon) {
 /// `params.base_url` 可选：壳可能指向镜像或测试服务端（默认 `delivery::DEFAULT_BASE_URL`）。
 ///
 /// ⚠️ **本方法刻意不走 `with_kernel`**（契约 §5.2）。它有三段网络 I/O，一段都不能持锁：
-///   - `delivery::fetch`：30 秒 × 3 次 + 1.5 秒退避 = 最坏 **91.5 秒**；
+///   - `delivery::fetch`：15 秒 × 5 次 + 15 秒退避 = 最坏 **90 秒**（2026-10-12 调参；记账仍按 91.5 秒留余量）；
 ///   - `clear_engine_batch`：10 秒快照 + 3×10 秒短路上限 = 最坏约 **40 秒**；
 ///   - 全量 `plan`：每个 crc64 为空的文件一次 HEAD，最坏 **30 秒 × N**。
 ///
@@ -1309,13 +1820,16 @@ pub fn op_load_delivery(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<V
 
     // ── 锁内 ①（短）：判"码变了没有"，并取旧引擎的句柄 ──────────────────
     let (code_changed, old_daemon) = {
-        let k = lock(kernel);
+        let mut k = lock(kernel);
         // ⚠️ **换码即作废，引擎侧也要清干净**（裁定 10 改判为"要修"）。
         // 只在**码真的变了**的时候清：同一个码重复 load（壳刷新树）不该把正在下的任务删掉。
-        (
-            k.manifest.as_ref().is_some_and(|old| old.code != m.code),
-            k.daemon.clone(),
-        )
+        let changed = k.manifest.as_ref().is_some_and(|old| old.code != m.code);
+        if changed {
+            // 在清引擎**之前**就作废后台队列与在飞的一批：清引擎要几十秒，期间飞着的
+            // addUri 若不被代数挡住，就会把旧批次的文件落进引擎。
+            k.discard_feed_queue();
+        }
+        (changed, k.daemon.clone())
     };
 
     // ── 锁外 ③：换码清理（最坏约 40 秒，见 `clear_engine_batch`）────────
@@ -1336,6 +1850,11 @@ pub fn op_load_delivery(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<V
         k.state.bind(&m.code);
         if let Err(e) = k.state.save() {
             eprintln!("benagen-core: 写状态文件失败（不影响本批）: {e}");
+        }
+        // 「想下的文件集」同样随码绑定：同一个码（重启内核后重放批次）原样保留，
+        // 换码即清空。落盘失败不致命，只影响「自动补回队列」。
+        if k.intent.bind(&m.code) {
+            k.save_intent();
         }
         k.manifest = Some(m.clone());
         k.verify = verify::CheckResult::default();
@@ -1857,123 +2376,100 @@ pub fn op_enqueue(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, 
         ensure_complete(kernel);
     }
 
-    let mut k = lock(kernel);
-    let m = k.require_manifest()?;
-    let targets = if raw.is_empty() {
-        let (path_map, tasks) = current_tasks(&mut k);
-        let states = view::compose(&m.files, &k.complete, &path_map, &tasks);
-        let pending = view::pending_paths(&m.files, &states);
-        // ⚠️ **"没有待下载的"不是错误**（约束 D-2 / 阶段 D 任务 A）。
-        //
-        // 壳在「勾选面 == 全部文件」时**故意**发 `{"paths": []}`（全局约束 C-3：不许把
-        // 整批路径塞进请求，会撑爆 8 MiB 行上限），所以"整批都已经下好了、客户又点了一次
-        // 下载"这条**常规**流必然走到这里、`pending` 必然为空。修复前它落到
-        // `resolve_targets` 的 `out.is_empty()` 分支，回的是
-        // `invalid_params: 没有匹配到任何文件`——一个**成功状态被报成了错误**。
-        //
-        // 回执形状逐字沿用下面那条成功回执（`added` / `rejected`），既有字段名与形状
-        // 一个不动（D-3）。这里**必须早退**，不能"让空 targets 走完下面的流程"：
-        // 那样会为一件事都不做启动 aria2c（`ensure_engine`）。
-        //
-        // 另一半**一个字都不许改**：`raw` 非空（客户点名了具体路径）时走下面那条
-        // `resolve_targets(&m, &raw)`，点名一个不存在的路径仍然必须是 `invalid_params`
-        // ——错误语义是不对称的，由 e2e 的
-        // `deleted_local_file_is_redownloaded_by_download_all` 一起钉住。
-        if pending.is_empty() {
-            return Ok(json!({"added": [], "rejected": []}));
+    // ── 锁内（短）：定目标、查磁盘、拿引擎。这里**不做** RPC（addUri 在锁外逐个做）──────
+    let (m, daemon, epoch, targets) = {
+        let mut k = lock(kernel);
+        let m = k.require_manifest()?;
+        let mig = k.migrate.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if mig.running {
+            return Err(ErrorBody::invalid_params(format!(
+                "正在搬运已下载的文件（{}/{}），搬完后再试",
+                mig.files_done, mig.files_total
+            )));
         }
-        resolve_targets(&m, &pending)?
-    } else {
-        resolve_targets(&m, &raw)?
+        let targets = if raw.is_empty() {
+            let (path_map, tasks) = current_tasks(&mut k);
+            let states = view::compose(&m.files, &k.complete, &path_map, &tasks);
+            // 已经在后台队列里等提交的，不算「待下载」：否则重复点「下载全部」会把同一个路径再 addUri 一遍。
+            let queued: BTreeSet<&str> = k.feed_queue.iter().map(|f| f.path.as_str()).collect();
+            // 引擎里已有**非完成**任务的路径（活跃 / 等待 / 暂停 / 失败）不由「下载全部」接手：
+            // 重复提交会为同一路径造出第二个 GID。暂停的交给「一键开始」，失败的交给自动重试或用户显式重试。
+            // 已完成的仍保留：本地文件被删后要能重下。
+            let owned: BTreeSet<&str> = tasks
+                .iter()
+                .filter(|t| t.state != engine::status::TaskState::Complete)
+                .filter_map(|t| path_map.get(&t.gid).map(String::as_str))
+                .collect();
+            let pending: Vec<String> = view::pending_paths(&m.files, &states)
+                .into_iter()
+                .filter(|p| !queued.contains(p.as_str()) && !owned.contains(p.as_str()))
+                .collect();
+            // ⚠️ **"没有待下载的"不是错误**（约束 D-2 / 阶段 D 任务 A）。
+            //
+            // 壳在「勾选面 == 全部文件」时**故意**发 `{"paths": []}`（全局约束 C-3：不许把
+            // 整批路径塞进请求，会撑爆 8 MiB 行上限），所以"整批都已经下好了、客户又点了一次
+            // 下载"这条**常规**流必然走到这里、`pending` 必然为空。修复前它落到
+            // `resolve_targets` 的 `out.is_empty()` 分支，回的是
+            // `invalid_params: 没有匹配到任何文件`——一个**成功状态被报成了错误**。
+            //
+            // 回执形状逐字沿用下面那条成功回执（`added` / `rejected`），既有字段名与形状
+            // 一个不动（D-3）。这里**必须早退**，不能"让空 targets 走完下面的流程"：
+            // 那样会为一件事都不做启动 aria2c（`ensure_engine`）。
+            //
+            // 另一半**一个字都不许改**：`raw` 非空（客户点名了具体路径）时走下面那条
+            // `resolve_targets(&m, &raw)`，点名一个不存在的路径仍然必须是 `invalid_params`
+            // ——错误语义是不对称的，由 e2e 的
+            // `deleted_local_file_is_redownloaded_by_download_all` 一起钉住。
+            if pending.is_empty() {
+                return Ok(json!({"added": [], "rejected": []}));
+            }
+            resolve_targets(&m, &pending)?
+        } else {
+            resolve_targets(&m, &raw)?
+        };
+
+        // ① 开工前检查：**先于**引擎启动。
+        // 🔴 **分段计时**（详细档，2026-10-08）。一次 `enqueue` 在真机上花过 **47 / 70 / 79 秒**
+        //    （壳日志），而日志里原先只看得到"总耗时"——**钱花在哪一段读不出来**。
+        //    ⚠️ 只在 `verbose` 档写（`log_verbose`）：普通档多这几行是噪声。
+        let need: i64 = targets.iter().map(|f| f.size).sum();
+        let t0 = std::time::Instant::now();
+        preflight(&k.download_dir, need)?;
+        crate::diagnostics::log_verbose(
+            "enqueue_stage",
+            &[
+                ("stage", "preflight".to_string()),
+                ("n", targets.len().to_string()),
+                ("ms", t0.elapsed().as_millis().to_string()),
+            ],
+        );
+
+        // ② 起引擎（仍在锁内：起引擎的网络 I/O 是既有的另一处，见 `ensure_engine`）。
+        let t1 = std::time::Instant::now();
+        let daemon = k.ensure_engine()?;
+        crate::diagnostics::log_verbose(
+            "enqueue_stage",
+            &[
+                ("stage", "ensure_engine".to_string()),
+                ("ms", t1.elapsed().as_millis().to_string()),
+            ],
+        );
+        (m, daemon, k.batch_epoch, targets)
     };
 
-    // 🔴 **分段计时**（详细档，2026-10-08）。一次 `enqueue` 在真机上花过 **47 / 70 / 79 秒**
-    //    （壳日志），而日志里原先只看得到"总耗时"——**钱花在哪一段读不出来**，
-    //    连着两轮排查都卡在这一格。下面每一段各记一条，下一次导出就能直接指认。
-    //    ⚠️ 只在 `verbose` 档写（`log_verbose`）：普通档多这几行是噪声。
-    //    ⚠️ 三段都记了、却都只有几十毫秒 ⇒ 时间在**上面**那一段（解析勾选面 /
-    //      `ensure_complete`），那时这三条小读数本身就是线索。
-
-    // ① 开工前检查：**先于**引擎启动
-    let need: i64 = targets.iter().map(|f| f.size).sum();
-    let t0 = std::time::Instant::now();
-    preflight(&k.download_dir, need)?;
-    crate::diagnostics::log_verbose(
-        "enqueue_stage",
-        &[
-            ("stage", "preflight".to_string()),
-            ("n", targets.len().to_string()),
-            ("ms", t0.elapsed().as_millis().to_string()),
-        ],
-    );
-
-    // ② 起引擎
-    let t1 = std::time::Instant::now();
-    let daemon = k.ensure_engine()?;
-    crate::diagnostics::log_verbose(
-        "enqueue_stage",
-        &[
-            ("stage", "ensure_engine".to_string()),
-            ("ms", t1.elapsed().as_millis().to_string()),
-        ],
-    );
-
-    // ③ 加任务
+    // ③ 加任务：大批量只同步提交前 [`FIRST_BATCH`] 个，让客户立刻看到任务开始；其余交给后台线程。
+    // 一口气提交成千上万个 `addUri` 既会让回执等上几分钟，引擎的响应也会随任务数逐级退化
+    // （现场日志：1ms → 8.6s → 超时）。
     let t2 = std::time::Instant::now();
-    let mut added: Vec<Value> = Vec::new();
-    let mut rejected: Vec<Value> = Vec::new();
-    // 引擎是在**第几个**文件上被判成断开的（`None` = 一路顺利）。见下面那一支的长注释。
-    let mut gave_up_at: Option<(usize, ErrorBody)> = None;
-    for (i, f) in targets.iter().enumerate() {
-        // 路径守卫（契约 §3.2）；`dir`/`out` 由 manifest.path 拆出且**不得规范化**（§3.1）
-        let Some(pf) = engine::new_planned_file(&m, f) else {
-            rejected.push(json!({"path": f.path, "reason": "路径不安全（越界/控制字符/空段）"}));
-            continue;
-        };
-        match daemon.add(&pf.url, &pf.dir, &pf.out) {
-            Ok(gid) => {
-                // 重下必须重新过一遍校验（旧的结论已经不成立了）——见 `reopen_for_download`。
-                reopen_for_download(&mut k, &f.path);
-                added.push(json!({"gid": gid, "path": f.path}));
-            }
-            Err(e) => {
-                let body = k.on_rpc_failure(&daemon, "aria2.addUri", e.clone());
-                if body.code == kcodes::ENGINE_DISCONNECTED {
-                    gave_up_at = Some((i, body));
-                    break;
-                }
-                rejected.push(json!({"path": f.path, "reason": e}));
-            }
-        }
-    }
-
-    // 🔴 **引擎中途不应答：停下来，但绝不把剩下那些静默吞掉**（2026-10-09）。
-    //
-    // **为什么停下来**：剩下的每一个 `addUri` 都要烧掉一次 10 秒超时，而失败那一支
-    // （`on_rpc_failure`）还会再打一次 10 秒探活 —— 现场那份日志里剩了 90 个文件，
-    // 一路试下去就是半个多小时，而客户眼前只有一条进度条。
-    //
-    // **为什么不是 `return Err`**（本版之前就是这样）：入队是**逐个生效**的 —— 走到这里时
-    // 前面那些**真的已经在下了**（现场那次是 62 个）。返回一个纯错误会把这份回执一起扔掉，
-    // 客户看到「下载引擎已断开」，完全不知道三分之二的批次已经入队。
-    // 现在按**正常回执**返回：`added` 保留已经加上的，剩下的每一个都进 `rejected`
-    // ——壳早就有一整套部分成功回执（「已加入 N 个下载任务」+ 逐条理由），
-    // **前端一个字都不用改**，而约束 4（不得静默少交）也照旧成立。
-    //
-    // ⚠️ 全局的"引擎已断开"状态**照旧**由 `on_rpc_failure` 置起（上面那一行已经置了），
-    //    横幅与闸门不受影响；壳的下一次调用仍然会拿到断开。
-    if let Some((at, body)) = &gave_up_at {
-        let reason = format!("未提交：{}", short_cause(&body.message));
-        for f in &targets[*at..] {
-            rejected.push(json!({"path": f.path, "reason": reason}));
-        }
-    }
-
-    if added.is_empty() && !rejected.is_empty() {
-        return Err(ErrorBody::invalid_params(format!(
-            "没有任何文件被加入下载：{rejected:?}"
-        )));
-    }
+    let (now_targets, later) = split_for_feeding(&targets);
+    let (added, mut rejected, stopped) = submit_off_lock(kernel, &daemon, &m, epoch, now_targets);
+    let stopped_at = stopped.as_ref().map(|(at, _)| *at);
+    let (pending, extra) = {
+        let mut k = lock(kernel);
+        hand_over(&mut k, epoch, now_targets, later, stopped)
+    };
+    rejected.extend(extra);
+    ensure_feeder(kernel);
     crate::diagnostics::log_verbose(
         "enqueue_stage",
         &[
@@ -1984,15 +2480,278 @@ pub fn op_enqueue(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, 
             // 这个读数就是"已经入队了多少"的直接证据。
             (
                 "stopped_at",
-                match gave_up_at {
-                    Some((at, _)) => at.to_string(),
+                match stopped_at {
+                    Some(at) => at.to_string(),
                     None => targets.len().to_string(),
                 },
             ),
             ("ms", t2.elapsed().as_millis().to_string()),
         ],
     );
-    Ok(json!({"added": added, "rejected": rejected}))
+    // 没有任何文件被加入、也没有待提交的 ⇒ 错误。待提交的（后台还会加）不算失败。
+    if added.is_empty() && pending == 0 && !rejected.is_empty() {
+        return Err(ErrorBody::invalid_params(format!(
+            "没有任何文件被加入下载：{rejected:?}"
+        )));
+    }
+    Ok(json!({"added": added, "rejected": rejected, "pending": pending}))
+}
+
+/// 队列里有活而后台线程没在跑 ⇒ 起一个（调用方持有 `kernel`，不持锁）。
+fn ensure_feeder(kernel: &Arc<Mutex<Kernel>>) {
+    let mut k = lock(kernel);
+    if !k.feeder_running && !k.feed_queue.is_empty() {
+        k.feeder_running = true;
+        spawn_feeder(Arc::clone(kernel));
+    }
+}
+
+/// 同步提交的第一批大小。
+const FIRST_BATCH: usize = 100;
+/// 后台每批提交的大小（持锁时间要短：每批之间放锁，让协议循环和校验线程插得进来）。
+const FEED_BATCH: usize = 20;
+
+/// 把目标切成「现在同步提交」与「后台陆续提交」两段。
+fn split_for_feeding(targets: &[delivery::File]) -> (&[delivery::File], &[delivery::File]) {
+    targets.split_at(targets.len().min(FIRST_BATCH))
+}
+
+/// 后台陆续加入线程：每拍取 [`FEED_BATCH`] 个提交，批间放锁并小睡；队列空了就退出。
+///
+/// 出队发生在**提交完成之后**（不是一取出就出队）：「下载全部」要据此排除正在飞的那一批。
+/// 队列只在换码时整体作废（见 [`Kernel::discard_feed_queue`]），等待期间绝不丢条目。
+pub fn spawn_feeder(kernel: Arc<Mutex<Kernel>>) {
+    thread::Builder::new()
+        .name("enqueue-feeder".to_string())
+        .spawn(move || loop {
+            if !feed_once(&kernel) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(200));
+        })
+        .expect("起后台入队线程失败");
+}
+
+/// 后台加入的一拍。返回 `false` ⇔ 队列已空、线程该退出（`feeder_running` 与它在同一把锁内复位）。
+///
+/// 返回 `true` 的等待情形：暂停全部按住、搬运中、引擎暂缺（自愈换引擎的窗口）。
+fn feed_once(kernel: &Arc<Mutex<Kernel>>) -> bool {
+    let (d, m, epoch, batch) = {
+        let mut k = lock(kernel);
+        if k.feed_queue.is_empty() {
+            k.feeder_running = false;
+            return false;
+        }
+        if k.hold_auto_retry || migrating(&k) {
+            return true;
+        }
+        let (Some(d), Some(m)) = (k.daemon.clone(), k.manifest.clone()) else {
+            return true;
+        };
+        let batch: Vec<delivery::File> = k.feed_queue.iter().take(FEED_BATCH).cloned().collect();
+        (d, m, k.batch_epoch, batch)
+    };
+
+    let (added, rejected, stopped) = submit_off_lock(kernel, &d, &m, epoch, &batch);
+
+    let mut k = lock(kernel);
+    if k.batch_epoch != epoch {
+        // 这一批在飞期间换了码：队列已经被整体登记为拒绝，这里不再记任何东西。
+        return true;
+    }
+    k.feed_added += added.len();
+    k.feed_rejected.extend(rejected);
+    match stopped {
+        None => {
+            k.feed_queue.drain(..batch.len());
+        }
+        Some((at, reason)) => {
+            // 引擎中途断开：本批余下的与队列里更后面的，一律登记为拒绝（不静默丢）。
+            let all: Vec<delivery::File> = k.feed_queue.drain(..).collect();
+            for f in &all[at..] {
+                k.feed_rejected.push(json!({"path": f.path, "reason": reason}));
+            }
+        }
+    }
+    true
+}
+
+/// `enqueue_status`：后台陆续加入的进度。读取即取走已完成的增量（`added` / `rejected`），
+/// `pending` 是还没提交的个数。
+pub fn op_enqueue_status(k: &mut Kernel) -> Result<Value, ErrorBody> {
+    let added = std::mem::take(&mut k.feed_added);
+    let rejected = std::mem::take(&mut k.feed_rejected);
+    Ok(json!({"pending": k.feed_queue.len(), "added": added, "rejected": rejected}))
+}
+
+/// 换码时未提交的理由（[`Kernel::discard_feed_queue`] 与 [`submit_off_lock`] 共用这一个）。
+const REPLACED_REASON: &str = "未提交：批次已换";
+
+// 测试缝：可换的 lookup（仅 `#[cfg(test)]`）。生产恒 `delivery::resolve_for_base` 的
+// `system_lookup`。先例：`diag_counters::Snapshot::log_with` 的出口注入——生产路径一个字不变。
+// （用 `//` 而非 `///`：`thread_local!` 是宏，rustdoc 不给宏展开产物生成文档。）
+#[cfg(test)]
+thread_local! {
+    static TEST_LOOKUP: std::cell::RefCell<Option<fn(&str, u16) -> Vec<std::net::IpAddr>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// 解析 base 的备胎 IP（规格 §5.3）。**每个提交操作解析一次、整批复用**。
+fn resolve_ips(base_url: &str) -> Vec<std::net::IpAddr> {
+    #[cfg(test)]
+    {
+        let lookup = TEST_LOOKUP.with(|t| *t.borrow());
+        if let Some(lookup) = lookup {
+            return delivery::resolve_for_base_with(lookup, base_url);
+        }
+    }
+    delivery::resolve_for_base(base_url)
+}
+
+/// 建 PlannedFile 并在真有备胎时补 Host 头（规格 §5.3 规则 6——同 [`delivery::host_header_for`]）。
+/// Host 头只在真有备胎时下发（域名-only 时 URI 自带正确 Host，多发反而错怪镜像）。
+///
+/// 真有备胎时在**构造点**记一笔多 IP 诊断（`record_multiip`）：只记构造证据——
+/// 「每 URI 成功/失败/被切换次数」aria2 的 `tellStatus` 取不到（§6.4 实测），
+/// 诚实边界写在 `diag_counters::record_multiip` 的注释里。
+fn plan_file(
+    m: &Manifest,
+    f: &delivery::File,
+    ips: &[std::net::IpAddr],
+    counters: &crate::diag_counters::Counters,
+) -> Option<engine::PlannedFile> {
+    let mut pf = engine::new_planned_file(m, f, ips)?;
+    if pf.uris.len() > 1 {
+        // `uris[0]` 是域名 URI，其后才是 IP 备胎 ⇒ 备胎数 = len - 1。
+        counters.record_multiip(pf.uris.len() - 1);
+        if let Some(h) = delivery::host_header_for(&m.base_url) {
+            pf.opts.insert("header".to_string(), h);
+        }
+    }
+    Some(pf)
+}
+
+/// 把一批文件逐个 `addUri` 进引擎。**RPC 全部在锁外**；每成功一个，才短暂进锁记 intent、复位复校验闸门。
+///
+/// `epoch` 是这一批取目标时的批次代数。进锁时若已变（换了码），刚加的那个立刻摘掉并停下：
+/// 它属于已经作废的批次，不得记进新批次的 intent。
+///
+/// 暂停全部按住期间加入的，立刻暂停；暂停不成功则摘掉并记为拒绝——不让它在按住期间悄悄写盘。
+///
+/// 返回 `(added, rejected, stopped)`。`stopped` 为 `Some((下标, 理由))` 时，**从该下标起的文件都未提交**，
+/// 由调用方登记（队列里的由 [`feed_once`] 登记，同步的由 [`hand_over`] 登记）。
+/// intent 在整批结束后统一落盘一次（逐个落盘是 O(N²) 的写放大）。
+fn submit_off_lock(
+    kernel: &Arc<Mutex<Kernel>>,
+    d: &Arc<Daemon>,
+    m: &Manifest,
+    epoch: u64,
+    targets: &[delivery::File],
+) -> (Vec<Value>, Vec<Value>, Option<(usize, String)>) {
+    let mut added: Vec<Value> = Vec::new();
+    let mut rejected: Vec<Value> = Vec::new();
+    let mut stopped: Option<(usize, String)> = None;
+    let mut intent_changed = false;
+    // 每个提交操作解析一次、整批复用（规格 §5.3）。
+    let ips = resolve_ips(&m.base_url);
+    // 多 IP 构造计数挂在 Kernel 的计数器上（跨换引擎存活）；这里借一次锁只取 Arc 克隆。
+    let counters = Arc::clone(&lock(kernel).counters);
+    for (i, f) in targets.iter().enumerate() {
+        // 路径守卫（契约 §3.2）；`dir`/`out` 由 manifest.path 拆出且**不得规范化**（§3.1）
+        let Some(pf) = plan_file(m, f, &ips, &counters) else {
+            rejected.push(json!({"path": f.path, "reason": "路径不安全（越界/控制字符/空段）"}));
+            continue;
+        };
+        let gid = match d.add(&pf.uris, &pf.dir, &pf.out, &pf.opts) {
+            Ok(gid) => gid,
+            Err(e) => {
+                let body = rpc_failure_off_lock(kernel, d, "aria2.addUri", e.clone());
+                if body.code == kcodes::ENGINE_DISCONNECTED {
+                    stopped = Some((i, format!("未提交：{}", short_cause(&body.message))));
+                    break;
+                }
+                rejected.push(json!({"path": f.path, "reason": e}));
+                continue;
+            }
+        };
+        let (current, held) = {
+            let mut k = lock(kernel);
+            if k.batch_epoch == epoch {
+                // 重下必须重新过一遍校验（旧的结论已经不成立了）——见 `reopen_for_download`。
+                reopen_for_download(&mut k, &f.path);
+                intent_changed |= k.intent.add(&f.path);
+                (true, k.hold_auto_retry)
+            } else {
+                (false, false)
+            }
+        };
+        if !current {
+            let _ = d.remove(&gid);
+            stopped = Some((i, REPLACED_REASON.to_string()));
+            break;
+        }
+        if held {
+            if let Err(e) = d.pause(&gid) {
+                let _ = d.remove(&gid);
+                rejected.push(json!({"path": f.path, "reason": e}));
+                continue;
+            }
+        }
+        added.push(json!({"gid": gid, "path": f.path}));
+    }
+    if intent_changed {
+        lock(kernel).save_intent();
+    }
+    (added, rejected, stopped)
+}
+
+/// 锁外版的 [`Kernel::on_rpc_failure`]：探活（网络 I/O）在锁外，只有判定那一下进锁。
+fn rpc_failure_off_lock(
+    kernel: &Arc<Mutex<Kernel>>,
+    d: &Arc<Daemon>,
+    op: &str,
+    err: String,
+) -> ErrorBody {
+    let ping_ok = d.ping().is_ok();
+    lock(kernel).settle_rpc_failure(ping_ok, op, err)
+}
+
+/// 同步提交一批之后的收尾（`enqueue` 与补回队列共用这一份）。
+///
+/// 一路顺利 ⇒ `later` 记 intent、进后台队列，返回待提交个数；
+/// 否则（引擎断开 / 换码）⇒ 本批余下的与 `later` 全部登记为拒绝，返回的就是这些拒绝项。
+/// 调用方持有 `k`（锁内）；入队之后由调用方在锁外 [`ensure_feeder`]。
+fn hand_over(
+    k: &mut Kernel,
+    epoch: u64,
+    now: &[delivery::File],
+    later: &[delivery::File],
+    stopped: Option<(usize, String)>,
+) -> (usize, Vec<Value>) {
+    let stop = stopped.or_else(|| {
+        (k.batch_epoch != epoch).then(|| (now.len(), REPLACED_REASON.to_string()))
+    });
+    match stop {
+        None => {
+            if later.is_empty() {
+                return (0, Vec::new());
+            }
+            for f in later {
+                k.intent.add(&f.path);
+            }
+            k.save_intent();
+            k.feed_queue.extend(later.iter().cloned());
+            (later.len(), Vec::new())
+        }
+        Some((at, reason)) => {
+            let rejected: Vec<Value> = now[at..]
+                .iter()
+                .chain(later)
+                .map(|f| json!({"path": f.path, "reason": reason}))
+                .collect();
+            (0, rejected)
+        }
+    }
 }
 
 /// 把一条内核错误消息压成**一行短因果**，给"未提交"那类逐条理由用。
@@ -2093,11 +2852,24 @@ pub fn op_task_action(k: &mut Kernel, params: &Value) -> Result<Value, ErrorBody
     // 而且壳需要"这个动作不存在"这条明确结论才能把界面上的按钮去掉。
     if !matches!(
         action,
-        "pause" | "unpause" | "retry" | "remove" | "clear_finished"
+        "pause" | "unpause" | "retry" | "remove" | "clear_finished" | "pause_all" | "resume_all"
     ) {
         return Err(ErrorBody::invalid_params(format!(
-            "不认识的动作 {action:?}（可用：pause / unpause / retry / remove / clear_finished）"
+            "不认识的动作 {action:?}（可用：pause / unpause / retry / remove / clear_finished / pause_all / resume_all）"
         )));
+    }
+    // `resume_all` 只能从 `handle` 的分流点进来（它需要 `Arc<Mutex<Kernel>>` 才能把
+    // `complete` 放在锁外算）。走到这里说明有人绕过了分流——大声报错，不要静默当成别的。
+    if action == "resume_all" {
+        return Err(ErrorBody::invalid_params(
+            "resume_all 必须经 handle 分流（内部错误：不应走到 op_task_action）",
+        ));
+    }
+
+    // 暂停全部在「引擎根本没起来」时是成功的空操作（没有东西可停；也别为此启动 aria2）。
+    if action == "pause_all" && k.daemon.is_none() {
+        k.hold_auto_retry = true;
+        return Ok(json!({"action": "pause_all"}));
     }
 
     let d = k.require_engine_for_action()?;
@@ -2119,9 +2891,26 @@ pub fn op_task_action(k: &mut Kernel, params: &Value) -> Result<Value, ErrorBody
         }
         "remove" => {
             let gid = need_gid()?;
-            rpc(d.remove(&gid))
+            // 先取路径（remove 会 forget 掉映射）：用户亲手移除的任务不该在换引擎后被补回来。
+            let rel = d.path_for(&gid);
+            let r = rpc(d.remove(&gid));
+            if r.is_ok() {
+                if let Some(rel) = rel {
+                    if k.intent.remove(&rel) {
+                        k.save_intent();
+                    }
+                }
+            }
+            r
         }
         "clear_finished" => rpc(d.clear_finished()),
+        "pause_all" => {
+            let r = rpc(d.pause_all());
+            if r.is_ok() {
+                k.hold_auto_retry = true;
+            }
+            r
+        }
         // ── 简报第 7 条：`retry` 是**编排层**的两步，不是 aria2 动作 ──────────
         "retry" => {
             let gid = need_gid()?;
@@ -2139,7 +2928,12 @@ pub fn op_task_action(k: &mut Kernel, params: &Value) -> Result<Value, ErrorBody
                 .ok_or_else(|| {
                     ErrorBody::invalid_params(format!("清单里没有 {rel:?}（批次可能已换）"))
                 })?;
-            let pf = engine::new_planned_file(&m, &f).ok_or_else(|| {
+            // 每个提交操作解析一次、整批复用（规格 §5.3）。
+            // ⚠️ **R9 批次债**：本段（DNS + remove/add RPC）在**内核锁内**执行——
+            //    DNS 无超时上界，慢解析会冻协议循环。随「锁内取输入、锁外做 RPC」
+            //    （F13/R9）一并搬出锁外；本波不重构，只登记。
+            let ips = resolve_ips(&m.base_url);
+            let pf = plan_file(&m, &f, &ips, &k.counters).ok_or_else(|| {
                 ErrorBody::invalid_params(format!("{} 的路径不安全，拒绝重试", f.path))
             })?;
 
@@ -2148,7 +2942,7 @@ pub fn op_task_action(k: &mut Kernel, params: &Value) -> Result<Value, ErrorBody
             // 用**当前的**逐任务选项重新 add（`Daemon::add` 内部取的就是当前那份）；
             // `-c` 恒开，所以这一下是从已下的部分续传。
             let new_gid = d
-                .add(&pf.url, &pf.dir, &pf.out)
+                .add(&pf.uris, &pf.dir, &pf.out, &pf.opts)
                 .map_err(|e| ErrorBody::new(kcodes::ENGINE_RPC_FAILED, e))?;
             // `retry` 同样是"客户重新下载"的入口，闸门要开得与 `enqueue` **一模一样**
             // ——包括 `verifying`（曾经这里漏了它，见 `reopen_for_download` 的注释）。
@@ -2157,9 +2951,259 @@ pub fn op_task_action(k: &mut Kernel, params: &Value) -> Result<Value, ErrorBody
         }
         // 上面已经把所有合法动作列完，这一支不可达；留着是为了 match 的穷尽性。
         other => Err(ErrorBody::invalid_params(format!(
-            "不认识的动作 {other:?}（可用：pause / unpause / retry / remove / clear_finished）"
+            "不认识的动作 {other:?}（可用：pause / unpause / retry / remove / clear_finished / pause_all / resume_all）"
         ))),
     }
+}
+
+/// `migrate_start`：把旧下载目录里已下载的文件（含断点控制文件）搬到当前下载目录。
+///
+/// 参数 `from`：旧目录的绝对路径（壳在改目录之前记下的那一个）。立刻返回，
+/// 真正的搬运在后台线程里，进度走 `migrate_status`。
+///
+/// 要搬哪些：清单里**每一个**在旧目录有、新目录没有的文件——不只是 `intent` 里的。
+/// 已经下完的文件也要搬，否则客户换盘之后它们会被当成「没下过」重新下载。
+pub fn op_migrate_start(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, ErrorBody> {
+    let from = params
+        .get("from")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ErrorBody::invalid_params("migrate_start 需要 from 参数（旧下载目录）"))?;
+    let from = PathBuf::from(from);
+    if !from.is_dir() {
+        return Err(ErrorBody::invalid_params(format!(
+            "旧下载目录不存在或不是目录：{}",
+            from.display()
+        )));
+    }
+
+    let (to, wanted, status) = {
+        let k = lock(kernel);
+        let m = k.require_manifest()?;
+        // 同一个目录（含符号链接 / 大小写别名指向同处）⇒ 无事可做，且绝不能「自己搬自己」。
+        let same = match (from.canonicalize(), k.download_dir.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => from == k.download_dir,
+        };
+        if same {
+            return Err(ErrorBody::invalid_params("旧目录与当前下载目录是同一个，无需搬运"));
+        }
+        let mut st = k.migrate.lock().unwrap_or_else(PoisonError::into_inner);
+        if st.running {
+            return Err(ErrorBody::invalid_params("上一次搬运还没结束"));
+        }
+        *st = migrate::Status {
+            running: true,
+            ..Default::default()
+        };
+        drop(st);
+        let wanted: Vec<String> = m.files.iter().map(|f| f.path.clone()).collect();
+        (k.download_dir.clone(), wanted, Arc::clone(&k.migrate))
+    };
+
+    let reset = Arc::clone(&status);
+    let kernel = Arc::clone(kernel);
+    thread::Builder::new()
+        .name("migrate".to_string())
+        .spawn(move || {
+            migrate::run(&from, &to, &wanted, false, &status);
+            let s = status.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            crate::diagnostics::log(
+                "migrate_done",
+                &[
+                    ("files", s.files_total.to_string()),
+                    ("bytes", s.bytes_total.to_string()),
+                    ("errors", s.errors.len().to_string()),
+                    ("skipped", s.skipped.len().to_string()),
+                ],
+            );
+            // 盘上变了：`complete` 要重算（搬来的完整文件现在应当被认出来）。
+            lock(&kernel).complete_dirty = true;
+        })
+        .map_err(|e| {
+            // 线程没起来 ⇒ 没有人会把 `running` 复位；不在这里复位，搬运门会永久挡住一键开始与自愈。
+            reset.lock().unwrap_or_else(PoisonError::into_inner).running = false;
+            ErrorBody::new(codes::INTERNAL, format!("起搬运线程失败：{e}"))
+        })?;
+    Ok(json!({"started": true}))
+}
+
+/// `get_download_dir`：内核此刻使用的下载目录（绝对路径原文）。
+///
+/// 为什么需要：偏好里「未配置」时落盘根是内核的默认值，**壳不知道它是哪儿**——
+/// 而换目录之前壳必须记下旧目录，才能在新内核起来之后让它把旧文件搬过来。
+pub fn op_get_download_dir(k: &mut Kernel) -> Result<Value, ErrorBody> {
+    Ok(json!({"dir": k.download_dir.to_string_lossy()}))
+}
+
+/// `migrate_status`：搬运进度（从没搬过 ⇒ 全零、`finished: false`）。
+pub fn op_migrate_status(k: &mut Kernel) -> Result<Value, ErrorBody> {
+    let s = k.migrate.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    to_value(&s)
+}
+
+/// 补回队列的结果（回执的 `added` / `rejected` 与 `enqueue` 同形）。
+#[derive(Default)]
+struct Restored {
+    added: Vec<Value>,
+    rejected: Vec<Value>,
+}
+
+/// 这批文件**还需要多少字节**：每个文件的大小减去盘上已有的长度（不为负）。
+///
+/// 为什么不像 `enqueue` 那样直接用全量大小：补回队列时半截文件往往已经在盘上
+/// （刚从旧目录搬来），按全量算会把「只差一点就下完」的批次误拦成「磁盘不够」。
+/// 稀疏文件的长度可能高估已下的量 ⇒ 这里**略微低估**需求，方向是放行；
+/// 磁盘真不够时 aria2 写盘报错会如实出现在任务上。
+fn remaining_bytes(dir: &Path, files: &[delivery::File]) -> i64 {
+    files
+        .iter()
+        .map(|f| {
+            let have = std::fs::metadata(dir.join(&f.path))
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
+            (f.size - have).max(0)
+        })
+        .sum()
+}
+
+/// 补回队列要提交的那一批（[`restore_batch`] 的产物）。
+struct RestoreBatch {
+    m: Manifest,
+    epoch: u64,
+    targets: Vec<delivery::File>,
+}
+
+/// **锁外取数**：`intent` 里「没完成、引擎里也没有、也不在后台队列里」的文件。没有要补的 ⇒ `None`。
+///
+/// `check_space` 为真时先做开工前检查（用户主动「一键开始」时要）。它**必须在解除暂停之前跑**：
+/// 否则暂停的任务已经全部恢复写盘，磁盘不够的报错就来晚了。引擎被自愈换掉后的静默补回不要——
+/// 那批文件当初已经过过一次检查。
+fn restore_batch(
+    kernel: &Arc<Mutex<Kernel>>,
+    d: &Arc<Daemon>,
+    check_space: bool,
+) -> Result<Option<RestoreBatch>, ErrorBody> {
+    let (m, epoch, dir, wanted, queued) = {
+        let k = lock(kernel);
+        let Some(m) = k.manifest.clone() else {
+            return Ok(None);
+        };
+        let wanted: BTreeSet<String> = k.intent.unfinished(&k.complete).into_iter().collect();
+        if wanted.is_empty() {
+            return Ok(None);
+        }
+        let queued: BTreeSet<String> = k.feed_queue.iter().map(|f| f.path.clone()).collect();
+        (m, k.batch_epoch, k.download_dir.clone(), wanted, queued)
+    };
+    let present: BTreeSet<String> = match d.snapshot() {
+        Ok(s) => s.path_map.into_values().collect(),
+        Err(e) => return Err(rpc_failure_off_lock(kernel, d, "快照（补回队列）", e)),
+    };
+    let targets: Vec<delivery::File> = m
+        .files
+        .iter()
+        .filter(|f| {
+            wanted.contains(&f.path) && !present.contains(&f.path) && !queued.contains(&f.path)
+        })
+        .cloned()
+        .collect();
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    if check_space {
+        preflight(&dir, remaining_bytes(&dir, &targets))?;
+    }
+    Ok(Some(RestoreBatch { m, epoch, targets }))
+}
+
+/// **锁外提交**补回队列的那一批；超出一批的交给后台线程。返回回执（与 `enqueue` 同形）。
+fn submit_restore(kernel: &Arc<Mutex<Kernel>>, d: &Arc<Daemon>, b: RestoreBatch) -> Restored {
+    let (now, later) = split_for_feeding(&b.targets);
+    let (added, mut rejected, stopped) = submit_off_lock(kernel, d, &b.m, b.epoch, now);
+    let (queued, extra) = {
+        let mut k = lock(kernel);
+        hand_over(&mut k, b.epoch, now, later, stopped)
+    };
+    crate::diagnostics::log(
+        "queue_restore",
+        &[
+            ("wanted", b.targets.len().to_string()),
+            ("added", added.len().to_string()),
+            ("rejected", (rejected.len() + extra.len()).to_string()),
+            ("queued", queued.to_string()),
+        ],
+    );
+    rejected.extend(extra);
+    ensure_feeder(kernel);
+    Restored { added, rejected }
+}
+
+/// 引擎被自愈换掉之后，把队列补回来（[`replace_engine`] 成功后调用）。
+///
+/// 搬运中不补：搬运与引擎不能同写一个文件（规格 §6）；搬完后由用户「一键开始」补回（`intent` 还在）。
+/// 失败一律只记日志：补不回来的路径还在 `intent` 里，用户点「一键开始」时会再补一次。
+pub fn restore_queue_after_replace(kernel: &Arc<Mutex<Kernel>>) {
+    ensure_complete(kernel);
+    let Some(d) = lock(kernel).daemon.clone() else {
+        return;
+    };
+    if migrating(&lock(kernel)) {
+        crate::diagnostics::log("queue_restore_skipped", &[("reason", "migrating".to_string())]);
+        return;
+    }
+    match restore_batch(kernel, &d, false) {
+        Ok(Some(b)) => {
+            let _ = submit_restore(kernel, &d, b);
+        }
+        Ok(None) => {}
+        Err(e) => crate::diagnostics::log("queue_restore_failed", &[("err", e.message)]),
+    }
+}
+
+/// `task_action` 的 `resume_all`（「一键开始」）：先查磁盘，再解开引擎里被暂停的全部，最后把
+/// `intent` 里引擎没有的补回来。
+///
+/// ⚠️ 不裹 `with_kernel`：`ensure_complete` 内含 HEAD 请求，必须在锁外跑。
+/// 没有可做的事（引擎没起、`intent` 也没有未完成的）⇒ 成功的空操作，**不启动 aria2**
+/// （与 `enqueue` 在无待下载时的口径一致）。
+pub fn op_resume_all(kernel: &Arc<Mutex<Kernel>>) -> Result<Value, ErrorBody> {
+    // 搬运期间不许开始：引擎与搬运同写一个文件是数据损坏级的风险（规格 §6）。
+    {
+        let k = lock(kernel);
+        let m = k.migrate.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if m.running {
+            return Err(ErrorBody::invalid_params(format!(
+                "正在搬运已下载的文件（{}/{}），搬完后再点「一键开始」",
+                m.files_done, m.files_total
+            )));
+        }
+    }
+    ensure_complete(kernel);
+    let d = {
+        let mut k = lock(kernel);
+        if k.daemon.is_none() && k.intent.unfinished(&k.complete).is_empty() {
+            k.hold_auto_retry = false;
+            return Ok(json!({"action": "resume_all", "added": [], "rejected": []}));
+        }
+        if k.daemon.is_none() {
+            k.ensure_engine()?
+        } else {
+            k.require_engine_for_action()?
+        }
+    };
+    // 先查磁盘，再解开暂停：查不过就什么都不动（暂停的任务留在暂停态，按住也不放）。
+    let batch = restore_batch(kernel, &d, true)?;
+    lock(kernel).hold_auto_retry = false;
+    d.unpause_all()
+        .map_err(|e| ErrorBody::new(kcodes::ENGINE_RPC_FAILED, e))?;
+    let r = match batch {
+        Some(b) => submit_restore(kernel, &d, b),
+        None => Restored::default(),
+    };
+    Ok(json!({"action": "resume_all", "added": r.added, "rejected": r.rejected}))
 }
 
 impl Kernel {
@@ -2239,6 +3283,12 @@ impl Kernel {
                     ("exited", self.engine_exited().to_string()),
                 ],
             );
+            // 判成断开的那一刻顺手采一次引擎进程的读数（CPU / IO / 句柄），与上一次做差：
+            // 这是下一次导出里唯一能分开「空转 / 在写盘 / 被阻塞」的证据。仅 Windows 有读数。
+            if now {
+                let pid = self.daemon.as_ref().and_then(|d| d.pid());
+                crate::procstat::log_sample(pid, &mut self.stall_prev, "disconnected");
+            }
         }
         self.engine_disconnected = now;
     }
@@ -2253,6 +3303,15 @@ impl Kernel {
             Some(d) => d.process_exited(),
             None => true,
         }
+    }
+
+    /// 换码：后台队列里还没提交的全部登记为拒绝，并把批次代数顶过去。正在飞的那一批
+    /// （[`submit_off_lock`]）进锁时发现代数变了，会摘掉刚加的任务、不再记账。
+    fn discard_feed_queue(&mut self) {
+        for f in self.feed_queue.drain(..) {
+            self.feed_rejected.push(json!({"path": f.path, "reason": REPLACED_REASON}));
+        }
+        self.batch_epoch += 1;
     }
 
     pub fn take_daemon(&mut self) -> Option<Arc<Daemon>> {
@@ -2302,7 +3361,7 @@ pub fn op_update_status(k: &mut Kernel) -> Result<Value, ErrorBody> {
         .last_seen
         .as_deref()
         .and_then(update::parse_version)
-        .map(|v| update::download_url(v, update::asset_name(update::platform(), update::arch())));
+        .map(|v| update::download_url(v, &update::asset_name(update::platform(), update::arch(), v)));
     Ok(json!({
         "enabled": k.update.enabled,
         "checking": k.update_checking,
@@ -2415,6 +3474,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::OnceLock;
+    use std::time::Instant;
 
     use crate::testutil::{RawResponse, StubHttp, TempDir};
 
@@ -2422,7 +3482,7 @@ mod tests {
     ///
     /// 契约 §5.2 的原话是「校验不得占住协议循环或**任何长持有的锁**」。
     /// `load_delivery` 里两段最贵的都是网络 I/O：
-    ///   - `delivery::fetch`：30 秒 × 3 次 + 1.5 秒退避 = 最坏 **91.5 秒**；
+    ///   - `delivery::fetch`：15 秒 × 5 次 + 15 秒退避 = 最坏 **90 秒**（2026-10-12 调参；记账仍按 91.5 秒留余量）；
     ///   - `Planner::plan`：对清单里**每个 crc64 为空的文件**发一次 HEAD，每次上限 30 秒
     ///     = 最坏 **30 秒 × N**（服务端"回读失败"导致 crc64 为空是生产上真实存在的形态）。
     ///
@@ -2512,7 +3572,7 @@ mod tests {
 
         assert!(
             fetch_free,
-            "拉清单时仍持有内核锁：`fetch` 最坏 30s×3 + 退避 = 91.5 秒，\
+            "拉清单时仍持有内核锁：`fetch` 最坏 15s×5 + 退避 = 90 秒（记账 91.5 秒），\
              这期间校验线程与落地监听器全部停摆（契约 §5.2）。\
              把 `delivery::fetch` 提到 `with_kernel` 之外。"
         );
@@ -2660,46 +3720,644 @@ mod tests {
         );
     }
 
-    /// **断开之后必须有人去探活**（规格 §3 A3）。这条守的是节拍判据本身。
+
+    /// 一次很慢的往返只让阶梯要求档 2，不要求换引擎，也不是"断了"。
     ///
-    /// ⚠️ 免责声明（必须留着）：它守的是**这张表**，不是**线程真的起来了**。
-    /// "把 `spawn_recovery` 的调用删掉"这个变异体**本测试抓不住**——那一层只有真机看得见。
+    /// 本用例只钉**档位**。"档 2 不置 `engine_disconnected`"这一条由**构造**保证：动作函数只吃 `&Daemon`，
+    /// 结构上够不着 `Kernel` 的那个字段（动作函数在任务 10 才接入，届时这条注释仍然成立）。
+    /// 运行时钉不到标志本身，别在这里假装钉到了。
+    /// 判别力：把慢判据从 `Liveness::is_unresponsive` 里删掉 ⇒ 红（阶梯会停在 Observe）。
     #[test]
-    fn recovery_probe_cadence_table() {
-        // 没断开：永远不探（省掉无谓的 RPC）。
-        assert!(!should_recover_probe(false, Duration::from_secs(0)));
-        assert!(!should_recover_probe(false, Duration::from_secs(3600)));
-        // 断开了但还没到点：不探。
-        assert!(!should_recover_probe(true, Duration::from_secs(9)));
-        // 断开了且到点：探。
-        assert!(should_recover_probe(true, RECOVERY_INTERVAL));
-        assert!(should_recover_probe(true, Duration::from_secs(30)));
+    fn slowness_alone_asks_for_pause_all_rather_than_a_swap() {
+        let mut a = Liveness::default();
+        a.record_ok(Duration::from_secs(31));
+        let mut l = Ladder::default();
+        let now = Instant::now();
+        assert_eq!(l.next(now, &a, 0, true), Rung::PauseAllThenResumeAll);
     }
 
-    /// **探测失败到一定次数就必须换引擎**，而不是永远等一个已经死掉的引擎自己活过来。
-    ///
-    /// 现场证据（0.2.3，2026-10-08）：日志里有两段引擎**完全不应答**的时段，分别
-    /// **45 分钟与 60 分钟**。期间自愈每 10 秒探一次、每次都耗满 10 秒超时，
-    /// **一次也没成功**——因为那时"自愈"成功时只翻一个标志、失败时什么都不做，
-    /// **从不重启引擎**。客户唯一的出路是点「重试」，而那颗按钮会重启**整个内核**、
-    /// 掐掉正在下的活。
-    ///
-    /// ⚠️ 免责声明与上面那条同款：这条守的是**阈值**，不是"线程真的换了引擎"。
-    /// 后者由 `replacing_a_wedged_engine_swaps_in_a_live_one` 守。
+    fn mk_task(gid: &str, state: TaskState, completed: i64) -> Task {
+        Task {
+            gid: gid.to_string(),
+            total: 0,
+            completed,
+            speed: 0,
+            conns: 0,
+            state,
+            err: String::new(),
+        }
+    }
+
+    /// 只有应当正在动的任务进入停滞判定：传完、出错、被移除的字节数永远不动，等待中的不算卡住。
+    /// 判别力：删掉 `active_tasks` 里的 `filter` ⇒ 红。
     #[test]
-    fn restart_decision_is_a_table() {
-        // 零次、少一次：继续探，不换引擎（换引擎要关掉旧进程，不是免费的）。
-        assert!(!should_restart_engine(0));
-        assert!(!should_restart_engine(RECOVERY_RESTART_AFTER - 1));
-        // 到阈值：换。
-        assert!(should_restart_engine(RECOVERY_RESTART_AFTER));
-        assert!(should_restart_engine(RECOVERY_RESTART_AFTER + 1));
+    fn active_tasks_keeps_only_the_ones_that_should_be_moving() {
+        let tasks = vec![
+            mk_task("act", TaskState::Active, 10),
+            mk_task("wait", TaskState::Waiting, 0),
+            mk_task("done", TaskState::Complete, 500),
+            mk_task("bad", TaskState::Error, 3),
+            mk_task("gone", TaskState::Removed, 7),
+        ];
+        assert_eq!(active_tasks(&tasks), vec![("act".to_string(), 10)]);
+    }
+
+    /// 停滞起表时记一次 `record_stall(how_long)`，同一停滞不重复记。
+    /// 判别力：删掉 `record_new_stalls` 里的 `record_stall` ⇒ 红。
+    #[test]
+    fn new_stalls_are_recorded_in_the_counters() {
+        let c = crate::diag_counters::Counters::default();
+        let mut already = BTreeSet::new();
+        let d180 = Duration::from_secs(180);
+        let d300 = Duration::from_secs(300);
+
+        // 第一拍：两个新停滞
+        let n = record_new_stalls(&c, &[("g1".to_string(), d180), ("g2".to_string(), d300)], &mut already);
+        assert_eq!(n, 2);
+        let s = c.snapshot();
+        assert_eq!(s.task_stalls, 2);
+        assert_eq!(s.stall_total, d180 + d300);
+
+        // 第二拍：还是这两个 ⇒ 不重复记
+        let n = record_new_stalls(&c, &[("g1".to_string(), d180), ("g2".to_string(), d300)], &mut already);
+        assert_eq!(n, 0);
+        assert_eq!(c.snapshot().task_stalls, 2);
+
+        // g1 不再停滞（消失了）⇒ 清掉；g1 再停滞 ⇒ 重记
+        let n = record_new_stalls(&c, &[("g2".to_string(), d300)], &mut already);
+        assert_eq!(n, 0);
+        let n = record_new_stalls(&c, &[("g1".to_string(), d180), ("g2".to_string(), d300)], &mut already);
+        assert_eq!(n, 1);
+        assert_eq!(c.snapshot().task_stalls, 3);
+    }
+
+    /// 重启预算的复位要同时满足"健康够久"与"下载在动"。
+    /// 判别力：去掉 `&& stalled.is_zero()` ⇒ 红（最后一条断言）。
+    #[test]
+    fn restart_budget_needs_sustained_health_and_a_moving_download() {
+        let t = Thresholds::default();
+        let window = t.pre_swap_wait;
+        assert!(restart_budget_is_refilled(Some(window), Duration::ZERO, &t), "健康够久、下载在动 ⇒ 复位");
+        assert!(
+            !restart_budget_is_refilled(Some(window - Duration::from_secs(1)), Duration::ZERO, &t),
+            "健康不够久 ⇒ 不复位"
+        );
+        assert!(!restart_budget_is_refilled(None, Duration::ZERO, &t), "此刻不健康 ⇒ 不复位");
+        assert!(
+            !restart_budget_is_refilled(Some(window), Duration::from_secs(1), &t),
+            "健康够久但下载全停 ⇒ 不许复位"
+        );
+    }
+
+    const RPC_OK: &str = r#"{"jsonrpc":"2.0","id":"1","result":"OK"}"#;
+    const RPC_ERR: &str = r#"{"jsonrpc":"2.0","id":"1","error":{"code":1,"message":"boom"}}"#;
+
+    /// 档 1 只动**那一个**任务，且是 pause → unpause 各一次（顺序也钉住）。
+    ///
+    /// 判别力：把 `unpause` 那句删掉 ⇒ 任务被**永久暂停** ⇒ 本用例红（请求数与 `aria2.unpause` 存在性断言）。
+    /// 断言用的是**桩收到的请求体**，不是我们的中间状态：只看中间状态的话，"到底发没发出去"验不到。
+    #[test]
+    fn reconnecting_one_task_pauses_then_unpauses_exactly_that_gid() {
+        let srv = StubHttp::start_with(|_| {
+            RawResponse::new(200).body(r#"{"jsonrpc":"2.0","id":"1","result":"OK"}"#.to_string())
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+
+        reconnect_one(&d, "abc123", &|| false);
+
+        let bodies: Vec<String> = srv.requests().into_iter().map(|r| r.body).collect();
+        assert_eq!(bodies.len(), 2, "pause 与 unpause 各一次：{bodies:?}");
+        let pause_at = bodies
+            .iter()
+            .position(|b| b.contains("\"aria2.pause\""))
+            .expect("必须调过 aria2.pause");
+        let unpause_at = bodies
+            .iter()
+            .position(|b| b.contains("\"aria2.unpause\""))
+            .expect("必须调过 aria2.unpause");
+        assert!(pause_at < unpause_at, "先暂停再恢复：{bodies:?}");
+        assert!(
+            bodies.iter().all(|b| b.contains("abc123")),
+            "只许动那一个 gid，不许波及其它：{bodies:?}"
+        );
+    }
+
+    /// 引擎**明确拒绝**了 pause：任务根本没被暂停 ⇒ 不欠账，也不许再发 unpause（那会打到一条不该被碰的任务上）。
+    /// 判别力：把 `Rejected` 那一支改成欠账 ⇒ 第一条断言红；pause 被拒也去 unpause ⇒ 第二条断言红。
+    #[test]
+    fn a_rejected_pause_is_not_owed_and_sends_no_unpause() {
+        let srv = StubHttp::start_with(|_| RawResponse::new(400).body(RPC_ERR));
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        assert_eq!(reconnect_one(&d, "abc123", &|| false), None, "pause 被拒 ⇒ 没有欠账");
+        assert_eq!(srv.requests().len(), 1, "pause 被拒后不许再发 unpause");
+    }
+
+    /// ⚠️ 超时 / 没回话 ≠ 没生效：读超时时请求很可能已经被 aria2 执行了，这条路上必须欠账。
+    /// 用连接被拒的端点造出"没回话"（传输层失败，立即返回）。
+    /// 判别力：把 `NoAnswer` 那一支改成 `None`（即上一轮那句错前提）⇒ 红。
+    #[test]
+    fn a_timed_out_pause_still_owes_an_unpause() {
+        let d = crate::engine::daemon::stub_daemon("http://127.0.0.1:1", "s", BTreeMap::new());
+        assert_eq!(reconnect_one(&d, "abc123", &|| false), Some("abc123".to_string()));
+    }
+
+    /// ⚠️ 收到了却读不懂（非 JSON）的应答，不算"明确拒绝"：请求可能已经被执行。
+    /// 判别力：把 `explicit` 的判定放宽为"所有协议层失败都算拒绝" ⇒ 红。
+    #[test]
+    fn an_unparseable_pause_answer_still_owes_an_unpause() {
+        let srv = StubHttp::start_with(|_| RawResponse::new(200).body("不是 JSON"));
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        assert_eq!(reconnect_one(&d, "abc123", &|| false), Some("abc123".to_string()));
+    }
+
+    /// 判别力：把 unpause 的 `Rejected` 也记成欠账 ⇒ 红。
+    #[test]
+    fn an_unpause_the_engine_refuses_leaves_nothing_owed() {
+        let srv = StubHttp::start_with(|req| {
+            if req.body.contains("\"aria2.unpause\"") {
+                RawResponse::new(400).body(RPC_ERR)
+            } else {
+                RawResponse::new(200).body(RPC_OK)
+            }
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        assert_eq!(reconnect_one(&d, "abc123", &|| false), None);
+    }
+
+    /// 造一个停滞满阈值的任务进展表（只有 `gid` 一个），返回 `(进展表, 阈值, 判定时刻)`。
+    fn one_stalled_task(gid: &str) -> (TaskProgress, Thresholds, Instant) {
+        let mut tp = TaskProgress::default();
+        let t0 = Instant::now();
+        let one = [mk_task(gid, TaskState::Active, 100)];
+        tp.observe(t0, &active_tasks(&one));
+        let t1 = t0 + Duration::from_secs(200);
+        tp.observe(t1, &active_tasks(&one));
+        (tp, Thresholds::default(), t1)
+    }
+
+    /// 「暂停全部」按在我们的 stop 与 unpause 之间：停已经生效，此时 hold 为真 ⇒ 不发 unpause，也不欠账。
+    /// 判别力：删掉 `relaunch` 里发 unpause 之前的那次重读 ⇒ 发出了一条 unpause ⇒ 红。
+    #[test]
+    fn a_hold_pressed_after_the_stop_sends_no_unpause_and_owes_nothing() {
+        let srv = StubHttp::start_with(|_| RawResponse::new(200).body(RPC_OK));
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        assert!(matches!(
+            relaunch(&d, "abc123", WriteOutcome::Applied, &|| true),
+            Relaunch::Clean
+        ));
+        assert!(srv.requests().is_empty(), "客户已按暂停全部 ⇒ 不许撤掉它");
+    }
+
+    /// 停没回话（可能已经生效）且 hold 为真：同样不发 unpause，且不得落成 `Silent`（那会让档 2 收手并欠账）。
+    /// 判别力：删掉重读 ⇒ 落成 Silent 并去打 unpause ⇒ 红。
+    #[test]
+    fn a_hold_after_an_unanswered_stop_is_clean_not_silent() {
+        let d = crate::engine::daemon::stub_daemon("http://127.0.0.1:1", "s", BTreeMap::new());
+        assert!(matches!(
+            relaunch(&d, "abc123", WriteOutcome::NoAnswer("x".to_string()), &|| true),
+            Relaunch::Clean
+        ));
+    }
+
+    /// 对照：没有 hold 时 unpause 照发 —— 上面两条的"没发"才有意义。
+    #[test]
+    fn without_a_hold_the_unpause_still_goes_out() {
+        let srv = StubHttp::start_with(|_| RawResponse::new(200).body(RPC_OK));
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        assert!(matches!(
+            relaunch(&d, "abc123", WriteOutcome::Applied, &|| false),
+            Relaunch::Clean
+        ));
+        assert_eq!(srv.requests().len(), 1, "没按 hold 就该照常 unpause");
+    }
+
+    /// 欠账经 `reconnect_most_stalled` 记进集合：只有"没回话"的那一次才记。
+    /// 判别力：删掉 `reconnect_most_stalled` 里的 `owed.insert(...)` ⇒ 第一条断言红。
+    /// `tellActive` 必须在场（动作前的活跃表复查），否则函数直接返回 None 走不到记账。
+    #[test]
+    fn reconnect_most_stalled_owes_only_the_unanswered_gid() {
+        // 第一段：pause 与 unpause 都没回话 ⇒ 欠账。`tellActive` 正常应答（活跃表里有 g）。
+        let srv = StubHttp::start_with(|req| {
+            if req.body.contains("\"aria2.tellActive\"") {
+                RawResponse::new(200).body(active_reply(&["g"]))
+            } else if req.body.contains("\"aria2.pause\"") || req.body.contains("\"aria2.unpause\"") {
+                RawResponse::new(200).body("不是 JSON")
+            } else {
+                RawResponse::new(200).body(RPC_OK)
+            }
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        let (mut tp, t, t1) = one_stalled_task("g");
+        let mut owed = BTreeSet::new();
+        assert_eq!(reconnect_most_stalled(&d, &mut tp, &t, t1, &mut owed, &|| false), Some("g".to_string()));
+        assert_eq!(owed, BTreeSet::from(["g".to_string()]), "pause 与 unpause 都没回话 ⇒ 欠账");
+
+        // 第二段：unpause 被引擎拒绝 ⇒ 不欠账。
+        let srv = StubHttp::start_with(|req| {
+            if req.body.contains("\"aria2.tellActive\"") {
+                RawResponse::new(200).body(active_reply(&["g"]))
+            } else if req.body.contains("\"aria2.unpause\"") {
+                RawResponse::new(400).body(RPC_ERR)
+            } else {
+                RawResponse::new(200).body(RPC_OK)
+            }
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        let (mut tp, t, t1) = one_stalled_task("g");
+        let mut owed = BTreeSet::new();
+        reconnect_most_stalled(&d, &mut tp, &t, t1, &mut owed, &|| false);
+        assert!(owed.is_empty(), "unpause 被引擎拒绝 ⇒ 不欠账");
+    }
+
+    /// 候选 gid 不在活跃表里（客户在采样后单独暂停了它）⇒ 一条 RPC 都不发。
+    /// 判别力：去掉 `reconnect_most_stalled` 里的 `active()` 交集 ⇒ 发出 pause/unpause ⇒ 红。
+    #[test]
+    fn a_candidate_the_client_paused_since_sampling_is_not_touched() {
+        let srv = StubHttp::start_with(|req| {
+            if req.body.contains("\"aria2.tellActive\"") {
+                // 活跃表里只有 other，没有 g
+                RawResponse::new(200).body(active_reply(&["other"]))
+            } else {
+                RawResponse::new(200).body(RPC_OK)
+            }
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        let (mut tp, t, t1) = one_stalled_task("g");
+        let mut owed = BTreeSet::new();
+        assert_eq!(reconnect_most_stalled(&d, &mut tp, &t, t1, &mut owed, &|| false), None);
+        assert!(owed.is_empty());
+        assert!(
+            srv.requests().iter().all(|r| {
+                !r.body.contains("\"aria2.pause\"") && !r.body.contains("\"aria2.unpause\"")
+            }),
+            "候选已被客户单独暂停 ⇒ 一条 pause/unpause 都不发：{:?}",
+            srv.requests().iter().map(|r| r.body.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 没回话的 unpause 留到后面的拍里补发；补上了才移出。这里用两个端点模拟"先不通、后来通了"。
+    /// 判别力：把 `retry_pending_unpause` 改成空操作 ⇒ 第二条断言红。
+    #[test]
+    fn an_unanswered_unpause_is_retried_on_a_later_tick() {
+        let dead = crate::engine::daemon::stub_daemon("http://127.0.0.1:1", "s", BTreeMap::new());
+        let srv = StubHttp::start_with(|_| RawResponse::new(200).body(RPC_OK));
+        let live = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        let mut pending = BTreeSet::from(["abc123".to_string()]);
+        retry_pending_unpause(&dead, &mut pending, false);
+        assert!(pending.contains("abc123"), "还没回话 ⇒ 留着");
+        retry_pending_unpause(&live, &mut pending, false);
+        assert!(pending.is_empty(), "补上了就移出");
+        assert_eq!(srv.requests().len(), 1, "只在通的那一拍发出一条 unpause");
+    }
+
+    /// 引擎明确拒绝（"找不到 / 不在暂停态"）⇒ 已经没有要还的了，立即移出，不再一拍一拍地去问。
+    /// 判别力：把 `retain` 改回"保留所有失败"（`NoAnswer(_) | Rejected(_)`）⇒ 红。
+    #[test]
+    fn a_rejected_unpause_clears_the_debt() {
+        let srv = StubHttp::start_with(|_| RawResponse::new(400).body(RPC_ERR));
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        let mut pending = BTreeSet::from(["abc123".to_string()]);
+        retry_pending_unpause(&d, &mut pending, false);
+        assert!(pending.is_empty(), "被拒 ⇒ 移出");
+    }
+
+    /// 客户按过「暂停全部」时补偿整段跳过：暂停正是客户要的，补发 unpause 等于违背客户意图。
+    /// 判别力：去掉 `hold` 的判断 ⇒ 集合被清空且多出一条 RPC ⇒ 红。
+    #[test]
+    fn a_held_pause_all_suppresses_the_compensation() {
+        let srv = StubHttp::start_with(|_| RawResponse::new(200).body(RPC_OK));
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        let mut pending = BTreeSet::from(["abc123".to_string()]);
+        retry_pending_unpause(&d, &mut pending, true);
+        assert_eq!(pending, BTreeSet::from(["abc123".to_string()]), "原样不动");
+        assert!(srv.requests().is_empty(), "一条 RPC 都不发");
+    }
+
+    /// 桩里 `tellActive` 的应答：列出 `gids` 这几个正在传的任务。
+    fn active_reply(gids: &[&str]) -> String {
+        let list: Vec<serde_json::Value> = gids
+            .iter()
+            .map(|g| {
+                json!({
+                    "gid": g, "status": "active", "totalLength": "0", "completedLength": "0",
+                    "downloadSpeed": "0", "connections": "1", "errorMessage": "",
+                })
+            })
+            .collect();
+        json!({"jsonrpc": "2.0", "id": "1", "result": list}).to_string()
+    }
+
+    /// 档 2 对每个卡住的 gid 都是「先 forcePause、后拉起」，逐个走，且从不发全局的 `forcePauseAll` / `unpauseAll`。
+    /// 判别力：改成优雅的 `pause` ⇒ 红；改回全局 `pause_all`/`unpause_all` ⇒ 红；删掉某个 gid 的 `unpause` ⇒ 红。
+    ///
+    /// 「档 2 不置 `engine_disconnected`」**钉不到运行时**：动作只吃 `&Daemon`，结构上够不到
+    /// `Kernel` 的字段（见 [`pause_then_resume_each`]）；而线程里调它的那一支活在不返回的
+    /// `spawn_recovery` 循环中，任何用例都走不到。那一条由源码级判据与报告承担，这里不假装钉住。
+    #[test]
+    fn rung_two_pauses_then_resumes_each_gid_with_force_pause_never_the_global_pair() {
+        let srv = StubHttp::start_with(|req| {
+            if req.body.contains("\"aria2.tellActive\"") {
+                RawResponse::new(200).body(active_reply(&["a", "b"]))
+            } else {
+                RawResponse::new(200).body(RPC_OK)
+            }
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+
+        let debts = pause_then_resume_each(&d, &["a".to_string(), "b".to_string()], &|| false, true);
+
+        assert!(debts.is_empty(), "两条都应答 ⇒ 不欠账");
+        let seq: Vec<(String, String)> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| !r.body.contains("\"aria2.tellActive\""))
+            .map(|r| {
+                let v: serde_json::Value = serde_json::from_str(&r.body).expect("请求体是 JSON");
+                let method = v["method"].as_str().unwrap_or_default().to_string();
+                let gid = v["params"].as_array().and_then(|p| p.last()).and_then(|x| x.as_str());
+                (method, gid.unwrap_or_default().to_string())
+            })
+            .collect();
+        let want: Vec<(String, String)> = [
+            ("aria2.forcePause", "a"),
+            ("aria2.unpause", "a"),
+            ("aria2.forcePause", "b"),
+            ("aria2.unpause", "b"),
+        ]
+        .iter()
+        .map(|(m, g)| (m.to_string(), g.to_string()))
+        .collect();
+        assert_eq!(seq, want, "逐个 gid、先强制停后拉起，且不发全局动作");
+    }
+
+    /// 暂停生效、拉起没回话 ⇒ 欠账（这正是客户会被永久停住的那一种）。
+    /// 判别力：把 `relaunch` 里 `NoAnswer` 的那条 unpause 改成不欠账 ⇒ 红。
+    #[test]
+    fn a_paused_gid_whose_resume_gets_no_answer_is_owed() {
+        let srv = StubHttp::start_with(|req| {
+            if req.body.contains("\"aria2.tellActive\"") {
+                RawResponse::new(200).body(active_reply(&["g"]))
+            } else if req.body.contains("\"aria2.unpause\"") {
+                RawResponse::new(200).body("不是 JSON")
+            } else {
+                RawResponse::new(200).body(RPC_OK)
+            }
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+
+        assert_eq!(pause_then_resume_each(&d, &["g".to_string()], &|| false, true), vec!["g".to_string()]);
+    }
+
+    /// 动作前已经不在 `tellActive` 里的 gid（客户在名单采样之后单独暂停了它）一条 RPC 都不发，也不欠账。
+    /// 判别力：去掉与 `tellActive` 的交集（对所有名单 gid 照做）⇒ `b` 被停启 ⇒ 红。
+    #[test]
+    fn a_gid_the_client_paused_since_sampling_is_not_touched() {
+        let srv = StubHttp::start_with(|req| {
+            if req.body.contains("\"aria2.tellActive\"") {
+                RawResponse::new(200).body(active_reply(&["a"]))
+            } else {
+                RawResponse::new(200).body(RPC_OK)
+            }
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+
+        let debts = pause_then_resume_each(&d, &["a".to_string(), "b".to_string()], &|| false, true);
+
+        assert!(debts.is_empty());
+        assert!(
+            srv.requests().iter().all(|r| !r.body.contains("\"b\"")),
+            "b 已被客户暂停，不许碰：{:?}",
+            srv.requests().iter().map(|r| r.body.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 某个 gid 的停与起都没回话 ⇒ 立即收手：后面的 gid 一个都不碰（它们只会同样各赔一次超时）。
+    /// 判别力：删掉 `Relaunch::Silent` 分支里的 `break` ⇒ `g2` 被动了 ⇒ 红。
+    #[test]
+    fn a_silent_gid_stops_the_batch_at_once() {
+        let srv = StubHttp::start_with(|req| {
+            if req.body.contains("\"aria2.tellActive\"") {
+                RawResponse::new(200).body(active_reply(&["g1", "g2"]))
+            } else if req.body.contains("\"g1\"") {
+                RawResponse::new(200).body("不是 JSON")
+            } else {
+                RawResponse::new(200).body(RPC_OK)
+            }
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+
+        let debts = pause_then_resume_each(&d, &["g1".to_string(), "g2".to_string()], &|| false, true);
+
+        assert_eq!(debts, vec!["g1".to_string()], "g1 停与起都没回话 ⇒ 欠账");
+        assert!(
+            srv.requests().iter().all(|r| !r.body.contains("\"g2\"")),
+            "g1 静默之后 g2 不许再动"
+        );
+    }
+
+    /// 停成功、拉起没回话 ⇒ 只欠账，**不**收手：引擎答得了 pause，后面的 gid 照常处理。
+    /// 判别力：把 `Relaunch::Owed` 也当成 `Silent` 收手 ⇒ `g2` 没被动 ⇒ 红。
+    #[test]
+    fn a_gid_that_stopped_but_could_not_resume_does_not_stop_the_batch() {
+        let srv = StubHttp::start_with(|req| {
+            if req.body.contains("\"aria2.tellActive\"") {
+                RawResponse::new(200).body(active_reply(&["g1", "g2"]))
+            } else if req.body.contains("\"g1\"") && req.body.contains("\"aria2.unpause\"") {
+                RawResponse::new(200).body("不是 JSON")
+            } else {
+                RawResponse::new(200).body(RPC_OK)
+            }
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+
+        let debts = pause_then_resume_each(&d, &["g1".to_string(), "g2".to_string()], &|| false, true);
+
+        assert_eq!(debts, vec!["g1".to_string()]);
+        assert!(
+            srv.requests().iter().any(|r| r.body.contains("\"g2\"") && r.body.contains("\"aria2.unpause\"")),
+            "g1 只是欠账，g2 照常停启"
+        );
+    }
+
+    /// 客户按过「暂停全部」时档 2 一条 RPC 都不发、也不欠账。
+    /// 判别力：删掉 `pause_then_resume_each` 里的 `if held` ⇒ 发出了 RPC ⇒ 红。
+    #[test]
+    fn a_held_pause_all_sends_no_rpc_for_rung_two() {
+        let srv = StubHttp::start_with(|_| RawResponse::new(200).body(RPC_OK));
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+
+        assert!(pause_then_resume_each(&d, &["g".to_string()], &|| true, true).is_empty());
+        assert!(srv.requests().is_empty(), "一条 RPC 都不发");
+    }
+
+    /// 本拍探活没拿到应答 ⇒ 档 2 的批量动作整批跳过，一条 RPC 都不发（它们注定失败，而且会白占掉这一拍）。
+    /// 与 `hold` 是两道不同的门：这里守的是 `answered`，那两条守的是 `held`，失效方式不同，不合并。
+    /// 判别力：删掉 `pause_then_resume_each` 里的 `if !answered` ⇒ 发出了 RPC ⇒ 红。
+    #[test]
+    fn a_rung_two_batch_is_skipped_when_the_probe_answered_nothing() {
+        let srv = StubHttp::start_with(|_| RawResponse::new(200).body(RPC_OK));
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+
+        assert!(pause_then_resume_each(&d, &["g".to_string()], &|| false, false).is_empty());
+        assert!(srv.requests().is_empty(), "一条 RPC 都不发");
+    }
+
+    /// 整批跑到一半时客户按下「暂停全部」：g1 的停启做完（unpause 已经发出）之后 hold 才变真，之后的 gid 一个都不碰。
+    /// 触发用"g1 的 unpause 已发出"而不是读取次数：`relaunch` 在发 unpause 前也会读一次 hold，
+    /// 按次数触发会把"何时按下"悄悄改掉。
+    /// 判别力：删掉逐 gid 前的 `if held()` ⇒ g2 被 forcePause ⇒ 红。
+    #[test]
+    fn a_hold_set_mid_batch_stops_the_rest() {
+        let srv = StubHttp::start_with(|req| {
+            if req.body.contains("\"aria2.tellActive\"") {
+                RawResponse::new(200).body(active_reply(&["g1", "g2"]))
+            } else {
+                RawResponse::new(200).body(RPC_OK)
+            }
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        let held = || {
+            srv.requests()
+                .iter()
+                .any(|r| r.body.contains("\"g1\"") && r.body.contains("\"aria2.unpause\""))
+        };
+
+        let debts = pause_then_resume_each(&d, &["g1".to_string(), "g2".to_string()], &held, true);
+
+        assert!(debts.is_empty(), "g1 正常停启，不欠账");
+        assert!(
+            srv.requests().iter().any(|r| r.body.contains("\"g1\"") && r.body.contains("\"aria2.unpause\"")),
+            "g1 在按下之前已经处理完"
+        );
+        assert!(
+            srv.requests().iter().all(|r| !r.body.contains("\"g2\"")),
+            "按下之后 g2 不许再被动：{:?}",
+            srv.requests().iter().map(|r| r.body.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `ladder_pause_each` 那一行的事件名与字段顺序是**契约**（读日志的人按位找，
+    /// 规格 §9.1 靠它对账"为什么这一档没动手"）。字段记反了没有任何东西会红，
+    /// 所以这里捕获出口、按名按位钉住。
+    /// 判别力：把 `("held", …)` 删掉或换名 ⇒ 红。
+    #[test]
+    fn logging_pause_each_reports_the_event_name_and_the_four_fields_in_order() {
+        let seen: std::cell::RefCell<Vec<(String, Vec<(String, String)>)>> =
+            std::cell::RefCell::new(Vec::new());
+        log_pause_each(
+            &|event, fields| {
+                seen.borrow_mut().push((
+                    event.to_string(),
+                    fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+                ));
+            },
+            0,
+            true,
+            false,
+            3,
+        );
+
+        let got = seen.into_inner();
+        assert_eq!(got.len(), 1, "只该写一条");
+        assert_eq!(got[0].0, "ladder_pause_each", "事件名是读日志的人的入口，不许改");
+        let want: Vec<(String, String)> = vec![
+            ("n".to_string(), "0".to_string()),
+            ("held".to_string(), "true".to_string()),
+            ("answered".to_string(), "false".to_string()),
+            ("owed".to_string(), "3".to_string()),
+        ];
+        assert_eq!(got[0].1, want, "四个字段、按名按位，顺序是契约");
+    }
+
+    /// `tellActive` 失败 ⇒ 整批一条 pause/unpause 都不发，也不欠账（不许拿未经核实的名单下手）。
+    /// 判别力：把失败分支改成"不做交集、照名单全做" ⇒ 发出了 pause ⇒ 红。
+    #[test]
+    fn a_failed_active_sends_no_pause_and_owes_nothing() {
+        let srv = StubHttp::start_with(|req| {
+            if req.body.contains("\"aria2.tellActive\"") {
+                RawResponse::new(200).body(RPC_ERR)
+            } else {
+                RawResponse::new(200).body(RPC_OK)
+            }
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+
+        let debts = pause_then_resume_each(&d, &["g".to_string()], &|| false, true);
+
+        assert!(debts.is_empty(), "不欠账");
+        assert!(
+            srv.requests().iter().all(|r| r.body.contains("\"aria2.tellActive\"")),
+            "只许有 tellActive 那一条：{:?}",
+            srv.requests().iter().map(|r| r.body.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 客户按过「暂停全部」时档 1 一条 RPC 都不发、也不欠账（即使确有停滞任务）。
+    /// 判别力：删掉 `reconnect_most_stalled` 里的 `if held` ⇒ 发出了 RPC ⇒ 红。
+    #[test]
+    fn a_held_pause_all_sends_no_rpc_for_rung_one() {
+        let srv = StubHttp::start_with(|_| RawResponse::new(200).body(RPC_OK));
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        let (mut tp, t, t1) = one_stalled_task("g");
+        let mut owed = BTreeSet::new();
+
+        assert_eq!(reconnect_most_stalled(&d, &mut tp, &t, t1, &mut owed, &|| true), None);
+        assert!(srv.requests().is_empty(), "一条 RPC 都不发");
+        assert!(owed.is_empty());
+    }
+
+    /// 重连之后轮换：两个都卡住时，第一次动的是停滞最久的那个，第二次必须轮到另一个。
+    /// 判别力：删掉 `reconnect_most_stalled` 里的 `mark_attempted` ⇒ 第二次仍是 `a` ⇒ 红。
+    /// `tellActive` 要在场（动作前的活跃表复查），桩里得回一个含两个 gid 的任务列表。
+    #[test]
+    fn a_reconnect_hands_the_next_turn_to_the_other_stuck_task() {
+        let srv = StubHttp::start_with(|req| {
+            if req.body.contains("\"aria2.tellActive\"") {
+                RawResponse::new(200).body(active_reply(&["a", "b"]))
+            } else {
+                RawResponse::new(200).body(RPC_OK)
+            }
+        });
+        let d = crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new());
+        let t = Thresholds::default();
+        let mut tp = TaskProgress::default();
+        let t0 = Instant::now();
+        let both = [mk_task("a", TaskState::Active, 100), mk_task("b", TaskState::Active, 100)];
+        tp.observe(t0, &active_tasks(&both[..1]));
+        tp.observe(t0 + Duration::from_secs(1), &active_tasks(&both));
+        let t1 = t0 + Duration::from_secs(200);
+        tp.observe(t1, &active_tasks(&both));
+        let mut owed = BTreeSet::new();
+        assert_eq!(reconnect_most_stalled(&d, &mut tp, &t, t1, &mut owed, &|| false), Some("a".to_string()));
+        let t2 = t1 + Duration::from_secs(60);
+        tp.observe(t2, &active_tasks(&both));
+        assert_eq!(reconnect_most_stalled(&d, &mut tp, &t, t2, &mut owed, &|| false), Some("b".to_string()), "a 刚被动过，轮到 b");
+    }
+
+    /// 全局速率大于 0（另一个任务照跑）时，停滞的那一个仍要被认出来，阶梯据此要求档 1。
+    #[test]
+    fn a_stuck_task_is_named_while_the_others_run() {
+        let t = Thresholds::default();
+        let mut tp = TaskProgress::default();
+        let t0 = Instant::now();
+        tp.observe(
+            t0,
+            &active_tasks(&[mk_task("moving", TaskState::Active, 100), mk_task("stuck", TaskState::Active, 100)]),
+        );
+        let t1 = t0 + Duration::from_secs(181);
+        tp.observe(
+            t1,
+            &active_tasks(&[mk_task("moving", TaskState::Active, 900), mk_task("stuck", TaskState::Active, 100)]),
+        );
+        assert_eq!(tp.stalled_count(t1, &t), 1);
+        assert_eq!(tp.most_stalled(t1, &t), Some("stuck".to_string()));
+        let mut l = Ladder::default();
+        assert_eq!(l.next(t1, &Liveness::default(), tp.stalled_count(t1, &t), true), Rung::ReconnectOne);
     }
 
     /// **换上的是另一个引擎、且断开标志被清掉**（"自愈真的能自愈"的那一层）。
     ///
-    /// 为什么需要它：`should_recover_probe` / `should_restart_engine` 都是纯函数，
-    /// 它们绿不代表**真的有一个新进程起来并把句柄换过去**——那是 `replace_engine`
+    /// 为什么需要它：阈值与判据的单元测试都是纯函数，绿不代表**真的有一个新进程起来并把句柄换过去**——那是 `replace_engine`
     /// 的活，只有起真引擎才验得到。这条用例真起两个 aria2。
     ///
     /// 三个断言各自钉一件事：
@@ -2746,6 +4404,1040 @@ mod tests {
             "内核手里必须拿着新引擎，不是旧的那一份"
         );
         assert!(!disconnected, "换成功之后不该还是断开态");
+    }
+
+    // -----------------------------------------------------------------------
+    // 「想下的文件集」/ 补回队列 / 暂停全部 / 一键开始（规格 2026-10-12）
+    // -----------------------------------------------------------------------
+
+    /// 一个只 `listen` 不 `accept` 的源：连得上、永远不回话 ⇒ 任务停在 Active。
+    struct StuckHost(std::net::TcpListener);
+
+    impl StuckHost {
+        fn start() -> Self {
+            Self(std::net::TcpListener::bind("127.0.0.1:0").expect("绑端口失败"))
+        }
+        fn base(&self) -> String {
+            format!("http://127.0.0.1:{}", self.0.local_addr().expect("端口").port())
+        }
+    }
+
+    /// 内核 + 一份两个文件的清单（`crc64` 非空 ⇒ `plan` 不发 HEAD）。
+    fn kernel_with_two_files(dir: &TempDir, host: &StuckHost) -> Arc<Mutex<Kernel>> {
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), dir.join("s.json"))));
+        install_manifest(&kernel, host);
+        kernel
+    }
+
+    fn install_manifest(kernel: &Arc<Mutex<Kernel>>, host: &StuckHost) {
+        let mut k = lock(kernel);
+        let m = delivery::parse(
+            format!(
+                r#"{{"code":"AbC","base_url":"{}","files":[
+                    {{"path":"t/a.bin","size":6,"crc64":"91"}},
+                    {{"path":"t/b.bin","size":6,"crc64":"92"}}]}}"#,
+                host.base()
+            )
+            .as_bytes(),
+        )
+        .expect("清单应当解析成功");
+        k.state.bind(&m.code);
+        if k.intent.bind(&m.code) {
+            k.save_intent();
+        }
+        k.manifest = Some(m);
+    }
+
+    /// 引擎里现在有哪些清单路径（含暂停的）。
+    fn engine_paths(kernel: &Arc<Mutex<Kernel>>) -> BTreeSet<String> {
+        let d = lock(kernel).daemon.clone().expect("引擎应当已经起来");
+        d.snapshot().expect("快照").path_map.into_values().collect()
+    }
+
+    fn close_engine(kernel: &Arc<Mutex<Kernel>>) {
+        if let Some(d) = lock(kernel).take_daemon() {
+            let _ = d.close();
+        }
+    }
+
+    fn paths(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 🔴 **引擎被换掉之后，队列必须自己回来**——这是「后台稳定持续运行」的承重判据。
+    ///
+    /// 判别力：删掉 `replace_engine` 里的 `restore_queue_after_replace(kernel)` ⇒ 新引擎是空的 ⇒ 红。
+    #[test]
+    fn replacing_the_engine_restores_the_queue() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+
+        op_enqueue(&kernel, &json!({"paths": ["t/a.bin", "t/b.bin"]})).expect("入队");
+        assert_eq!(engine_paths(&kernel), paths(&["t/a.bin", "t/b.bin"]));
+
+        replace_engine(&kernel).expect("换引擎");
+        let after = engine_paths(&kernel);
+        close_engine(&kernel);
+
+        assert_eq!(after, paths(&["t/a.bin", "t/b.bin"]), "新引擎里应当补回了全部未完成的");
+    }
+
+    /// 用户亲手移除的任务，换引擎之后**不该**被补回来（否则「移除」就成了一句空话）。
+    /// 判别力：去掉 `remove` 分支里的 `intent.remove` ⇒ 红。
+    #[test]
+    fn a_task_the_user_removed_is_not_restored() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+
+        let out = op_enqueue(&kernel, &json!({"paths": ["t/a.bin", "t/b.bin"]})).expect("入队");
+        let gid_a = out["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["path"] == "t/a.bin")
+            .map(|x| x["gid"].as_str().unwrap().to_string())
+            .expect("a 应当在 added 里");
+        with_kernel(&kernel, |k| {
+            op_task_action(k, &json!({"action": "remove", "gid": gid_a}))
+        })
+        .expect("移除");
+
+        replace_engine(&kernel).expect("换引擎");
+        let after = engine_paths(&kernel);
+        close_engine(&kernel);
+
+        assert_eq!(after, paths(&["t/b.bin"]), "被移除的 a 不该回来");
+    }
+
+    /// 「想下的文件集」落盘：重启内核（改下载目录就是这样）之后，一键开始能把队列补回来。
+    /// 判别力：不落盘 / 重启后不读 ⇒ 第二个内核的 `intent` 为空 ⇒ 红。
+    #[test]
+    fn the_wanted_set_survives_a_kernel_restart_and_resume_all_restores_it() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let first = kernel_with_two_files(&dir, &host);
+        op_enqueue(&first, &json!({"paths": ["t/a.bin", "t/b.bin"]})).expect("入队");
+        close_engine(&first);
+        drop(first);
+
+        // 同一个设置目录、全新的内核（= 重启）；壳重放批次 = 装上同一份清单。
+        std::fs::create_dir_all(dir.join("dl2")).unwrap();
+        let second = Arc::new(Mutex::new(Kernel::new(dir.join("dl2"), dir.join("s.json"))));
+        install_manifest(&second, &host);
+
+        let out = op_resume_all(&second).expect("一键开始");
+        let after = engine_paths(&second);
+        close_engine(&second);
+
+        assert_eq!(out["added"].as_array().map(Vec::len), Some(2), "{out}");
+        assert_eq!(after, paths(&["t/a.bin", "t/b.bin"]));
+    }
+
+    /// 暂停全部 → 全部离开 active；一键开始 → 暂停的回来，**引擎里缺的**也补上。
+    /// 判别力：`pause_all` 空转 ⇒ 第一条红；`resume_all` 不 unpause ⇒ 第二条红；不补缺 ⇒ 第三条红。
+    #[test]
+    fn pause_all_then_resume_all_unpauses_and_fills_the_gaps() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        let out = op_enqueue(&kernel, &json!({"paths": ["t/a.bin", "t/b.bin"]})).expect("入队");
+        let gid_b = out["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["path"] == "t/b.bin")
+            .map(|x| x["gid"].as_str().unwrap().to_string())
+            .unwrap();
+
+        with_kernel(&kernel, |k| op_task_action(k, &json!({"action": "pause_all"}))).expect("暂停全部");
+        let d = lock(&kernel).daemon.clone().unwrap();
+        let wait = |want_active: bool| {
+            let t0 = std::time::Instant::now();
+            loop {
+                let snap = d.snapshot().expect("快照");
+                let active = snap
+                    .tasks
+                    .iter()
+                    .filter(|t| t.state == crate::engine::status::TaskState::Active)
+                    .count();
+                if (active > 0) == want_active {
+                    return;
+                }
+                assert!(t0.elapsed() < Duration::from_secs(15), "等不到 active>0 == {want_active}");
+                thread::sleep(Duration::from_millis(100));
+            }
+        };
+        wait(false);
+
+        // 造一个缺口：b 被绕过 intent 直接从引擎里弄掉（模拟换引擎后丢了）。
+        d.remove(&gid_b).expect("移除 b");
+        assert_eq!(engine_paths(&kernel), paths(&["t/a.bin"]));
+
+        let out = op_resume_all(&kernel).expect("一键开始");
+        wait(true);
+        let after = engine_paths(&kernel);
+        close_engine(&kernel);
+
+        assert_eq!(after, paths(&["t/a.bin", "t/b.bin"]), "缺的 b 必须补上");
+        assert_eq!(out["added"].as_array().map(Vec::len), Some(1), "只补缺的一个: {out}");
+    }
+
+    /// 没有任何事可做时，两个动作都是成功的空操作，且**不启动 aria2**。
+    #[test]
+    fn pause_all_and_resume_all_with_nothing_to_do_do_not_start_the_engine() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+
+        with_kernel(&kernel, |k| op_task_action(k, &json!({"action": "pause_all"}))).expect("空暂停");
+        let out = op_resume_all(&kernel).expect("空开始");
+
+        assert_eq!(out["added"].as_array().map(Vec::len), Some(0), "{out}");
+        assert!(lock(&kernel).daemon.is_none(), "没有可做的事就不该起 aria2");
+    }
+
+    /// 完成的文件不该被补回队列（`complete` 里的从「想下的」里扣掉）。
+    ///
+    /// 直接调 `restore_batch` + `submit_restore`：`op_resume_all` 会先 `ensure_complete` 重算，
+    /// 而重算认的是盘上的真文件 + 状态记录，在这里造那两样不如直接钉过滤这一步。
+    /// 判别力：去掉 `unfinished` 里的过滤 ⇒ a 也被加进引擎 ⇒ 红。
+    #[test]
+    fn restoring_the_queue_skips_completed_files() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        {
+            let mut k = lock(&kernel);
+            k.intent.add("t/a.bin");
+            k.intent.add("t/b.bin");
+            k.complete.insert("t/a.bin".to_string());
+        }
+        let d = lock(&kernel).ensure_engine().expect("起引擎");
+        let batch = restore_batch(&kernel, &d, false).expect("取数").expect("有要补的");
+        let added = submit_restore(&kernel, &d, batch).added;
+        let after = engine_paths(&kernel);
+        close_engine(&kernel);
+
+        assert_eq!(added.len(), 1, "只该补 b: {added:?}");
+        assert_eq!(after, paths(&["t/b.bin"]));
+    }
+
+    /// 端到端（内核层）：搬运把旧目录里清单内的文件搬进当前目录，进度可轮询，之后 `complete` 过期。
+    /// 判别力：不起线程 / 不设 `finished` ⇒ 轮询等不到 ⇒ 红；搬了清单外的文件 ⇒ 第二条断言红。
+    #[test]
+    fn migrate_start_moves_manifest_files_and_reports_progress() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        let old = dir.join("old");
+        std::fs::create_dir_all(old.join("t")).unwrap();
+        std::fs::write(old.join("t/a.bin"), b"partial").unwrap();
+        std::fs::write(old.join("t/a.bin.aria2"), b"ctl").unwrap();
+        std::fs::write(old.join("t/not-in-manifest.bin"), b"x").unwrap();
+
+        op_migrate_start(&kernel, &json!({"from": old.to_str().unwrap()})).expect("启动搬运");
+        let t0 = std::time::Instant::now();
+        let status = loop {
+            let s = with_kernel(&kernel, op_migrate_status).expect("状态");
+            if s["finished"] == json!(true) {
+                break s;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "搬运迟迟不结束: {s}");
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        assert_eq!(status["files_total"], json!(1), "{status}");
+        assert_eq!(status["errors"].as_array().map(Vec::len), Some(0), "{status}");
+        assert_eq!(std::fs::read(dir.join("dl/t/a.bin")).unwrap(), b"partial");
+        assert_eq!(std::fs::read(dir.join("dl/t/a.bin.aria2")).unwrap(), b"ctl");
+        assert!(old.join("t/not-in-manifest.bin").exists(), "清单外的文件不许碰");
+        assert!(lock(&kernel).complete_dirty, "搬完之后 complete 必须过期");
+    }
+
+    #[test]
+    fn get_download_dir_reports_the_directory_the_kernel_uses() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        let v = with_kernel(&kernel, op_get_download_dir).expect("应当成功");
+        assert_eq!(v["dir"], json!(dir.join("dl").to_string_lossy()));
+    }
+
+    #[test]
+    fn migrate_start_refuses_the_same_directory_and_a_missing_one() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+
+        let same = op_migrate_start(&kernel, &json!({"from": dir.join("dl").to_str().unwrap()}))
+            .expect_err("同一个目录必须拒绝");
+        assert!(same.message.contains("同一个"), "{}", same.message);
+
+        let missing = op_migrate_start(&kernel, &json!({"from": dir.join("nope").to_str().unwrap()}))
+            .expect_err("不存在的目录必须拒绝");
+        assert!(missing.message.contains("不存在"), "{}", missing.message);
+
+        assert!(op_migrate_start(&kernel, &json!({})).is_err(), "缺 from 参数");
+    }
+
+    /// 搬运期间「一键开始」必须被拦下（引擎与搬运同写一个文件是数据损坏级风险）。
+    /// 判别力：去掉 `op_resume_all` 开头那段检查 ⇒ 红。
+    #[test]
+    fn resume_all_is_refused_while_a_migration_is_running() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        {
+            let k = lock(&kernel);
+            let mut m = k.migrate.lock().unwrap();
+            m.running = true;
+            m.files_done = 2;
+            m.files_total = 5;
+        }
+        let e = op_resume_all(&kernel).expect_err("搬运中必须拒绝");
+        assert!(e.message.contains("2/5"), "{}", e.message);
+        assert!(lock(&kernel).daemon.is_none(), "拒绝时不该启动引擎");
+    }
+
+    fn wait_for_error_state(kernel: &Arc<Mutex<Kernel>>) {
+        let d = lock(kernel).daemon.clone().expect("引擎应当已起");
+        let t0 = std::time::Instant::now();
+        loop {
+            let s = d.snapshot().expect("快照");
+            if s.tasks.iter().any(|t| t.state == crate::engine::status::TaskState::Error) {
+                return;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(20), "等不到任务落到 Error");
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// 把清单换成只有 `t/a.bin`、且指向一个**没人监听**的地址（连过去立刻 Connection refused）。
+    fn point_manifest_at_a_closed_port(kernel: &Arc<Mutex<Kernel>>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let m = delivery::parse(
+            format!(
+                r#"{{"code":"AbC","base_url":"http://127.0.0.1:{port}","files":[
+                    {{"path":"t/a.bin","size":6,"crc64":"91"}}]}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        lock(kernel).manifest = Some(m);
+    }
+
+    /// 🔴 服务器突然 `Connection refused`：任务落到 Error 之后，自动重试把它重新入队。
+    /// 判别力：删掉 `auto_retry_tick` 里的 `d.add` ⇒ 返回 0、gid 不变 ⇒ 红。
+    #[test]
+    fn a_transiently_failed_task_is_requeued_automatically() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        point_manifest_at_a_closed_port(&kernel);
+        op_enqueue(&kernel, &json!({"paths": ["t/a.bin"]})).expect("入队");
+        wait_for_error_state(&kernel);
+        let d = lock(&kernel).daemon.clone().unwrap();
+        let before: BTreeSet<String> = d.snapshot().unwrap().path_map.into_keys().collect();
+
+        let mut tracker = autoretry::Tracker::default();
+        let n = auto_retry_tick(&kernel, &mut tracker, std::time::Instant::now(), 0.0);
+        let after: BTreeSet<String> = d.snapshot().unwrap().path_map.into_keys().collect();
+        close_engine(&kernel);
+
+        assert_eq!(n, 1, "应当重新入队 1 个");
+        assert_eq!(tracker.attempts("t/a.bin"), 1);
+        assert_ne!(before, after, "旧 gid 被换成了新的");
+    }
+
+    /// 「暂停全部」按住期间，自动重试不得把失败的任务悄悄拉起来。
+    /// 判别力：去掉 `hold_auto_retry` 的判断 ⇒ 返回 1 ⇒ 红。
+    #[test]
+    fn auto_retry_is_held_while_everything_is_paused() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        point_manifest_at_a_closed_port(&kernel);
+        op_enqueue(&kernel, &json!({"paths": ["t/a.bin"]})).expect("入队");
+        wait_for_error_state(&kernel);
+        with_kernel(&kernel, |k| op_task_action(k, &json!({"action": "pause_all"}))).expect("暂停全部");
+
+        let mut tracker = autoretry::Tracker::default();
+        let held = auto_retry_tick(&kernel, &mut tracker, std::time::Instant::now(), 0.0);
+        lock(&kernel).hold_auto_retry = false; // 一键开始 ⇒ 放开
+        let released = auto_retry_tick(&kernel, &mut tracker, std::time::Instant::now(), 0.0);
+        close_engine(&kernel);
+
+        assert_eq!(held, 0, "暂停全部期间不得自动重试");
+        assert_eq!(released, 1);
+    }
+
+    /// `failing` 为空是常态：`auto_retry_tick` 不许在没有要重试的文件时还发 DNS。
+    /// 每 5 秒一拍的无界网络 I/O，解析慢时 tick 自己被阻塞。
+    /// 判别力：把惰性解析改回循环外无条件 `resolve_ips` ⇒ lookup 被调 ⇒ 红。
+    #[test]
+    fn auto_retry_tick_does_not_resolve_dns_when_there_is_nothing_to_retry() {
+        static LOOKUP_HIT: AtomicBool = AtomicBool::new(false);
+        fn counting_lookup(_host: &str, _port: u16) -> Vec<std::net::IpAddr> {
+            LOOKUP_HIT.store(true, Ordering::SeqCst);
+            vec!["1.2.3.4".parse().unwrap()]
+        }
+        TEST_LOOKUP.with(|t| *t.borrow_mut() = Some(counting_lookup));
+        // 桩引擎：tell* 回空表、getGlobalStat 回正常读数 ⇒ snapshot() 成功、任务表为空。
+        // 不这样答的话 snapshot() 直接 Err，函数提前 return 0，根本走不到 DNS 行。
+        let srv = StubHttp::start_with(|req| {
+            let result = if req.body.contains("aria2.getGlobalStat") {
+                json!({"downloadSpeed": "0", "numActive": "0", "numWaiting": "0", "numStopped": "0"})
+            } else {
+                json!([]) // tellActive / tellWaiting / tellStopped
+            };
+            RawResponse::new(200).body(json!({"jsonrpc": "2.0", "id": "1", "result": result}).to_string())
+        });
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), dir.join("s.json"))));
+        {
+            let mut k = lock(&kernel);
+            let m = delivery::parse(
+                format!(
+                    r#"{{"code":"AbC","base_url":"http://download.benagen.com","files":[
+                        {{"path":"t/a.bin","size":6,"crc64":"91"}}]}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("清单应当解析成功");
+            k.state.bind(&m.code);
+            if k.intent.bind(&m.code) {
+                k.save_intent();
+            }
+            k.manifest = Some(m);
+            k.daemon = Some(Arc::new(crate::engine::daemon::stub_daemon(
+                &srv.base(),
+                "s",
+                BTreeMap::new(),
+            )));
+        }
+        // 不入队、不制造失败任务 ⇒ `failing` 为空。
+        let mut tracker = autoretry::Tracker::default();
+        let n = auto_retry_tick(&kernel, &mut tracker, std::time::Instant::now(), 1.0);
+        let hit = LOOKUP_HIT.load(Ordering::SeqCst);
+        TEST_LOOKUP.with(|t| *t.borrow_mut() = None);
+        assert_eq!(n, 0);
+        assert!(
+            !hit,
+            "没有要重试的文件时不得发 DNS（每 5 秒一次的无界网络 I/O，慢解析会阻塞 tick 自己）"
+        );
+    }
+
+    /// 🔴 大批量入队：同步只提交前 100 个并返回 `pending`，其余由后台线程陆续加入，最终一个不少。
+    /// 判别力：去掉 `split_for_feeding`（全部同步）⇒ `pending` 为 0 ⇒ 红；
+    /// 后台线程不推进 ⇒ 等不到全部入队 ⇒ 红。
+    #[test]
+    fn a_big_enqueue_returns_after_the_first_hundred_and_feeds_the_rest() {
+        const N: usize = 260;
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        let files: Vec<String> = (0..N)
+            .map(|i| format!(r#"{{"path":"d/f{i}.bin","size":6,"crc64":"9{i}"}}"#))
+            .collect();
+        lock(&kernel).manifest = Some(
+            delivery::parse(
+                format!(
+                    r#"{{"code":"AbC","base_url":"{}","files":[{}]}}"#,
+                    host.base(),
+                    files.join(",")
+                )
+                .as_bytes(),
+            )
+            .unwrap(),
+        );
+
+        let out = op_enqueue(&kernel, &json!({"paths": ["d"]})).expect("入队");
+        assert_eq!(out["added"].as_array().map(Vec::len), Some(FIRST_BATCH), "{out}");
+        assert_eq!(out["pending"], json!(N - FIRST_BATCH));
+
+        let t0 = std::time::Instant::now();
+        let mut added_later = 0usize;
+        loop {
+            let st = with_kernel(&kernel, op_enqueue_status).expect("状态");
+            added_later += st["added"].as_u64().unwrap() as usize;
+            if st["pending"] == json!(0) && FIRST_BATCH + added_later == N {
+                break;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(60), "后台入队迟迟不完: {st}");
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(engine_paths(&kernel).len(), N);
+        close_engine(&kernel);
+    }
+
+    fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
+        let t0 = std::time::Instant::now();
+        while !ok() {
+            assert!(t0.elapsed() < Duration::from_secs(15), "等不到：{what}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn raw_status(d: &Daemon, gid: &str) -> Option<String> {
+        d.snapshot().ok()?.raw_status.get(gid).cloned()
+    }
+
+    /// 清单里放 `n` 个文件（`d/f{i}.bin`），用于大批量入队的测试。
+    fn big_manifest(host: &StuckHost, n: usize) -> delivery::Manifest {
+        let files: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"path":"d/f{i}.bin","size":6,"crc64":"9{i}"}}"#))
+            .collect();
+        delivery::parse(
+            format!(
+                r#"{{"code":"AbC","base_url":"{}","files":[{}]}}"#,
+                host.base(),
+                files.join(",")
+            )
+            .as_bytes(),
+        )
+        .expect("清单应当解析成功")
+    }
+
+    /// 一个应答正常、但拒绝每一次 `addUri` 的引擎桩：探活成功，于是失败只归于"这一个文件"。
+    ///
+    /// 每个回包都带 `Connection: close`：桩一次只服务一条连接，而 `addUri` 走的池化连接若一直
+    /// 开着，探活（`ping` 另开新连接）就会排在它后面超时——那会把"拒绝一个文件"误判成"引擎断开"。
+    fn refusing_engine() -> StubHttp {
+        StubHttp::start_with(|req| {
+            let body: Value = serde_json::from_str(&req.body).unwrap_or(Value::Null);
+            let reply = if body["method"].as_str() == Some("aria2.addUri") {
+                json!({"jsonrpc": "2.0", "id": "1", "error": {"code": 1, "message": "拒绝这个地址"}})
+            } else {
+                json!({"jsonrpc": "2.0", "id": "1", "result": {}})
+            };
+            RawResponse::new(200)
+                .header("Connection", "close")
+                .body(reply.to_string())
+        })
+    }
+
+    /// 🔴 换码时，后台队列里还没提交的旧批次文件必须作废：不得被新批次的 `base_url` 拼出去下载。
+    /// 判别力：删掉 `op_load_delivery` 里的 `discard_feed_queue` ⇒ 队列原样留着 ⇒ 红。
+    #[test]
+    fn a_code_change_discards_the_previous_batch_still_waiting_to_be_fed() {
+        const CODE_B: &str = "BbBbBbBbBbBbBbBbBbBb";
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        lock(&kernel).ensure_engine().expect("起引擎");
+        let old = delivery::parse(
+            format!(
+                r#"{{"code":"AbC","base_url":"{}","files":[
+                    {{"path":"t/q1.bin","size":6,"crc64":"91"}},
+                    {{"path":"t/q2.bin","size":6,"crc64":"92"}}]}}"#,
+                host.base()
+            )
+            .as_bytes(),
+        )
+        .expect("清单应当解析成功")
+        .files;
+        {
+            let mut k = lock(&kernel);
+            k.hold_auto_retry = true;
+            for f in old {
+                k.intent.add(&f.path);
+                k.feed_queue.push_back(f);
+            }
+        }
+        ensure_feeder(&kernel);
+
+        let srv = manifest_server(CODE_B, &host.base(), r#"{"path":"b/x.bin","size":6,"crc64":"81"}"#);
+        let r = op_load_delivery(&kernel, &json!({"code": CODE_B, "base_url": srv.base()}));
+        assert!(r.is_ok(), "换码应当成功: {:?}", r.err());
+        let left = lock(&kernel).feed_queue.len();
+        assert_eq!(left, 0, "换码后旧批次的待加入项必须清空，实际仍有 {left} 个");
+
+        lock(&kernel).hold_auto_retry = false;
+        wait_for("后台线程收尾", || {
+            let k = lock(&kernel);
+            k.feed_queue.is_empty() && !k.feeder_running
+        });
+        let after = engine_paths(&kernel);
+        close_engine(&kernel);
+        assert!(
+            after.iter().all(|p| !p.starts_with("t/q")),
+            "旧批次的文件不得被加入新批次的引擎: {after:?}"
+        );
+    }
+
+    /// 清单请求的回包固定为 `code` + 一个文件，用来触发 `load_delivery`。
+    fn manifest_server(code: &str, base: &str, file: &str) -> StubHttp {
+        let body = format!(r#"{{"code":"{code}","base_url":"{base}","files":[{file}]}}"#);
+        StubHttp::start_with(move |_req| RawResponse::new(200).body(body.clone()))
+    }
+
+    /// 🔴 `enqueue` 的 `addUri` 在锁外做：RPC 在飞时内核锁必须是自由的（契约 §5.2，本批第 2 条）。
+    /// 判别力：把 `submit_off_lock` 里的 `d.add` 挪进 `lock(kernel)` 的作用域 ⇒ 探针红。
+    #[test]
+    fn enqueue_does_not_hold_the_kernel_lock_while_add_uri_is_in_flight() {
+        let (seen_tx, seen_rx) = mpsc::channel::<()>();
+        let release = Arc::new(AtomicBool::new(false));
+        let release_h = Arc::clone(&release);
+        let first = AtomicBool::new(true);
+        let srv = StubHttp::start_with(move |req| {
+            let body: Value = serde_json::from_str(&req.body).unwrap_or(Value::Null);
+            if body["method"].as_str() == Some("aria2.addUri") && first.swap(false, Ordering::SeqCst) {
+                let _ = seen_tx.send(());
+                while !release_h.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            RawResponse::new(200).body(json!({"jsonrpc": "2.0", "id": "1", "result": "gid-1"}).to_string())
+        });
+
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        lock(&kernel).daemon = Some(Arc::new(crate::engine::daemon::stub_daemon(
+            &srv.base(),
+            "s",
+            BTreeMap::new(),
+        )));
+
+        let k2 = Arc::clone(&kernel);
+        let worker = thread::spawn(move || op_enqueue(&k2, &json!({"paths": ["t/a.bin"]})));
+        seen_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("addUri 没有发出去");
+        let free_while_in_flight = kernel_lock_is_free(&kernel);
+        release.store(true, Ordering::SeqCst);
+        let out = worker.join().expect("工作线程 panic");
+
+        assert!(
+            free_while_in_flight,
+            "addUri 进行中时仍持有内核锁：一批 100 个约 14 分钟会卡住窗口。把 `d.add` 留在锁外。"
+        );
+        assert!(out.is_ok(), "入队应当成功: {:?}", out.err());
+    }
+
+    /// 从 addUri 请求体取出 `(uris, options)`。下标承重：线上形态是 `[token, uris, options]`。
+    fn add_uri_uris_and_opts(raw_body: &str) -> (Vec<String>, Option<serde_json::Map<String, Value>>) {
+        let body: Value = serde_json::from_str(raw_body).expect("请求体必须是 JSON");
+        let params = body["params"].as_array().cloned().unwrap_or_default();
+        let uris: Vec<String> = params
+            .get(1)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let opts = params.get(2).and_then(|v| v.as_object()).cloned();
+        (uris, opts)
+    }
+
+    /// 建一份**域名 base_url** 的单文件内核 + 记录 addUri 的桩引擎。
+    /// 不能用 `kernel_with_two_files`：它的 base 是 `127.0.0.1`（IP 字面量），
+    /// `resolve_for_base` 规则 3 会直接返回空，测不到多 IP 链路。
+    fn kernel_with_domain_base(dir: &TempDir, base_url: &str) -> (Arc<Mutex<Kernel>>, StubHttp) {
+        let srv = StubHttp::start_with(|_req| {
+            RawResponse::new(200).body(json!({"jsonrpc": "2.0", "id": "1", "result": "gid-1"}).to_string())
+        });
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), dir.join("s.json"))));
+        {
+            let mut k = lock(&kernel);
+            let m = delivery::parse(
+                format!(
+                    r#"{{"code":"AbC","base_url":"{base_url}","files":[
+                        {{"path":"t/a.bin","size":6,"crc64":"91"}}]}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("清单应当解析成功");
+            k.state.bind(&m.code);
+            if k.intent.bind(&m.code) {
+                k.save_intent();
+            }
+            k.manifest = Some(m);
+            k.daemon = Some(Arc::new(crate::engine::daemon::stub_daemon(
+                &srv.base(),
+                "s",
+                BTreeMap::new(),
+            )));
+        }
+        (kernel, srv)
+    }
+
+    /// 多 IP 一次交付：stub resolver 给 2 个 IP ⇒ addUri 的 uris 是 3 个、域名第一，
+    /// options 带 header=Host: <域名>。判别力：去掉 Host 注入 ⇒ options 无 header ⇒ 红。
+    #[test]
+    fn enqueue_sends_domain_first_and_ip_backups_with_host_header() {
+        fn stub_lookup(_host: &str, _port: u16) -> Vec<std::net::IpAddr> {
+            vec!["1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap()]
+        }
+        TEST_LOOKUP.with(|t| *t.borrow_mut() = Some(stub_lookup));
+        let dir = TempDir::new();
+        let (kernel, srv) = kernel_with_domain_base(&dir, "http://download.benagen.com");
+
+        let out = op_enqueue(&kernel, &json!({"paths": ["t/a.bin"]})).expect("入队");
+        assert_eq!(out["added"].as_array().map(Vec::len), Some(1), "一个文件应当入队: {out}");
+
+        let add_uri = srv
+            .requests()
+            .into_iter()
+            .find(|r| {
+                let b: Value = serde_json::from_str(&r.body).unwrap_or(Value::Null);
+                b["method"].as_str() == Some("aria2.addUri")
+            })
+            .expect("应当有 addUri 请求");
+        let (uris, opts) = add_uri_uris_and_opts(&add_uri.body);
+        assert_eq!(uris.len(), 3, "域名 + 2 个 IP 备胎 = 3 条 URI，实际: {uris:?}");
+        assert!(uris[0].starts_with("http://download.benagen.com/"), "域名必须打头: {}", uris[0]);
+        assert!(uris[1].starts_with("http://1.2.3.4/"), "备胎 1: {}", uris[1]);
+        assert!(uris[2].starts_with("http://5.6.7.8/"), "备胎 2: {}", uris[2]);
+        let opts = opts.expect("params[2] 必须是选项对象");
+        assert_eq!(
+            opts.get("header").and_then(|v| v.as_str()),
+            Some("Host: download.benagen.com"),
+            "有备胎时必须下发 Host 头: {opts:?}"
+        );
+        TEST_LOOKUP.with(|t| *t.borrow_mut() = None);
+    }
+
+    /// https 的批次只发域名 URI 且不带 header。判别力：scheme 门去掉 ⇒ uris 变 3 ⇒ 红。
+    #[test]
+    fn enqueue_https_sends_domain_uri_only() {
+        fn stub_lookup(_host: &str, _port: u16) -> Vec<std::net::IpAddr> {
+            vec!["1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap()]
+        }
+        TEST_LOOKUP.with(|t| *t.borrow_mut() = Some(stub_lookup));
+        let dir = TempDir::new();
+        let (kernel, srv) = kernel_with_domain_base(&dir, "https://download.benagen.com");
+
+        let out = op_enqueue(&kernel, &json!({"paths": ["t/a.bin"]})).expect("入队");
+        assert_eq!(out["added"].as_array().map(Vec::len), Some(1), "一个文件应当入队: {out}");
+
+        let add_uri = srv
+            .requests()
+            .into_iter()
+            .find(|r| {
+                let b: Value = serde_json::from_str(&r.body).unwrap_or(Value::Null);
+                b["method"].as_str() == Some("aria2.addUri")
+            })
+            .expect("应当有 addUri 请求");
+        let (uris, opts) = add_uri_uris_and_opts(&add_uri.body);
+        assert_eq!(uris.len(), 1, "https 只发域名 URI，实际: {uris:?}");
+        assert!(uris[0].starts_with("https://download.benagen.com/"), "域名 URI: {}", uris[0]);
+        let opts = opts.expect("params[2] 必须是选项对象");
+        assert!(
+            opts.get("header").is_none(),
+            "https 不该下发 Host 头（机制整体关着）: {opts:?}"
+        );
+        TEST_LOOKUP.with(|t| *t.borrow_mut() = None);
+    }
+
+    /// 多 IP 构造要进诊断计数器（§6.1 的诚实替代——只记构造证据，「被切换次数」RPC 取不到，
+    /// 边界见 `diag_counters::record_multiip`）。判别力：**去掉 `plan_file` 里的
+    /// `record_multiip` 接线点 ⇒ 红**（计数器停在 0）。
+    #[test]
+    fn enqueue_counts_multiip_construction_in_diag_counters() {
+        fn stub_lookup(_host: &str, _port: u16) -> Vec<std::net::IpAddr> {
+            vec!["1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap()]
+        }
+        TEST_LOOKUP.with(|t| *t.borrow_mut() = Some(stub_lookup));
+        let dir = TempDir::new();
+        let (kernel, _srv) = kernel_with_domain_base(&dir, "http://download.benagen.com");
+
+        let out = op_enqueue(&kernel, &json!({"paths": ["t/a.bin"]})).expect("入队");
+        assert_eq!(out["added"].as_array().map(Vec::len), Some(1), "一个文件应当入队: {out}");
+
+        let s = lock(&kernel).counters.snapshot();
+        assert_eq!(s.multiip_tasks, 1, "一个带备胎的任务 ⇒ 记一次");
+        assert_eq!(s.multiip_backup_uris, 2, "2 个 IP 备胎 ⇒ 备胎 URI 总数 2");
+        TEST_LOOKUP.with(|t| *t.borrow_mut() = None);
+    }
+
+    /// 🔴 替换引擎的窗口期（引擎暂缺、未换码）里，后台队列必须等待，而不是被清空（本批第 3 条）。
+    /// 判别力：把 `feed_once` 的"引擎暂缺"分支改回 `clear()` ⇒ 窗口里队列消失 ⇒ 红。
+    #[test]
+    fn the_feeder_waits_out_an_engine_swap_instead_of_dropping_the_queue() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        {
+            let mut k = lock(&kernel);
+            let files = k.manifest.as_ref().expect("清单").files.clone();
+            for f in files {
+                k.intent.add(&f.path);
+                k.feed_queue.push_back(f);
+            }
+        }
+        ensure_feeder(&kernel);
+        thread::sleep(Duration::from_secs(1));
+        {
+            let k = lock(&kernel);
+            assert_eq!(k.feed_queue.len(), 2, "引擎暂缺时队列不得消失");
+            assert!(k.feed_rejected.is_empty(), "引擎暂缺时不得记任何拒绝: {:?}", k.feed_rejected);
+            assert!(k.feeder_running, "线程应当还在等");
+        }
+
+        lock(&kernel).ensure_engine().expect("起引擎");
+        wait_for("引擎就绪后两个都加入", || {
+            engine_paths(&kernel) == paths(&["t/a.bin", "t/b.bin"])
+        });
+        close_engine(&kernel);
+    }
+
+    /// 🔴 前 100 个全被拒、后面的还在后台排队：回执**不是错误**，后面的仍会被加入（本批第 6 条）。
+    /// 判别力：把 `op_enqueue` 的错误判断挪回后台入队之前，或去掉 `pending == 0` ⇒ 红。
+    #[test]
+    fn a_big_enqueue_whose_first_hundred_are_refused_is_not_reported_as_failed() {
+        const N: usize = 160;
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        let srv = refusing_engine();
+        {
+            let mut k = lock(&kernel);
+            k.manifest = Some(big_manifest(&host, N));
+            k.daemon = Some(Arc::new(crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new())));
+        }
+
+        let out = op_enqueue(&kernel, &json!({"paths": ["d"]}))
+            .expect("后面还有待加入的，就不是「没有任何文件被加入下载」");
+        assert_eq!(out["pending"], json!(N - FIRST_BATCH), "{out}");
+        assert_eq!(out["rejected"].as_array().map(Vec::len), Some(FIRST_BATCH), "{out}");
+
+        wait_for("后台队列排空", || {
+            let k = lock(&kernel);
+            k.feed_queue.is_empty() && !k.feeder_running
+        });
+        let st = with_kernel(&kernel, op_enqueue_status).expect("状态");
+        assert_eq!(st["rejected"].as_array().map(Vec::len), Some(N - FIRST_BATCH), "{st}");
+    }
+
+    /// 一个都没加上、也没有待加入的入队，仍然是错误（与上一条配对：错误判断只在"真的一个都没有"时触发）。
+    #[test]
+    fn an_enqueue_that_every_file_refuses_is_still_an_error() {
+        const N: usize = 100;
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        let srv = refusing_engine();
+        {
+            let mut k = lock(&kernel);
+            k.manifest = Some(big_manifest(&host, N));
+            k.daemon = Some(Arc::new(crate::engine::daemon::stub_daemon(&srv.base(), "s", BTreeMap::new())));
+        }
+
+        let e = op_enqueue(&kernel, &json!({"paths": ["d"]})).expect_err("全被拒且无待加入必须是错误");
+        assert!(e.message.contains("没有任何文件被加入下载"), "{}", e.message);
+    }
+
+    /// 🔴 重试任务**下载中**时，它的次数记账不得被清零（本批第 5 条）。
+    /// 判别力：把 `retain_failing` 的参数改回"只留失败态" ⇒ 第二拍后次数为 0 ⇒ 红。
+    #[test]
+    fn a_retry_that_is_downloading_keeps_its_attempt_count() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        point_manifest_at_a_closed_port(&kernel);
+        op_enqueue(&kernel, &json!({"paths": ["t/a.bin"]})).expect("入队");
+        wait_for_error_state(&kernel);
+        // 重试时源要换成一个连得上、却永不回数据的：重试任务就会停在下载中。
+        install_manifest(&kernel, &host);
+
+        let mut tracker = autoretry::Tracker::default();
+        let first = auto_retry_tick(&kernel, &mut tracker, std::time::Instant::now(), 0.0);
+        assert_eq!(first, 1, "第一拍应当重新入队");
+        let d = lock(&kernel).daemon.clone().expect("引擎应当已起");
+        wait_for("重试任务离开 error 态", || {
+            let snap = d.snapshot().expect("快照");
+            snap.tasks.iter().any(|t| {
+                t.state != engine::status::TaskState::Error
+                    && snap.path_map.get(&t.gid).is_some_and(|p| p == "t/a.bin")
+            })
+        });
+
+        let second = auto_retry_tick(&kernel, &mut tracker, std::time::Instant::now(), 0.0);
+        close_engine(&kernel);
+        assert_eq!(second, 0, "下载中的任务不该再被重试");
+        assert_eq!(tracker.attempts("t/a.bin"), 1, "下载中的任务，次数记账不得清零");
+    }
+
+    /// 🔴 「暂停全部」之后的入队不解除暂停（本批第 8 条）：新加入的也必须是暂停态。
+    /// 判别力：把 `op_enqueue` 里的 `hold_auto_retry = false` 加回去 ⇒ 第一条断言红。
+    #[test]
+    fn enqueuing_while_everything_is_paused_keeps_the_pause() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        op_enqueue(&kernel, &json!({"paths": ["t/a.bin"]})).expect("入队");
+        with_kernel(&kernel, |k| op_task_action(k, &json!({"action": "pause_all"}))).expect("暂停全部");
+
+        let out = op_enqueue(&kernel, &json!({"paths": ["t/b.bin"]})).expect("暂停期间入队");
+        let held = lock(&kernel).hold_auto_retry;
+        let d = lock(&kernel).daemon.clone().expect("引擎应当已起");
+        let gid_b = out["added"][0]["gid"].as_str().expect("gid").to_string();
+        wait_for("新加入的 b 是暂停态", || raw_status(&d, &gid_b).as_deref() == Some("paused"));
+        close_engine(&kernel);
+        assert!(held, "入队不得解除「暂停全部」");
+    }
+
+    /// 🔴 「下载全部」时，已经在后台队列里等着的文件不得再被提交一次（本批第 7 条）。
+    /// 判别力：去掉 `op_enqueue` 里对 `feed_queue` 的过滤 ⇒ t/b.bin 被 addUri 进引擎 ⇒ 红。
+    #[test]
+    fn download_all_does_not_resubmit_what_is_already_waiting_to_be_fed() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        {
+            let mut k = lock(&kernel);
+            k.hold_auto_retry = true;
+            let b = k
+                .manifest
+                .as_ref()
+                .expect("清单")
+                .files
+                .iter()
+                .find(|f| f.path == "t/b.bin")
+                .cloned()
+                .expect("b 在清单里");
+            k.intent.add(&b.path);
+            k.feed_queue.push_back(b);
+        }
+
+        op_enqueue(&kernel, &json!({"paths": []})).expect("下载全部");
+        let added = engine_paths(&kernel);
+        close_engine(&kernel);
+        assert_eq!(added, paths(&["t/a.bin"]), "等待中的 t/b.bin 不得被再提交一次");
+    }
+
+    /// 🔴 「下载全部」不为引擎里已有的路径再造一个 GID（裁决：暂停交给「一键开始」）。
+    /// 判别力：去掉 `owned` 过滤 ⇒ a 被再次加入，任务数变成 3 ⇒ 红。
+    #[test]
+    fn download_all_does_not_duplicate_a_task_the_engine_already_has() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        let first = op_enqueue(&kernel, &json!({"paths": ["t/a.bin"]})).expect("入队");
+        let gid_a = first["added"][0]["gid"].as_str().expect("gid").to_string();
+        let d = lock(&kernel).daemon.clone().expect("引擎应当已起");
+
+        let out = op_enqueue(&kernel, &json!({})).expect("下载全部");
+        let added: Vec<&str> = out["added"]
+            .as_array()
+            .expect("added 是个数组")
+            .iter()
+            .map(|x| x["path"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(added, vec!["t/b.bin"], "只该补 b，a 已经在引擎里: {out}");
+        assert_eq!(d.snapshot().expect("快照").path_map.len(), 2, "同一路径不得出现两个任务");
+
+        with_kernel(&kernel, |k| op_task_action(k, &json!({"action": "pause_all"}))).expect("暂停全部");
+        let again = op_enqueue(&kernel, &json!({})).expect("暂停后下载全部");
+        let snap = d.snapshot().expect("快照");
+        close_engine(&kernel);
+        assert_eq!(again["added"].as_array().map(Vec::len), Some(0), "暂停的任务不由「下载全部」恢复: {again}");
+        assert_eq!(snap.path_map.len(), 2, "暂停期间不得多出任务");
+        assert_eq!(snap.path_map.get(&gid_a).map(String::as_str), Some("t/a.bin"), "原任务保持原 GID");
+    }
+
+    /// 🔴 失败态的任务不由「下载全部」静默重提（瞬时的归自动重试，永久的归用户显式重试）。
+    /// 判别力：去掉 `owned` 过滤 ⇒ 失败的 a 被再次加入 ⇒ 任务数变成 2 ⇒ 红。
+    #[test]
+    fn download_all_does_not_resubmit_a_failed_task() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        point_manifest_at_a_closed_port(&kernel);
+        op_enqueue(&kernel, &json!({"paths": ["t/a.bin"]})).expect("入队");
+        wait_for_error_state(&kernel);
+        let d = lock(&kernel).daemon.clone().expect("引擎应当已起");
+
+        let out = op_enqueue(&kernel, &json!({})).expect("下载全部");
+        let count = d.snapshot().expect("快照").path_map.len();
+        close_engine(&kernel);
+        assert_eq!(out["added"].as_array().map(Vec::len), Some(0), "失败的任务不得被静默重提: {out}");
+        assert_eq!(count, 1, "同一路径不得出现第二个任务");
+    }
+
+    /// 判别力：把 `op_resume_all` 里的 `unpause_all` 挪到 `restore_batch` 之前 ⇒ 暂停的任务已被放开 ⇒ 红。
+    #[test]
+    fn resume_all_refused_for_space_leaves_the_paused_tasks_paused() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        let out = op_enqueue(&kernel, &json!({"paths": ["t/a.bin"]})).expect("入队");
+        let gid_a = out["added"][0]["gid"].as_str().expect("gid").to_string();
+        with_kernel(&kernel, |k| op_task_action(k, &json!({"action": "pause_all"}))).expect("暂停全部");
+        let d = lock(&kernel).daemon.clone().expect("引擎应当已起");
+        wait_for("a 已暂停", || raw_status(&d, &gid_a).as_deref() == Some("paused"));
+
+        // 清单里另一个文件大到盘上一定放不下，且它在意向集里 ⇒ 一键开始会因磁盘不足失败。
+        let huge = delivery::parse(
+            format!(
+                r#"{{"code":"AbC","base_url":"{}","files":[
+                    {{"path":"t/a.bin","size":6,"crc64":"91"}},
+                    {{"path":"t/b.bin","size":1152921504606846976,"crc64":"92"}}]}}"#,
+                host.base()
+            )
+            .as_bytes(),
+        )
+        .expect("清单应当解析成功");
+        {
+            let mut k = lock(&kernel);
+            k.manifest = Some(huge);
+            k.intent.add("t/b.bin");
+        }
+        let r = op_resume_all(&kernel);
+        thread::sleep(Duration::from_millis(800));
+        let still = raw_status(&d, &gid_a);
+        close_engine(&kernel);
+        assert!(r.is_err(), "磁盘放不下，一键开始必须报错");
+        assert_eq!(still.as_deref(), Some("paused"), "查不过磁盘就不能先把暂停的放开");
+    }
+
+    /// 🔴 搬运在跑的时候，入队与自愈补回都不得碰引擎（本批第 11 条）。
+    /// 判别力：删掉 `op_enqueue` 的搬运检查 ⇒ 第一条断言红；删掉 `restore_queue_after_replace` 的搬运检查 ⇒ 第二条断言红。
+    #[test]
+    fn a_running_migration_keeps_the_engine_untouched() {
+        let dir = TempDir::new();
+        let host = StuckHost::start();
+        let kernel = kernel_with_two_files(&dir, &host);
+        let mig = Arc::clone(&lock(&kernel).migrate);
+        mig.lock().unwrap_or_else(PoisonError::into_inner).running = true;
+
+        let e = op_enqueue(&kernel, &json!({"paths": ["t/a.bin"]})).expect_err("搬运中入队必须拒绝");
+        assert!(e.message.contains("搬运"), "{}", e.message);
+        assert!(lock(&kernel).daemon.is_none(), "拒绝之后不得已经起了引擎");
+
+        lock(&kernel).ensure_engine().expect("起引擎");
+        {
+            let mut k = lock(&kernel);
+            k.intent.add("t/a.bin");
+            k.intent.add("t/b.bin");
+        }
+        restore_queue_after_replace(&kernel);
+        let after = engine_paths(&kernel);
+        close_engine(&kernel);
+        assert!(after.is_empty(), "搬运中自愈补回不得往引擎里加任务: {after:?}");
+    }
+
+    /// 盘上已有的半截文件要从「还需要的空间」里扣掉，别把「只差一点」误拦成「磁盘不够」。
+    #[test]
+    fn remaining_bytes_subtracts_what_is_already_on_disk() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("t")).unwrap();
+        std::fs::write(dir.join("t/a.bin"), vec![0u8; 4]).unwrap();
+        let f = |p: &str, size: i64| delivery::File {
+            path: p.to_string(),
+            size,
+            crc64: String::new(),
+            source_mtime: String::new(),
+        };
+        let files = [f("t/a.bin", 10), f("t/none.bin", 7), f("t/a.bin", 3)];
+        // 10-4 + 7-0 + max(3-4,0)=0
+        assert_eq!(remaining_bytes(dir.path(), &files), 13);
     }
 
     /// **引擎中途不应答时，回执必须把每一件没入队的文件都交代清楚**（2026-10-09）。
@@ -3139,8 +5831,8 @@ mod tests {
         let file = url.rsplit('/').next().unwrap();
         assert_eq!(
             file,
-            update::asset_name(update::platform(), update::arch()),
-            "文件名必须按本平台/架构选（拼错会给客户一个装不上的包）：{url}"
+            update::asset_name(update::platform(), update::arch(), (999, 0, 0)),
+            "文件名必须按本平台/架构选、且版本段与 URL 同源（拼错会给客户一个装不上的包）：{url}"
         );
     }
 }

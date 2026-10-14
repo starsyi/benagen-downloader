@@ -103,13 +103,18 @@ impl TransferRow {
     /// aria2 里"已暂停"的原始状态串（`core/src/engine/status.rs` 的透传值）。
     pub const PAUSED_RAW_STATUS: &'static str = "paused";
 
+    /// 这一条是不是「已暂停」（行的暂停徽标、防休眠的排除都走这一个判据）。
+    pub fn is_paused(item: &TransferItem) -> bool {
+        item.raw_status == Self::PAUSED_RAW_STATUS
+    }
+
     /// `transfer_list` 的一条 → 一行。
     ///
     /// ⚠️ **W-6（命名）**：上游是 `init(_ item:)`，这里按简报的 API 块写成 `new(item)` ——
     ///    Rust 没有"与类型同名的构造器"那个惯例位置，`new` 是这个语言里的对位写法。
     pub fn new(item: &TransferItem) -> Self {
         let path = TransferReveal::manifest_path(item.path.as_deref());
-        let is_paused = item.raw_status == Self::PAUSED_RAW_STATUS;
+        let is_paused = Self::is_paused(item);
         Self {
             gid: item.gid.clone(),
             title: path.unwrap_or(Self::UNKNOWN_PATH).to_string(),

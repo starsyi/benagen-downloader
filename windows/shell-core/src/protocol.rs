@@ -561,12 +561,15 @@ pub struct RejectedTask {
 pub struct EnqueueResult {
     pub added: Vec<AddedTask>,
     pub rejected: Vec<RejectedTask>,
+    /// 还没提交给引擎、正由内核后台陆续加入的个数（2026-10-12 起；旧内核没有这一格 ⇒ 0）。
+    #[serde(default)]
+    pub pending: usize,
 }
 
 /// `task_action` 的 `action` 参数（`core/src/main.rs` 的 `op_task_action`）。
 ///
-/// ⚠️ 这五个是**线上值**：壳把它们填进 `params.action` 发给内核，而内核用**字面量**匹配
-/// （`"pause" | "unpause" | "retry" | "remove" | "clear_finished"`），
+/// ⚠️ 这七个是**线上值**：壳把它们填进 `params.action` 发给内核，而内核用**字面量**匹配
+/// （`"pause" | "unpause" | "retry" | "remove" | "clear_finished" | "pause_all" | "resume_all"`），
 /// 不认识的会回 `invalid_params` 并列出可用的那几个。
 /// 出处：`macos/Sources/BenagenCoreKit/Protocol.swift:168-170` 与内核的匹配臂，两边逐字一致。
 ///
@@ -592,6 +595,39 @@ pub enum TaskAction {
     Remove,
     /// 清空已完成。
     ClearFinished,
+    /// 暂停全部（列表级，没有 gid；内核用 `forcePauseAll`，立刻停写）。
+    PauseAll,
+    /// 一键开始（列表级，没有 gid）：继续全部暂停的，并把引擎里缺的补回队列。
+    ResumeAll,
+}
+
+/// `migrate_status` 里的一条问题（跳过 / 失败）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MigrateProblem {
+    pub path: String,
+    pub reason: String,
+}
+
+/// `migrate_status` 的回执（`core/src/migrate.rs` 的 `Status`）：换下载目录时
+/// 把旧目录里已下载的文件搬到新目录的进度。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct MigrateStatus {
+    pub running: bool,
+    pub finished: bool,
+    pub files_done: usize,
+    pub files_total: usize,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    #[serde(default)]
+    pub skipped: Vec<MigrateProblem>,
+    #[serde(default)]
+    pub errors: Vec<MigrateProblem>,
+}
+
+/// `get_download_dir` 的回执。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DownloadDirResult {
+    pub dir: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,7 +1145,7 @@ mod tests {
         }
     }
 
-    /// `TaskAction` —— `task_action` 的五个线上字面量（控制者裁决 S）。
+    /// `TaskAction` —— `task_action` 的七个线上字面量（控制者裁决 S；后两个是 2026-10-12 加的列表级动作）。
     ///
     /// ⚠️ **这条测试原先坐在「壳自己持有的三个枚举（无线上形态）」那个块里，是错位**
     ///    （任务 14 顺手归位，只搬位置、一个字都没改）：`TaskAction` **带
@@ -1124,13 +1160,15 @@ mod tests {
     /// 顺带钉住 `Ord`：任务 15 用的是 `BTreeSet<TaskAction>`（`task-15-brief.md:33`）。
     /// 少了 `Ord`，那边会以一条编译错误的形式发现——不如在这里钉住。
     #[test]
-    fn task_action_pins_the_five_wire_literals() {
+    fn task_action_pins_the_wire_literals() {
         for (v, want) in [
             (TaskAction::Pause, "pause"),
             (TaskAction::Unpause, "unpause"),
             (TaskAction::Retry, "retry"),
             (TaskAction::Remove, "remove"),
             (TaskAction::ClearFinished, "clear_finished"),
+            (TaskAction::PauseAll, "pause_all"),
+            (TaskAction::ResumeAll, "resume_all"),
         ] {
             assert_eq!(
                 serde_json::to_value(v).expect("序列化不该失败"),

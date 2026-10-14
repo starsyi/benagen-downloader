@@ -360,18 +360,9 @@ export function mount(el, ctx) {
     // ⚠️ 「未勾选任何项，将下载全部待下载文件」—— `null` = 这一格此刻不该出现
     // （有勾选时它就不出现；macOS `SelectionBar.swift:33` 的 `hint`）。
     const hint = action && typeof action.empty_selection_hint === "string" ? action.empty_selection_hint : "";
-    // 🔴 「这个动作此刻**按不下去**，因为……」（`DownloadAction.blocked_reason`，**Rust 给的**）。
-    //    勾选面大到一次发不出去时（C-3 的另一半），按下去只会撞上一条发不出去的请求 ——
-    //    所以这个动作**此刻不可用**（工具栏那颗按钮禁用），而这句话就摆在底栏这里。
-    //    措辞、门槛、判据全在 Rust 里，
-    //    本文件**一个字都不造**（§3.2），这里只做"是不是一个字符串"这一步取值。
-    //    ⚠️ 与 `hint` **共用同一个坑位**（两者互斥）：空勾选面发的是一个空数组
-    //    （请求体恒定）⇒ 它不可能超预算，所以这两句话永远不会同时出现。
-    const blocked = blockedReason();
-    const note = blocked === "" ? hint : blocked;
-    setText(hintEl, note);
-    hintEl.hidden = note === "";
-    hintSepEl.hidden = note === "";
+    setText(hintEl, hint);
+    hintEl.hidden = hint === "";
+    hintSepEl.hidden = hint === "";
     // 🔴 **底栏这颗与右键菜单那一项：真的禁用**（`files.css` 的 `:disabled` 段给了它们
     //    看得出来的禁用态 —— `panels.css` 那套写法的同一份：变灰 + 光标归一 +
     //    悬停**不再**点亮）。少了"看得出"这三个字，禁用就退化成"看着能用、点下去没反应"。
@@ -386,19 +377,9 @@ export function mount(el, ctx) {
     //    少了这半条，首挂（或 `reseed`）那一段里底栏这颗是"**空文案 + 可点**"，
     //    而工具栏那颗是禁用的 —— 客户看到一颗没有字的蓝色主按钮，点下去**一条消息都没有**。
     //    （实测：那一刻点击 ⇒ `enqueue` 被 `inFlight` 挡在门口、`invoke` 零调用。）
-    const unusable = action === null || blocked !== "";
+    const unusable = action === null;
     downloadEl.disabled = unusable;
     menuDownloadEl.disabled = unusable;
-  }
-
-  /**
-   * 当前载荷说"这个动作按不下去"的理由（**空串 = 可以按**）。
-   *
-   * ⚠️ 一律走这一个取值口：两处入口（底栏 / 工具栏）各写一遍 `typeof`，
-   *    迟早会漂成"一个禁用一个不禁用"—— 而那种不一致在界面上看起来只是"那颗还能点"。
-   */
-  function blockedReason() {
-    return action && typeof action.blocked_reason === "string" ? action.blocked_reason : "";
   }
 
   /** `enqueue` 的回执：顶上一句 + **逐条**拒绝理由（约束 4：两边都要有落点）。 */
@@ -736,10 +717,7 @@ export function mount(el, ctx) {
    *
    * ⚠️ **C-3 那道保护的两半都在壳里**（前端一个字都不判）：
    *    · "勾选面覆盖整批 ⇒ 交给内核的是空数组" —— 任务 16 接在 `commands::enqueue` 里；
-   *    · "部分勾选但仍然超预算 ⇒ 这个动作**按不下去**" —— 任务 17 接在载荷里
-   *      （`DownloadAction.blocked_reason`）。**本文件只读那一格**：是字符串 ⇒
-   *      工具栏那颗禁用、并把 Rust 给的那句话摆在底栏（`paintBar` / `blockedReason`）。
-   *      ⚠️ 所以本屏**不再**有"最大的那条路走不通"这个缺口 —— 但判据仍然只有一份实现。
+   *    · "部分勾选但仍然超预算" —— 由壳切块分批发送（`commands::enqueue_with`），前端不再有"按不下去"的一档。
    *    ⚠️ 还有一道**兜底闸**在 `commands::enqueue_with` 里：前端这一格是异步取回来的，
    *      勾完之后到载荷回来之间那一下点得下去 —— 那一下由壳挡（不发内核、把同一句话当回执）。
    */
@@ -1092,17 +1070,14 @@ export function mount(el, ctx) {
      *    这一屏被挂起来时 `routeOfState` 已经保证 `load.kind === "loaded"`，
      *    所以 `null` 只出现在"刚挂上、第一拍 `tree()` 还没回来"的那一小段。
      *
-     * 🔴 **`enabled` 就是"这一刻按下去发不发得出去"**（任务 17）：载荷说按不下去
-     *    （`action.blocked_reason` 是个字符串）时它是 `false` —— 与底栏那颗**同一个判据**
-     *    （都走 `blockedReason()`），而那句话由底栏摆出来（工具栏那一格只放得下标题）。
-     *    ⚠️ 这不是"暂时没有选中项"那个分支：那种情况 `enabled` 仍然是 `true`
-     *    （那时按钮换一句话说、点下去 = 下全部待下载 —— 见 `button_title` 的文档）。
+     * ⚠️ 大批量不再有"按不下去"的一档（超预算的勾选面由壳切块发送，见 `commands::enqueue_with`），
+     *    所以有载荷就是可以按的。
      */
     toolbarDownload() {
       if (!action) return null;
       return {
         title: action.button_title,
-        enabled: blockedReason() === "",
+        enabled: true,
         // ⚠️ `run` **不接参数**：壳不知道勾选面（那是这一屏的私有状态）。
         run: () => {
           void enqueue([...kept.selection]);

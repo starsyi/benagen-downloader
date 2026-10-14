@@ -14,10 +14,26 @@ import Foundation
 ///
 /// `readLine()` 返回 `nil` 表示 **EOF**（对端关了写端 / 进程已退出）——
 /// 它是"内核没了"的唯一可靠信号，必须与"读到一行空串"区分开。
+///
+/// ⚠️ `readLine(deadline:)` 是**唯一的例外**（F11）：无期限的读会永久挂住并堵死
+///    `CoreClient` 的串行队列。它有默认实现（直接调无期限版），测试替身不必跟着改；
+///    `ProcessChannel` 覆盖它做真正的 poll 限时。
 public protocol LineChannel: AnyObject {
     func writeLine(_ s: String) throws
     func readLine() throws -> String?     // nil = EOF
+    func readLine(deadline: Duration) throws -> String?   // 超时抛 `CoreError.timedOut`
     func close()
+}
+
+extension LineChannel {
+    /// 默认实现：**不带期限**（测试替身的读是同步的，本来就不挂）。
+    ///
+    /// ⚠️ 因为 `readLine(deadline:)` 是**协议要求**（不是只写在 extension 里），
+    ///    `ProcessChannel` 的覆盖会经由 witness table 被动态分发 —— 这是 Swift 的
+    ///    "协议扩展默认方法 + 协议要求"机制，写在 extension 而不进协议则永远走默认。
+    public func readLine(deadline: Duration) throws -> String? {
+        try readLine()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +84,58 @@ struct LineReader {
             buffer.removeAll()
             return rest
         }
+    }
+
+    /// 带期限的读一行。到点抛 [`CoreError.timedOut`]。`nil` = EOF。
+    ///
+    /// ⚠️ 实现在**读端**上等（`poll(2)` 带超时），不是在调用线程上睡眠、也不是
+    ///    "起一条线程去做阻塞 `read(2)`、到点关 fd 叫醒它"——后两者在超时之后都会
+    ///    把流弄断/弄乱，而超时之后还**必须**继续读同一条流把失步的应答排干净
+    ///    （`CoreClient` 的排空对齐，见 `performCallInner`）。`poll` 到点只是返回，
+    ///    fd 一个字节都不动，流保持原样。
+    ///
+    /// ⚠️ 超时**不等于**进程没了：抛 [`CoreError.timedOut`]，**不许**转成 transport /
+    ///    "内核没了"——内核可能只是慢。EOF 才是"内核没了"（返回 `nil`）。
+    mutating func nextLine(deadline: Duration) throws -> String? {
+        let deadlineDate = Date().addingTimeInterval(Self.timeInterval(of: deadline))
+        while true {
+            if let idx = buffer.firstIndex(of: 0x0A) {
+                let line = buffer[buffer.startIndex..<idx]
+                buffer.removeSubrange(buffer.startIndex...idx)
+                return String(decoding: line, as: UTF8.self)
+            }
+            // 先等数据到（或 EOF），有事才 `read`——`read(2)` 在管道上是"有数据就返回"，
+            // 但没有数据时会阻塞，所以必须先 `poll` 把阻塞换成可超时的等待。
+            let remaining = deadlineDate.timeIntervalSinceNow
+            if remaining <= 0 { throw CoreError.timedOut }
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ms = Int32(min(remaining * 1000, Double(Int32.max - 1)))
+            let pr = poll(&pfd, 1, ms)
+            if pr == 0 { throw CoreError.timedOut }     // 到点没数据
+            if pr < 0 {
+                if errno == EINTR { continue }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            // poll 说"有事发生了"（POLLIN / POLLHUP / POLLERR）——去读，由 read(2) 告诉真相。
+            var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+            let n = chunk.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
+            if n > 0 {
+                buffer.append(contentsOf: chunk[0..<n])
+                continue
+            }
+            if n < 0 && errno == EINTR { continue }
+            if n < 0 { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            guard !buffer.isEmpty else { return nil }
+            let rest = String(decoding: buffer, as: UTF8.self)
+            buffer.removeAll()
+            return rest
+        }
+    }
+
+    /// `Duration` → `TimeInterval`。
+    private static func timeInterval(of d: Duration) -> TimeInterval {
+        TimeInterval(d.components.seconds)
+            + TimeInterval(d.components.attoseconds) / 1e18
     }
 }
 
@@ -215,6 +283,26 @@ public final class ProcessChannel: LineChannel, @unchecked Sendable {
         } catch {
             // 读端被关掉（强制收尾）时这里会拿到 EBADF；子进程没了则是 EOF（走 nil 那条）。
             // 两条都变成一条**显式的** transport 错误交给上层——绝不允许静默失败。
+            throw CoreError.transport(
+                "读取内核响应失败（管道已断）：\(error.localizedDescription)")
+        }
+    }
+
+    /// 带期限的读。超时抛 [`CoreError.timedOut`]——**不等于**内核死了（内核可能只是慢）。
+    ///
+    /// ⚠️ 实现在**读端**上等（`LineReader.nextLine(deadline:)` 的 `poll(2)`），
+    ///    不是在调用线程上睡眠。到点 `poll` 只是返回，fd 一个字节都不动——
+    ///    而超时之后还必须继续读同一条流把失步的应答排干净（`CoreClient` 的排空对齐）。
+    /// ⚠️ 超时抛 `timedOut`，**不许**抛 transport / "内核没了"（照抄 Windows 壳
+    ///    `ClientError::CallTimedOut` 与 `KernelGone` 的区分语义）。
+    public func readLine(deadline: Duration) throws -> String? {
+        readLock.lock()
+        defer { readLock.unlock() }
+        do {
+            return try stdoutReader.nextLine(deadline: deadline)
+        } catch CoreError.timedOut {
+            throw CoreError.timedOut
+        } catch {
             throw CoreError.transport(
                 "读取内核响应失败（管道已断）：\(error.localizedDescription)")
         }

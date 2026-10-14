@@ -136,6 +136,9 @@ async function invoke(cmd, args) {
     if (mode === "empty") return FIX.transfersEmpty;
     if (mode === "down") return FIX.transfersEngineDown;
     if (mode === "afterRemove") return FIX.transfersAfterRemove;
+    if (mode === "handover") return FIX.transfersHandover;
+    if (mode === "migrating") return FIX.transfersMigrating;
+    if (mode === "migratedErrors") return FIX.transfersMigratedWithErrors;
     if (mode === "tick") {
       tickToggle = !tickToggle;
       return tickToggle ? FIX.transfersTick : FIX.transfersSnapshot;
@@ -263,6 +266,7 @@ function start() {
   else if (SCENARIO === "down") void runScenario(runEngineDown);
   else if (SCENARIO === "gate") void runScenario(runGate);
   else if (SCENARIO === "loading") void runScenario(runLoading);
+  else if (SCENARIO === "batch") void runScenario(runBatch);
   else void runScenario(runLayoutAndMenu);
 }
 let started = false;
@@ -534,6 +538,26 @@ async function runLayoutAndMenu() {
     !!cleared && cleared.args.action === "clear_finished" && cleared.args.gid === null,
     JSON.stringify(cleared && cleared.args));
 
+  // ---- ⑧b 「暂停全部」「一键开始」：列表级动作（没有 gid），可用性来自载荷 -----------
+  //    夹具这一份既有活动的行、也有已暂停的行 ⇒ 两颗都可用（判据在 Rust：`BatchControl::of`）。
+  const pauseAllBtn = doc().getElementById("transfers-pause-all");
+  const resumeAllBtn = doc().getElementById("transfers-resume-all");
+  check("有活动的行 ⇒ 「暂停全部」可用", pauseAllBtn.disabled === false);
+  check("有已暂停的行 ⇒ 「一键开始」可用", resumeAllBtn.disabled === false);
+  click(pauseAllBtn);
+  await sleep(400);
+  const pausedAll = invocations.filter((i) => i.cmd === "task_action").pop();
+  check("点「暂停全部」⇒ 发 task_action{action:'pause_all', gid:null}（**没有 gid**）",
+    !!pausedAll && pausedAll.args.action === "pause_all" && pausedAll.args.gid === null,
+    JSON.stringify(pausedAll && pausedAll.args));
+  click(resumeAllBtn);
+  await sleep(400);
+  const resumedAll = invocations.filter((i) => i.cmd === "task_action").pop();
+  check("点「一键开始」⇒ 发 task_action{action:'resume_all', gid:null}（**没有 gid**）",
+    !!resumedAll && resumedAll.args.action === "resume_all" && resumedAll.args.gid === null,
+    JSON.stringify(resumedAll && resumedAll.args));
+  check("没有在搬运 ⇒ 搬运那一行不出现", doc().getElementById("transfers-migrate").hidden);
+
   // ---- ⑨ 动作失败：原文逐字、**而且不被 200 ms 那一拍清掉** --------------------
   failNextAction = true;
   click(rowByGid("g-error").querySelector(".transfers__menu-btn"));
@@ -704,6 +728,54 @@ async function runEngineDown() {
 }
 
 // ===========================================================================
+// 场景 batch：换目录之后 —— 搬运进行中 / 搬完有失败 / 空列表但「一键开始」可用
+// ===========================================================================
+// 三份载荷都是 Rust 倒出来的（`BatchControl::of`）：判据（谁可用、说什么话）不在这里算，
+// 这里只验"前端忠实地画了它"。
+async function runBatch() {
+  const pauseAll = () => doc().getElementById("transfers-pause-all");
+  const resumeAll = () => doc().getElementById("transfers-resume-all");
+  const migrate = () => doc().getElementById("transfers-migrate");
+  const migrateText = () => textOf(doc(), "#transfers-migrate-text");
+
+  // ① 换完目录、引擎是空的：列表一行都没有，「一键开始」可用，「暂停全部」不可用。
+  mode = "handover";
+  await enterTransfers();
+  await sleep(400);
+  check("没有行", rowsOf().length === 0);
+  check("🔴 空列表 + 待补队列 ⇒ 「一键开始」可用（引擎是空的，只有壳知道还有事要做）",
+    resumeAll().disabled === false);
+  check("没有活动的行 ⇒ 「暂停全部」不可用", pauseAll().disabled === true);
+  check("没有搬运 ⇒ 搬运那一行不出现", migrate().hidden);
+
+  // ② 搬运进行中：两颗都灰，进度话逐字来自载荷。
+  mode = "migrating";
+  await sleep(600);
+  const want = FIX.transfersMigrating.data.batch.migrate_text;
+  check("搬运进行中 ⇒ 两颗按钮都不可用（搬运与引擎同写一个文件是数据损坏级的风险）",
+    pauseAll().disabled === true && resumeAll().disabled === true);
+  check("搬运那一行出现，正文**逐字**是载荷里 Rust 成好的那句话",
+    !migrate().hidden && migrateText() === want && want.length > 0,
+    JSON.stringify(migrateText()));
+
+  // ③ 搬完但有失败：结果话在场（点明后果与文件在哪），「一键开始」可用。
+  mode = "migratedErrors";
+  await sleep(600);
+  const note = FIX.transfersMigratedWithErrors.data.batch.migrate_note;
+  check("搬完有失败 ⇒ 结果话在场且逐字来自载荷",
+    !migrate().hidden && migrateText() === note && note.length > 0,
+    JSON.stringify(migrateText()));
+  check("结果话说清了后果（会从头下载）与文件在哪（旧文件仍在原目录）",
+    note.includes("从头下载") && note.includes("旧文件仍在原目录"));
+  check("搬完了 ⇒ 「一键开始」可用", resumeAll().disabled === false);
+
+  // ④ 回到没有搬运的状态 ⇒ 那一行收起来。
+  mode = "empty";
+  await sleep(600);
+  check("搬运结束且没有话要说 ⇒ 搬运那一行收起", migrate().hidden);
+}
+
+// ===========================================================================
 // 场景 gate：**闸门关着**（`state().allows_requests == false`）⇒ 一拍都不发
 // ===========================================================================
 // 这是 `EngineGate` 那条既有语义在本屏的落点，也是"引擎不可用时那颗「刷新」在场但禁用"
@@ -723,6 +795,9 @@ async function runGate() {
       && doc().getElementById("transfers-refresh").disabled === true);
   check("「清空已完成」同样禁用（`can_clear_finished` 取不到 + 闸门关着，两道都是 fail-closed）",
     doc().getElementById("transfers-clear").disabled === true);
+  check("「暂停全部」「一键开始」同样禁用（载荷取不到 + 闸门关着，fail-closed）",
+    doc().getElementById("transfers-pause-all").disabled === true
+      && doc().getElementById("transfers-resume-all").disabled === true);
   check("`state` 仍然在按 1 s 的节拍跑（它是壳的、不受闸门管 —— 否则闸门永远解不开）",
     invocations.filter((i) => i.cmd === "state").length >= 2,
     invocations.filter((i) => i.cmd === "state").length + " 次");

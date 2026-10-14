@@ -34,6 +34,13 @@ public final class CoreClient: CoreCalling, @unchecked Sendable {
     private var shutdownStarted = false
     private var closedForRequests = false
 
+    /// 通道是否已判死（超时后排空也失败 ⇒ 不许留着一条错位的流继续用）。
+    ///
+    /// ⚠️ 读写**一律持 `stateLock`**（写在 [`markChannelDead`]，读在 `performCallInner`）：
+    ///    虽然目前两者都在 `queue` 上（单线程），但"锁形统一"是防下一个人加一条
+    ///    队列外的读就踩数据竞争的坑。代价是一次锁，不引死锁（`stateLock` 不嵌套别的锁）。
+    private var channelDead = false
+
     /// 协议级错误（`id == 0`）。用锁而不是队列：读它的是界面线程，
     /// 而 `queue.sync` 在读的时候会把界面卡在一条慢请求后面。
     private let alertLock = NSLock()
@@ -299,13 +306,30 @@ public final class CoreClient: CoreCalling, @unchecked Sendable {
         guard !requestsClosed else {
             throw CoreError.transport("内核连接已关闭（shutdown 已调用）")
         }
+        stateLock.lock()
+        let dead = channelDead
+        stateLock.unlock()
+        if dead {
+            throw CoreError.transport("内核连接已判死（读超时后未能重新对齐）")
+        }
 
         let id = nextId
         nextId += 1
         try channel.writeLine(try RequestLine.encode(id: id, method: method, params: params))
 
+        let timeout = Self.callTimeout(for: method)
         while true {
-            guard let line = try channel.readLine() else {
+            let line: String?
+            do {
+                line = try channel.readLine(deadline: timeout)
+            } catch CoreError.timedOut {
+                // 🔴 超时之后**必须把流重新对齐**再返回：上一次读丢下了，而内核的应答
+                //    还在管道里 —— 下一次调用再读会读到旧应答、id 对不上、抛失步错，
+                //    于是此后每一次调用都差一条。排空到"该 id 的那一条"为止，其它行丢弃。
+                //    排空另给一个上界（同档时限）；上界到了 ⇒ 内核真的不吭声 ⇒ 通道判死。
+                return try drainUntilMatch(id: id, deadline: timeout)
+            }
+            guard let line else {
                 throw CoreError.transport("内核进程已退出（管道结束）")
             }
             let env = try decodeEnvelope(line)
@@ -330,6 +354,112 @@ public final class CoreClient: CoreCalling, @unchecked Sendable {
             return try env.unwrapResult()
         }
     }
+
+    /// 超时后的**排空对齐**：继续读到"该 id 的那一条"为止，读到的其它行丢弃。
+    ///
+    /// 为什么不"直接 throw 就走"：读超时之后我们把那次读丢下了，而内核的应答还在管道里。
+    /// 下一次调用写请求、再读 —— 读到的正是**上一次那条应答** ⇒ id 对不上 ⇒ 抛失步错；
+    /// 而**这次**的应答又留在了管道里 ⇒ **此后每一次调用都差一条，直到进程重启**。
+    /// 一次超时会把整条连接永久性地弄坏，比"一次卡住"更难查。
+    ///
+    /// ⚠️ 这段等待**另给一个上界**（同档时限，从排空起点算起的**总**上界）。
+    ///    上界到了 ⇒ 说明内核是真的不吭声了 ⇒ **把通道标记为已死**（后续调用立刻失败），
+    ///    不许留着一条已经错位的流继续用。
+    /// ⚠️ 排空途中找到的迟到应答**照常返回**（它本来就是这一次的结果）；
+    ///    排空失败才抛 `timedOut` —— 超时 ≠ 内核死亡，通道判死由后续调用感知。
+    private func drainUntilMatch(id: UInt64, deadline: Duration) throws -> JSONValue {
+        let drainDeadline = Date().addingTimeInterval(Self.timeInterval(of: deadline))
+        while true {
+            let remaining = drainDeadline.timeIntervalSinceNow
+            let line: String?
+            do {
+                if remaining <= 0 { throw CoreError.timedOut }
+                line = try channel.readLine(deadline: .seconds(remaining))
+            } catch CoreError.timedOut {
+                markChannelDead()
+                throw CoreError.timedOut
+            }
+            guard let line else {
+                markChannelDead()
+                throw CoreError.transport("内核进程已退出（管道结束）")
+            }
+            // 排空途中：解不开的行、id==0 告警、别人的应答 —— 一律丢掉，接着找自己那条。
+            guard let env = try? decodeEnvelope(line) else { continue }
+            if env.id == 0 {
+                if let error = env.error { appendAlert(error) }
+                continue
+            }
+            if env.id == id {
+                return try env.unwrapResult()
+            }
+            // id 不对：丢弃，继续排空
+        }
+    }
+
+    /// 把通道标记为已死：后续调用立刻失败，不再收发。
+    private func markChannelDead() {
+        stateLock.lock()
+        channelDead = true
+        stateLock.unlock()
+    }
+
+    /// `Duration` → `TimeInterval`（与 `LineReader.timeInterval` 同一换算）。
+    private static func timeInterval(of d: Duration) -> TimeInterval {
+        TimeInterval(d.components.seconds)
+            + TimeInterval(d.components.attoseconds) / 1e18
+    }
+
+    // MARK: - 时限分两档（F11，对齐 Windows A5 修正后的取值）
+
+    /// **普通**调用的读时限。绝大多数方法在百毫秒级（一次 aria2 RPC 的传输上限是
+    /// 内核侧的 `RPC_TIMEOUT` ＝ 10 秒，`core/src/engine/rpc.rs:17`），120 秒
+    /// 是一个数量级以上的余量。
+    ///
+    /// ⚠️ **别拿它去衡量长调用**：`load_delivery` 这一家族的记账见
+    ///    [`Self::LONG_CALL_TIMEOUT`] —— 那个数**不是** 91.5 秒（91.5 只是它三段里的第一段）。
+    ///    Windows A5 第一版犯过这个错（`windows/shell-core/src/client.rs:888-921`）：
+    ///    把 91.5 当成 `load_delivery` 的最坏值、用 150 秒去卡，结果"网络慢 + 换码 +
+    ///    清单大"的一次**合法**慢调用被误杀并杀掉内核。macOS 这份**照抄那次修正**。
+    static func callTimeout(for method: String) -> Duration {
+        if Self.longCallMethods.contains(method) {
+            return .seconds(600)
+        }
+        return .seconds(120)
+    }
+
+    /// **已知的长调用家族**的上界 600 秒。名单与 Windows 的 `LONG_CALL_METHODS` 逐字对齐
+    /// （`windows/shell-core/src/client.rs:948-954`）。
+    ///
+    /// ## 取值 600 秒的依据（照抄 Windows 那份记账，`client.rs:891-921`）
+    ///
+    /// 内核自己对 `load_delivery` 的记账在 `core/src/kernel.rs:1740-1743`，三段**顺序执行**：
+    ///   * `delivery::fetch`：≤91.5 秒（15 秒 × 5 次 + 退避，记账留了余量）；
+    ///   * `clear_engine_batch`：≤约 40 秒（换码时）；
+    ///   * 全量 `plan`：每个 crc64 为空的文件一次 HEAD，≤30 秒 × N
+    ///     （单次 30 秒：`core/src/delivery.rs:22` 的 `FETCH_TIMEOUT`）。
+    ///
+    /// 三段**顺序**跑，所以算第三段时前两段已经花掉：`600 − 131.5 = 468.5` 秒，
+    /// 按 30 秒一次折算 ⇒ **N ≈ 15**。
+    ///
+    /// ⚠️ **余量就到这里为止，别把它读成"600 秒一定够"**：`plan` 是 30 秒 × N、
+    ///    **内核里没有全局 deadline**（`core/src/planner.rs:186` 的记账）⇒ **N 很大时
+    ///    任何常数都盖不住**。这是 `plan` 缺全局 deadline 的直接后果，是**既有问题**
+    ///    （本批不动它，也不假装本档把它解决了）。一个"网络慢 + 换交付码 +
+    ///    清单里几千个 crc64 为空"的批次会走到那里。
+    ///
+    /// ⚠️ 名单与内核分派表**必须一起改**。`tree_json` **不在**这张表里，因为它
+    ///    **不是** RPC 方法名（`core/src/kernel.rs:1863`，是内核私有函数），
+    ///    由 `list_dir`/`get_tree`/`enqueue` 的代码路径调用。`clear_engine_batch` 同理
+    ///    （`kernel.rs:1682`，`load_delivery` 内部调用）。
+    /// ⚠️ `plan` **在**表里但**壳今天不发它**：它是一个真方法、而且正是本档取值理由里
+    ///    第三段（30 秒 × N）挂靠的方法，留着是**保险**。
+    static let longCallMethods: Set<String> = [
+        "load_delivery",
+        "list_dir",
+        "get_tree",
+        "plan",
+        "enqueue",
+    ]
 
     private func decodeEnvelope(_ line: String) throws -> RawEnvelope {
         do {

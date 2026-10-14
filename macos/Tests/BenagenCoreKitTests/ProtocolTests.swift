@@ -387,7 +387,18 @@ private let GET_STATE_OK = #"{"id":7,"ok":true,"result":{"code":"R.pnhIQhki1xxKW
             == ["ok","bad","missing","size_mismatch","unverifiable","unreadable"])
     #expect(PlanKind.allCases.map(\.rawValue) == ["skip","download"])
     #expect(TaskAction.allCases.map(\.rawValue)
-            == ["pause","unpause","retry","remove","clear_finished"])
+            == ["pause","unpause","retry","remove","clear_finished","pause_all","resume_all"])
+}
+
+@Test func migrateStatusReadsTheCoresSnakeCaseKeys() throws {
+    let line = #"{"running":true,"finished":false,"files_done":2,"files_total":5,"bytes_done":1024,"bytes_total":4096,"skipped":[{"path":"a","reason":"x"}],"errors":[]}"#
+    let s = try CoreJSON.decoder.decode(MigrateStatus.self, from: Data(line.utf8))
+    #expect(s.running && !s.finished)
+    #expect(s.filesDone == 2 && s.filesTotal == 5)
+    #expect(s.bytesDone == 1024 && s.bytesTotal == 4096)
+    #expect(s.skipped == [MigrateProblem(path: "a", reason: "x")])
+    let d = try CoreJSON.decoder.decode(DownloadDirResult.self, from: Data(#"{"dir":"/d"}"#.utf8))
+    #expect(d.dir == "/d")
 }
 
 @Test func verifyClassReadsItsOwnBucket() throws {

@@ -52,7 +52,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use super::rpc::{GlobalStat, RpcClient};
+use super::rpc::{GlobalStat, RpcClient, WriteOutcome};
 use super::status::{raw_status_to_state, Task, TaskState};
 
 /// RPC 就绪的等待上限。
@@ -501,14 +501,13 @@ const _: () = assert!(
 
 /// 内嵌的 GPLv2 全文。
 ///
-/// ⚠️ **本项（连同下面的 `license_text`）是一条既有的 `dead_code` 告警，保留不按掉**：
-/// 按 D-4「本任务**不新增**」执行——`#[allow(dead_code)]`、删符号两条路都不许。
+/// ⚠️ **本项已不再是死代码**（2026-10-13 订正）：`license_text()` 在
+/// `core/src/cli/mod.rs:198` 的 CLI 生产路径（`--license`）上被调用，随之读取本项。
+/// 符号仍要留着（GPL 分发义务），按 D-4「本任务**不新增**」执行——`#[allow(dead_code)]`、
+/// 删符号两条路都不许。
 /// 基线账本见 `docs/superpowers/plans/2026-09-18-client-phase-d.md` **全局约束表的 D-4 行**
-/// （当前在 `:24`）：它点名了这四条告警（`crc64xz::sum` / `ARIA2_LICENSE` / `license_text` /
-/// `Daemon{secret,argv}`），并写明按"本任务**不新增**执行、
-/// **不要**用 `#[allow(dead_code)]` 或删符号去按掉它们"。
-/// ⚠️ 原指针写的是 `windows/scripts/test.sh` 头部——**那个文件在本仓库里不存在**
-/// （`windows/` 不在本工作树），照它去查会扑空；已订正为上面这处。
+/// （当前在 `:24`）。⚠️ 实测基线已收敛为 **1 条**（`Daemon{secret,argv}`），
+/// 见 `windows/scripts/test.sh` 头部。
 ///
 /// # 为什么它值得留着（论证保留，但**不是**按掉告警的理由）
 ///
@@ -532,8 +531,8 @@ const _: () = assert!(
 ///      这个交换在合规问题上不需要犹豫。
 ///
 /// ⚠️ 上面那段论证**说明它不该被删**（删它是从内核二进制里移除一份分发义务的载体，
-/// 那是合规层面的决定，不该由"清告警"顺手做掉）——但它**不构成按掉告警的理由**：
-/// 告警本身按 D-4 保留，`cargo build` 会照报。别再用 `reason =` 之类的写法把它盖掉。
+/// 那是合规层面的决定，不该由"清告警"顺手做掉）——但告警已不再出现，
+/// **符号仍按 D-4 保留**（GPL 分发义务——别用 `reason=` 之类盖它）。
 const ARIA2_LICENSE: &str = include_str!("../../assets/COPYING-GPLv2.txt");
 
 // ⚠️ 这里曾经有一个 `pub const ARIA2_SOURCE_URL = "https://github.com/aria2/aria2";`
@@ -564,6 +563,8 @@ pub struct DaemonOptions {
     /// 仅供测试：非零时先试这个端口，用于构造"端口被占"的场景。
     /// **不得出现在生产调用路径上。**
     pub force_port: Option<u16>,
+    /// §6 的量化证据。`None` = 不记账（测试与命令行那一路）。
+    pub counters: Option<Arc<crate::diag_counters::Counters>>,
 }
 
 /// 某一刻的任务状态。
@@ -730,11 +731,9 @@ pub struct Daemon {
     /// 删符号三条路都不许（`cfg(test)` 字面上不是"删符号"，但它仍是"按掉它们"，
     /// 而且会让 `Daemon` 的字段在测试与生产构建下**不一样**）。
     /// 基线账本见 `docs/superpowers/plans/2026-09-18-client-phase-d.md` **全局约束表的 D-4 行**
-    /// （当前在 `:24`）：它点名了这四条告警（`crc64xz::sum` / `ARIA2_LICENSE` / `license_text` /
-    /// `Daemon{secret,argv}`），并写明按"本任务**不新增**执行、
-    /// **不要**用 `#[allow(dead_code)]` 或删符号去按掉它们"。
-    /// ⚠️ 原指针写的是 `windows/scripts/test.sh` 头部——**那个文件在本仓库里不存在**
-    /// （`windows/` 不在本工作树），照它去查会扑空；已订正为上面这处。
+    /// （当前在 `:24`）。⚠️ 实测基线已收敛为 **1 条**——就是本条 `Daemon{secret,argv}`；
+    /// `ARIA2_LICENSE`/`license_text` 因 CLI 用起来（`--license` 生产路径）而不再是死代码，
+    /// `crc64xz::sum` 是 `pub mod` 的公开 API。见 `windows/scripts/test.sh` 头部。
     ///
     /// **但"没人读"这件事本身是查过的**——判定依据是**认证有没有接上**，不是"字段有没有人读"：
     ///   - 认证**接上了**：真正拿去发 RPC 的是 `client` 里那一份——`start_on_port` 把
@@ -833,6 +832,15 @@ impl Daemon {
         self.client.ping()
     }
 
+    /// 一条 `getGlobalStat`，把响应整个交出来，供内核的判活线程同时取应答性与速率。
+    ///
+    /// 与 [`Self::ping`] 的分工：那个只回答"通不通"，把响应丢了；这个要那几个字段。
+    /// 与 [`Self::snapshot`] 的分工：那个是 3 条 `tell*` + 1 条 `getGlobalStat`，
+    /// 其中 `tellActive` 正是现场卡住的那一条（规格 F2/F3），判活不许用它。
+    pub fn probe(&self) -> Result<GlobalStat, String> {
+        self.client.global()
+    }
+
     /// 引擎子进程**是否已经退出**（收尸完成）。
     ///
     /// 为什么要有它（2026-10-09）：现场日志里"RPC 10 秒超时"这一个症状对应两种完全
@@ -848,11 +856,23 @@ impl Daemon {
         self.inner.done.is_done()
     }
 
+    /// 引擎子进程的 PID。已收尸 / 桩引擎（没有真进程）⇒ `None`。
+    ///
+    /// 只给 [`crate::procstat`] 用：引擎不应答时去读它的 CPU / IO 读数，
+    /// 好分清「在空转 / 在写盘 / 被阻塞」。
+    pub fn pid(&self) -> Option<u32> {
+        self.inner.cmd.lock().ok()?.as_ref().map(Child::id)
+    }
+
     /// 加一个下载任务，并**记下 GID → manifest 相对路径的映射**。
+    ///
+    /// `uris` 是全量 URI 列表（规格 §5.1）：域名 URI 打头、IP 备胎跟后。
+    /// `more_opts` 与 `per_task` 合并（`more_opts` 后写 = 同名键覆盖 `per_task`）；
+    /// `dir`/`out` 仍最后压轴（extra 改不了落盘基准——既有不变量）。
     ///
     /// 映射必须我们自己维护：aria2 只回 GID，它的 `files[].path` 是落盘路径
     /// （带着下载根），反推既不可靠也没必要。
-    pub fn add(&self, url: &str, dir: &str, out: &str) -> Result<String, String> {
+    pub fn add(&self, uris: &[String], dir: &str, out: &str, more_opts: &BTreeMap<String, String>) -> Result<String, String> {
         // PerTask 必须在这里交付：任务诞生这一刻是逐任务选项唯一干净的落地点
         // （`-x`/`-s`/`-k`/`--max-tries`/`--retry-wait` 的事后补救为什么都不干净，
         // 见 `RpcClient::add_uri` 的注释）。
@@ -865,8 +885,13 @@ impl Daemon {
             let st = self.inner.state.lock().unwrap();
             st.per_task.clone()
         };
+        // more_opts 后写 = 同名键覆盖 per_task（Host 头等逐任务覆盖走这里）。
+        let mut merged = per_task;
+        for (k, v) in more_opts {
+            merged.insert(k.clone(), v.clone());
+        }
 
-        let gid = self.client.add_uri(url, dir, out, &per_task)?;
+        let gid = self.client.add_uri(uris, dir, out, &merged)?;
 
         // URL 与选项只经 `addUri` 的**结构化字段**（`params[1]` 的 URI 数组、
         // `params[2]` 的选项对象）传递——见文件头的"安全前提"一节。
@@ -902,6 +927,13 @@ impl Daemon {
         }
         // 只经 `changeGlobalOption` 的结构化字段（一个 JSON 对象）传递。
         self.client.change_global_option(opts)
+    }
+
+    /// 只取**活跃**的任务，一条 `tellActive`。停滞采样只用它：`snapshot()` 还要
+    /// `tellWaiting` / `tellStopped`（各最多 1000 条），采样一条都用不到。
+    pub fn active(&self) -> Result<Vec<Task>, String> {
+        let raw = self.client.active()?;
+        Ok(raw.iter().map(|r| r.to_task()).collect())
     }
 
     /// 读一次状态。
@@ -959,6 +991,31 @@ impl Daemon {
     /// 继续一个被暂停的任务（传输列表的"继续"）。
     pub fn unpause(&self, gid: &str) -> Result<(), String> {
         self.client.unpause(gid)
+    }
+
+    /// 同 [`Daemon::pause`]，但区分"引擎拒绝"与"没回话"（见 [`WriteOutcome`]）。
+    pub fn pause_detailed(&self, gid: &str) -> WriteOutcome {
+        self.client.pause_detailed(gid)
+    }
+
+    /// 同 `pause_detailed`，但走 `aria2.forcePause`（档 2 用：丢连接，不等收尾）。
+    pub fn force_pause_detailed(&self, gid: &str) -> WriteOutcome {
+        self.client.force_pause_detailed(gid)
+    }
+
+    /// 同 [`Daemon::unpause`]，但区分"引擎拒绝"与"没回话"（见 [`WriteOutcome`]）。
+    pub fn unpause_detailed(&self, gid: &str) -> WriteOutcome {
+        self.client.unpause_detailed(gid)
+    }
+
+    /// **强制**暂停全部任务（传输页「暂停全部」）。不动 GID 映射——任务还在，只是停了。
+    pub fn pause_all(&self) -> Result<(), String> {
+        self.client.force_pause_all()
+    }
+
+    /// 继续全部被暂停的任务（传输页「一键开始」的第一半；第二半是内核补回队列）。
+    pub fn unpause_all(&self) -> Result<(), String> {
+        self.client.unpause_all()
     }
 
     /// 移除一个任务，并**忘掉它的 GID 映射**。
@@ -1193,7 +1250,11 @@ impl Daemon {
 /// ⚠️ 承重：`--dir=` 是相对**子进程工作目录**解析的，而我们又把子进程的工作目录设成了
 /// 同一个目录。调用方给相对路径时，两者会**互相叠一层**（`<目标>/<目标>/…`），
 /// 落盘基准就歪了——Go 的 `Run` 注释记着这件事（GUI 从 Finder 启动时 cwd 是 `/`）。
-fn absolute_dir(dir: &Path) -> Result<PathBuf, String> {
+///
+/// `pub(crate)`：启动（`--dir=` 与子进程工作目录）与**日志轮转**必须从同一个绝对形式推导
+/// （内核轮转拿的是 `Kernel::download_dir` 原样，不经这里会退回"靠 cwd 恒定"兜底——
+/// `$HOME` 缺失时 `paths::download_dir()` 正是相对路径）。两侧共用这一份。
+pub(crate) fn absolute_dir(dir: &Path) -> Result<PathBuf, String> {
     // `std::path::absolute` 与 Go 的 `filepath.Abs` 同义：**不碰文件系统**
     // （不做 `canonicalize`，因此不解析符号链接），相对路径接在当前工作目录之后。
     std::path::absolute(dir).map_err(|e| format!("目标目录路径无效: {e}"))
@@ -1261,6 +1322,41 @@ fn ca_bundle_arg(exists: impl Fn(&Path) -> bool) -> Option<OsString> {
     Some(arg)
 }
 
+/// aria2 自己那份日志的文件名。只在这里定义一次：`launch_args` 拼 `--log=`，内核轮转也拿它拼路径。
+pub const ENGINE_LOG_FILE: &str = "aria2.log";
+
+/// aria2 日志的单文件上限，与诊断日志同口径（`diagnostics::MAX_BYTES`）：客户会把几个文件一起发回来。
+pub const MAX_ENGINE_LOG_BYTES: u64 = 1_048_576;
+
+/// 超上限就留一代（`.1`）并把当前那份截断。
+///
+/// 🔴 **不能用 rename**：aria2 全程持有那个 fd，改名后它继续写进 `.1`，且不会新建 `aria2.log`，
+/// 下一拍 `metadata` 报错就早退——这辈子只轮转一次，看着在限、实际没限。
+/// 截断安全：aria2 是 O_APPEND 追加写，截断后从新的文件尾继续，不留稀疏洞。
+/// 顺序必须是先 copy 后 truncate，反过来中间那段内容就没了。
+///
+/// 写不进去（目录不可写、磁盘满）时无声跳过——与诊断日志同一条口径：为日志轮转失败去打断下载是本末倒置。
+///
+/// ⚠️ 换目录后，旧目录里那份 `aria2.log` 会留下成为孤儿：`migrate::scan` 只搬清单里的文件，
+/// 它不在其中，此后无人轮转它。记一句备查，不计缺陷。
+pub fn rotate_engine_log(path: &Path) {
+    let Ok(md) = std::fs::metadata(path) else { return };
+    if md.len() <= MAX_ENGINE_LOG_BYTES {
+        return;
+    }
+    let _ = std::fs::copy(path, path.with_extension("log.1"));
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path);
+}
+
+// （`--file-allocation` 的按卷选择已废弃——2026-10-14 翻表为一律 `trunc`，
+//  理由见 `launch_args` 里的长注释：MinGW 的 falloc 不占簇且有整引擎写零阻塞的失败形态。）
+
+// （`volume_fs_name` 卷探测与 `GetVolumeInformationW` 裸 extern 随翻表一并删除——
+//  一律 trunc 之后没有消费方；要恢复按卷选择，从 git 历史 559dd542 取回。）
+
 /// 常驻模式的启动 argv（不含 argv[0]）。
 ///
 /// 逐项都有出处，**不是随手排的**（规格 §3 的三条硬约束在这里落地）：
@@ -1276,6 +1372,8 @@ fn launch_args(dir: &Path, secret: &str, port: u16) -> Vec<OsString> {
     // 路径本身按 `OsString` 拼接而不是 `to_string_lossy`——非 UTF-8 的目录名也走得通。
     let mut dir_arg = OsString::from("--dir=");
     dir_arg.push(dir.as_os_str());
+    let mut log_arg = OsString::from("--log=");
+    log_arg.push(dir.join(ENGINE_LOG_FILE).as_os_str());
 
     let mut args = vec![
         OsString::from("--enable-rpc"),
@@ -1287,12 +1385,42 @@ fn launch_args(dir: &Path, secret: &str, port: u16) -> Vec<OsString> {
         dir_arg,
         // 断点续传恒开（规格 §3 约束 5）。
         OsString::from("-c"),
-        OsString::from("--file-allocation=none"),
+        // 一律 `trunc`（2026-10-14 翻表，规格 §4.2 的 NTFS→falloc 行经 P3/P4 实测后废弃）：
+        // MinGW 的 falloc = `SetFileValidData()`，只延伸有效数据长度、**不占簇**
+        // （不防碎片、不预留空间——规格表的两条理由在 MinGW 构建上都不成立），
+        // 且拿不到 SeManageVolumePrivilege（非管理员客户的常态）时 aria2 自述会
+        // 「filling zero, which blocks whole aria2 execution」——整引擎阻塞写零正是
+        // 本规格要修的故障形态。trunc 恒瞬时、零特权、未写区间读作零
+        // （p4-probe 实测 1.1 GB 真实流量两种字节一致）。宁可碎片，不可阻塞。
+        OsString::from("--file-allocation=trunc"),
         // 下面两条直接决定"落盘路径 = manifest.path 原文"：`--auto-file-renaming`
         // 默认是 true，重下会写出 `name.1`，落盘基准就与清单对不上了。
         OsString::from("--auto-file-renaming=false"),
         OsString::from("--allow-overwrite=true"),
-        OsString::from("--summary-interval=1"),
+        // 规格 §5.1：多 URI 时**容错不是提速**——`inorder` 先用第一个（域名，CDN 分发域名
+        // 不换连接），坏了才轮到下一个（IP 备胎）。aria2 默认 `feedback` 会并发混用
+        // 多个来源——那是提速不是容错，与本场景的目标相反。
+        OsString::from("--uri-selector=inorder"),
+        // 不读任何用户配置（规格 §4.3，F9）：aria2 默认会读 ~/.aria2/aria2.conf，
+        // 客户机上任何遗留配置都会静默覆盖上面这些钉死参数——「参数写了但没生效」
+        // 正是最难排查的静默失效。R7 已登记：若某台客户机上真有配置在生效，行为会变，
+        // 这正是目的。
+        OsString::from("--no-conf"),
+        // 连接级的一层（规格 §3.3）：让 aria2 自己更快地发现"这条连接不该再等下去"。
+        // ⚠️ 全部**保守**取值（规格 R2）：误杀的代价是一条几 GB 的段被丢弃重来。
+        //    这三个值是**真机调参的起点**，不是结论 —— 按 §9.1 的现场数据再收放。
+        //    ⚠️ `--max-tries` **不在 argv 里**（重试归我们）：逐任务层 `per_task_options()`
+        //    无条件下发 `max-tries`、会覆盖命令行 ⇒ 放这里等于放一条永不生效的空操作。
+        //    单一来源在 `settings::default_settings().max_tries`，判据见
+        //    `retry_ownership_lands_in_the_per_task_layer_not_the_argv`。
+        OsString::from("--timeout=30"),
+        OsString::from("--connect-timeout=15"),
+        // aria2 默认 0 = **完全不检测零速率挂死** —— 那正是"引擎无响应"最可能的形态之一。
+        OsString::from("--lowest-speed-limit=1K"),
+        // 并发优化器（规格 §4.1）：打开后 settings.parallel（max-concurrent-downloads）
+        // 只是起始值，aria2 自己加减档（P2 实测：它按 max-concurrent-downloads 为起点算
+        // optimized at N）。收敛性待真机验证——见 README 未验项。
+        OsString::from("--optimize-concurrent-downloads=true"),
         // IPv6 恒定关闭（规格 §12）：**不是**"顺手加的优化"，是修一个客户可见的故障。
         // 内置引擎的 `disable-ipv6` 默认是 `false`（规格 §12.1 的 G2，实测）；开着它时，
         // **有 IPv6 地址但没有可用 IPv6 路由**的机器上每个任务一启动就报网络不可达
@@ -1301,6 +1429,12 @@ fn launch_args(dir: &Path, secret: &str, port: u16) -> Vec<OsString> {
         //    所以它在 argv 里，而**不是** `settings.per_task_options()` 那一份。
         //    三端都关，不加平台门（规格 §12.2）。
         OsString::from("--disable-ipv6=true"),
+        // aria2 自己的日志（规格 §6.3）：起始档位 info（debug 的体积约是它的两个数量级）。
+        // 路径落在下载目录里，所以它会随 argv 进诊断日志 —— `redact` 必须抹掉它。
+        log_arg,
+        OsString::from("--log-level=info"),
+        // 不传 `--async-dns`：macOS/Linux 的内嵌 aria2 没编 c-ares，认不出该选项会启动失败；
+        // Windows 版编了 c-ares，沿用 aria2 默认的异步解析。
     ];
     // 系统 CA 证书包（见 `SYSTEM_CA_BUNDLES` 的长注释）：**平台门就在这一句上**。
     //   - Linux：探三条候选，第一个存在的用 `--ca-certificate=` 传进去；都没有就不传。
@@ -1312,6 +1446,31 @@ fn launch_args(dir: &Path, secret: &str, port: u16) -> Vec<OsString> {
         args.extend(ca_bundle_arg(|p| p.is_file()));
     }
     args
+}
+
+/// 启动参数，**每个参数一个字段**（`arg0`..`argN`），给诊断日志用。
+///
+/// 🔴 **不许拼成一行塞进一个字段**：诊断日志对**每个字段值**封顶 `MAX_VALUE_CHARS`(200)
+/// 字符，而完整参数串 macOS 204 / Linux 256 字符。拼一行会静默截断尾部，丢了参数就等于没记。
+/// 每个参数自己都很短，拆成多个字段就一个字节都不丢。
+pub fn argv_fields(args: &[OsString]) -> Vec<(String, String)> {
+    args.iter()
+        .enumerate()
+        .map(|(i, a)| (format!("arg{i}"), redact(&a.to_string_lossy())))
+        .collect()
+}
+
+/// 抹掉**凭据**与**客户目录名**。
+fn redact(s: &str) -> String {
+    if s.starts_with("--rpc-secret") {
+        "--rpc-secret=<抹除>".to_string()
+    } else if s.starts_with("--dir=") {
+        "--dir=<抹除>".to_string()
+    } else if s.starts_with("--log=") {
+        "--log=<抹除>".to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// 在指定端口上起一次 aria2 并等它就绪。
@@ -1326,6 +1485,10 @@ fn start_on_port(
     // `--dir=` 与子进程的工作目录必须指向**同一个绝对路径**（见 `absolute_dir`）。
     let dir = absolute_dir(&opts.download_dir)?;
     let args = launch_args(&dir, secret, port);
+    // 每个参数一个字段 —— 拼成一行会被 200 字符的字段值上限静默截断。
+    let fields = argv_fields(&args);
+    let refs: Vec<(&str, String)> = fields.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    crate::diagnostics::log("engine_argv", &refs);
 
     // 供测试断言用的那份 argv 记录（见 `Daemon::argv` 的说明）：内容就是下面交给
     // `Command` 的 `bin` + `args`。它只被测试读，所以生产构建下那一处会报 dead_code
@@ -1340,8 +1503,8 @@ fn start_on_port(
         .current_dir(&dir)
         // ⚠️ 全局约束 1：stdout 是内核的**协议专用通道**，子进程的输出绝不能漏上去。
         // 这里取 `Stdio::null()`（= Go 的 `cmd.Stdout = nil`，即 /dev/null）：
-        // 既堵死了"漏进协议通道"这条路，也不会让 aria2 的 `--summary-interval=1`
-        // 摘要堵在一条没人读的管道里（管道写满会让 aria2 自己卡住）。
+        // 既堵死了"漏进协议通道"这条路，也不会让 aria2 自己的输出（进度摘要等）
+        // 堵在一条没人读的管道里（管道写满会让 aria2 自己卡住）。
         // **不要**改成 `inherit`。
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1359,7 +1522,12 @@ fn start_on_port(
     spawn_reaper(Arc::clone(&inner));
 
     let url = format!("http://127.0.0.1:{port}/jsonrpc");
-    let client = Arc::new(RpcClient::new(&url, secret));
+    let client = RpcClient::new(&url, secret);
+    let client = match &opts.counters {
+        Some(c) => client.with_counters(Arc::clone(c)),
+        None => client,
+    };
+    let client = Arc::new(client);
     let d = Daemon {
         inner,
         client,
@@ -1803,6 +1971,7 @@ mod tests {
             per_task: BTreeMap::new(),
             binary_path: None,
             force_port: None,
+            counters: None,
         }
     }
 
@@ -1991,6 +2160,33 @@ mod tests {
         d.ping().expect("RPC 探活失败");
     }
 
+    /// 计数器必须真的接进生产路径上的 RPC 客户端：恒为 0 的计数器什么也证明不了。
+    /// 删掉 `start_on_port` 里挂计数器的那三行 ⇒ 红。
+    #[test]
+    fn daemon_rpc_calls_are_counted_when_counters_are_given() {
+        let dir = TempDir::new();
+        let c = Arc::new(crate::diag_counters::Counters::default());
+        let opts = DaemonOptions { counters: Some(Arc::clone(&c)), ..options(dir.path()) };
+        let d = Daemon::start(opts).expect("启动失败");
+        let _g = guard(&d);
+        d.ping().expect("RPC 探活失败");
+        assert!(c.snapshot().rpc_calls >= 1, "生产路径上的 RPC 必须被计数");
+    }
+
+    /// 停滞采样只发**一条** `tellActive`。判别力：把 `Daemon::active` 的方法体换回 `snapshot()`
+    /// （四条请求）⇒ 红。
+    #[test]
+    fn active_sampling_sends_exactly_one_request() {
+        let srv = StubHttp::start_with(|_req| {
+            RawResponse::new(200).body(r#"{"jsonrpc":"2.0","id":"1","result":[]}"#.to_string())
+        });
+        let d = stub_daemon(&srv.base(), "s", BTreeMap::new());
+        d.active().expect("tellActive 应当成功");
+        let seen = srv.requests();
+        assert_eq!(seen.len(), 1, "采样只许一条请求，实际 {} 条", seen.len());
+        assert!(seen[0].body.contains("aria2.tellActive"), "那一条必须是 tellActive：{}", seen[0].body);
+    }
+
     /// 对应 Go `TestDaemonCloseIsIdempotent`。
     #[test]
     fn daemon_close_is_idempotent() {
@@ -2027,7 +2223,7 @@ mod tests {
 
         // 用一个必然连不上的地址，只为验证"加了任务就记下映射"
         let gid = d
-            .add("http://127.0.0.1:1/none", "PFX/sub", "a.txt")
+            .add(&["http://127.0.0.1:1/none".to_string()], "PFX/sub", "a.txt", &BTreeMap::new())
             .expect("addUri 不应失败");
         assert_eq!(
             d.path_for(&gid).as_deref(),
@@ -2045,7 +2241,7 @@ mod tests {
         // 而没有任何一处报错。（Go 侧同样没有守这条：`filepath.Join` 自己就会 Clean，
         // 在非规范路径上**本来就违反** §3.1。）
         let gid2 = d
-            .add("http://127.0.0.1:1/none", "a/.", "b.txt")
+            .add(&["http://127.0.0.1:1/none".to_string()], "a/.", "b.txt", &BTreeMap::new())
             .expect("addUri 不应失败");
         assert_eq!(
             d.path_for(&gid2).as_deref(),
@@ -2058,7 +2254,7 @@ mod tests {
         //   - 下面：**`.` 不得被拼进去**（`dir="."` 是**最常走**的那条路——根目录下的文件）。
         // 把 `join_rel` 整个换成朴素的 `format!("{dir}/{out}")`，只有这一条会红。
         let gid3 = d
-            .add("http://127.0.0.1:1/none", ".", "top.txt")
+            .add(&["http://127.0.0.1:1/none".to_string()], ".", "top.txt", &BTreeMap::new())
             .expect("addUri 不应失败");
         assert_eq!(
             d.path_for(&gid3).as_deref(),
@@ -2074,7 +2270,7 @@ mod tests {
         let d = Daemon::start(options(dir.path())).expect("启动失败");
         let _g = guard(&d);
 
-        d.add("http://127.0.0.1:1/none", ".", "x.txt")
+        d.add(&["http://127.0.0.1:1/none".to_string()], ".", "x.txt", &BTreeMap::new())
             .expect("加任务失败");
         // 给 aria2 一点时间把任务报出来
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2182,7 +2378,7 @@ mod tests {
         let _g = guard(&d);
 
         let gid = d
-            .add("http://127.0.0.1:1/none", ".", "p.txt")
+            .add(&["http://127.0.0.1:1/none".to_string()], ".", "p.txt", &BTreeMap::new())
             .expect("加任务失败");
         let got = get_option(&d, &gid).expect("getOption 失败");
 
@@ -2217,7 +2413,7 @@ mod tests {
 
         let ask = |out: &str| -> BTreeMap<String, String> {
             let gid = d
-                .add("http://127.0.0.1:1/none", ".", out)
+                .add(&["http://127.0.0.1:1/none".to_string()], ".", out, &BTreeMap::new())
                 .expect("加任务失败");
             get_option(&d, &gid).expect("getOption 失败")
         };
@@ -2284,7 +2480,7 @@ mod tests {
             }
             s.spawn(|| {
                 for _ in 0..30 {
-                    d.add("http://127.0.0.1:1/x", ".", "f.txt")
+                    d.add(&["http://127.0.0.1:1/x".to_string()], ".", "f.txt", &BTreeMap::new())
                         .expect("加任务失败");
                 }
             });
@@ -2828,6 +3024,164 @@ mod tests {
         );
     }
 
+    /// 启动参数进诊断日志时**每个参数一个字段**，且凭据与客户目录名必须被抹掉。
+    /// 判别力：把 `redact` 的三支任删一支 ⇒ 对应那行红。
+    #[test]
+    fn every_argument_gets_its_own_field_and_the_secret_and_dir_are_redacted() {
+        let args: Vec<OsString> = vec![
+            OsString::from("--rpc-secret=deadbeefcafe"),
+            OsString::from("--dir=/Users/张三/Downloads/Benagen"),
+            OsString::from("--split=4"),
+        ];
+        let f = argv_fields(&args);
+        assert_eq!(f[0], ("arg0".to_string(), "--rpc-secret=<抹除>".to_string()));
+        assert_eq!(f[1], ("arg1".to_string(), "--dir=<抹除>".to_string()));
+        assert_eq!(f[2], ("arg2".to_string(), "--split=4".to_string()));
+        assert!(!f.iter().any(|(_, v)| v.contains("deadbeefcafe")), "{f:?}");
+        assert!(!f.iter().any(|(_, v)| v.contains("张三")), "客户目录名不许进日志：{f:?}");
+    }
+
+    /// 🔴 每一个字段值都必须 ≤ 诊断日志的单字段上限 —— 否则会**静默截断**。
+    /// 判别力：把 `argv_fields` 改回"拼成一行"⇒ 红。
+    /// ⚠️ 用**真实的**参数表（`launch_args` 造的那份），不是手搓短样例 ——
+    ///    手搓的样例量不出"macOS 204 / Linux 256"这个事实。
+    #[test]
+    fn no_field_exceeds_the_diagnostics_field_limit() {
+        let real = launch_args(Path::new("/tmp/x"), "secret", 6800);
+        let fields = argv_fields(&real);
+        assert!(!fields.is_empty(), "总得记点什么");
+        for (k, v) in &fields {
+            assert!(
+                v.chars().count() <= crate::diagnostics::MAX_VALUE_CHARS,
+                "字段 {k} 有 {} 字符，超过上限 {} ⇒ 日志里会被静默截断：{v}",
+                v.chars().count(),
+                crate::diagnostics::MAX_VALUE_CHARS
+            );
+        }
+    }
+
+    /// ⚠️ **守着上面那条用例的前提**：它只在"拼起来会超上限"时才有判别力，
+    /// 而实测余量只有 4 个字符（204 vs 200）——参数表一旦短 5 个字符以上，
+    /// 上面那条就退化成永远为真的绿灯，而没有任何东西会红。
+    ///
+    /// 所以这里正面断言那个前提成立。参数表变短时，红的是这一条，
+    /// 它替你问："是不是该换个办法证明我们在防截断了？"
+    /// （同型先例：`core/tests/cli_e2e.rs` 的 `peak_aria2c > 0` 前置守卫。）
+    #[test]
+    fn the_real_argv_would_not_fit_in_one_field() {
+        let real = launch_args(Path::new("/tmp/x"), "secret", 6800);
+        let joined = real
+            .iter()
+            .map(|a| redact(&a.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.chars().count() > crate::diagnostics::MAX_VALUE_CHARS,
+            "真实参数串拼起来只有 {} 字符，没超过上限 {} ⇒ 上面那条用例已经没有判别力了。\
+             要么参数表变短了、要么上限改了：请换个办法证明『我们在防截断』，\
+             不要把这一条删掉了事。",
+            joined.chars().count(),
+            crate::diagnostics::MAX_VALUE_CHARS
+        );
+    }
+
+    #[test]
+    fn the_engine_log_is_wired_with_a_level_and_a_rotation_cap() {
+        let args = launch_args(Path::new("/tmp/x"), "secret", 6800);
+        let s: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let log = Path::new("/tmp/x").join(ENGINE_LOG_FILE);
+        assert!(
+            s.iter().any(|a| *a == format!("--log={}", log.display())),
+            "要给 aria2 一个日志文件，且落在下载目录里：{s:?}"
+        );
+        assert!(s.iter().any(|a| a == "--log-level=info"),
+                "起始档位是 info（不是 debug —— 见规格 §6.3 的体积账）：{s:?}");
+    }
+
+    /// ⚠️ `--log=` 会把客户的下载目录整个带进 argv，而 argv 是要写进诊断日志的（任务 6）。
+    /// 任务 6 的 `redact` 只认 `--rpc-secret` 与 `--dir=`，漏了 `--log=`，不补就会绕道进日志。
+    /// 判别力：把 `redact` 里 `--log=` 那一支删掉 ⇒ 红。
+    #[test]
+    fn the_engine_log_path_is_redacted_out_of_the_argv_log() {
+        let args = launch_args(Path::new("/tmp/x"), "secret", 6800);
+        let fields = argv_fields(&args);
+        let joined = fields
+            .iter()
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!joined.contains("/tmp/x"), "客户目录不许进日志：{joined}");
+    }
+
+    /// 超上限 ⇒ 轮转出一代，且**就地截断**（见实现里那段实测说明）。
+    #[test]
+    fn an_oversized_engine_log_is_rotated_to_one_generation() {
+        let d = TempDir::new();
+        let log = d.join("aria2.log");
+        std::fs::write(&log, vec![b'x'; (MAX_ENGINE_LOG_BYTES + 1) as usize]).unwrap();
+        rotate_engine_log(&log);
+        assert!(d.join("aria2.log.1").is_file(), "超上限要留下一代");
+        assert_eq!(
+            std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0),
+            0,
+            "**当前那份必须被就地截断** —— 只留一代而不清空当前那份，等于没限住体积"
+        );
+    }
+
+    /// 反面守卫：与上一条成对，才证明"上限判断"真的在起作用。
+    /// 判别力：删掉 `rotate_engine_log` 里的上限判断 ⇒ 小文件也被轮转 ⇒ 红。
+    #[test]
+    fn a_small_engine_log_is_left_alone() {
+        let d = TempDir::new();
+        let log = d.join("aria2.log");
+        std::fs::write(&log, b"tiny").unwrap();
+        rotate_engine_log(&log);
+        assert!(!d.join("aria2.log.1").exists(), "没超上限就不许动它");
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 4, "内容也不许被清");
+    }
+
+    /// 上表那**三个**连接级参数都要出现在启动 argv 里，且取值就是表里那三个。
+    /// 判别力：删掉任一条 ⇒ 对应那行红。
+    /// ⚠️ 重试（`--max-tries`）**不在这条里**：它必须落在逐任务层，见
+    ///    `retry_ownership_lands_in_the_per_task_layer_not_the_argv`。
+    #[test]
+    fn the_shipped_connection_limits_are_wired_into_the_argv() {
+        let args = launch_args(Path::new("/tmp/x"), "secret", 6800);
+        let s: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(s.iter().any(|a| a == "--timeout=30"), "{s:?}");
+        assert!(s.iter().any(|a| a == "--connect-timeout=15"), "{s:?}");
+        assert!(s.iter().any(|a| a == "--lowest-speed-limit=1K"), "{s:?}");
+    }
+
+    /// 🔴 **重试所有权转移（用户 2026-10-13 表态）的落地判据 —— 钉在逐任务层。**
+    ///
+    /// ⚠️ 为什么不在 argv：`per_task_options()` 无条件下发的 `max-tries` 会**覆盖**命令行
+    ///    （aria2 逐任务选项优先）⇒ argv 里写 `--max-tries=1` 是**空操作**。
+    ///    真正每条路（新入队 / autoretry 重新入队 / 后台 feeder）都经过的只有 `Daemon::add`
+    ///    → `per_task` 那一层 —— 值必须放在那里才算"归我们"。
+    ///
+    /// 判别力：把 `default_settings().max_tries` 改回 3 ⇒ 第一条断言红；
+    ///        把 `per_task_options()` 里的 `"max-tries"` 下发删掉 ⇒ 第二条断言红。
+    #[test]
+    fn retry_ownership_lands_in_the_per_task_layer_not_the_argv() {
+        let s = crate::settings::default_settings();
+        assert_eq!(s.max_tries, 1, "默认 1：失败立刻成为可观测的内核事件，交给 autoretry");
+        assert!(
+            s.per_task_options().iter().any(|(k, v)| k == "max-tries" && v == "1"),
+            "逐任务层必须真的下发 1（argv 的全局值会被它覆盖）"
+        );
+        let args = launch_args(Path::new("/tmp/x"), "secret", 6800);
+        let joined = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !joined.contains("--max-tries"),
+            "单一来源：argv 不带它（带了一条永不生效的参数只会骗下一个人）：{joined}"
+        );
+    }
+
     /// 对应 Go `TestArgsDefaults`（判定：**移植**，但断言的是**常驻 RPC 模式**的那份 argv）。
     ///
     /// `DefaultArgs()` 是 Go 版**一次性 `-i` 运行**的参数表；Rust 版从第一天就是常驻
@@ -2843,14 +3197,18 @@ mod tests {
     ///
     /// ⚠️ **本次之后这条 argv 按平台分叉了**（裁定 R32 + R9）：Linux 上会多一条
     /// `--ca-certificate=<系统 CA 包>`，macOS 上**一条都不多**。
-    /// 所以下面按"**跨平台必须逐字相同的前十条** + **平台特有的尾巴**"两段判：
-    ///   - 前十条：**一条都不放宽**（macOS 那串是已经验过的）；
-    ///   - 尾巴：macOS 必须**为空**（这正是 R9 那条"不许因为这次改动多一个参数"的
+    /// 所以下面按"**跨平台必须逐字相同的那一段**（`want` 表，条数看 `want.len()`，
+    /// 不在注释里写死）+ **平台特有的尾巴**"两段判：
+    ///   - 钉死表那段：**一条都不放宽**（macOS 那串是已经验过的）；
+    ///   - 尾巴：macOS 必须**为空**（这正是 R9 那条"不许多出钉死表以外的参数"的
     ///     可执行判据）；Linux 至多一条，且必须真的指向一个存在的文件。
     #[test]
     fn args_defaults() {
         let argv = launch_args(Path::new("/tmp/基准目录"), "s3cr3t", 6800);
-        // 「跨平台必须相同」的那十条。**单一来源**：平台特有的尾巴另判，不复制这张表。
+
+        // `--file-allocation=trunc` 已回到「跨平台必须相同」的钉死表（2026-10-14 翻表后
+        // 不再按卷分叉）；位置由表内顺序钉死（`-c` 之后、`--auto-file-renaming=false` 之前）。
+        // 「跨平台必须相同」的钉死表。**单一来源**：平台特有的尾巴另判，不复制这张表。
         let want: Vec<OsString> = [
             "--enable-rpc",
             "--rpc-listen-all=false",
@@ -2858,21 +3216,44 @@ mod tests {
             "--rpc-listen-port=6800",
             "--dir=/tmp/基准目录",
             "-c",
-            "--file-allocation=none",
+            // 2026-10-14 翻表：一律 trunc（MinGW falloc 的语义与失败形态见 `launch_args`）。
+            "--file-allocation=trunc",
             "--auto-file-renaming=false",
             "--allow-overwrite=true",
-            "--summary-interval=1",
+            // 2026-10-14 按规格 §5.1 加入：多 URI 用 inorder（容错不是提速——先用域名，
+            // 坏了才轮到 IP 备胎）。整条参数表逐字钉死，新增项必须在此现身。
+            "--uri-selector=inorder",
+            // 2026-10-14 按规格 §4.3 加入（F9）：aria2 默认读用户目录的 aria2.conf，
+            // 客户机上的遗留配置会静默覆盖我们钉死的参数。
+            "--no-conf",
+            // 2026-10-13 按规格 §3.3 加入（理由见 `launch_args`）：连接级的收窄。
+            // 整条参数表逐字钉死，所以新增项必须在此现身。重试（`max-tries`）**不在 argv**，
+            // 它的单一来源在逐任务层 —— 见 `retry_ownership_lands_in_the_per_task_layer_not_the_argv`。
+            "--timeout=30",
+            "--connect-timeout=15",
+            "--lowest-speed-limit=1K",
+            // 2026-10-14 按规格 §4.1 加入：并发优化器打开，settings.parallel 变成
+            // 起始值而非硬上限（P2 已证实它会接管这个数字并自报 optimized at N）。
+            // 收敛性未证——真机观察是验收项（见 README）。
+            "--optimize-concurrent-downloads=true",
             // 2026-10-05 按规格 §12 加入（理由见 `launch_args`）：aria2 的 `disable-ipv6`
             // 默认 false，这里把它关掉。整条参数表逐字钉死，所以新增的一项也必须在此现身。
             "--disable-ipv6=true",
         ]
         .iter()
         .map(OsString::from)
+        .chain([
+            OsString::from(format!(
+                "--log={}",
+                Path::new("/tmp/基准目录").join(ENGINE_LOG_FILE).display()
+            )),
+            OsString::from("--log-level=info"),
+        ])
         .collect();
 
         assert!(
             argv.len() >= want.len(),
-            "启动参数比十条基线还短（{} < {}）：{argv:?}",
+            "启动参数比基线还短（{} < {}）：{argv:?}",
             argv.len(),
             want.len()
         );
@@ -2886,10 +3267,11 @@ mod tests {
         // 平台特有的尾巴。
         let tail = &argv[want.len()..];
         if cfg!(target_os = "macos") {
-            // R9 的机械判据：macOS 那条已经验过的 argv **不许因为这次改动多一个参数**。
+            // R9 的机械判据：macOS 那条已经验过的 argv **不许多出钉死表以外的参数**。
             assert!(
                 tail.is_empty(),
-                "macOS 的启动 argv 不该多出参数（argv 是已验过的那十条）：{tail:?}"
+                "macOS 的启动 argv 不该多出钉死表以外的参数（钉死表 {} 条）：{tail:?}",
+                want.len()
             );
         } else if cfg!(target_os = "linux") {
             assert!(
@@ -2916,6 +3298,9 @@ mod tests {
         // 因此它们**不出现在启动 argv 里**，不是漏了。
     }
 
+    // -----------------------------------------------------------------------
+    // `--file-allocation` 按卷选择的测试已随翻表删除（一律 trunc 后无映射可测）。
+    // -----------------------------------------------------------------------
     // -----------------------------------------------------------------------
     // 系统 CA 证书包的探测（**R9，非移植**）
     //
@@ -4022,7 +4407,7 @@ mod tests {
         let _g = guard(&d);
 
         let src = StuckSource::start();
-        let gid = d.add(&src.url("slow.bin"), ".", "slow.bin")
+        let gid = d.add(&[src.url("slow.bin")], ".", "slow.bin", &BTreeMap::new())
             .expect("加任务失败");
         wait_until(&d, "任务变成 active", |s| {
             state_of(s, &gid) == Some(TaskState::Active)
@@ -4078,7 +4463,7 @@ mod tests {
         let _g = guard(&d);
 
         let srv = file_source();
-        let gid = d.add(&format!("{}/f.txt", srv.base()), ".", "f.txt")
+        let gid = d.add(&[format!("{}/f.txt", srv.base())], ".", "f.txt", &BTreeMap::new())
             .expect("加任务失败");
         wait_until(&d, "任务下载完成", |s| {
             state_of(s, &gid) == Some(TaskState::Complete)
@@ -4119,13 +4504,13 @@ mod tests {
         // 只用一种的话，过滤器里的另一支没有任何测试走过——把 `matches!` 改成
         // 只认 `Complete`，测试照样全绿（本项目反复栽过的"只守住了一半"）。
         let srv_a = file_source();
-        let done1 = d.add(&format!("{}/a.txt", srv_a.base()), ".", "a.txt")
+        let done1 = d.add(&[format!("{}/a.txt", srv_a.base())], ".", "a.txt", &BTreeMap::new())
             .expect("加任务失败");
-        let done2 = d.add(&closed_url("b.txt"), ".", "b.txt")
+        let done2 = d.add(&[closed_url("b.txt")], ".", "b.txt", &BTreeMap::new())
             .expect("加任务失败");
         // 一个永远下不完的任务：它既不在 tellStopped 里、也不该被 forget。
         let src = StuckSource::start();
-        let live = d.add(&src.url("live.bin"), ".", "live.bin")
+        let live = d.add(&[src.url("live.bin")], ".", "live.bin", &BTreeMap::new())
             .expect("加任务失败");
 
         wait_until(&d, "一个下完、一个失败", |s| {
@@ -4184,7 +4569,7 @@ mod tests {
         let _g = guard(&d);
 
         let src = StuckSource::start();
-        let gid = d.add(&src.url("r.bin"), ".", "r.bin")
+        let gid = d.add(&[src.url("r.bin")], ".", "r.bin", &BTreeMap::new())
             .expect("加任务失败");
         wait_until(&d, "任务变成 active", |s| {
             state_of(s, &gid) == Some(TaskState::Active)
@@ -4227,7 +4612,7 @@ mod tests {
         let _g = guard(&d);
 
         let src = StuckSource::start();
-        let gid = d.add(&src.url("p.bin"), ".", "p.bin")
+        let gid = d.add(&[src.url("p.bin")], ".", "p.bin", &BTreeMap::new())
             .expect("加任务失败");
         wait_until(&d, "任务变成 active", |s| {
             state_of(s, &gid) == Some(TaskState::Active)
@@ -4247,6 +4632,48 @@ mod tests {
         wait_until(&d, "任务回到 active", |s| {
             state_of(s, &gid) == Some(TaskState::Active)
         });
+    }
+
+    /// 暂停全部 / 继续全部：走真实 aria2，两个动作都要真的改变**每一个**任务的状态。
+    ///
+    /// 判别力：`pause_all` 空转 ⇒ 第一条 `wait_until`（全部离开 active）红；
+    /// 把它换成只暂停一个 ⇒ 同一条红；`unpause_all` 空转 ⇒ 最后一条红。
+    /// 暂停不该动 GID 映射（与单个暂停同一条）。
+    #[test]
+    fn daemon_pause_all_then_unpause_all_round_trips() {
+        let dir = TempDir::new();
+        let d = Daemon::start(options(dir.path())).expect("启动失败");
+        let _g = guard(&d);
+
+        let src = StuckSource::start();
+        let g1 = d.add(&[src.url("a.bin")], ".", "a.bin", &BTreeMap::new()).expect("加任务失败");
+        let g2 = d.add(&[src.url("b.bin")], ".", "b.bin", &BTreeMap::new()).expect("加任务失败");
+        wait_until(&d, "两个任务都 active", |s| {
+            state_of(s, &g1) == Some(TaskState::Active) && state_of(s, &g2) == Some(TaskState::Active)
+        });
+
+        d.pause_all().expect("暂停全部不应失败");
+        wait_until(&d, "两个任务都离开 active", |s| {
+            state_of(s, &g1) == Some(TaskState::Waiting) && state_of(s, &g2) == Some(TaskState::Waiting)
+        });
+        assert_eq!(d.path_for(&g1).as_deref(), Some("a.bin"), "暂停不该动映射");
+        assert_eq!(d.path_for(&g2).as_deref(), Some("b.bin"), "暂停不该动映射");
+
+        d.unpause_all().expect("继续全部不应失败");
+        wait_until(&d, "两个任务都回到 active", |s| {
+            state_of(s, &g1) == Some(TaskState::Active) && state_of(s, &g2) == Some(TaskState::Active)
+        });
+    }
+
+    /// 没有任何任务时两个动作都应成功（空操作）——「一键开始」不该因为队列是空的而报错。
+    #[test]
+    fn daemon_pause_all_and_unpause_all_on_an_empty_engine_succeed() {
+        let dir = TempDir::new();
+        let d = Daemon::start(options(dir.path())).expect("启动失败");
+        let _g = guard(&d);
+
+        d.pause_all().expect("空引擎上暂停全部应成功");
+        d.unpause_all().expect("空引擎上继续全部应成功");
     }
 
     /// 移除一个 aria2 根本不认识的 GID：错误必须**带出来**。

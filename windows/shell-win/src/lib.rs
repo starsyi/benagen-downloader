@@ -28,6 +28,7 @@
 ///    把当时的 `main.rs` 整个换掉了，于是**不属于传输层**的那批东西（内核查找三路、
 ///    握手的有界等待、后台线程那个形状）连同 8 条装配用例一起离开了工作区。
 ///    搬回来的清单、原文出处与"为什么另外 4 条不搬"都写在 `bootstrap.rs` 的文件头。
+pub mod batch;
 pub mod bootstrap;
 pub mod commands;
 /// 内嵌内核 exe 的**释放**（规格 §3.3 第 3 步）。
@@ -43,6 +44,7 @@ pub mod embed;
 ///    失败那句话），本模块只做那两次系统调用（`create_dir_all` / `fs::copy`）
 ///    与"逐份文件量事实"。拆法与 `pickdir` / `reveal` 逐字同款。
 pub mod export;
+pub mod keepalive;
 pub mod kernel;
 /// 「打开更新下载页」的**平台那一半**（更新提示那条提示条上的「去下载」，R15）。
 ///

@@ -580,6 +580,13 @@ fn link_manifest_and_version(out_dir: &Path) {
     let rc_path = out_dir.join("app.rc");
     write_if_changed(&manifest_path, manifest.as_bytes());
     write_if_changed(&rc_path, rc.as_bytes());
+    // exe 自己的图标（资源管理器里显示）：`.rc` 里的 `"icon.ico"` 按 `-I <OUT_DIR>` 解析。
+    let icon_src = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
+        .join("icons/icon.ico");
+    let icon_bytes = std::fs::read(&icon_src)
+        .unwrap_or_else(|e| panic!("读不到 {}：{e}（exe 图标资源编不进去）", icon_src.display()));
+    assert!(icon_bytes.len() > 100, "icon.ico 小得不像一个图标：{} 字节", icon_bytes.len());
+    write_if_changed(&out_dir.join("icon.ico"), &icon_bytes);
 
     let res_path = out_dir.join("app.res");
     run_windres(&rc_path, &res_path);
@@ -679,6 +686,7 @@ fn rc_source(quad: &[u16; 4]) -> String {
     format!(
         r#"// 由 shell-win/build.rs 生成，**不要手改**（改这里等于改构建脚本）。
 1 24 "app.manifest"
+1 ICON "icon.ico"
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION {comma}
  PRODUCTVERSION {comma}

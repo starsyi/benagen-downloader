@@ -19,6 +19,7 @@ use serde::Serialize;
 
 pub mod about_info;
 pub mod app_preferences;
+pub mod batch_control;
 pub mod batch_history;
 pub mod breadcrumb;
 pub mod browser_primary_action;

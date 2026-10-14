@@ -322,3 +322,49 @@ func theBudgetBoundaryIsInclusive() {
     #expect(noCode.summary(currentCode: "AAA-1") == "批次 —：没有需要下载的文件",
             "真有码可比且对不上时，宁可写占位也不冒充新批次")
 }
+
+// ---------------------------------------------------------------------------
+// 分批加入（pending）与超预算的单条路径
+// ---------------------------------------------------------------------------
+
+@Test func anEnqueueReceiptWithoutThePendingKeyCountsZero() throws {
+    // 旧内核不发 `pending` 键：缺键必须按 0 算，不得因此解码失败。
+    #expect(try enqueued(#"{"added":[],"rejected":[]}"#).pending == 0)
+}
+
+@Test func anEnqueueReceiptCarriesItsPendingCount() throws {
+    #expect(try enqueued(#"{"added":[{"gid":"g1","path":"a.bin"}],"rejected":[],"pending":7}"#).pending == 7)
+}
+
+@Test func aPendingReceiptSaysTheRestAreStillComing() throws {
+    // 大批量：先让客户看到任务开始，其余的在下载的同时陆续加入 —— 话里必须说出「还在加」。
+    let f = EnqueueFeedback.of(try enqueued(#"{"added":[{"gid":"g1","path":"a.bin"}],"rejected":[],"pending":7}"#))
+    #expect(f.summary == "已加入 1 个下载任务，另有 7 个正在后台继续加入")
+    #expect(f.switchesToTransfers, "已经有任务在列表里，切过去看")
+}
+
+@Test func aReceiptWithOnlyPendingStillSwitchesToTransfers() throws {
+    // `added` 为空但还有 pending：不能被当成「没有需要下载的文件」。
+    let f = EnqueueFeedback.of(try enqueued(#"{"added":[],"rejected":[],"pending":3}"#))
+    #expect(f.summary == "已加入 0 个下载任务，另有 3 个正在后台继续加入")
+    #expect(f.switchesToTransfers)
+}
+
+@Test func aSinglePathOverTheBudgetIsSplitOutOfEveryChunk() {
+    let huge = String(repeating: "y", count: DownloadTargets.requestBudgetBytes)
+    let paths = ["a.bin", huge, "b.bin"]
+
+    #expect(DownloadTargets.oversized(in: paths) == [huge])
+    #expect(DownloadTargets.chunks(paths) == [["a.bin", "b.bin"]],
+            "超预算的那条不进任何一块；其余路径照样发、顺序不变")
+    #expect(DownloadTargets.chunks([huge]).isEmpty, "全部超预算 ⇒ 没有可发的块（不得变成 `[[]]`）")
+}
+
+@Test func aPathExactlyAtTheBudgetIsNotOversized() {
+    // 单条的线上字节 = 请求体 − 基底；恰好等于预算的单条仍可发（与 `exceedsRequestBudget` 的 `>` 同口径）。
+    let base = DownloadTargets.requestBytes([])
+    let fits = String(repeating: "z", count: DownloadTargets.requestBudgetBytes - base - 2)
+    #expect(DownloadTargets.requestBytes([fits]) == DownloadTargets.requestBudgetBytes)
+    #expect(!DownloadTargets.isOversized(fits))
+    #expect(DownloadTargets.oversized(in: [fits]).isEmpty)
+}

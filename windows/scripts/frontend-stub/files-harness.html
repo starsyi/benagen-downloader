@@ -3,10 +3,7 @@
   windows/scripts/frontend-stub/files-harness.html —— **文件页的无头验收夹具**（常驻）。
 
   跑法（**一条命令**）：bash windows/scripts/check_files_screen.sh
-  直接打开：/files-harness.html?s=sub|blocked|keep|root|fail|switch（要先起本地静态服务，见 runner）
-  ⚠️ `blocked` 是任务 17 加的第二档载荷场景（超预算的勾选面 ⇒ 那个动作按不下去）：
-     `sub` 那一档的 `blocked_reason` 是 `null`，所以"界面照那一格做了没有"在那里不可观测
-     —— 两档合起来才是一条判据的**正反两面**。
+  直接打开：/files-harness.html?s=sub|keep|root|fail|switch|update（要先起本地静态服务，见 runner）
   ⚠️ `keep` 是**换屏**那一档（**真机缺陷**：选一个文件 → 看一眼传输列表 → 切回来 →
      点「下载选中」⇒ 下的是整批）。`sub` 那一场从头到尾**没换过屏** ⇒ 那条缺陷在那里
      长得和"做对了"一模一样 —— 只有真的切走再切回来，它才可观测（理由写在场里）。
@@ -113,9 +110,7 @@ async function invoke(cmd, args) {
   }
   if (cmd === "tree") {
     const path = args && typeof args.path === "string" ? args.path : null;
-    // 无 path：整棵树那一支。⚠️ **两档**（任务 17）：默认那一档 `blocked_reason` 是 `null`；
-    // `blocked` 场景给的是**超预算**那一档（`blocked_reason` 是个字符串）。
-    if (path === null) return SCENARIO === "blocked" ? FIX.treeWholeBlocked : FIX.treeWhole;
+    if (path === null) return FIX.treeWhole;
     if (path === SUB_PATH) return SCENARIO === "fail" ? FIX.treeLevelFailure : FIX.treeLevelSub;
     return FIX.treeLevelRoot;                                       // "" 与回退之后的根
   }
@@ -225,7 +220,6 @@ const dbl = (el) => {
 document.getElementById("f").addEventListener("load", (e) => {
   e.target.contentWindow.__TAURI__ = { core: { invoke } };
   if (SCENARIO === "sub") void runScenario(runInteractions);
-  else if (SCENARIO === "blocked") void runScenario(runBlocked);
   else if (SCENARIO === "fail") void runScenario(runFailure);
   else if (SCENARIO === "switch") void runScenario(runSwitch);
   else if (SCENARIO === "keep") void runScenario(runKept);
@@ -239,60 +233,6 @@ async function runStill() {
   const hasState = ROOT_ROWS.some((r) => "state" in r);
   check("夹具里没有 `state` 那一格（R-35：别发没人读的字段）", !hasState);
   check("根那一层 7 行都画出来了", rowsOf().length === ROOT_ROWS.length, rowsOf().length + " 行");
-}
-
-// ---- 场景 blocked：勾选面大到一次发不出去 ⇒ 那个动作**真的按不下去**（任务 17）----
-//
-// 🔴 **这个场景为什么必须存在**（R-61：行为成立 ≠ 被守住）：`sub` 那一档的载荷里
-//    `blocked_reason` 是 `null`，于是"交不交勾选面 / 读不读那一格 / 有没有把它落到 DOM"
-//    这三件事**做没做长得一模一样** —— 只有一份 `blocked_reason` 非 `null` 的载荷
-//    才分得开。判据（什么时候算按不下去）在 Rust（`DownloadTargets::blocked_reason`，
-//    有单测）；本场景只验**界面照那一格做了没有**。
-async function runBlocked() {
-  await sleep(1600);
-  const act = FIX.treeWholeBlocked.data.action;
-  const bar = doc().querySelector("#files-bar-download");
-  const hint = doc().querySelector("#files-bar-hint");
-
-  // ⚠️ 先钉住处**夹具的前提**：这一档必须真的带着那句话（否则下面几条会退化成恒真）。
-  check("夹具给的是「按不下去」那一档（blocked_reason 是个非空字符串）",
-    typeof act.blocked_reason === "string" && act.blocked_reason !== "", String(act.blocked_reason));
-
-  check("底栏那颗下载按钮**真的禁用**（不是「点了没反应」）", bar.disabled === true, "disabled=" + bar.disabled);
-  // 🔴 **而且禁用要看得出来**（`files.css` 的 `:disabled` 那一段）：同一颗按钮，把 `disabled`
-  //    摘掉再读一次计算样式 —— 两次**必须不同**。⚠️ 只断言 `disabled === true` 是不够的：
-  //    `.is-primary` 的 accent 底色会盖住浏览器默认的禁用观感（那条 `:hover` 原本还会
-  //    把它点亮），于是"补了样式"与"没补"在 DOM 上一模一样 —— 那正是本任务修的那个形状。
-  const win = document.getElementById("f").contentWindow;
-  const bgDisabled = win.getComputedStyle(bar).backgroundColor;
-  bar.disabled = false;
-  const bgEnabled = win.getComputedStyle(bar).backgroundColor;
-  bar.disabled = true;
-  check("禁用态与可用态**看得出不一样**（同一颗按钮，背景色必须不同）",
-    bgDisabled !== bgEnabled, "禁用 " + bgDisabled + " / 可用 " + bgEnabled);
-  check("那句话显示出来了，且**逐字来自夹具**（Rust 给的，前端一个字都不造）",
-    !hint.hidden && hint.textContent === act.blocked_reason, "「" + hint.textContent + "」");
-  check("那句话旁边的分隔符也跟着出现（不然它会贴着项数）",
-    !doc().querySelector("#files-bar-hint-sep").hidden);
-  // ⚠️ 按钮文案**不受影响**：它仍然叫「下载选中」—— "此刻按不动"与"它叫什么"是两件事。
-  check("按钮文案仍然是夹具里的 button_title", bar.textContent === act.button_title, bar.textContent);
-
-  // ⚠️ 这一档的载荷**只改底栏那几格**：列表与面包屑一个字都不该受影响。
-  check("根那一层照旧画出来了（这一档的载荷不改列表）",
-    rowsOf().length === ROOT_ROWS.length, rowsOf().length + " 行");
-
-  // 右键菜单里那一项是**同一个入口**（同一处判据）⇒ 同样按不动。
-  const second = rowByPath(ROOT_ROWS[1].path);
-  if (!second) {
-    check("右键菜单那一项：行不在场（见上一条）", false,
-      "rowByPath 没找到 " + ROOT_ROWS[1].path + "；实际在场的是 " + rowsOf().map((r) => r.dataset.path).join(" / "));
-  } else {
-    second.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 700, clientY: 300 }));
-    await sleep(400);
-    check("右键菜单那一项也在场（右键点开了）", !doc().querySelector("#files-menu").hidden);
-    const item = doc().querySelector("#files-menu-download");
-    check("右键菜单里那一项也禁用了", item.disabled === true, "disabled=" + item.disabled);
-  }
 }
 
 // ---- 场景 fail：读某一层回 failure（回退 + 那条说明 + 上一层的内容还在）--------
@@ -638,8 +578,8 @@ async function runInteractions() {
   check("底栏按钮文案来自夹具", doc().querySelector("#files-bar-download").textContent === act.button_title, act.button_title);
   check("有勾选时那句「明说」不出现（夹具里是 null）",
     act.empty_selection_hint === null && doc().querySelector("#files-bar-hint").textContent === "");
-  // ⚠️ **对照组**（任务 17）：同一颗按钮，`blocked_reason` 是 `null` 的正常载荷下**必须不禁用**
-  //    —— 少了这一条，`blocked` 场景那条"真的禁用了"就会被"把按钮写成恒禁用"蒙过去。
+  // 对照：`blocked_reason` 是 `null` 的正常载荷下那颗按钮**必须不禁用**
+  //    —— 少了这一条，"按钮被写成恒禁用"就没有任何东西会红。
   check("正常载荷（blocked_reason 是 null）⇒ 那颗按钮**不禁用**、也不显示理由",
     act.blocked_reason === null
       && doc().querySelector("#files-bar-download").disabled === false

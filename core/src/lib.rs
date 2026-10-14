@@ -6,13 +6,18 @@
 //!    两个 bin 都只是它的壳。详见 `docs/superpowers/specs/2026-09-21-benagen-cli-design.md` §4。
 
 pub mod cli;
+pub mod autoretry;
 pub mod crc64xz;
 pub mod delivery;
+pub mod diag_counters;
 pub mod diagnostics;
 pub mod engine;
+pub mod intent;
 pub mod kernel;
+pub mod migrate;
 pub mod paths;
 pub mod planner;
+pub mod procstat;
 pub mod protocol;
 pub mod settings;
 pub mod state;

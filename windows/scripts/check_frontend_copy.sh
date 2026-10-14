@@ -423,6 +423,8 @@ WHITELIST = {
     ("windows/web/index.html", "更改并重启内核"): (1, "确认框那颗确认按钮（同上）。⚠️ 它的标题把**后果**再说一遍，而不是一句空泛的「确定」"),
     ("windows/web/index.html", "开源许可"): (1, "许可全文窗口的标题（`LicenseView.swift` 的 `Text(\"开源许可\")`）。两处条目的名字来自载荷（`License.name`），这一格不是"),
     ("windows/web/index.html", "全文"): (1, "sha256 那一行的小标签（`licenses.rs` 把那个值**发出来**就是为了让它真的出现在界面上：用户能拿它去跟官方发布件核对）"),
+    ("windows/web/index.html", "暂停全部"): (1, "传输列表屏：顶部那颗**列表级**动作（与上面「清空已完成」同族：没有 gid、不属于任何一行）。标题与数据无关、任何状态下都一样 ⇒ 结构文案；**可用与否**不在这里判 —— 由 Rust 的 `BatchControl::can_pause_all` 算好随载荷下来，JS 只读。macOS 侧尚无对位物（本轮只做 Windows），对位时落到 `TransfersView.summaryBar`"),
+    ("windows/web/index.html", "一键开始"): (1, "传输列表屏：与「暂停全部」成对的那颗列表级动作。标题是结构文案；可用与否由 `BatchControl::can_resume_all` 判（含「刚换过下载目录、队列还没补回」那一支 —— 列表里一行都没有，只有 Rust 侧知道）"),
     ("windows/web/index.html", "清空已完成"): (1, "传输列表屏：顶部那颗**列表级**动作（`TransfersView.summaryBar` 的 `Label(\"清空已完成\")`）。它没有 gid、不属于任何一行 —— `TransferRow::actions` 的注释里写着为什么它不许出现在行级菜单里"),
     ("windows/web/index.html", "已暂停"): (1, "传输列表屏：行首那颗角标（`TransferRowView.titleLine` 的 `Text(\"已暂停\")`）。⚠️ 它与数据有关的是**显隐**（`shows_paused_badge`，判据只能来自 `raw_status`，裁决 #88），而这两个字本身与数据无关 ⇒ 字住这里、显隐由 JS 切"),
     ("windows/web/index.html", "这一行的操作"): (1, "传输列表屏：行尾那颗「⋯」的**无障碍名字**（`TransferRowView.actionsMenu` 的 `.help`）。那颗按钮本身是运行时才出现的（从行模板克隆），所以字必须跟着模板走"),

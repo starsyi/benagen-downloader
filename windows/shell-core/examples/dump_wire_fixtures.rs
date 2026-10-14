@@ -42,9 +42,10 @@ use shell_core::presentation::about_info::AboutInfo;
 use shell_core::presentation::app_preferences::{
     DownloadDirChange, DownloadDirectory, VerboseLoggingChange,
 };
+use shell_core::presentation::batch_control::BatchControl;
 use shell_core::presentation::batch_history::NoteDrafts;
 use shell_core::presentation::breadcrumb::Breadcrumb;
-use shell_core::presentation::browser_row::{BrowserRow, BrowserSelection, SelectionSummary};
+use shell_core::presentation::browser_row::{BrowserRow, SelectionSummary};
 use shell_core::presentation::download_targets::{DownloadTargets, EnqueueFeedback};
 use shell_core::presentation::settings_form::SettingsForm;
 use shell_core::presentation::transfer_row::{
@@ -52,7 +53,7 @@ use shell_core::presentation::transfer_row::{
 };
 use shell_core::presentation::verify_summary::ProgressSummary;
 use shell_core::protocol::{
-    DeliveryInfo, EngineState, EnqueueResult, FileState, FlatEntry, GlobalStat, ListDirResult,
+    DeliveryInfo, EngineState, EnqueueResult, GlobalStat, ListDirResult,
     LoadState, Settings, SettingsResult, TransferItem, TreeResult, TreeNode,
 };
 use shell_core::session_view::SessionView;
@@ -651,10 +652,6 @@ fn main() {
     let progress = ProgressSummary::of(Some(&tree), code, code);
     let selected: BTreeSet<String> = tree.default_selected.iter().cloned().collect();
     let sizes = SelectionSummary::size_index(&tree.flat);
-    // ⚠️ 判据要的"这一批的全部文件"取自 `flat` —— 与 `whole_tree` 同源同算法
-    //    （那边也是 `BrowserSelection::all_files(&tree.flat)`；两条来源的等价性由
-    //    `the_two_receipts_of_one_manifest_name_the_same_files` 钉着）。
-    let all_paths = BrowserSelection::all_files(&tree.flat);
     let action = api::tree::DownloadAction {
         button_title: DownloadTargets::button_title(&selected),
         empty_selection_hint: if selected.is_empty() {
@@ -662,47 +659,9 @@ fn main() {
         } else {
             None
         },
-        // ⚠️ 与 `commands.rs:whole_tree` **逐字同一处判据**（任务 17）：入参是"真正要发出去的
-        //    那一串"（勾选面过一遍 `DownloadTargets::paths`）—— 这批只有两个文件，
-        //    所以这里就是 `None`。**不手写 `None`**：手写的话，"载荷里那一格是不是判据给的"
-        //    在这份夹具上不可观测（判据改了夹具照样绿）。
-        blocked_reason: DownloadTargets::blocked_reason(&DownloadTargets::paths(&selected, &all_paths))
-            .map(str::to_string),
-    };
-
-    // ---- 任务 17：**按不下去**那一档（超预算的勾选面）----------------------------
-    //
-    // ⚠️ **为什么要自己造一份 20 万条的勾选面**：真机上"按不下去"只在**勾选面大到发不出去**
-    //    时出现，而上面那份夹具树只有两个文件 —— 拿它算出来的 `blocked_reason` 永远是 `None`
-    //    ⇒ 这一档**永远没有对象**，前端那条"禁用 + 把那句话摆出来"的验收也就没有载荷可吃
-    //    （做没做都验不出来，R-61 那个形态）。所以照真机的量级造一份
-    //    （与 `download_targets.rs` 的 `an_over_budget_set` 同一个数、同一串形状）。
-    // ⚠️ **它只有两格会进 JSON**（`selection.count_text` / `size_text`）：那 20 万条路径
-    //    本身**不进载荷**（那正是这条判据存在的理由），夹具的体积不受它影响。
-    // ⚠️ `blocked_reason` **不手写**：走与 `commands.rs:whole_tree` 逐字同一处判据。
-    let blocked_paths: BTreeSet<String> = (0..200_000)
-        .map(|i| format!("dir{i}/file-with-a-fairly-long-name-{i}.bin"))
-        .collect();
-    let blocked_flat: Vec<FlatEntry> = blocked_paths
-        .iter()
-        .map(|path| FlatEntry {
-            path: path.clone(),
-            name: path.rsplit('/').next().unwrap_or(path).to_string(),
-            // 每项 1 MiB：只是让这份样张的「合计」读起来像真的（判据不看它，看的是**项数**）。
-            size: 1 << 20,
-            state: FileState::Pending,
-        })
-        .collect();
-    let blocked_sizes = SelectionSummary::size_index(&blocked_flat);
-    let blocked_action = api::tree::DownloadAction {
-        button_title: DownloadTargets::button_title(&blocked_paths),
-        // 勾选面非空 ⇒ 这句「明说」不在场（与真机上那一档逐字相同）。
-        empty_selection_hint: None,
-        blocked_reason: DownloadTargets::blocked_reason(&DownloadTargets::paths(
-            &blocked_paths,
-            &all_paths,
-        ))
-        .map(str::to_string),
+        // ⚠️ 与 `commands.rs:whole_tree` 一致：大批量不再拦截，`blocked_reason` 恒为 `None`
+        //    （超预算的勾选面由壳切块分批发送）。这一格在线上仍然存在，只是值永远是 `null`。
+        blocked_reason: None,
     };
 
     // ---- 读不到某一层 --------------------------------------------------------
@@ -732,6 +691,34 @@ fn main() {
         .filter(|it| it.gid != "g-done")
         .map(TransferRow::new)
         .collect();
+    // 「暂停全部 / 一键开始」那两颗按钮：判据在 `BatchControl::of`，夹具从它倒出来。
+    let batch_rows = BatchControl::of(&transfer_rows, false, None);
+    let batch_rows_next = BatchControl::of(&transfer_rows_next, false, None);
+    let batch_rows_after = BatchControl::of(&transfer_rows_after, false, None);
+    let batch_none = BatchControl::of(&[], false, None);
+    // 换完目录、引擎是空的、队列还没补回来：列表一行都没有，「一键开始」靠壳记着。
+    let batch_handover = BatchControl::of(&[], true, None);
+    // 搬运进行中 / 搬完但有失败。
+    let migrating = shell_core::protocol::MigrateStatus {
+        running: true,
+        files_done: 2,
+        files_total: 5,
+        bytes_done: 3 * 1024 * 1024,
+        bytes_total: 9 * 1024 * 1024,
+        ..Default::default()
+    };
+    let migrated_with_errors = shell_core::protocol::MigrateStatus {
+        finished: true,
+        files_done: 5,
+        files_total: 5,
+        errors: vec![shell_core::protocol::MigrateProblem {
+            path: "01.RawData/a.fastq.gz".to_string(),
+            reason: "写入目标失败：磁盘已满".to_string(),
+        }],
+        ..Default::default()
+    };
+    let batch_migrating = BatchControl::of(&transfer_rows, true, Some(&migrating));
+    let batch_migrated_errors = BatchControl::of(&[], true, Some(&migrated_with_errors));
     let transfer_global = TransferGlobalSummary::of(&TRANSFER_GLOBAL);
     let transfer_global_next = TransferGlobalSummary::of(&TRANSFER_GLOBAL_NEXT);
     // 空态那句话由 `TransferListEmpty::of` 给：引擎在跑 ⇒ 「没有正在传输的任务」；
@@ -758,17 +745,6 @@ fn main() {
             &tree.default_selected,
             &action,
         ),
-        // `tree()` 无 path：**同一支命令的第二档回执** —— 勾选面大到一次发不出去，
-        // 于是 `action.blocked_reason` 是一个字符串（任务 17；前端的 `blocked` 场景吃它）。
-        "treeWholeBlocked": api::tree::whole(
-            &Breadcrumb::new(""),
-            progress.as_ref(),
-            &SelectionSummary::of(&blocked_paths, &blocked_sizes),
-            // ⚠️ `selected` 是**内核给的默认面**（"勾选面该被播种成什么"），与"这一刻按哪个面
-            //    渲染"是两件事 —— 这一档沿用同一批的那一份。
-            &tree.default_selected,
-            &blocked_action,
-        ),
         // `tree("")`：根那一层。
         "treeLevelRoot": api::tree::level(&root_bc, &root_rows),
         // `tree("01.RawData")`：子目录那一层。
@@ -787,23 +763,42 @@ fn main() {
             &transfer_rows,
             Some(&transfer_global),
             empty_running,
+            &batch_rows,
         ),
         // 下一拍：**同一批行、只有数字在走**（200 ms 那条用例的载荷）。
         "transfersTick": api::transfers::transfers(
             &transfer_rows_next,
             Some(&transfer_global_next),
             empty_running,
+            &batch_rows_next,
         ),
         // 「移除了一行之后」：结构真的变了一次（那条用例的**对照组**）。
         "transfersAfterRemove": api::transfers::transfers(
             &transfer_rows_after,
             Some(&transfer_global),
             empty_running,
+            &batch_rows_after,
         ),
         // 空态：`rows: []` + **`global: null`** + 「没有正在传输的任务」。
-        "transfersEmpty": api::transfers::transfers(&[], None, empty_running),
+        "transfersEmpty": api::transfers::transfers(&[], None, empty_running, &batch_none),
+        // 换完目录之后：空列表 + 「一键开始」可用（`resume_pending`）。
+        "transfersHandover": api::transfers::transfers(&[], None, empty_running, &batch_handover),
+        // 搬运进行中：两颗按钮都不可用 + 进度话。
+        "transfersMigrating": api::transfers::transfers(
+            &transfer_rows,
+            Some(&transfer_global),
+            empty_running,
+            &batch_migrating,
+        ),
+        // 搬完但有失败：提示话在场，「一键开始」可用。
+        "transfersMigratedWithErrors": api::transfers::transfers(
+            &[],
+            None,
+            empty_running,
+            &batch_migrated_errors,
+        ),
         // 引擎不可用：`empty_text` 是 **`null`** —— 这一屏**什么都不说**。
-        "transfersEngineDown": api::transfers::transfers(&[], None, empty_engine_down),
+        "transfersEngineDown": api::transfers::transfers(&[], None, empty_engine_down, &batch_none),
 
         // ---- 任务 13：换码面板 / 设置窗口 ------------------------------------
         // `history_get`：三条（带备注 / 没备注 / 从自定义服务器加载的）。

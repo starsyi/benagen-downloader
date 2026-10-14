@@ -100,6 +100,7 @@
 use std::sync::Arc;
 
 use shell_core::client::CoreClient;
+use shell_core::lifecycle;
 use shell_core::protocol::EngineState;
 use shell_win::bootstrap;
 use shell_win::commands::{self, Shell};
@@ -315,49 +316,126 @@ fn main() {
     // ⚠️ `generate_context!` 是**编译期**读 `tauri.conf.json` 的（图标、窗口配置、
     //    前端资源的路径都在那一刻定下来）⇒ 那几样东西缺任何一样都是**构建期失败**，
     //    不是运行期的惊喜。
-    // ⚠️ **关窗即退出**（规格 §3.3 第 6 条）——它落在 `on_window_event` 的这一段里。
+    // ⚠️ **关窗 = 收到托盘，下载继续**（2026-10-12 起，推翻原先的"关窗即退出"）。
     //
-    // 判据是 `WindowEvent::CloseRequested`（**一条显式事件**）：用户在窗口上点 ×、
-    // 或者按 Alt+F4，都会先发它。这里**同步**把内核连接收掉（[`shutdown`]），
-    // 然后**不拦**这次关闭（没有 `signal_tx`、也没有 `api.prevent_close()`）：
-    // 窗口照常关掉 ⇒ tauri 发现"一个窗口都不剩了" ⇒ `run()` 返回 ⇒ 进程退出。
+    // 现场：客户端必须一直在线，关窗就退出会中断长时间的下载。判据在
+    // `shell_core::lifecycle::close_intent`：托盘装得上 ⇒ 藏起来；**装不上 ⇒ 真退出**
+    // （否则窗口、任务栏、托盘都没有，用户再也退不掉程序）。
+    // 真退出只有两条路：托盘菜单「退出」，或托盘不可用时关窗。
     //
-    // ⚠️ **这里没有、也不许有**：心跳、看门狗、超时推断（第二代那一整套的全部理由
-    //    是"我们没有一个能被程序控制的窗口"，规格 §1.2）。这一行**就是**"关窗即退出"。
-    //
-    // ⚠️ **事件是每个窗口都发的**：本代只有一个窗口（规格 §2.2：不做多窗口），
-    //    所以"关掉它"就是"关掉全部"；`shutdown` 幂等，将来真加了第二个窗口也不会重复收尾。
+    // ⚠️ `shutdown` 幂等；`RunEvent::Exit` 与 `run` 返回之后各调一次（兜底）。
+    let tray_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let window_events = {
-        let watcher = Arc::clone(&session);
-        move |_window: &tauri::Window, event: &tauri::WindowEvent| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                shutdown(&watcher);
+        let session = Arc::clone(&session);
+        let tray_available = Arc::clone(&tray_available);
+        move |window: &tauri::Window, event: &tauri::WindowEvent| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                match lifecycle::close_intent(tray_available.load(std::sync::atomic::Ordering::Relaxed)) {
+                    lifecycle::CloseIntent::HideToTray => {
+                        api.prevent_close();
+                        let _ = window.hide();
+                        shell_win::keepalive::WINDOW_VISIBLE
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    lifecycle::CloseIntent::Exit => shutdown(&session),
+                }
             }
         }
     };
 
-    if let Err(why) = tauri::Builder::default()
+    let setup_session = Arc::clone(&session);
+    let setup_tray = Arc::clone(&tray_available);
+    let app = tauri::Builder::default()
         .manage(Shell::new(Arc::clone(&session)))
         .invoke_handler(commands::invoke_handler())
         .on_window_event(window_events)
-        .run(tauri::generate_context!())
-    {
-        // ⚠️ 走到这里说明**窗口都没起来**（前端资源坏了、webview 初始化失败、…）。
-        //    与 ① 同一档：那一刻没有界面、没有控制台 ⇒ 只剩原生消息框这一条路。
-        native_message_box(&format!(
-            "{WINDOW_TITLE} 起不来：\n\n{why}\n\n补救：把这条原样发给我们。"
-        ));
-        std::process::exit(1);
+        .setup(move |app| {
+            let tray = build_tray(app.handle());
+            let on_count: Arc<dyn Fn(usize) + Send + Sync> = match tray {
+                Ok(tray) => {
+                    setup_tray.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Arc::new(move |n| {
+                        let _ = tray.set_tooltip(Some(lifecycle::tray_tip(n)));
+                    })
+                }
+                // 托盘装不上：不致命——关窗会走"真退出"那条（见 `close_intent`）。
+                Err(_why) => Arc::new(|_| {}),
+            };
+            // 看护线程与托盘在不在无关：防休眠与引擎保活都要它。
+            shell_win::keepalive::spawn(Arc::clone(&setup_session), on_count);
+            Ok(())
+        })
+        .build(tauri::generate_context!());
+
+    let app = match app {
+        Ok(app) => app,
+        Err(why) => {
+            // 走到这里说明**窗口都没起来**（前端资源坏了、webview 初始化失败、…）。
+            native_message_box(&format!(
+                "{WINDOW_TITLE} 起不来：\n\n{why}\n\n补救：把这条原样发给我们。"
+            ));
+            std::process::exit(1);
+        }
+    };
+
+    let exit_session = Arc::clone(&session);
+    app.run(move |_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            shutdown(&exit_session);
+        }
+    });
+
+    // 兜底：事件没走到我们这里的退出路径（幂等）。
+    shutdown(&session);
+}
+
+/// 建托盘：左键 / 「显示主窗口」把窗口叫回来；「退出」是**唯一**的真退出入口。
+fn build_tray(
+    app: &tauri::AppHandle,
+) -> Result<tauri::tray::TrayIcon, Box<dyn std::error::Error>> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    use tauri::Manager;
+
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or("exe 里没有图标资源：任务栏图标无从显示")?;
+
+    fn show_main(app: &tauri::AppHandle) {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.show();
+            let _ = w.unminimize();
+            let _ = w.set_focus();
+        }
+        shell_win::keepalive::WINDOW_VISIBLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // ⚠️ **关窗之后走到这里**（Tauri 的默认行为：最后一个窗口关掉 ⇒ `run()` 返回）。
-    //    这一段是**兜底**：正常路径上连接已经在 `CloseRequested` 那一刻收掉了
-    //    （上面那个闭包），而 `shutdown` 是**幂等**的 —— 第二次调用时
-    //    `take_client()` 回 `None`，本行什么都不做。
-    //    ⚠️ 它在两条"事件没走到我们这里"的路上是**唯一**的收尾：窗口被程序化关掉
-    //    （`Window::close` 也会发 CloseRequested，所以其实也走到了）、或者事件循环
-    //    因为别的原因退出（例如 tauri 自己要求重启）。
-    shutdown(&session);
+    let tray = TrayIconBuilder::new()
+        .icon(icon)
+        .tooltip(lifecycle::tray_tip(0))
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(tray)
 }
 
 #[cfg(test)]

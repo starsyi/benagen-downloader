@@ -163,6 +163,12 @@ pub fn save_failed(cause: &str) -> String {
     format!("下载目录没有改成（偏好写入失败：{cause}）")
 }
 
+/// [`save_failed`] 的同一件事，但这一次**已经把全部任务暂停了**：话里要点明，
+/// 否则客户只看到"没改成"，却不知道下载已经停了。
+pub fn save_failed_after_pause(cause: &str) -> String {
+    format!("下载目录没有改成（偏好写入失败：{cause}）。已暂停全部任务，需要的话点「一键开始」继续。")
+}
+
 /// 「详细日志」那一格**写盘失败**那句话。
 ///
 /// 🔴 与 [`save_failed`] **同一个理由、同一个位置**（壳自己写的：那一刻内核还不知道

@@ -53,12 +53,15 @@ pub fn arch() -> Arch {
     if cfg!(target_arch = "aarch64") { Arch::Aarch64 } else { Arch::X86_64 }
 }
 
-/// 该平台该架构要下哪个文件。
-pub fn asset_name(platform: Platform, arch: Arch) -> &'static str {
+/// 该平台该架构要下哪个文件。**文件名带版本号**（2026-10-14 起，Release 附件一眼可辨）。
+/// 版本段与下载链接里的 tag **同源**——两者都由调用方传入的同一个三元组拼出，不可能对不上。
+/// ⚠️ 三处真相必须同格式：本函数、各构建脚本的产物名、Release 页上的附件名。
+pub fn asset_name(platform: Platform, arch: Arch, version: (u64, u64, u64)) -> String {
+    let v = format!("{}.{}.{}", version.0, version.1, version.2);
     match (platform, arch) {
-        (Platform::MacOs, Arch::Aarch64) => "BenagenDownloader-AppleSilicon.dmg",
-        (Platform::MacOs, Arch::X86_64) => "BenagenDownloader-Intel.dmg",
-        (Platform::Windows, Arch::X86_64) => "BenagenDownloader-Windows-x86_64.exe",
+        (Platform::MacOs, Arch::Aarch64) => format!("BenagenDownloader-{v}-AppleSilicon.dmg"),
+        (Platform::MacOs, Arch::X86_64) => format!("BenagenDownloader-{v}-Intel.dmg"),
+        (Platform::Windows, Arch::X86_64) => format!("BenagenDownloader-{v}-Windows-x86_64.exe"),
         // 未列举的组合**按平台兜底**，而不是一律退回 macOS 的 dmg。
         // `(Windows, Aarch64)` 是唯一会走到这里的一格（Windows on ARM，真实存在）——
         // 平台这个轴是确定的，架构这个轴在 Windows 上才不确定，所以按确定的那个轴兜：
@@ -68,7 +71,7 @@ pub fn asset_name(platform: Platform, arch: Arch) -> &'static str {
             eprintln!(
                 "benagen-core: 未列举的平台/架构组合 {platform:?}/{arch:?}，退回 x86_64 那份"
             );
-            "BenagenDownloader-Windows-x86_64.exe"
+            format!("BenagenDownloader-{v}-Windows-x86_64.exe")
         }
     }
 }
@@ -268,15 +271,17 @@ mod tests {
         assert_eq!(parse_version("v1.2.3/../../evil"), None, "路径注入必须被解析挡下");
     }
 
-    /// 文件名按平台与架构选。
+    /// 文件名按平台与架构选，**版本段逐字来自传入的三元组**（格式钉死，与具体版本无关）。
     #[test]
     fn asset_names_are_a_table() {
-        assert_eq!(asset_name(Platform::MacOs, Arch::Aarch64), "BenagenDownloader-AppleSilicon.dmg");
-        assert_eq!(asset_name(Platform::MacOs, Arch::X86_64), "BenagenDownloader-Intel.dmg");
-        assert_eq!(asset_name(Platform::Windows, Arch::X86_64), "BenagenDownloader-Windows-x86_64.exe");
+        assert_eq!(asset_name(Platform::MacOs, Arch::Aarch64, (0, 2, 6)), "BenagenDownloader-0.2.6-AppleSilicon.dmg");
+        assert_eq!(asset_name(Platform::MacOs, Arch::X86_64, (0, 2, 6)), "BenagenDownloader-0.2.6-Intel.dmg");
+        assert_eq!(asset_name(Platform::Windows, Arch::X86_64, (0, 2, 6)), "BenagenDownloader-0.2.6-Windows-x86_64.exe");
         // 未列举的 `(Windows, Aarch64)`（Windows on ARM）：按**平台**兜，要给 Windows 那份，
         // 不能退回 macOS 的 dmg —— 后者在 Windows 上根本打不开。
-        assert_eq!(asset_name(Platform::Windows, Arch::Aarch64), "BenagenDownloader-Windows-x86_64.exe");
+        assert_eq!(asset_name(Platform::Windows, Arch::Aarch64, (0, 2, 6)), "BenagenDownloader-0.2.6-Windows-x86_64.exe");
+        // 版本段必须真的流动（不是把常量抄一遍）：换三元组名字就得换。
+        assert_eq!(asset_name(Platform::MacOs, Arch::Aarch64, (9, 9, 9)), "BenagenDownloader-9.9.9-AppleSilicon.dmg");
     }
 
     /// `platform()` 的取值必须与**编译期**的 `cfg!(target_os)` 一致。

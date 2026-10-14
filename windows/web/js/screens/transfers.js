@@ -115,11 +115,15 @@ const ALL_COLOR_CLASSES = Object.values(COLOR_CLASS);
  *    完全由载荷里的 `available_actions` 决定，本文件里**没有**任何"某状态下有哪几个动作"
  *    的判断（那是 `TransferRow::actions()` 的判据，把它抄一份到前端 = 第二份会分叉的真相）。
  *    这里唯一写死的，是"那颗列表级按钮按下去发哪个动作名"。
- *    字面量由 `protocol.rs` 的 `task_action_pins_the_five_wire_literals` 逐字钉着
+ *    字面量由 `protocol.rs` 的 `task_action_pins_the_wire_literals` 逐字钉着
  *    （内核按字面量匹配）。行级那五个字面量**不在这里** —— 它们在
  *    `index.html` 的 `tpl-screen-transfers-menu` 里，和 Item 的名字待在一起。
  */
 const ACTION_CLEAR_FINISHED = "clear_finished";
+
+/** 「暂停全部」「一键开始」两颗列表级按钮发的动作名（`TaskAction::PauseAll` / `ResumeAll`）。 */
+const ACTION_PAUSE_ALL = "pause_all";
+const ACTION_RESUME_ALL = "resume_all";
 
 /** 本屏那一拍的任务名（`poller.start` / `poller.stop` 用的是同一个键）。 */
 const TICK = "transfers";
@@ -144,6 +148,10 @@ export function mount(el, ctx) {
   const activityEl = byIdIn(el, "transfers-activity");
   const refreshEl = byIdIn(el, "transfers-refresh");
   const clearEl = byIdIn(el, "transfers-clear");
+  const pauseAllEl = byIdIn(el, "transfers-pause-all");
+  const resumeAllEl = byIdIn(el, "transfers-resume-all");
+  const migrateEl = byIdIn(el, "transfers-migrate");
+  const migrateTextEl = byIdIn(el, "transfers-migrate-text");
   const failureEl = byIdIn(el, "transfers-failure");
   const failureIconEl = byIdIn(el, "transfers-failure-icon");
   const failureTextEl = byIdIn(el, "transfers-failure-text");
@@ -186,6 +194,9 @@ export function mount(el, ctx) {
    *  ⚠️ `null` 是**正常态**（内核那条回执里根本没有 `global` 这一格，见 `api/transfers.rs`）
    *     ⇒ 整条顶部**不渲染**：不编一个"0 B/s / 活动 0"替内核说话。 */
   let global = null;
+  /** 最近一次成功载荷里的 `batch`（`BatchControl` 原样：两颗按钮的可用性 + 搬运话）。
+   *  `null` = 还没有载荷：两颗按钮都灰着，搬运行不画。 */
+  let batch = null;
   /** 空态那句话（`TransferListEmpty::of` 的原文）；`null` = 这一屏此刻不说话。 */
   let emptyText = null;
   /**
@@ -531,6 +542,26 @@ export function mount(el, ctx) {
     if (clearEl.disabled !== wantClear) clearEl.disabled = wantClear;
     const wantRefresh = !gateOpen;
     if (refreshEl.disabled !== wantRefresh) refreshEl.disabled = wantRefresh;
+    // 「暂停全部」「一键开始」：可用性是 Rust 算好的（`BatchControl::of`），这里只与闸门相与。
+    const wantPauseAll = !(batch !== null && batch.can_pause_all === true && gateOpen);
+    if (pauseAllEl.disabled !== wantPauseAll) pauseAllEl.disabled = wantPauseAll;
+    const wantResumeAll = !(batch !== null && batch.can_resume_all === true && gateOpen);
+    if (resumeAllEl.disabled !== wantResumeAll) resumeAllEl.disabled = wantResumeAll;
+  }
+
+  /**
+   * 搬运那一行：进行中画进度话，结束后有事要说就画结果话，都没有就整行隐藏。
+   * ⚠️ 两句话都是 Rust 成好的整句（`migrate_text` / `migrate_note`），这里一个字都不拼。
+   */
+  function paintMigrate() {
+    const text =
+      batch !== null && typeof batch.migrate_text === "string"
+        ? batch.migrate_text
+        : batch !== null && typeof batch.migrate_note === "string"
+          ? batch.migrate_note
+          : null;
+    migrateEl.hidden = text === null;
+    if (text !== null) writeText(migrateTextEl, text);
   }
 
   /**
@@ -584,6 +615,7 @@ export function mount(el, ctx) {
   /** 把这一拍的状态整块画出来。 */
   function paint() {
     paintGlobal();
+    paintMigrate();
     // ① 结构：只有 `gid` 序列变了才动 DOM
     const gids = rows.map((r) => r.gid);
     if (gids.length !== paintedGids.length || gids.some((g, i) => g !== paintedGids[i])) {
@@ -831,6 +863,14 @@ export function mount(el, ctx) {
     void sendAction(ACTION_CLEAR_FINISHED, null);
   });
 
+  // 「暂停全部」「一键开始」：列表级动作（没有 gid）。
+  pauseAllEl.addEventListener("click", () => {
+    void sendAction(ACTION_PAUSE_ALL, null);
+  });
+  resumeAllEl.addEventListener("click", () => {
+    void sendAction(ACTION_RESUME_ALL, null);
+  });
+
   // 点别处 / 按 Esc 关掉行菜单（**全局监听**，`unmount` 时要解绑）。
   const onDocumentPointerDown = (event) => {
     if (menuEl.hidden) return;
@@ -880,6 +920,7 @@ export function mount(el, ctx) {
     //    而 `global` 缺是**内核这条回执里根本没有那个字段** ⇒ 原样收下 `null`，
     //    不当成失败、更不编三个 0。
     global = data && data.global ? data.global : null;
+    batch = data && data.batch ? data.batch : null;
     emptyText = data && typeof data.empty_text === "string" ? data.empty_text : null;
     paint();
   }

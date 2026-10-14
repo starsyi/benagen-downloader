@@ -269,11 +269,9 @@ mod tests {
             } else {
                 None
             },
-            // ⚠️ 这一格**不手写**：它由判据算（`blocked_reason`），入参是"真正要发出去的那一串"
-            //    —— 这里给的就是那个集合本身（这批是一个正常规模的勾选面 ⇒ 恒 `None`）。
-            //    手写 `None` 的话，"这一格到底带没带上判据"在断言上不可观测。
-            blocked_reason: DownloadTargets::blocked_reason(&set.iter().cloned().collect::<Vec<_>>())
-                .map(str::to_string),
+            // ⚠️ 与 `commands::whole_tree` 一致：大批量不再拦截（超预算的勾选面切块分批发送），
+            //    线上的 `blocked_reason` 恒为 `null`。这里的勾选面都是小规模的，手写 `None` 即可。
+            blocked_reason: None,
         }
     }
 
