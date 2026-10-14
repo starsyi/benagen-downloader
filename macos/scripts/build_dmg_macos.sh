@@ -7,8 +7,8 @@
 #
 # 产物名**自解释**（F-3）：本阶段出**两个独立包**（不做通用二进制，见阶段 F 计划），
 # 客户必须一眼看出下哪个：
-#     BenagenDownloader-0.2.6-AppleSilicon.dmg   ← arm64
-#     BenagenDownloader-0.2.6-Intel.dmg          ← x86_64
+#     BenagenDownloader-0.2.7-AppleSilicon.dmg   ← arm64
+#     BenagenDownloader-0.2.7-Intel.dmg          ← x86_64
 #
 # ⚠️ **架构是"读"出来的，不是"传"进来的**：脚本对包内那三个二进制逐个 `lipo -archs`，
 #    三者必须是**同一个单架构**，再由它决定文件名。于是"名字说 Intel、里面其实是
@@ -54,8 +54,8 @@
 #   bash macos/scripts/build_app_macos.sh [arm64|x86_64]
 #   bash macos/scripts/build_dmg_macos.sh
 #
-#   两个架构各跑一遍这两条，就得到 BenagenDownloader-0.2.6-AppleSilicon.dmg 与
-#   BenagenDownloader-0.2.6-Intel.dmg —— 见 macos/README.md「出 Intel 包」。
+#   两个架构各跑一遍这两条，就得到 BenagenDownloader-0.2.7-AppleSilicon.dmg 与
+#   BenagenDownloader-0.2.7-Intel.dmg —— 见 macos/README.md「出 Intel 包」。
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -132,7 +132,7 @@ for f in "$MAIN" "$CORE" "$ARIA2C"; do
   #    于是"三个必须同架构"**静默退化成**"三个都等于第一个**非空**值"——
   #    第一个读不出的二进制被跳过、它的架构**从来没被验过**，而产物名照样照后两个定下来
   #    （复现过：把壳换成非 Mach-O 可执行文件，脚本照样打印"包是单架构 arm64 ⇒ 产物名
-  #    BenagenDownloader-0.2.6-AppleSilicon.dmg"，失败点被推迟到盘内自验、退出码才非 0，
+  #    BenagenDownloader-0.2.7-AppleSilicon.dmg"，失败点被推迟到盘内自验、退出码才非 0，
   #    而且 dist/ 里留下一张**名字与内容不符**的半成品 —— 验收动作恰好就是在这个目录里
   #    逐个 lipo 复查）。判据与 `build_app_macos.sh` 的 `verify_arch()` **逐字对齐**：
   #    **读不出 = 失败**。两处标准必须一致：否则同一份字节会出现"打包脚本说行、装盘脚本说不行"，
@@ -153,7 +153,7 @@ done
 
 # 版本段进产物名（2026-10-14，用户要求：Release 附件一眼可辨）。
 # 与 `core/src/update.rs::asset_name` 同格式：BenagenDownloader-<版本>-<平台>.dmg
-BENAGEN_VERSION="${VERSION:-0.2.6}"
+BENAGEN_VERSION="${VERSION:-0.2.7}"
 
 # 架构 → 产物名。这里是 F-3 的全部：**名字必须让人看出该下哪个**。
 case "$ONLY_ARCH" in

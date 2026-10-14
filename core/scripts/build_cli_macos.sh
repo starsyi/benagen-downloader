@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 构建 `benagen-dl` 的 macOS 分发产物：dist_cli/benagen-dl-0.2.6-macos-{arm64,x86_64}
+# 构建 `benagen-dl` 的 macOS 分发产物：dist_cli/benagen-dl-0.2.7-macos-{arm64,x86_64}
 #
 # 用法：
 #   bash core/scripts/build_cli_macos.sh              # 两个架构都出（默认）
@@ -22,9 +22,9 @@
 #      上面那句"照样能出"指的是"**能出**"，不是"出同一份字节"。
 #
 # 产物与用法（`dist_cli/` 不入库，见仓库根 .gitignore —— **认 sha256 不认文件名**）
-#     dist_cli/benagen-dl-0.2.6-macos-arm64    ← Apple Silicon（M 系列）
-#     dist_cli/benagen-dl-0.2.6-macos-x86_64   ← Intel
-#     $ dist_cli/benagen-dl-0.2.6-macos-arm64 <交付码> -o /path/to/dir
+#     dist_cli/benagen-dl-0.2.7-macos-arm64    ← Apple Silicon（M 系列）
+#     dist_cli/benagen-dl-0.2.7-macos-x86_64   ← Intel
+#     $ dist_cli/benagen-dl-0.2.7-macos-arm64 <交付码> -o /path/to/dir
 #
 # ---------------------------------------------------------------------------
 # 为什么与 `macos/scripts/build_app_macos.sh` 是**两个**脚本，而不是一个
@@ -123,7 +123,7 @@ STAGE="$(mktemp -d "$DIST/.stage.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 
 # **本次**产出（收尾要逐条列，并说"这些各自过了自验"）。
-# ⚠️ 不能拿 `find "$DIST" -name 'benagen-dl-0.2.6-macos-*'` 代替它：那会把 dist_cli/ 里
+# ⚠️ 不能拿 `find "$DIST" -name 'benagen-dl-0.2.7-macos-*'` 代替它：那会把 dist_cli/ 里
 #    **上一次留下的**、本次根本没重出的产物一并列出来，然后替它们背书说"过了自验"
 #    —— 本脚本的自验只对本次编出来的那一份负责。
 PRODUCED=""
@@ -151,7 +151,7 @@ build_one() {  # $1 = arm64 / x86_64
     *) die "不认识的架构 '$arch'（只支持 arm64 / x86_64）" 2 ;;
   esac
   aria2c_name="aria2c-macos-$arch"
-  dist_name="benagen-dl-${VERSION:-0.2.6}-macos-$arch"
+  dist_name="benagen-dl-${VERSION:-0.2.7}-macos-$arch"
   local aria2c_src="$ROOT/assets/$aria2c_name"
 
   # 入库资产的存在性检查放在**编译之前**：缺件的正确处置是"立刻说清楚"，
@@ -287,4 +287,4 @@ printf '\n    上面列出的**本次产物**各自过了：新鲜度（比 src/
 printf '    架构（lipo -archs）、内嵌 aria2c 摘要（--version 与 core/assets/ 那一份逐字一致）、\n'
 printf '    --help 可读。\n'
 printf '    ⚠️ 本脚本**没有**为它们声明最低系统版本（minos）—— 那一条不属于它的判据；\n'
-printf '       要那个读数自己看：otool -l dist_cli/benagen-dl-0.2.6-macos-arm64 | grep -A3 LC_BUILD_VERSION\n'
+printf '       要那个读数自己看：otool -l dist_cli/benagen-dl-0.2.7-macos-arm64 | grep -A3 LC_BUILD_VERSION\n'

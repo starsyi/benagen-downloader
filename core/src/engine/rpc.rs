@@ -14,7 +14,14 @@ use serde::{Deserialize, Serialize};
 use super::status::{parse_num, RawTask};
 
 /// 单次 RPC 的超时。对应 Go 的 `&http.Client{Timeout: 10 * time.Second}`。
+/// **快档**（探活/写/控制/判活采样）：判活要快，放宽它等于放慢「断开」判定与恢复阶梯。
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// **慢档**超时（快照类读：`tell*` 与快照的 `getGlobalStat`）。
+/// 现场证据（诊断日志 20261014-081646）：245 次传输层重试里 94 次重试成功、
+/// 应答落在首试 10 秒超时后的 2~9 秒 ⇒ 30 秒档下这些全是首试干净成功。
+/// ⚠️ 慢档**单次尝试、不重试**（规格 §3.2）：周期性读，下一拍就是重试。
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// **`tellActive` / `tellWaiting` / `tellStopped` 的 `keys` 白名单**（2026-10-08）。
 ///
@@ -44,14 +51,23 @@ fn task_keys() -> serde_json::Value {
     serde_json::Value::Array(TASK_KEYS.iter().map(|k| serde_json::Value::from(*k)).collect())
 }
 
-/// `tellWaiting` / `tellStopped` 一次拉多少条。
+/// `tellWaiting` 一次拉多少条（**队头**）。
 ///
-/// ⚠️ **沿用 Go 的 1000，本轮不动它**：它决定传输列表里能看到多少条"已完成"，
-///    改小是**行为变更**（界面少显示几条），得单独评估 —— 不该混在"只改传输形状"
-///    的这一轮里。真要收，正确的路子是让计数走 `getGlobalStat` 的
-///    `numStopped` / `numWaiting` / `numActive`（那几个数字本来就在同一次快照里取了），
-///    而列表只拉界面当前要显示的那一页。
-const TELL_RANGE: u64 = 1000;
+/// ⚠️ **值保持 1000，与 Go 逐字相同**：`tellWaiting` 是队头在前（FIFO，实验证明），
+///    截头无损；更要紧的是「已暂停」任务**住在 waiting 表里**——[`super::daemon::Daemon`]
+///    的「一键开始」判据（`BatchControl`）要看得见它们，收小会把暂停中的任务藏起来。
+const WAITING_RANGE: u64 = 1000;
+
+/// `tellStopped` 取**尾窗**多少条（最近完成的）。
+///
+/// ⚠️ **最旧在前**（实验证明，内嵌 aria2c 1.37.0）：`offset=0` 是**最老**的完成项，
+///    截头会显示陈旧完成、藏起刚完成的。所以取的是**尾窗**——
+///    `offset = max(0, numStopped − STOPPED_WINDOW)`——才是「最近 300 条」。
+///    计数仍全量走 `getGlobalStat`，不许从行数推导。
+///
+/// ⚠️ **300 是行为变更**（2026-10-14 起，规格 §4.3）：传输列表的「已完成/失败」行
+///    最多显示最近 300 条；已登记进两份 README 的验收册。UI 分页是它的下半场（§5 留给下一轮）。
+const STOPPED_WINDOW: u64 = 300;
 
 /// 一次 RPC 的失败。
 ///
@@ -136,6 +152,12 @@ pub struct RpcClient {
     /// `ureq::Agent` 自带连接池，它就是 Go 侧 `http.Client` 的等价物：
     /// 轮询每 200 ms 一次，每次新建 agent 等于每次重来一遍 TCP 握手。
     agent: ureq::Agent,
+    /// **慢档**的 agent（快照类读：`tell*` 与快照的 `getGlobalStat`）。
+    ///
+    /// 与 [`Self::agent`] 的差别只有超时：`.timeout(SNAPSHOT_TIMEOUT)`（读响应放宽到 30 秒）
+    /// 而 `.timeout_connect(RPC_TIMEOUT)`（**连接阶段仍要快**——放宽的只是读响应，
+    /// 规格 §3 A4）。慢档调用走 [`Self::call_slow`]，**单次尝试、不重试**。
+    slow_agent: ureq::Agent,
     /// 下一个请求 ID。只用 `fetch_add`，没有"先读后写"。
     next_id: AtomicU64,
     /// 详细档那一行的出口（见 [`VerboseSink`]）。生产恒为 `diagnostics::log_verbose`。
@@ -204,6 +226,23 @@ struct GlobalStatRaw {
     num_stopped: String,
 }
 
+/// `getGlobalStat` 的解析：线上形态（四个字符串数字）→ [`GlobalStat`]。
+///
+/// [`RpcClient::global`] 与 [`RpcClient::global_slow`] 共用这一段——**两个入口、
+/// 同一段解析**，避免两处实现漂移（`parse_num` 那次教训的同款形状）。
+fn parse_global_stat(raw: serde_json::Value) -> Result<GlobalStat, String> {
+    let r: GlobalStatRaw = serde_json::from_value(raw)
+        .map_err(|e| format!("解析 getGlobalStat 失败: {e}"))?;
+    Ok(GlobalStat {
+        // 与 `status::RawTask` 共用同一个 `parse_num`（同一份 `fmt.Sscanf("%d")` 语义），
+        // 不在这里重写一遍——两处实现漂移过一次就够受了。
+        download_speed: parse_num(&r.download_speed),
+        num_active: parse_num(&r.num_active),
+        num_waiting: parse_num(&r.num_waiting),
+        num_stopped: parse_num(&r.num_stopped),
+    })
+}
+
 impl RpcClient {
     /// 构造客户端。`url` 形如 `http://127.0.0.1:6800/jsonrpc`。
     pub fn new(url: &str, secret: &str) -> Self {
@@ -217,6 +256,11 @@ impl RpcClient {
                 //    少了这一行，`rpc.rs` 与 `daemon.rs` 里"最坏约 10 秒"的论证在**连接阶段**
                 //    就是错的（最坏 30 秒）——`connect_phase_is_bounded_by_rpc_timeout`
                 //    守着这一行。规格 §3 A4。
+                .timeout_connect(RPC_TIMEOUT)
+                .build(),
+            slow_agent: ureq::AgentBuilder::new()
+                // 读响应放宽到 30 秒；连接阶段仍按 `RPC_TIMEOUT`（见 [`Self::slow_agent`]）。
+                .timeout(SNAPSHOT_TIMEOUT)
                 .timeout_connect(RPC_TIMEOUT)
                 .build(),
             next_id: AtomicU64::new(1),
@@ -411,6 +455,16 @@ impl RpcClient {
         }
     }
 
+    /// 慢档调用：**单次尝试**（规格 §3.2）。只有快照类读走它。
+    ///
+    /// 与 [`Self::call`] 的差别只有两处：用 [`Self::slow_agent`]（读响应 30 秒），
+    /// 以及**不走** `is_retryable_read` 的传输层重试——慢档读是周期性的（200 ms 轮询），
+    /// 下一拍就是天然的重试；重试会把最坏代价翻倍，而契约 §4.3 要的正是"一次快照失败
+    /// 的最坏代价小"。
+    fn call_slow(&self, method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+        self.send(&self.slow_agent, method, params).map_err(|e| e.msg)
+    }
+
     /// 探活与校验 secret。
     ///
     /// 统一走 `aria2.getGlobalStat`：它同样校验 token，探活与验密一次做完。
@@ -441,16 +495,19 @@ impl RpcClient {
     /// 读全局统计。aria2 把这些数当字符串传，这里统一转成整数。
     pub fn global(&self) -> Result<GlobalStat, String> {
         let raw = self.call("aria2.getGlobalStat", &[])?;
-        let r: GlobalStatRaw = serde_json::from_value(raw)
-            .map_err(|e| format!("解析 getGlobalStat 失败: {e}"))?;
-        Ok(GlobalStat {
-            // 与 `status::RawTask` 共用同一个 `parse_num`（同一份 `fmt.Sscanf("%d")` 语义），
-            // 不在这里重写一遍——两处实现漂移过一次就够受了。
-            download_speed: parse_num(&r.download_speed),
-            num_active: parse_num(&r.num_active),
-            num_waiting: parse_num(&r.num_waiting),
-            num_stopped: parse_num(&r.num_stopped),
-        })
+        parse_global_stat(raw)
+    }
+
+    /// 慢档读全局统计（快照路径，[`super::daemon::Daemon::snapshot`] 用它）。
+    ///
+    /// 与 [`Self::global`] **同一段 `getGlobalStat` 解析**（[`parse_global_stat`]）、
+    /// 同一个线上形态，只是走 [`Self::call_slow`]（30 秒档、单次尝试）。
+    /// `global()` 是**快档**，留给 [`super::daemon::Daemon::probe`] 与判活采样——
+    /// `getGlobalStat` 有两个调用点、两种语义，档位按**调用面**分，不按方法名分
+    /// （规格 §3.3）：把 `getGlobalStat` 一律放宽会让判活变慢，恰得其反。
+    pub fn global_slow(&self) -> Result<GlobalStat, String> {
+        let raw = self.call_slow("aria2.getGlobalStat", &[])?;
+        parse_global_stat(raw)
     }
 
     /// 加一个下载任务，返回 GID。
@@ -508,7 +565,7 @@ impl RpcClient {
 
     /// 只取**活跃**的任务（一条 `tellActive`）。
     ///
-    /// 停滞采样只用它：`list()` 还要 `tellWaiting` / `tellStopped`（各最多 1000 条），
+    /// 停滞采样只用它：`list()` 还要 `tellWaiting`（队头 1000 条）/ `tellStopped`（尾窗 300 条），
     /// 而采样一条都用不到。
     pub fn active(&self) -> Result<Vec<RawTask>, String> {
         let raw = self.call("aria2.tellActive", &[task_keys()])?;
@@ -528,16 +585,30 @@ impl RpcClient {
     /// 唯一胜出者、再应用一次"的做法，存在的理由就是这条顺序），而且**不会报错**。
     /// 若认为该顺序在 Rust 侧应当不同，先停下来报告。
     ///
-    /// ⚠️ **第一次出错就返回**：不要先跑完三个子请求再报错。契约 §4.3 的论证建立在这上面
-    /// ——"一次快照失败即判定引擎断开"的实际代价是 **1–2 次** RPC 尝试（最坏约 10 秒），
-    /// 而不是 3–6 次 × 10 秒。⚠️ 次数**不再恒为 1**：读方法在**传输层**失败时会换一条新连接
-    /// 重试一次（`is_retryable_read`），所以是 1–2；**写方法从不重试**，恒为 1。
-    /// 先跑完会把最坏情况拖成三倍，也就把"为它多等几轮"这个被否掉的做法又请了回来。
+    /// ⚠️ **`stopped_count` 是 `getGlobalStat.numStopped` 的全量计数**，用来算
+    /// `tellStopped` 的尾窗偏移（`max(0, stopped_count − STOPPED_WINDOW)`）——
+    /// 最旧在前（实验证明），截头会显示陈旧完成、藏起刚完成的，只有尾窗才是「最近」。
+    /// **计数仍全量走 `getGlobalStat`**，调用方不许从行数推导。快照路径上它由
+    /// [`super::daemon::Daemon::snapshot`] 先发 `global_slow()` 再传进来。
     ///
-    /// ⚠️ **"约 10 秒"是单次尝试的上界，且含连接阶段**：两个 Agent 都显式设了
-    /// `timeout_connect(RPC_TIMEOUT)`（规格 §3 A4）。少了那一行，连接阶段会退到 ureq
-    /// 默认的 **30 秒**（`timeout_connect` 在连接阶段**优先于**整体超时），这句"最坏约
-    /// 10 秒"在连接阶段就不成立——`connect_phase_is_bounded_by_rpc_timeout` 守着这一点。
+    /// ⚠️ **第一次出错就返回**：不要先跑完三个子请求再报错。契约 §4.3 的论证建立在这上面
+    /// ——**真死引擎**时"一次快照失败即判定引擎断开"的失败上界是**慢档单次 30 秒**
+    /// （`SNAPSHOT_TIMEOUT`，首错即返）。反事实是「三个子请求都跑完才报错」= 3×30 秒量级
+    /// （旧账「3–6 次 × 30 秒」是**含重试**的算法，慢档不重试后不成立）。
+    /// 慢应答**成功**路径 ≈ 3×`SNAPSHOT_TIMEOUT`（本方法的三个子请求；整份快照 4×，
+    /// 见 `kernel::current_tasks`）。
+    /// ⚠️ **慢档单次尝试、不重试**（规格 §3.2）：快照类读是周期性的
+    /// （200 ms 轮询），下一拍就是天然的重试；重试会把最坏代价翻倍，而这里要的正是
+    /// "一次快照失败的最坏代价小"。"连接坏了还是引擎不理人"的判别由 `on_rpc_failure`
+    /// 的探活承担，不靠读重试。先跑完会把最坏情况拖成三倍，也就把"为它多等几轮"
+    /// 这个被否掉的做法又请了回来。
+    ///
+    /// ⚠️ **"30 秒"是单次尝试的上界，且含连接阶段**：慢档 agent 显式设了
+    /// `.timeout(SNAPSHOT_TIMEOUT)`（读响应）与 `.timeout_connect(RPC_TIMEOUT)`（连接阶段
+    /// 仍要快——放宽的只是读响应，规格 §3 A4）。少了 `timeout_connect` 那一行，连接阶段
+    /// 会退到 ureq 默认的 **30 秒**（`timeout_connect` 在连接阶段**优先于**整体超时）——
+    /// `slow_connect_phase_is_bounded_by_rpc_timeout` 与
+    /// `connect_phase_is_bounded_by_rpc_timeout` 分别守着慢档与快档这两处。
     ///
     /// ⚠️ **这里曾经踩过一个静默坑，值得记住形状**（修复轮 1 已修）：
     /// `list()` 是 `RawTask` 的第一个**反序列化**消费者——任务 5 的四条测试全部直接构造结构体，
@@ -548,7 +619,7 @@ impl RpcClient {
     /// 恰好同名，所以看着"大部分是对的"，这掩盖了它）。
     /// 现在由 `status::tests::raw_task_reads_aria2_wire_form` 钉住（那条测试**真的走 serde**）。
     /// 教训是测试的形状：**绕开真正会出错的那条路的测试，等于没测**。
-    pub fn list(&self) -> Result<Vec<RawTask>, String> {
+    pub fn list(&self, stopped_count: u64) -> Result<Vec<RawTask>, String> {
         // 顺序逐字照 Go：active → waiting → stopped。见本方法的文档注释——
         // 这是契约 §1.2 的前提，不是随手排的。
         let mut out: Vec<RawTask> = Vec::new();
@@ -566,30 +637,53 @@ impl RpcClient {
         //    ⇒ 撞满 10 秒的 `RPC_TIMEOUT` ⇒ 内核判「引擎已断开」。
         //    整场 41% 的调用失败、`transfer_list` 撞壳的 30 秒超时。
         let keys = task_keys();
-        for (method, with_range) in [
-            ("aria2.tellActive", false),
-            ("aria2.tellWaiting", true),
-            ("aria2.tellStopped", true),
+        // 尾窗偏移：`max(0, numStopped − 300)`。不足一窗时是 0（从头取，全量也就这么多）。
+        let stopped_offset = stopped_count.saturating_sub(STOPPED_WINDOW);
+        for (method, range) in [
+            ("aria2.tellActive", None),
+            ("aria2.tellWaiting", Some((0u64, WAITING_RANGE))),
+            ("aria2.tellStopped", Some((stopped_offset, STOPPED_WINDOW))),
         ] {
             // `tellActive` 只收一个可选的 keys 数组，不收 [offset, num]；另两个要
             // （`tellWaiting(offset, num, keys)` / `tellStopped(offset, num, keys)`）。
             // （Go 里就是 `if m != "aria2.tellActive"` 这一句的效果。）
-            let params: Vec<serde_json::Value> = if with_range {
-                vec![
-                    serde_json::Value::from(0),
-                    serde_json::Value::from(TELL_RANGE),
+            let params: Vec<serde_json::Value> = match range {
+                Some((offset, num)) => vec![
+                    serde_json::Value::from(offset),
+                    serde_json::Value::from(num),
                     keys.clone(),
-                ]
-            } else {
-                vec![keys.clone()]
+                ],
+                None => vec![keys.clone()],
             };
             // 第一次出错就返回：不跑完剩下的子请求（契约 §4.3 的代价论证）。
-            let raw = self.call(method, &params)?;
+            // 慢档：30 秒读响应、**单次尝试**（规格 §3.2）。
+            let raw = self.call_slow(method, &params)?;
             let batch: Vec<RawTask> = serde_json::from_value(raw)
                 .map_err(|e| format!("解析 {method} 失败: {e}"))?;
             out.extend(batch);
         }
         Ok(out)
+    }
+
+    /// **全量** `tellStopped`——低频动作专用，**不受 [`STOPPED_WINDOW`] 尾窗约束**。
+    ///
+    /// [`super::daemon::Daemon::clear_finished`] 用它取 forget 集合：尾窗是高频轮询的
+    /// 省载荷优化，而清空是低频动作，**必须**把窗口外的老完成项也查出来（不然 `by_gid`
+    /// 泄漏，`restore_batch` 会把泄漏路径当 present、「一键开始」静默不补失败文件）。
+    ///
+    /// `(offset, num) = (0, 1000)`：引擎 `keep-download-result` 的环本身就是 1000 条，
+    /// 一次拉全——**不要**拿 [`Self::list`] 的窗口版充数，也**不要**用「by_gid − 存活集」
+    /// 反推（`tellWaiting` 同样有 1000 上限，>1000 排队时那个反推会误杀存活 GID）。
+    ///
+    /// 慢档（与 [`Self::list`] 同档、单次尝试）：千条级 payload，且这是点按钮才走的路。
+    pub fn stopped_full(&self) -> Result<Vec<RawTask>, String> {
+        let params = [
+            serde_json::Value::from(0u64),
+            serde_json::Value::from(1000u64),
+            task_keys(),
+        ];
+        let raw = self.call_slow("aria2.tellStopped", &params)?;
+        serde_json::from_value(raw).map_err(|e| format!("解析 aria2.tellStopped 失败: {e}"))
     }
 
     /// 改全局选项（`-j` 并行数、限速），**即时生效**（契约 §2.5）。
@@ -692,6 +786,31 @@ impl RpcClient {
         self.call("aria2.unpauseAll", &[]).map(|_| ())
     }
 
+    /// `aria2.tellStatus` 的**单键**查询：只问 `status` 一个键。
+    ///
+    /// [`super::daemon::Daemon::remove`] 用它回答「这个 GID 停了没有」——
+    /// ⚠️ **为什么不用 `list()` 做判据**（0.2.7，规格 §4.2）：`tellStopped` 取尾窗之后，
+    /// 列表里**可能看不到**老完成项，判据不能建立在窗口上；单条 `tellStatus` 不受窗口影响。
+    ///
+    /// ⚠️ **GID 失效（aria2 回 400，如 `GID … is not found`）转成 `Err(原文)`**：
+    /// 调用方把 `Err` 按「没停」处理，后续 `aria2.remove` 的错误原文照登——
+    /// 与「不在列表里就按没停」的既有语义逐字相同。传输层失败同样是 `Err`，同一处理。
+    ///
+    /// ⚠️ **GID 落在 `params[1]`**：`params[0]` 恒为 `token:<secret>`（[`RpcClient::send`] 补的）。
+    /// 读方法、快档（控制路径上的单条小查，与 [`Self::remove`] 同档）；**不在**
+    /// [`is_retryable_read`] 白名单里——单次尝试，判据失败就交回调用方按「没停」走。
+    pub fn status(&self, gid: &str) -> Result<String, String> {
+        let params = [
+            serde_json::Value::String(gid.to_string()),
+            serde_json::Value::Array(vec![serde_json::Value::from("status")]),
+        ];
+        let raw = self.call("aria2.tellStatus", &params)?;
+        raw.get("status")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("解析 tellStatus 返回失败: 期望 status 字符串，实际 {raw}"))
+    }
+
     /// `aria2.remove` —— 移除一个**活动/等待中**的任务。
     ///
     /// **不删除已落盘的部分文件**（`-c` 恒开，重下会续传）。
@@ -759,7 +878,7 @@ mod tests {
     /// 而 Go 的桩写死 `"1"` 是因为它的客户端从不解析 `id`。
     fn new_stub_rpc<F>(handler: F) -> StubHttp
     where
-        F: Fn(&str, &[Value]) -> Result<Value, (i64, String)> + Send + 'static,
+        F: Fn(&str, &[Value]) -> Result<Value, (i64, String)> + Send + Sync + 'static,
     {
         StubHttp::start_with(move |req| {
             let body: Value = serde_json::from_str(&req.body).unwrap_or(Value::Null);
@@ -1109,7 +1228,7 @@ mod tests {
         let c = RpcClient::new(&rpc_url(&srv), "s");
 
         let gids: Vec<String> = c
-            .list()
+            .list(0)
             .expect("list 不应失败")
             .iter()
             .map(|t| t.gid.clone())
@@ -1169,14 +1288,14 @@ mod tests {
 
     /// `list` 第一次出错就返回，**不**跑完剩下的子请求。
     ///
-    /// 契约 §4.3 的代价论证直接建立在这上面："一次快照失败即判定引擎断开"的实际代价是
-    /// **1–2 次** RPC 尝试（最坏约 10 秒，connection refused 约 0 秒），而不是 3–6 次 × 10 秒。
-    /// ⚠️ 次数**不再恒为 1**：读方法在**传输层**失败时会换一条新连接重试一次
-    /// （`is_retryable_read`），所以是 1–2；**写方法从不重试**，恒为 1。
-    /// ⚠️ **"约 10 秒"是单次尝试的上界，且含连接阶段**：两个 Agent 都显式设了
-    /// `timeout_connect(RPC_TIMEOUT)`（规格 §3 A4）。少了那一行，连接阶段会退到 ureq
-    /// 默认的 **30 秒**（`timeout_connect` 在连接阶段**优先于**整体超时），这句"最坏约
-    /// 10 秒"在连接阶段就不成立——`connect_phase_is_bounded_by_rpc_timeout` 守着这一点。
+    /// 契约 §4.3 的代价论证直接建立在这上面：**真死引擎**时"一次快照失败即判定引擎断开"
+    /// 的失败上界是**慢档单次 30 秒**（`SNAPSHOT_TIMEOUT`，connection refused 约 0 秒，
+    /// 首错即返）；反事实是「跑完三个子请求才报错」= 3×30 秒量级
+    /// （旧账「3–6 次 × 30 秒」含重试，慢档不重试后不成立）。
+    /// ⚠️ **慢档单次尝试、不重试**（规格 §3.2）：快照类读是周期性的，下一拍就是重试。
+    /// ⚠️ **"30 秒"是单次尝试的上界，且含连接阶段**：慢档 agent 显式设了
+    /// `.timeout(SNAPSHOT_TIMEOUT)` 与 `.timeout_connect(RPC_TIMEOUT)`（放宽的只是读响应，
+    /// 规格 §3 A4）——`slow_connect_phase_is_bounded_by_rpc_timeout` 守着这一点。
     /// 先跑完会把最坏情况拖成三倍，也就把"为它多等几轮"这个被否掉的做法又请了回来。
     ///
     /// ⚠️ 本条测试的桩回的是**协议层**错误（`error` 对象），不在重试之列，所以那两条
@@ -1209,7 +1328,7 @@ mod tests {
         // 场景 A：第一个子请求就失败 —— 一个后续请求都不该发
         let srv_a = stub_failing_at(0);
         let c_a = RpcClient::new(&rpc_url(&srv_a), "s");
-        let err = c_a.list().expect_err("第一个子请求出错时 list 必须报错");
+        let err = c_a.list(0).expect_err("第一个子请求出错时 list 必须报错");
         assert!(err.contains("boom"), "aria2 的错误必须带出来: {err:?}");
         assert_eq!(
             srv_a.requests().len(),
@@ -1220,12 +1339,72 @@ mod tests {
         // 场景 B：第二个子请求失败 —— 第三个不该发
         let srv_b = stub_failing_at(1);
         let c_b = RpcClient::new(&rpc_url(&srv_b), "s");
-        assert!(c_b.list().is_err(), "第二个子请求出错时 list 必须报错");
+        assert!(c_b.list(0).is_err(), "第二个子请求出错时 list 必须报错");
         assert_eq!(
             srv_b.requests().len(),
             2,
             "第二次出错后不得再发第三个子请求"
         );
+    }
+
+    /// 🔴 **`tellStopped` 取尾窗**（规格 §4）：最旧在前（实验证明）⇒ 截头显示陈旧完成、
+    /// 藏起刚完成的；`offset = max(0, numStopped−300)` 才是「最近 300 条」。
+    ///
+    /// 判别力：写死 offset=0 ⇒ 第一条红；窗口算反（加而不是减）⇒ 第二条红。
+    ///
+    /// ⚠️ **线上参数形状是 `[token, offset, num, keys]`**（[`RpcClient::send`] 恒在
+    /// `params[0]` 补 token）——所以偏移落在**下标 1**、窗口落在**下标 2**，
+    /// 与 `list_concatenates_active_then_waiting_then_stopped` 里 `waiting[1]`/`waiting[2]`
+    /// 的取法逐字相同。
+    #[test]
+    fn tell_stopped_asks_for_the_recent_window_not_the_oldest() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<Value>)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_srv = seen.clone();
+        let srv = new_stub_rpc(move |m, p| {
+            seen_srv.lock().unwrap().push((m.to_string(), p.to_vec()));
+            Ok(match m {
+                "aria2.tellActive" | "aria2.tellWaiting" | "aria2.tellStopped" => json!([]),
+                _ => json!({"downloadSpeed": "0", "numActive": "0", "numWaiting": "0", "numStopped": "0"}),
+            })
+        });
+        let c = RpcClient::new(&rpc_url(&srv), "s");
+
+        c.list(1000).unwrap();
+        let stopped = seen.lock().unwrap().iter()
+            .find(|(m, _)| m == "aria2.tellStopped").cloned().expect("发过 tellStopped");
+        assert_eq!(stopped.1[1], json!(700), "尾窗偏移要等于 numStopped−300：{:?}", stopped.1);
+        assert_eq!(stopped.1[2], json!(300), "窗口大小是 STOPPED_WINDOW：{:?}", stopped.1);
+
+        seen.lock().unwrap().clear();
+        let c2 = RpcClient::new(&rpc_url(&srv), "s");
+        c2.list(20).unwrap();
+        let stopped2 = seen.lock().unwrap().iter()
+            .find(|(m, _)| m == "aria2.tellStopped").cloned().expect("发过 tellStopped");
+        assert_eq!(stopped2.1[1], json!(0), "不足一窗时 offset 必须是 0：{:?}", stopped2.1);
+    }
+
+    /// `tellWaiting` 保持队头 1000 条（值与今天逐字相同；已暂停任务住在 waiting 表里——
+    /// `BatchControl` 的「一键开始」判据要看得见它们）。
+    #[test]
+    fn tell_waiting_keeps_the_queue_head_at_1000() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<Value>)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_srv = seen.clone();
+        let srv = new_stub_rpc(move |m, p| {
+            seen_srv.lock().unwrap().push((m.to_string(), p.to_vec()));
+            Ok(match m {
+                "aria2.tellActive" | "aria2.tellWaiting" | "aria2.tellStopped" => json!([]),
+                _ => json!({"downloadSpeed": "0", "numActive": "0", "numWaiting": "0", "numStopped": "0"}),
+            })
+        });
+        let c = RpcClient::new(&rpc_url(&srv), "s");
+
+        c.list(0).unwrap();
+        let waiting = seen.lock().unwrap().iter()
+            .find(|(m, _)| m == "aria2.tellWaiting").cloned().expect("发过 tellWaiting");
+        assert_eq!(waiting.1[1], json!(0), "tellWaiting 的 offset 不许动：{:?}", waiting.1);
+        assert_eq!(waiting.1[2], json!(1000), "tellWaiting 的 (0,1000) 不许动：{:?}", waiting.1);
     }
 
     /// `change_global_option` 打在**精确**的方法名上。
@@ -1857,6 +2036,259 @@ mod tests {
         assert!(
             why.contains("Invalid GID x"),
             "`why` 必须带 **aria2 的原文**（这一整档存在的理由），实际：{why:?}"
+        );
+    }
+
+    /// 「接了就断」的假引擎：每条连接 accept 之后立刻松手（连接被对端关掉），
+    /// 客户端读到传输层错误。返回 `(JSON-RPC 地址, 已 accept 的连接条数)`。
+    ///
+    /// 为什么不用既有的 [`StubHttp`] / [`new_stub_rpc`]：它们不对外暴露"accept 过几条连接"，
+    /// 而下面两条判据数的正是这个数（慢档不许重试 / 快档必须重试一次）。
+    /// 形状照 [`counting_keepalive_rpc_stub`]：同一个返回元组、同一处计数时机
+    /// （accept 之后、应答之前——本桩没有应答，所以是 accept 之后立刻计数再松手）。
+    fn drop_after_accept_stub() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let conns = Arc::new(AtomicUsize::new(0));
+        let conns_srv = Arc::clone(&conns);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定桩端口失败");
+        let port = listener.local_addr().expect("取桩端口失败").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                // 接受即松手：连接被对端关掉，客户端读到传输层错误。
+                if stream.is_ok() {
+                    conns_srv.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{port}/jsonrpc"), conns)
+    }
+
+    /// 🔴 **慢档单次尝试、不重试**（规格 §3.2）：一个「接了就断」的假引擎，
+    /// 慢档读必须只连一次——重试会把最坏代价翻倍，而它们是周期性读（下一拍就是重试）。
+    ///
+    /// 判别力：给 `list()` 也挂上 `is_retryable_read` 的重试 ⇒ 连接计数变 2 ⇒ 红。
+    #[test]
+    fn slow_snapshot_reads_never_transport_retry() {
+        let (url, accepted) = drop_after_accept_stub();
+        let c = RpcClient::new(&url, "s");
+        let e = c.list(0).expect_err("接了就断的引擎不该成功");
+        assert!(e.contains("RPC 请求失败"), "{e}");
+        let n = accepted.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(n, 1, "慢档不许传输层重试：实际连了 {n} 次");
+    }
+
+    /// 🔴 **`global_slow` 同样单次尝试、不重试**（终审 Important #2 的补钉）——
+    /// 同款「接了就断」桩，只连一次。
+    ///
+    /// 判别力：把 `global_slow` 的 `call_slow` 换成 [`Self::call`]（`getGlobalStat`
+    /// 在 [`is_retryable_read`] 白名单里 ⇒ 传输层失败换新连接再试一次）⇒ 连接计数变 2 ⇒ 红。
+    /// 超时档那一半由 [`slow_reads_wait_out_the_snapshot_timeout_before_giving_up`]
+    /// 的 `global_slow` 探针钉（≥25s 且 ≤35s）——两条互为补集。
+    #[test]
+    fn slow_global_stat_never_transport_retries() {
+        let (url, accepted) = drop_after_accept_stub();
+        let c = RpcClient::new(&url, "s");
+        let e = c.global_slow().expect_err("接了就断的引擎不该成功");
+        assert!(e.contains("RPC 请求失败"), "{e}");
+        let n = accepted.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(n, 1, "慢档 global_slow 不许传输层重试：实际连了 {n} 次");
+    }
+
+    /// 🔴 **快档读仍然重试一次**（对照组：上一条的反面）——同款假引擎，`global()`（快档）
+    /// 允许换新连接再试一次 ⇒ 连接计数 2。
+    #[test]
+    fn fast_reads_still_retry_once_on_transport_failure() {
+        let (url, accepted) = drop_after_accept_stub();
+        let c = RpcClient::new(&url, "s");
+        let e = c.global().expect_err("接了就断的引擎不该成功");
+        assert!(e.contains("RPC 请求失败"), "{e}");
+        let n = accepted.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(n, 2, "快档读的传输层重试不能丢（判别连接死 vs 引擎死的既有机制）");
+    }
+
+    /// 慢档的连接阶段同样受 `RPC_TIMEOUT` 约束（规格 §3 A4）——
+    /// `slow_agent` 放宽的只是**读响应**（`SNAPSHOT_TIMEOUT`），连接阶段仍要快。
+    ///
+    /// 做法与 [`connect_phase_is_bounded_by_rpc_timeout`] 同源：连黑洞地址、判耗时上界、
+    /// **宽松上界 + 快败跳过**（那条的免责声明同样适用：这里守的是"那个数字被写进构造里了"，
+    /// 不是"ureq 是否真的尊重这个值"）。
+    ///
+    /// 探的是 `global_slow()`（慢档 `getGlobalStat`）与 `list()`（三条 `tell*`）两个慢档入口
+    /// ——它们共用 `slow_agent`，但只探其中一个的话，另一个改回快档/漏了 `timeout_connect`
+    /// 不会有任何测试变红。
+    #[test]
+    fn slow_connect_phase_is_bounded_by_rpc_timeout() {
+        let c = RpcClient::new("http://10.255.255.1:9/jsonrpc", "s");
+        let probes: [(&str, fn(&RpcClient) -> Result<(), String>); 2] = [
+            ("慢档 global_slow", |c| c.global_slow().map(|_| ())),
+            ("慢档 list", |c| c.list(0).map(|_| ())),
+        ];
+        for (label, probe) in probes {
+            let started = std::time::Instant::now();
+            let e = probe(&c).expect_err("这个地址不该有人应答");
+            let took = started.elapsed();
+
+            if took < Duration::from_secs(2) {
+                eprintln!(
+                    "跳过：本机对 10.255.255.1:9 立刻失败（{label} {took:?}），\
+                     走不到超时那条路，判据无判别力"
+                );
+                continue;
+            }
+            assert!(e.contains("RPC 请求失败"), "{label} 的错误文案变了：{e}");
+            assert!(
+                took <= RPC_TIMEOUT + Duration::from_secs(5),
+                "{label} 的连接阶段耗时 {took:?} 超出了 RPC_TIMEOUT（{RPC_TIMEOUT:?}）——\
+                 慢档放宽的只是读响应，连接阶段必须仍显式 .timeout_connect(RPC_TIMEOUT)"
+            );
+        }
+    }
+
+    /// **慢档 30 秒上界 + 快档 10 秒上界**（规格 §6 判据 1）—— 快慢档各自的耗时上界。
+    ///
+    /// 做法与 [`connect_phase_is_bounded_by_rpc_timeout`] 逐字同款：连黑洞地址、
+    /// 判**耗时上界**、**宽松上界 + 快败跳过**。
+    ///
+    /// 三个探面与各自上界：
+    ///   · `list()`（慢档 `tell*`）与 `global_slow()`（慢档 `getGlobalStat`）——
+    ///     上界 `SNAPSHOT_TIMEOUT + 5 秒`；
+    ///   · 对照组 `ping()`（快档探活）——上界 `RPC_TIMEOUT + 5 秒`。
+    ///
+    /// **为什么缺一不可**：只测慢档的话，「快档被误改成 30 秒」不会有任何测试变红。
+    /// ⚠️ 这条**只钉上界**——黑洞地址死在连接阶段（被 `timeout_connect(RPC_TIMEOUT)` 钉住），
+    /// 慢档读超时**值**对它不可观测（把 `SNAPSHOT_TIMEOUT` 改回 10s 本条照样绿，实测过）。
+    /// 慢档读超时的值由 [`slow_reads_wait_out_the_snapshot_timeout_before_giving_up`]
+    /// 的「接受但不回」桩钉——两条互为补集。
+    ///
+    /// ⚠️ **免责声明照 [`connect_phase_is_bounded_by_rpc_timeout`] 那条**：
+    /// 这条测不出"ureq 是否真的尊重这个值"——守的是"**那个数字被写进构造里了**"。
+    /// 这句必须留着：否则下一个人会以为这条测试验过超时行为。
+    ///
+    /// ⚠️ 对照组用 `ping()` 而**不是** `global()`：`global()` 走 [`Self::call`]，
+    /// 传输层失败会**重试一次**（`is_retryable_read`），对黑洞地址就是 2 × 10 秒
+    /// ——超出 `RPC_TIMEOUT + 5 秒` 的上界，那不是"快档超时变了"而是"重试在起作用"。
+    /// `ping()` 与 [`Self::call_slow`] 一样是**单次** `send`，读数才可比。
+    ///
+    /// ⚠️ 在网络受限的机器上（立刻 connection refused）与同款一样**跳过**，
+    /// 不伪装通过。
+    #[test]
+    fn slow_tier_is_bounded_by_snapshot_timeout_and_fast_by_rpc_timeout() {
+        let c = RpcClient::new("http://10.255.255.1:9/jsonrpc", "s");
+        // (标签, 探针, 上界)——慢档上界 `SNAPSHOT_TIMEOUT`、快档上界 `RPC_TIMEOUT`。
+        let probes: [(&str, fn(&RpcClient) -> Result<(), String>, Duration); 3] = [
+            ("慢档 list（tell*）", |c| c.list(0).map(|_| ()), SNAPSHOT_TIMEOUT),
+            ("慢档 global_slow", |c| c.global_slow().map(|_| ()), SNAPSHOT_TIMEOUT),
+            ("快档 ping（对照组）", |c| c.ping(), RPC_TIMEOUT),
+        ];
+        for (label, probe, bound) in probes {
+            let started = std::time::Instant::now();
+            let e = probe(&c).expect_err("这个地址不该有人应答");
+            let took = started.elapsed();
+
+            if took < Duration::from_secs(2) {
+                eprintln!(
+                    "跳过：本机对 10.255.255.1:9 立刻失败（{label} {took:?}），\
+                     走不到超时那条路，判据无判别力"
+                );
+                continue;
+            }
+            assert!(e.contains("RPC 请求失败"), "{label} 的错误文案变了：{e}");
+            assert!(
+                took <= bound + Duration::from_secs(5),
+                "{label} 的耗时 {took:?} 超出了上界 {bound:?}（+5 秒宽松量）——\
+                 这条守的是「那个数字被写进构造里了」，不是「ureq 真的尊重这个值」\
+                 （后者由 ureq 语义保证，见 connect_phase_is_bounded_by_rpc_timeout 的说明）"
+            );
+        }
+    }
+
+    /// 「接受但不回」的桩：accept 后持有连接、**永不回响应**——客户端只能靠**读超时**放弃。
+    /// 返回 JSON-RPC 地址。每条连接一个线程持有它（不关、不写），确定性等到读超时。
+    fn accept_but_never_respond_stub() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定桩端口失败");
+        let port = listener.local_addr().expect("取桩端口失败").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if let Ok(s) = stream {
+                    // 接受后持有、永不回响应——读超时由客户端那一侧触发。
+                    std::thread::spawn(move || {
+                        let _held = s;
+                        std::thread::sleep(std::time::Duration::from_secs(300));
+                    });
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}/jsonrpc")
+    }
+
+    /// 🔴 **慢档读超时的值真的在生效**（与 [`slow_tier_is_bounded_by_snapshot_timeout_and_fast_by_rpc_timeout`] 互为补集）。
+    ///
+    /// 「接受但不回」桩（[`accept_but_never_respond_stub`]）：accept 后持有连接、
+    /// 永不回响应 ⇒ 客户端只能靠**读超时**放弃，且耗时确定性 ≈ 读超时值。
+    ///   · `list()`（慢档）⇒ 必须等满 `SNAPSHOT_TIMEOUT` 才失败：
+    ///     `took >= SNAPSHOT_TIMEOUT - 5s`（≥25s，防"被改回 10s"）且
+    ///     `took <= SNAPSHOT_TIMEOUT + 5s`（上界照旧）。
+    ///   · `global_slow()`（慢档）⇒ 同款两界（终审 Important #2 补钉：与 `list()` 共用
+    ///     `slow_agent`，但只探一头的话另一头被改回快档不会红）。
+    ///   · 对照组 `ping()`（快档）⇒ `took <= RPC_TIMEOUT + 5s` 且 `took < 20s`
+    ///     （防"快档被放宽"——上界行为测已有，这里再钉下界方向的分野）。
+    ///
+    /// ⚠️ 这条守的是「**那个 30 秒真的在生效**」，不是「数字被写进构造里了」——
+    /// 后者由 [`slow_tier_is_bounded_by_snapshot_timeout_and_fast_by_rpc_timeout`] 守。
+    /// 两条互为补集：那条对读超时**值**不可观测（黑洞地址死在连接阶段，
+    /// 被 `timeout_connect(RPC_TIMEOUT)` 钉住），这条能观测到。
+    ///
+    /// 确定性 30 秒（接受后持有、永不回响应），不需要快败跳过分支。
+    #[test]
+    fn slow_reads_wait_out_the_snapshot_timeout_before_giving_up() {
+        let url = accept_but_never_respond_stub();
+        let c = RpcClient::new(&url, "s");
+
+        // 慢档 `list()`：必须等满读超时（30 秒）才放弃。
+        let started = std::time::Instant::now();
+        let e = c.list(0).expect_err("永不回响应的桩不该成功");
+        let took = started.elapsed();
+        assert!(e.contains("RPC 请求失败"), "慢档失败文案：{e}");
+        assert!(
+            took >= SNAPSHOT_TIMEOUT - Duration::from_secs(5),
+            "慢档 `list()` 在 {took:?} 就放弃了——没等满 SNAPSHOT_TIMEOUT（{SNAPSHOT_TIMEOUT:?}）：\
+             那说明 30 秒档没在生效（被改回 10s 的形状）"
+        );
+        assert!(
+            took <= SNAPSHOT_TIMEOUT + Duration::from_secs(5),
+            "慢档 `list()` 等了 {took:?} 才放弃，超出 SNAPSHOT_TIMEOUT（{SNAPSHOT_TIMEOUT:?}）上界"
+        );
+
+        // 慢档 `global_slow()`：同款口径（终审 Important #2 的补钉——它与 `list()` 共用
+        // `slow_agent`，但只探 `list()` 的话，`global_slow` 被改回快档/`call` 不会有测试变红）。
+        let started = std::time::Instant::now();
+        let e = c.global_slow().expect_err("永不回响应的桩不该成功");
+        let took = started.elapsed();
+        assert!(e.contains("RPC 请求失败"), "慢档失败文案：{e}");
+        assert!(
+            took >= SNAPSHOT_TIMEOUT - Duration::from_secs(5),
+            "慢档 `global_slow()` 在 {took:?} 就放弃了——没等满 SNAPSHOT_TIMEOUT（{SNAPSHOT_TIMEOUT:?}）：\
+             那说明它不在 30 秒档上（被改回 `call`/10s 的形状）"
+        );
+        assert!(
+            took <= SNAPSHOT_TIMEOUT + Duration::from_secs(5),
+            "慢档 `global_slow()` 等了 {took:?} 才放弃，超出 SNAPSHOT_TIMEOUT（{SNAPSHOT_TIMEOUT:?}）上界"
+        );
+
+        // 对照组快档 `ping()`：同一根桩，必须明显更快放弃。
+        let started = std::time::Instant::now();
+        let e = c.ping().expect_err("永不回响应的桩不该成功");
+        let took = started.elapsed();
+        assert!(e.contains("RPC 请求失败"), "快档失败文案：{e}");
+        assert!(
+            took <= RPC_TIMEOUT + Duration::from_secs(5),
+            "快档 `ping()` 等了 {took:?}，超出 RPC_TIMEOUT（{RPC_TIMEOUT:?}）上界——快档被放宽了？"
+        );
+        assert!(
+            took < Duration::from_secs(20),
+            "快档 `ping()` 等了 {took:?}（≥20s）——与慢档分不开，说明快档被放宽了"
         );
     }
 

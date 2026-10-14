@@ -1742,16 +1742,19 @@ fn clear_engine_batch(d: &Daemon) {
             return;
         }
     };
-    // ⚠️ **连续失败即短路**。每个 `d.remove(gid)` 自己还要先发一次 `client.list()`
-    // ——也就是**正常路径上**每个任务约 2 次 RPC；`RPC_TIMEOUT` 是 10 秒。
+    // ⚠️ **连续失败即短路**。每个 `d.remove(gid)` 自己还要先发一次 `client.status()`
+    // （`tellStatus` 单查判停走，0.2.7）——也就是**正常路径上**每个任务约 2 次 RPC；
+    // `RPC_TIMEOUT` 是 10 秒。
     //
     // ⚠️ **两个口径别混**（它们量级相同、成因完全不同，摆在一起容易被读成 600 秒）：
     //   - **正常路径**（引擎健康）：每次移除 2 次 RPC，但都秒回，30 个任务是毫秒级；
-    //   - **黑洞路径**（aria2 不响应也不拒连）：**第一条 `d.remove` 里的 `list()` 就会
-    //     等满 10 秒超时**，然后进 `Err` 分支、`consecutive` 加一——**每次失败只花 1 次
-    //     RPC（就是那次 `list()`），不是 2 次**（失败在 `list()` 上，`remove` 根本没发出去）。
-    //     连续 3 次失败即短路，所以黑洞路径的上界是 **10s 快照 + 3×10s ≈ 40 秒**，
-    //     与任务数**无关**——30 个任务和 3000 个任务都是这个数。
+    //   - **黑洞路径**（aria2 不响应也不拒连）：**`d.remove` 里的 `status()` 会
+    //     等满 10 秒超时**，`Err` 按「没停」处理后仍要发那次 `aria2.remove`（它同样
+    //     等满 10 秒）——**每次失败 2 次 RPC、约 20 秒**（0.2.7 把判据从 `list()`
+    //     换成 `tellStatus` 单查之后，判据那一查失败**不再**短路掉后面的 `remove`：
+    //     「GID 失效 400 按没停处理」与传输层失败在 `Result<String,_>` 上不可分，
+    //     不做字符串匹配）。连续 3 次失败即短路，所以黑洞路径的上界是
+    //     **10s 快照 + 3×20s ≈ 70 秒**，与任务数**无关**——30 个任务和 3000 个任务都是这个数。
     //
     // 把"单次 RPC"这个已接受的模式放大成**无界的循环**是量变到质变——
     // 正常情况毫秒级无感，坏情况下是用户会来投诉的形状。所以给它一个上界：
@@ -1760,9 +1763,9 @@ fn clear_engine_batch(d: &Daemon) {
     // 而连续三次说明是系统性的。
     //
     // ⚠️ **本函数现在跑在 `kernel` 锁外**（I-2）：它是由 `op_load_delivery` 在
-    // 锁外 ③ 那一段调的，所以那约 40 秒不再冻结校验线程与落地监听器。
+    // 锁外 ③ 那一段调的，所以那约 70 秒不再冻结校验线程与落地监听器。
     // 短路保护**照样保留**——读循环仍然是同步的，引擎卡死时客户点"加载交付码"
-    // 仍要等这 40 秒才拿到响应。
+    // 仍要等这 70 秒才拿到响应。
     // 残余：`clear_finished` 对"已经被 aria2 自己 purge 掉的 GID"无能为力——
     // 那是既有瑕疵，不在本轮。
     const MAX_CONSECUTIVE_FAILURES: usize = 3;
@@ -1992,14 +1995,19 @@ fn state_name(s: Option<view::State>) -> &'static str {
 /// 都是**持有内核 `Mutex` 的时候**执行。
 /// （这里曾经写着"快照不持锁"——那句话是错的，会误导后来者。）
 ///
-/// **这是 I-2 修复之后仍然留在锁内的最后一段网络 I/O**，所以把上界写准：
-/// `snapshot()` = 3 条 `tell*` + 1 条 `getGlobalStat`，而 `list()` **第一次出错就返回**
-/// （契约 §4.3），因此它的真实上界是**一次 RPC 超时 ≈ 10 秒**
-/// （`RPC_TIMEOUT`；connection refused 时约 0 秒）——不是 4×10 秒。
+/// **这是 I-2 修复之后仍然留在锁内的最后一段网络 I/O**，所以把上界写准
+/// （规格 §3.4 的两段口径，**别混读**）：
+/// `snapshot()` = 1 条 `getGlobalStat` + 3 条 `tell*`（0.2.7 起 `getGlobalStat` 先行——
+/// 尾窗偏移要它的 `numStopped`）。
+///   · **真死引擎**（失败路径）：`list()`/`global_slow()` **第一次出错就返回**（契约 §4.3）
+///     ⇒ 失败上界 = **单次慢档 30 秒**（`SNAPSHOT_TIMEOUT`，单次尝试、不重试；
+///     connection refused 时约 0 秒）——不是 4×30 秒；
+///   · **慢应答但最终成功**（成功路径）：四个方法都要等到**自己的**应答
+///     ⇒ 上界 ≈ **4×`SNAPSHOT_TIMEOUT`**。**这段 I/O 在内核锁内，按它计**。
 /// `load_delivery` 里那三段真正的长 I/O（`fetch` 91.5 秒、`plan` N×30 秒、
-/// 换码清理约 40 秒）已经全部移到锁外，见各自的注释。
+/// 换码清理约 70 秒）已经全部移到锁外，见各自的注释。
 ///
-/// 之所以 10 秒这一段现在不是 bug：读循环是**同步的**，一次只处理一条请求，
+/// 之所以慢应答那一段现在不是 bug：读循环是**同步的**，一次只处理一条请求，
 /// 所以不存在"另一个协议请求被这把锁挡住"这回事。代价是**校验线程与落地监听器**
 /// 要排在这次快照后面。要让读路径也彻底不持锁，得把这四个 handler 的
 /// "取快照"那一步也拆出来（它们还要拿 `engine_disconnected` 与重连逻辑，
@@ -2813,7 +2821,7 @@ pub fn op_transfer_list(k: &mut Kernel) -> Result<Value, ErrorBody> {
     let d = k.read_engine()?;
     let snap = match d.snapshot() {
         Ok(s) => s,
-        Err(e) => return Err(k.on_rpc_failure(&d, "快照（tellActive/tellWaiting/tellStopped）", e)),
+        Err(e) => return Err(k.on_rpc_failure(&d, "快照（getGlobalStat/tellActive/tellWaiting/tellStopped）", e)),
     };
     // `snap.tasks` 的重复 GID 已在 `Daemon::snapshot` 里折过（生产者持有该不变式），
     // 且与 `raw_status` 一一对应——这里直接用，不再自己折一次。
@@ -5833,6 +5841,33 @@ mod tests {
             file,
             update::asset_name(update::platform(), update::arch(), (999, 0, 0)),
             "文件名必须按本平台/架构选、且版本段与 URL 同源（拼错会给客户一个装不上的包）：{url}"
+        );
+    }
+
+    /// 🔴 **入队节奏钉住**（规格 §2/§5）：同步只提交前 100 个、后台每批 20 个、批间 200 ms。
+    /// 0.2.5 现场（诊断日志 20261014-081646）`n=686 ms=464` 一次灌完正是**没有**这套节奏的
+    /// 形态；它已在 0.2.6（`4d93d08a`）落地——这条防的是「调参不记账」的静默漂移。
+    ///
+    /// ⚠️ 200 ms 那一格用**源码即判据**钉（`include_str!` 手法同 `free_bytes_has_a_windows_arm_that_shells_out_to_nothing`）：
+    /// 它是 `spawn_feeder` 里的一个字面量，不抽常量就没法用行为测便宜地够着。
+    /// **这条够不着什么**：它钉的是「200 这个字面量在 `spawn_feeder` 里」，
+    /// 不是「线程真的按 200 ms 节奏睡」——后者要真引擎计时（0.2.6 验收的人肉读数），
+    /// 单测里的 sleep 耗时断言会把 200 ms 的容差抖成 flake，故不取。
+    #[test]
+    fn the_enqueue_pacing_constants_are_pinned() {
+        assert_eq!(FIRST_BATCH, 100, "同步批次动过就得同步这条与规格 §2");
+        assert_eq!(FEED_BATCH, 20, "后台每批个数动过就得同步这条与规格 §2");
+
+        // 批间 200 ms：源码断言（见本条文档的「够不着什么」）。
+        let src = include_str!("kernel.rs");
+        let feeder = src
+            .split("pub fn spawn_feeder(")
+            .nth(1)
+            .expect("`spawn_feeder` 不见了——批间节奏都没了落点");
+        let body = &feeder[..feeder.find("\n}\n").map_or(feeder.len(), |i| i + 3)];
+        assert!(
+            body.contains("thread::sleep(Duration::from_millis(200))"),
+            "`spawn_feeder` 的批间小睡不是 200 ms 了（规格 §2/§5 的第三格）——实际正文片段里找不着 `thread::sleep(Duration::from_millis(200))`"
         );
     }
 }

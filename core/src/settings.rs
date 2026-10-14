@@ -48,16 +48,17 @@ pub struct Settings {
 
 /// 默认值。
 ///
-/// 🔴 **三个并发数在 2026-10-09 从 8/16/16 降到了 5/8/8**，理由是**现场证据**，
-///    不是口味：0.2.3 的诊断日志（9.4 小时）里，引擎的响应延迟**随并发下载数逐级退化**
-///    —— 一个**全新引擎、空任务表**，152 个 `addUri` 从 1 ms 一路退化到 8.6 秒，
-///    56 秒后第一次超时；而同一份日志里 `tellWaiting`/`tellStopped` 在 `tellActive`
-///    超时的**同一时刻**仍然 20 ms 就回 —— 引擎没死，是"要去问正在下载的那些任务"
-///    这一类请求答不了。旧的默认值是 8 个文件 × 16 连接 = **128 条并发连接**，
-///    而 152 个文件**全部指向同一个服务器**。
+/// 🔴 **三个并发数的时间线（每一步都是产品决定，按时间从旧到新）：**
+///
+/// | 何时 | 值（并行/连接/分片） | 为什么 |
+/// |---|---|---|
+/// | 规格 §6 | 8/16/16（128 条并发连接） | 原始决定 |
+/// | 2026-10-09 | **5/8/8**（40 条） | **现场证据**：0.2.3 的诊断日志（9.4 小时）里引擎响应延迟**随并发下载数逐级退化** —— 全新引擎、空任务表，152 个 `addUri` 从 1 ms 退化到 8.6 秒、56 秒后第一次超时；同一份日志里 `tellWaiting`/`tellStopped` 在 `tellActive` 超时的**同一时刻**仍 20 ms 就回（引擎没死，是"问正在下载的任务"这类请求答不了）。152 个文件**全部指向同一个服务器**。 |
+/// | 2026-10-12 | 5/4/4（20 条） | 「再降一档」（用户决定，记录在 `docs/superpowers/specs/2026-10-12-engine-resilience-and-pause-all-design.md`） |
+/// | **2026-10-14** | **5/8/8**（40 条） | **用户决定撤销 10-12 那一步**：产品口径以 5/8/8 为准（0.2.6 发布后客户现场核对默认值时定的） |
 ///
 /// ⚠️ **这是对规格 §6 的一次偏离**（那一条写的是 8/16/16）。规格是**历史决策记录**，
-///    按本仓规矩不改写它；新值在这里与 `benagen_dl_usage_guide.md` 各自记账，
+///    按本仓规矩不改写它；现行值在这里与 `benagen_dl_usage_guide.md` 各自记账，
 ///    判据见 `parallel_is_a_starting_value_and_connections_splits_are_pinned_product_decisions`。
 ///    ⚠️ 并行数的语义是**起始值**（2026-10-14 起
 ///    `--optimize-concurrent-downloads=true` 会自适应加减档，规格 §4.1）；
@@ -68,7 +69,8 @@ pub struct Settings {
 ///    我们这套原先是它好几倍。
 ///
 /// ⚠️ **改这里只影响"从没点过保存"的人**：设置文件只在 `settings_set` 里落盘
-///    （见 `load_from`），存过盘的那份会盖住默认值。
+///    （见 `load_from`），存过盘的那份会盖住默认值 —— 2026-10-12 与 10-14 之间存过盘的
+///    客户仍会看到 5/4/4，直到他们在面板上改一次并保存。
 ///
 /// 🔴 **`max_tries` 默认 1（2026-10-13）是重试所有权的转移**，不是调参：aria2 自己重试时
 ///    我们看不见（`tellStatus` 无 `retryCount`），"在重试"与"卡住了"在判定表里分不开；
@@ -81,8 +83,8 @@ pub struct Settings {
 pub fn default_settings() -> Settings {
     Settings {
         parallel: 5,
-        connections: 4,
-        splits: 4,
+        connections: 8,
+        splits: 8,
         min_split_size: "20M".to_string(),
         limit_mbps: 0,
         max_tries: 1,
@@ -488,8 +490,8 @@ mod tests {
     fn parallel_is_a_starting_value_and_connections_splits_are_pinned_product_decisions() {
         let d = default_settings();
         assert_eq!(d.parallel, 5, "并行文件数默认值（起始值）动过就得同步这条");
-        assert_eq!(d.connections, 4, "单文件连接数默认值动过就得同步这条");
-        assert_eq!(d.splits, 4, "分片数默认值动过就得同步这条");
+        assert_eq!(d.connections, 8, "单文件连接数默认值动过就得同步这条");
+        assert_eq!(d.splits, 8, "分片数默认值动过就得同步这条");
     }
 
     /// 对应 Go `TestLoadCorruptFileGivesDefaults`。
@@ -523,7 +525,7 @@ mod tests {
                 Settings {
                     parallel: 5,
                     connections: 4,
-                    splits: 4,
+                    splits: 8,
                     min_split_size: "20M".into(),
                     limit_mbps: 0,
                     max_tries: 1,
@@ -536,7 +538,7 @@ mod tests {
                 Settings {
                     parallel: 5,
                     connections: 4,
-                    splits: 4,
+                    splits: 8,
                     min_split_size: "20M".into(),
                     limit_mbps: 0,
                     max_tries: 1,
@@ -560,12 +562,12 @@ mod tests {
             ),
             (
                 // 4294967302 截断成 6，正好落回 1–16 —— 用 as i32 截断的实现会把它当合法值保留；
-                // 期望是默认值 4，与截断结果 6 不同，两种行为才可区分
-                "connections 超上限且截断后落回合法区间，回默认 4",
+                // 期望是默认值 8，与截断结果 6 不同，两种行为才可区分
+                "connections 超上限且截断后落回合法区间，回默认 8",
                 r#"{"parallel":32,"connections":4294967302,"splits":5,"min_split_size":"30M","limit_mbps":7,"max_tries":6,"retry_wait":2}"#,
                 Settings {
                     parallel: 32,
-                    connections: 4,
+                    connections: 8,
                     splits: 5,
                     min_split_size: "30M".into(),
                     limit_mbps: 7,
@@ -707,12 +709,12 @@ mod tests {
             (
                 "connections 越界",
                 r#"{"parallel":32,"connections":17,"splits":6,"min_split_size":"30M","limit_mbps":7,"max_tries":6,"retry_wait":2}"#,
-                mk(&base_want, |s| s.connections = 4),
+                mk(&base_want, |s| s.connections = 8),
             ),
             (
                 "splits 越界",
                 r#"{"parallel":32,"connections":6,"splits":0,"min_split_size":"30M","limit_mbps":7,"max_tries":6,"retry_wait":2}"#,
-                mk(&base_want, |s| s.splits = 4),
+                mk(&base_want, |s| s.splits = 8),
             ),
             (
                 "min_split_size 越界",

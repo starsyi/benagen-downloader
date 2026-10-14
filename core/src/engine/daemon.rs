@@ -930,7 +930,7 @@ impl Daemon {
     }
 
     /// 只取**活跃**的任务，一条 `tellActive`。停滞采样只用它：`snapshot()` 还要
-    /// `tellWaiting` / `tellStopped`（各最多 1000 条），采样一条都用不到。
+    /// `tellWaiting`（队头 1000 条）/ `tellStopped`（尾窗 300 条），采样一条都用不到。
     pub fn active(&self) -> Result<Vec<Task>, String> {
         let raw = self.client.active()?;
         Ok(raw.iter().map(|r| r.to_task()).collect())
@@ -941,19 +941,28 @@ impl Daemon {
     /// 用列表方法而非按 GID 的 `tellStatus`——后者在 GID 失效时会 400（`Invalid GID`），
     /// 列表方法不需要我们维护 GID 生命周期。
     ///
-    /// ⚠️ `list` 在前、`global` 在后，且**第一次出错就返回**（`?`）：契约 §4.3 的代价
-    /// 论证建立在这上面——"一次快照失败即判定引擎断开"的实际代价是 **1–2 次** RPC 尝试
-    /// （最坏约 10 秒，connection refused 约 0 秒），而不是 8 次 × 10 秒。
-    /// ⚠️ 次数**不再恒为 1**：本方法打的四个方法**全是读方法**（`tellActive`/`tellWaiting`/
-    /// `tellStopped` + `getGlobalStat`），每一个在**传输层**失败时都会换一条新连接重试一次
-    /// （`rpc::is_retryable_read`，规格 §3 A1），所以是 1–2；**写方法从不重试**，恒为 1。
-    /// ⚠️ **"约 10 秒"是单次尝试的上界，且含连接阶段**：`rpc` 里两个 Agent 构造都显式设了
-    /// `timeout_connect(RPC_TIMEOUT)`（规格 §3 A4）。少了那一行，连接阶段会退到 ureq 默认的
-    /// **30 秒**（`timeout_connect` 在连接阶段**优先于**整体超时），上面那句"最坏约 10 秒"
-    /// 在连接阶段就不成立。
+    /// ⚠️ **`global_slow` 在前、`list` 在后**（0.2.7）：`tellStopped` 取**尾窗**，
+    /// 偏移要 `getGlobalStat.numStopped` 才算得出来（`max(0, numStopped−300)`）——
+    /// 所以计数那条先发。`global` 字段仍用这一条，**不多发请求**。
+    /// 顺序不是实现细节：`list` 在前就拿不到 `numStopped`，尾窗无从算起。
+    /// ⚠️ **第一次出错就返回**（`?`）：契约 §4.3 的代价论证建立在这上面——
+    /// **真死引擎**时「一次快照失败即判定引擎断开」的失败上界是**慢档单次 30 秒**
+    /// （`SNAPSHOT_TIMEOUT`，首错即返；connection refused 约 0 秒）。
+    /// 反事实是「四个慢档读都跑完才报错」= 4×30 秒量级（旧账「8 次 × 30 秒」是**含重试**的
+    /// 算法，慢档不重试后不成立）。⚠️ 这只是**失败路径**的账：**慢应答但最终成功**的成功路径
+    /// 上界 ≈ 4×`SNAPSHOT_TIMEOUT`（四个方法各等各的应答）——`kernel::current_tasks` 按它计。
+    /// ⚠️ **慢档单次尝试、不重试**（规格 §3.2）：本方法打的四个方法全是**快照类读**
+    /// （`tellActive`/`tellWaiting`/`tellStopped` + 快照的 `getGlobalStat`），走 `rpc` 的
+    /// `call_slow`——传输层失败**不再**换新连接重试（下一拍轮询就是重试）。
+    /// 判活/写/控制类仍在快档、仍按 `rpc::is_retryable_read` 的既有语义。
+    /// ⚠️ **"30 秒"是单次尝试的上界，且含连接阶段**：慢档 agent 显式设了
+    /// `.timeout(SNAPSHOT_TIMEOUT)`（读响应）与 `.timeout_connect(RPC_TIMEOUT)`（连接阶段
+    /// 仍要快——放宽的只是读响应，规格 §3 A4）。少了 `timeout_connect` 那一行，连接阶段
+    /// 会退到 ureq 默认的 **30 秒**（`timeout_connect` 在连接阶段**优先于**整体超时）。
     pub fn snapshot(&self) -> Result<Snapshot, String> {
-        let raw = self.client.list()?;
-        let global = self.client.global()?;
+        let global = self.client.global_slow()?;
+        // `num_stopped` 是 `i64`（线上字符串数字解析来的），负值没有意义——钳到 0 再进 u64。
+        let raw = self.client.list(global.num_stopped.max(0) as u64)?;
         // 折叠重复 GID：**必须在生产者这里做**（`raw_status` 是 map、天然取最后一次，
         // 不折叠的话两个出口对同一个 GID 说法相反）。见 `fold_duplicate_gids`。
         let tasks: Vec<Task> = fold_duplicate_gids(raw.iter().map(|r| r.to_task()).collect());
@@ -1027,17 +1036,18 @@ impl Daemon {
     /// `removeDownloadResult` 同样报 400（`Could not remove download result of GID#…`）。
     /// 而传输列表里两种都有，用户点"移除"时不会区分——**分派是本方法的责任**。
     ///
-    /// 判据是**本地状态**（该 GID 停在哪个 `TaskState` 上），**不是** aria2 的错误文案：
-    /// 靠"先调 remove、失败了再试另一个"要匹配错误串，而字符串契约没有测试守护
-    /// （任务 3 的审查记过同类脆弱性）。
+    /// 判据是 **`tellStatus` 的 `status` 字段**（经 [`raw_status_to_state`]），**不是**
+    /// aria2 的错误文案：靠"先调 remove、失败了再试另一个"要匹配错误串，而字符串契约
+    /// 没有测试守护（任务 3 的审查记过同类脆弱性）。
     ///
-    /// ⚠️ 判据走 **`list()`** 而**不是** `snapshot()`（修复轮 2 的 ②）：
-    /// `snapshot()` = `list()` 的 3 条 + `global()` 的 1 条，而 `getGlobalStat` 对
-    /// "该用哪个方法"**零贡献**。更要紧的是失败模式——它一挂，移除连试都不会试就返回
-    /// 错误，**一个与移除毫不相干的 RPC 能把用户点的"移除"挡住**。
-    /// 控制者的计划原文写的是 `snapshot()`，那句话**想窄了**：`snapshot()` 是给四态合成用的
-    /// （它需要 `path_map` 与统计），而这里只需要回答"这个 GID 停没停"。
-    /// **用一个大而全的读去回答一个小问题，就会继承它那些与自己无关的失败模式。**
+    /// ⚠️ 判据走 **`tellStatus(gid, ["status"])` 单查**（0.2.7，规格 §4.2），既不是
+    /// `snapshot()` 也不是 `list()`：
+    ///   - **不能是 `snapshot()`**（修复轮 2 的 ②）：它 = 3 条 `tell*` + 1 条 `getGlobalStat`，
+    ///     而 `getGlobalStat` 对"该用哪个方法"**零贡献**；更要紧的是失败模式——它一挂，
+    ///     移除连试都不会试就返回错误，**一个与移除毫不相干的 RPC 能把用户点的"移除"挡住**。
+    ///     **用一个大而全的读去回答一个小问题，就会继承它那些与自己无关的失败模式。**
+    ///   - **不能是 `list()`**（0.2.7）：`tellStopped` 取**尾窗**（最近 300 条）之后，
+    ///     列表里**可能看不到**老完成项——判据不能建立在窗口上。单条 `tellStatus` 不受窗口影响。
     ///
     /// （它与 `clear_finished` 的过滤集合回答**同一个问题**、改动要**同向**：
     /// 两处的三个状态字面量必须一致。数据来源不同是刻意的——见上。两处是独立的 locus，
@@ -1051,16 +1061,17 @@ impl Daemon {
     /// RPC 失败时**不** forget（错误原样带出去）：GID 在 aria2 那边还在，
     /// 映射也应当留着——界面下一次快照还能把它认出来。
     pub fn remove(&self, gid: &str) -> Result<(), String> {
-        // 判据是**这一次列表读**里该 GID 的状态。取不到（不在列表里）时按"没停"处理：
-        // 那样会走 `aria2.remove`，于是 aria2 报 `GID … is not found` 并被带出去
-        // ——比"猜一个方法然后吞掉错误"诚实。
-        let stopped = self.client.list()?.iter().any(|t| {
-            t.gid == gid
-                && matches!(
-                    raw_status_to_state(&t.status),
-                    TaskState::Complete | TaskState::Error | TaskState::Removed
-                )
-        });
+        // 判据是 `tellStatus` 的单查。**任何 `Err`（GID 失效的 400、传输层失败）都按
+        // 「没停」处理**：那样会走 `aria2.remove`，于是 aria2 报错并被原样带出去
+        // ——比"猜一个方法然后吞掉错误"诚实，与「不在列表里就按没停」的既有语义逐字相同
+        // （GID 失效 400 ⇒ `aria2.remove` 的 `GID … is not found` 原文照登）。
+        let stopped = match self.client.status(gid) {
+            Ok(s) => matches!(
+                raw_status_to_state(&s),
+                TaskState::Complete | TaskState::Error | TaskState::Removed
+            ),
+            Err(_) => false,
+        };
         if stopped {
             self.client.remove_download_result(gid)?;
         } else {
@@ -1073,11 +1084,17 @@ impl Daemon {
 
     /// 清空已完成/失败的历史条目，并忘掉对应映射。
     ///
-    /// ⚠️ **必须先取 GID 快照，再 purge**：`purgeDownloadResult` 一执行，`tellStopped`
+    /// ⚠️ **必须先取 GID 集合，再 purge**：`purgeDownloadResult` 一执行，`tellStopped`
     /// 就空了，此时再去取 GID 列表会拿到**空集**——映射就永久留在 `by_gid` 里。
-    /// 顺序是：`snapshot()` 记下所有 `Complete`/`Error`/`Removed` 的 GID → `purge` → 逐个 `forget`。
+    /// 顺序是：全量 stopped 查询记下所有 `Complete`/`Error`/`Removed` 的 GID → `purge` → 逐个 `forget`。
     /// **症状是静默的**：列表看着干净，只是内部映射越积越多、`snapshot()` 的
     /// `path_map` 越带越大，而没有任何一处报错。
+    ///
+    /// ⚠️ **forget 集合来自 `stopped_full()`（`tellStopped(0, 1000)`），不是 `snapshot()`**
+    /// （终审 Important #1）：后者的 `tellStopped` 是**尾窗**（最近 300 条）——那是高频轮询的
+    /// 省载荷优化，**不能**约束这个低频动作，否则窗口外的老完成项不被 forget ⇒ `by_gid`
+    /// 泄漏 ⇒ `restore_batch` 把泄漏路径当 present ⇒「一键开始」静默不补失败文件。
+    /// 也不要拿「by_gid − 存活集」反推：`tellWaiting` 同样有 1000 上限，>1000 排队时会误杀存活 GID。
     ///
     /// ⚠️ **忘掉的是 `Complete`/`Error`/`Removed` 三种**，与 `purgeDownloadResult` 的
     /// 实际作用域**逐一对齐**（实测：purge 会一并清掉 `removed` 条目）。
@@ -1089,19 +1106,21 @@ impl Daemon {
     ///
     /// （本处的过滤集合与 `Daemon::remove` 的分派表回答**同一个问题**——"这个任务是否已停止"，
     /// **改动要同向**：两处的三个状态字面量必须一致。数据来源不同是刻意的——
-    /// `remove` 用 `list()`（它只需要回答"停没停"），本处用 `snapshot()`（它本来就要读全量任务）。
+    /// `remove` 用 `tellStatus` 单查（它只需要回答"停没停"，且不能建立在 `tellStopped` 的
+    /// 尾窗上），本处用**全量** stopped 查询（`stopped_full()`，本动作要的是"purge 会清掉
+    /// 哪些 GID"的完整集合，同样不能建立在尾窗上）。
     /// 两处是独立的 locus，各由测试单独守着，**不抽公共谓词**：抽出来会让"改一处等于同时改
     /// 两处语义"。反过来那边也有同一句，改这里之前先读它。）
     pub fn clear_finished(&self) -> Result<(), String> {
-        // ⚠️ 顺序承重：**先取快照**。purge 之后 `tellStopped` 就空了，
+        // ⚠️ 顺序承重：**先取 GID 集合**。purge 之后 `tellStopped` 就空了，
         // 那时再取 GID 集合只会得到空集，一条映射都忘不掉。
         let finished: Vec<String> = self
-            .snapshot()?
-            .tasks
+            .client
+            .stopped_full()?
             .iter()
             .filter(|t| {
                 matches!(
-                    t.state,
+                    raw_status_to_state(&t.status),
                     TaskState::Complete | TaskState::Error | TaskState::Removed
                 )
             })
@@ -4597,6 +4616,75 @@ mod tests {
         assert_eq!(state_of(&snap, &gid), None, "removed 条目应已被 purge 清掉");
     }
 
+    /// 🔴 **`clear_finished` 的 forget 集合不受 `tellStopped` 尾窗约束**（终审 Important #1）：
+    /// 尾窗是高频轮询的省载荷优化，**不能**约束低频的清空动作——窗口外的老完成项
+    /// 不被 forget ⇒ `by_gid` 泄漏 ⇒ `restore_batch` 把泄漏路径当 present ⇒
+    /// 「一键开始」静默不补失败文件。
+    ///
+    /// 夹具：350 个已结束 GID，`tellStopped(0, 1000)` 回全量 350 条、
+    /// 尾窗 `(50, 300)` 只回最近 300 条（最旧在前 ⇒ 窗口外的是**最旧的 50 个**）。
+    ///
+    /// 判别力：forget 集合改回 `snapshot()`（走尾窗）→ 前 50 条必红（映射残留）。
+    #[test]
+    fn clear_finished_forgets_stopped_gids_outside_the_tail_window() {
+        let n = 350usize;
+        let gids: Vec<String> = (0..n).map(|i| format!("gid-stopped-{i:03}")).collect();
+        let gids_in_stub = gids.clone();
+        let srv = StubHttp::start_with(move |req| {
+            let (method, params) = method_and_params(&req.body);
+            // 线上形状 `[token, offset, num, keys]`。
+            let offset = params.get(1).and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let num = params.get(2).and_then(serde_json::Value::as_u64).unwrap_or(0);
+            match method.as_str() {
+                "aria2.tellActive" | "aria2.tellWaiting" => rpc_ok(serde_json::json!([])),
+                "aria2.tellStopped" => {
+                    let all: Vec<serde_json::Value> = gids_in_stub
+                        .iter()
+                        .map(|g| task_entry(g, "complete"))
+                        .collect();
+                    // `(0, 1000)` 全量；`(offset, num)` 是窗口切片——与线上语义同构。
+                    let got: Vec<serde_json::Value> = if num >= 1000 {
+                        all
+                    } else {
+                        let start = (offset as usize).min(all.len());
+                        all[start..].iter().take(num as usize).cloned().collect()
+                    };
+                    rpc_ok(serde_json::json!(got))
+                }
+                "aria2.getGlobalStat" => rpc_ok(serde_json::json!({
+                    "downloadSpeed": "0", "numActive": "0",
+                    "numWaiting": "0", "numStopped": "350",
+                })),
+                "aria2.purgeDownloadResult" => rpc_ok(serde_json::json!("OK")),
+                other => rpc_err(&format!("意外的方法: {other}")),
+            }
+        });
+        let by_gid: BTreeMap<String, String> = gids
+            .iter()
+            .map(|g| (g.clone(), format!("f/{g}.bin")))
+            .collect();
+        let d = stub_daemon(&srv.base(), "s", by_gid);
+
+        d.clear_finished().expect("clear_finished 不应失败");
+
+        // 窗口外的**最旧 50 条**（350 − 300）——终审要修的就是这一段
+        for g in &gids[..50] {
+            assert!(
+                d.path_for(g).is_none(),
+                "窗口外的 {g} 仍留着映射（by_gid 泄漏 ⇒ 一键开始静默不补文件）：{:?}",
+                d.path_for(g)
+            );
+        }
+        // 窗口内的也要 forget（既有语义，顺带钉住）
+        for g in &gids[300..] {
+            assert!(
+                d.path_for(g).is_none(),
+                "窗口内的 {g} 仍留着映射：{:?}",
+                d.path_for(g)
+            );
+        }
+    }
+
     /// 暂停 / 继续一个任务：走真实 aria2，两个动作都要真的改变任务的状态。
     ///
     /// 判别力：`Daemon::pause` 若只是空转（或调错成 `unpause`），第二条 `wait_until`
@@ -4767,6 +4855,8 @@ mod tests {
                     "downloadSpeed": "0", "numActive": "1",
                     "numWaiting": "0", "numStopped": "0",
                 })),
+                // 0.2.7 起停走判据走 tellStatus —— 这个任务在 aria2 那边是活着的
+                "aria2.tellStatus" => rpc_ok(serde_json::json!({"status": "active"})),
                 // 而"移除"这一趟失败
                 "aria2.remove" => rpc_err("boom"),
                 other => rpc_err(&format!("意外的方法: {other}")),
@@ -4792,10 +4882,11 @@ mod tests {
 
     /// `remove` 的判据**不得**依赖 `getGlobalStat`。
     ///
-    /// `snapshot()` = `list()` 的 3 条 + `global()` 的 1 条，而 `getGlobalStat` 对
+    /// `snapshot()` = `getGlobalStat` 的 1 条 + `list()` 的 3 条，而 `getGlobalStat` 对
     /// "该用哪个方法"**零贡献**。更要紧的是失败模式：它一挂，"移除"就连试都不会试地
     /// 返回错误——**一个与移除毫不相干的 RPC 能把用户点的移除挡住**。
     /// 用一个大而全的读去回答一个小问题，就会继承它那些与自己无关的失败模式。
+    /// （0.2.7 起判据是 `tellStatus` 单查——比 `list()` 更小，同一论证只更成立。）
     ///
     /// 判别力：把 `remove` 的判据换回 `snapshot()` → 本条必红
     /// （`global()` 那趟 400 会直接把 `remove` 顶回去）。跑全套。
@@ -4807,6 +4898,8 @@ mod tests {
             match method.as_str() {
                 "aria2.tellActive" => rpc_ok(serde_json::json!([active_entry(gid)])),
                 "aria2.tellWaiting" | "aria2.tellStopped" => rpc_ok(serde_json::json!([])),
+                // 0.2.7 起停走判据走 tellStatus —— 这个任务在 aria2 那边是活着的
+                "aria2.tellStatus" => rpc_ok(serde_json::json!({"status": "active"})),
                 // 与"移除"毫不相干的一趟读，坏掉
                 "aria2.getGlobalStat" => rpc_err("getGlobalStat 挂了"),
                 "aria2.remove" => rpc_ok(serde_json::json!("OK")),
@@ -4829,6 +4922,150 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // 0.2.7：`remove` 的停走判据改 `tellStatus`（尾窗之后判据不能建立在列表上）
+    // -----------------------------------------------------------------------
+
+    /// 桩里的一条任务条目（线上形态：数值都是字符串），状态可指定。
+    fn task_entry(gid: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "gid": gid,
+            "status": status,
+            "totalLength": "0",
+            "completedLength": "0",
+            "downloadSpeed": "0",
+            "connections": "1",
+            "errorMessage": "",
+        })
+    }
+
+    /// 从桩的请求日志里取出方法名序列（断言「打没打对方法」）。
+    fn methods_of(srv: &StubHttp) -> Vec<String> {
+        srv.requests()
+            .iter()
+            .map(|r| method_and_params(&r.body).0)
+            .collect()
+    }
+
+    /// 🔴 **`remove` 的停走判据走 `tellStatus`，不是窗口里的列表**（0.2.7，规格 §4.2）：
+    /// `tellStopped` 取尾窗之后，`list()` 可能**看不到**老完成项——判据不能建立在窗口上。
+    ///
+    /// 夹具把「窗口外的完成项」做实：三条 `tell*` **都不返回它**（= 300 条尾窗之外），
+    /// 只有 `tellStatus` 说 `complete` ⇒ 必须发 `removeDownloadResult`。
+    ///
+    /// 判别力：把判据换回 `list()` → 本条必红（列表里没有它 ⇒ 走 `aria2.remove`，
+    /// 被桩里那句「不该走 aria2.remove」顶回来）。
+    #[test]
+    fn remove_judges_stopped_via_tell_status_even_outside_the_window() {
+        let gid = "cccccccccccccccc";
+        let srv = StubHttp::start_with(move |req| {
+            let (method, _) = method_and_params(&req.body);
+            match method.as_str() {
+                // 三条 tell* 都看不见它 —— 模拟「在 300 条尾窗之外」
+                "aria2.tellActive" | "aria2.tellWaiting" | "aria2.tellStopped" => {
+                    rpc_ok(serde_json::json!([]))
+                }
+                "aria2.getGlobalStat" => rpc_ok(serde_json::json!({
+                    "downloadSpeed": "0", "numActive": "0",
+                    "numWaiting": "0", "numStopped": "0",
+                })),
+                "aria2.tellStatus" => rpc_ok(serde_json::json!({"status": "complete"})),
+                "aria2.removeDownloadResult" => rpc_ok(serde_json::json!("OK")),
+                "aria2.remove" => rpc_err("不该走 aria2.remove（这一条已停止）"),
+                other => rpc_err(&format!("意外的方法: {other}")),
+            }
+        });
+        let d = stub_daemon(
+            &srv.base(),
+            "s",
+            BTreeMap::from([(gid.to_string(), "old.bin".to_string())]),
+        );
+
+        d.remove(gid)
+            .expect("tellStatus 说 complete 就必须走 removeDownloadResult 并成功");
+        assert!(
+            d.path_for(gid).is_none(),
+            "移除成功后映射必须被忘掉，实际仍是 {:?}",
+            d.path_for(gid)
+        );
+        let seen = methods_of(&srv);
+        assert!(
+            seen.iter().any(|m| m == "aria2.tellStatus"),
+            "判据必须来自 tellStatus，实际发过：{seen:?}"
+        );
+        assert!(
+            seen.iter().any(|m| m == "aria2.removeDownloadResult"),
+            "已停止的条目必须发 removeDownloadResult，实际发过：{seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|m| m == "aria2.remove"),
+            "已停止的条目不许发 aria2.remove，实际发过：{seen:?}"
+        );
+    }
+
+    /// `tellStatus` 400（GID 失效）⇒ 按「没停」走 `aria2.remove`，**错误原文照登**
+    /// ——既有语义逐字保留（「查不到就按没停，让 aria2 的错误原样带出去」）。
+    ///
+    /// ⚠️ 夹具故意让三条 `tell*` 把它报成 **complete**（= 若判据退回 `list()` 就会走
+    /// `removeDownloadResult`）：这样本条对「判据换了来源」也有判别力，不只是对
+    /// 「两支有没有接反」。
+    ///
+    /// 判别力：把判据换回 `list()` → 走 `removeDownloadResult`，拿到的是桩里那句
+    /// 「不该走 removeDownloadResult」，「错误原文照登」那条必红。
+    #[test]
+    fn remove_treats_tell_status_400_as_not_stopped_and_surfaces_remove_error() {
+        let gid = "dddddddddddddddd";
+        let srv = StubHttp::start_with(move |req| {
+            let (method, _) = method_and_params(&req.body);
+            match method.as_str() {
+                "aria2.tellActive" | "aria2.tellWaiting" => rpc_ok(serde_json::json!([])),
+                // 列表**会**把它说成 complete —— 判据若退回 list() 就走错支
+                "aria2.tellStopped" => rpc_ok(serde_json::json!([task_entry(gid, "complete")])),
+                "aria2.getGlobalStat" => rpc_ok(serde_json::json!({
+                    "downloadSpeed": "0", "numActive": "0",
+                    "numWaiting": "0", "numStopped": "1",
+                })),
+                // 判据：GID 失效的 400
+                "aria2.tellStatus" => rpc_err("GID dddddddddddddddd is not found"),
+                "aria2.removeDownloadResult" => {
+                    rpc_err("不该走 removeDownloadResult（GID 失效按没停处理）")
+                }
+                "aria2.remove" => rpc_err("Active Download not found for GID#dddddddddddddddd"),
+                other => rpc_err(&format!("意外的方法: {other}")),
+            }
+        });
+        let d = stub_daemon(
+            &srv.base(),
+            "s",
+            BTreeMap::from([(gid.to_string(), "keep.bin".to_string())]),
+        );
+
+        let err = d
+            .remove(gid)
+            .expect_err("aria2.remove 报错必须带出来，不能吞成 Ok(())");
+        assert!(
+            err.contains("Active Download not found for GID#dddddddddddddddd"),
+            "错误原文照登（必须是 aria2.remove 那句，不是判据那一查的）：{err:?}"
+        );
+        assert!(
+            d.path_for(gid).is_some(),
+            "失败路径上不许 forget——GID 在 aria2 那边还在，映射要留给下一次快照认人"
+        );
+        let seen = methods_of(&srv);
+        assert!(
+            seen.iter().any(|m| m == "aria2.tellStatus"),
+            "判据必须来自 tellStatus，实际发过：{seen:?}"
+        );
+        assert!(
+            seen.iter().any(|m| m == "aria2.remove"),
+            "GID 失效按没停处理 ⇒ 必须走 aria2.remove，实际发过：{seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|m| m == "aria2.removeDownloadResult"),
+            "没停的条目不许发 removeDownloadResult，实际发过：{seen:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // 结构性不适用清单（对应 Go 的测试，逐条判定后**不移植**）
     // -----------------------------------------------------------------------
 
@@ -4839,9 +5076,10 @@ mod tests {
     // 等于把一条已经不存在的边界画回图上。
 
     // ⚠️ 传输列表动作**没有可移植的测试源**：Go 内核没有 `pause`/`unpause`/`remove`
-    // 的封装（设计规格 §8.4：这一段是相对 Go 版的新增）。本节的 **8** 条测试（任务 11
-    // 首轮 5 条 + 修复轮 1 的 `Removed` 1 条 + 修复轮 2 的桩测试 2 条）+ `rpc.rs`
-    // 那一节的 10 条 = **18 条**全部是**新写**的，按全局约束 6 在报告里逐条记账。
+    // 的封装（设计规格 §8.4：这一段是相对 Go 版的新增）。本节的 **11** 条测试（任务 11
+    // 首轮 5 条 + 修复轮 1 的 `Removed` 1 条 + 修复轮 2 的桩测试 2 条 + 0.2.7 的
+    // `tellStatus` 判据 2 条 + 终审修复波的尾窗 forget 1 条）+ `rpc.rs` 那一节的 10 条
+    // = **21 条**全部是**新写**的，按全局约束 6 在报告里逐条记账。
     //
     // ⚠️ **这个数字是活账**：再加测试时必须同步改这里。数字错了，下一个人就核不上账，
     // 而"记账"这条约束的全部价值就在于它**能被核对**。

@@ -474,6 +474,13 @@ fn enqueue_with(session: &Arc<Session>, paths: Vec<String>) -> Value {
         }
     }
     session.set_last_error(None);
+    // ⚠️ **全部块都成功 ⇒ 引擎在跑**（对齐 macOS 入队尾部的 `if allSent { engine =
+    //    .running }`，`AppModel.swift:1822` —— 成功 ⇒ 内核在 `op_enqueue` 里已经
+    //    `ensure_engine` 过了）。走到这里必然全成功：任何一块失败都在上面提前 `return`，
+    //    那时 `note_failure` 刚写下的结论（`.unavailable` / `.notStarted`）才是事实，
+    //    不许被这行覆盖。
+    //    ⚠️ 少了这一行，入队之后徽标停在「引擎未启动」而列表已在下载（2026-10-14 现场）。
+    session.set_engine(EngineState::Running);
     api::enqueue::enqueue(&EnqueueFeedback::of(&merged))
 }
 
@@ -539,17 +546,31 @@ fn batch_control(rows: &[TransferRow]) -> shell_core::presentation::batch_contro
 ///    而闸门是 `state().allows_requests`（`EngineGate`，规格 §3.5）。
 #[tauri::command(async)]
 pub fn transfers(app: tauri::State<'_, Shell>) -> Value {
-    let Some(client) = app.session.client() else {
+    transfers_with(&app.session)
+}
+
+/// `transfers` 的**命令体**（[`transfers`] 的唯一实现，单测直接调它 —— Tauri 的
+/// `State` 只有运行时造得出来，同 [`enqueue_with`] 的拆法）。
+fn transfers_with(session: &Arc<Session>) -> Value {
+    let Some(client) = session.client() else {
         return api::envelope::err(api::NO_KERNEL);
     };
     // ⚠️ 空列表那句话要用到引擎态 ⇒ 先取一份快照（锁只在这一行里）。
-    let engine = app.session.view().engine;
-    // ⚠️ 先取出这一拍的结局再 `match`（`flips_engine_to_not_started` 要读它，
-    //    而那两处**在同一臂里**：一臂拿走了 `poll` 就没法再问它了）。
+    let engine = session.view().engine;
+    // ⚠️ 两个翻格判据**先算出来再 `match`**：`Snapshot` 臂按值拿走了 `result` 之后
+    //    `poll` 就动不了了。判据本身住在 `TransferPoll`（四档各有一条用例钉着）。
     let poll = kernel::transfer_list(&client);
+    let promote_running = poll.promotes_engine_to_running();
+    let flip_not_started = poll.flips_engine_to_not_started();
     match poll {
         TransferPoll::Snapshot(result) => {
-            app.session.set_last_error(None);
+            session.set_last_error(None);
+            // ⚠️ **成功 ⇒ 引擎在跑**（同 `task_action` 那一行；判据与四档表在
+            //    `TransferPoll::promotes_engine_to_running`）。少了这一行，列表在
+            //    下载、徽标停在「引擎未启动」（2026-10-14 现场的那条缺口）。
+            if promote_running {
+                session.set_engine(EngineState::Running);
+            }
             let rows: Vec<TransferRow> = result.items.iter().map(TransferRow::new).collect();
             api::transfers::transfers(
                 &rows,
@@ -570,8 +591,8 @@ pub fn transfers(app: tauri::State<'_, Shell>) -> Value {
             //    ⚠️ 它**不影响**闸门：`EngineGate::allows_requests` 对 `NotStarted` 与
             //    `Running` 都给 `true`（那一格回答的是"能不能发请求"，而 `enqueue` 正是
             //    靠 `NotStarted` 放行才会去起引擎的）。
-            if poll.flips_engine_to_not_started() {
-                app.session.note_engine_not_started();
+            if flip_not_started {
+                session.note_engine_not_started();
             }
             api::transfers::transfers(&[], None, TransferListEmpty::of(&engine), &batch_control(&[]))
         }
@@ -583,11 +604,11 @@ pub fn transfers(app: tauri::State<'_, Shell>) -> Value {
         //    ⚠️ 这一档**不碰 `last_error`**：macOS 的 `absorb` 把它当 `.absorbed`
         //    （正常态、不显示那句话），我们照办 —— 界面上的表现就是**空态**，不是红横幅。
         TransferPoll::NoDelivery => {
-            app.session.reset_to_empty_state();
+            session.reset_to_empty_state();
             api::transfers::transfers(&[], None, TransferListEmpty::of(&engine), &batch_control(&[]))
         }
         TransferPoll::Failed(why) => {
-            note_failure(&app.session, &why);
+            note_failure(session, &why);
             api::failure(&why)
         }
     }
@@ -1264,12 +1285,104 @@ pub fn history_put(entry: shell_core::api::history::HistoryWrite) -> Value {
         Ok(path) => path,
         Err(why) => return api::envelope::err(&why),
     };
-    let history = History::load(&path);
-    let updated = api::history::apply(&history, &entry, current_unix_seconds());
-    if let Err(cause) = updated.save(&path) {
-        return api::envelope::err(&api::history::write_failed(&cause.to_string()));
+    match write_history_entry(&path, &entry) {
+        Ok(updated) => api::history::payload(&updated),
+        Err(cause) => api::envelope::err(&api::history::write_failed(&cause)),
     }
-    api::history::payload(&updated)
+}
+
+/// 写一条历史的**唯一胶水**（判据在 `api::history::apply`，落盘在 `History::save`）。
+///
+/// ⚠️ 三个调用点（`history_put` / `record_loaded_batch_in` / `remembered_code_in`）
+///    都从这里过 —— "怎么写一条历史"不许长出第二份。
+fn write_history_entry(
+    path: &std::path::Path,
+    entry: &shell_core::api::history::HistoryWrite,
+) -> Result<History, String> {
+    let history = History::load(path);
+    let updated = api::history::apply(&history, entry, current_unix_seconds());
+    updated.save(path).map_err(|cause| cause.to_string())?;
+    Ok(updated)
+}
+
+/// 一次**成功**的加载之后把它记进批次历史（对齐 macOS `AppModel.recordLoadedBatch`）。
+///
+/// ⚠️ **只在成功那一支调**（`spawn_load` 的 `Ok` 臂），与内核 `remember_last_code`
+///    的时机一致：失败的加载写进去，历史里就会堆满打错的码。
+/// ⚠️ 记的是**这次请求用的** `base_url`（不是内核回显的 `info.base_url`）——
+///    回显那份在"用户没指定"时是内核的默认交付服务器，写进历史、下次再显式传回去，
+///    会在**内核默认值变化时静默分叉**（E-5 的同一条纪律）。
+/// ⚠️ **调用点没有判据**（同 `remember_for_redaction` 的诚实记账）：判它要写真的
+///    `%APPDATA%` 历史文件，越过本仓对测试的底线 ⇒ 被钉住的是 `_in` 那一层，
+///    "调用点有没有被走到"只有真机验收能回答。与 macOS 的一处**有意差异**：
+///    那边写盘失败有常驻提示行（`historyWriteFailure`），我们这一侧的记录发生在
+///    **后台线程**、没有可挂的回执 ⇒ 落 `diag-shell.log`（导出可见），不打断加载、不上屏。
+pub fn record_loaded_batch(code: &str, base_url: &str) {
+    let outcome = match history_path() {
+        Ok(path) => record_loaded_batch_in(&path, code, base_url),
+        Err(why) => Err(why),
+    };
+    if let Err(why) = outcome {
+        shell_core::diagnostics::log("history_write_failed", &[("why", why)]);
+    }
+}
+
+/// [`record_loaded_batch`] 的可测内核（路径是参数，测试用临时目录）。
+fn record_loaded_batch_in(
+    path: &std::path::Path,
+    code: &str,
+    base_url: &str,
+) -> Result<(), String> {
+    let entry = shell_core::api::history::HistoryWrite::Used {
+        code: code.to_string(),
+        base_url: base_url.to_string(),
+        note: None,
+    };
+    write_history_entry(path, &entry).map(|_| ())
+}
+
+/// 自动加载「记住的交付码」用哪个码（对齐 macOS `AppModel.rememberedCode()`，E-4）。
+///
+/// **权威只有一个：**
+/// - 壳的历史非空 ⇒ 用它最近使用的那条（`base_url` 一起带回去）；内核的 `last_code`
+///   **一个字都不读** —— 要防的分裂是"界面显示 A（壳的历史）、内核却自动加载 B"。
+/// - 壳的历史为空（第一次升级、用户删了文件）⇒ 读内核的 `last_code` 作为**一次性种子**，
+///   写进历史，之后不再读它（"先落下再加载"——这样"之后壳不再读它"才是一条真的承诺）。
+/// - 两个来源都没有 ⇒ `None`："没有任何码可加载 ⇒ 一个请求都不发"。
+///
+/// ⚠️ **调用点没有判据**（同 [`record_loaded_batch`]）：真历史在 `%APPDATA%`。
+///    ⚠️ 内核那个值可能带结尾换行（macOS 逐字注明）：trim 之后再当历史的主键用 ——
+///    带空白的主键会让"同一个码"看起来是两条。
+pub fn remembered_code(kernel_last_code: &str) -> Option<(String, String)> {
+    let path = history_path().ok()?;
+    remembered_code_in(&path, kernel_last_code)
+}
+
+/// [`remembered_code`] 的可测内核（路径是参数，测试用临时目录）。
+fn remembered_code_in(
+    path: &std::path::Path,
+    kernel_last_code: &str,
+) -> Option<(String, String)> {
+    let history = History::load(path);
+    if let Some(newest) = history.most_recent() {
+        let base_url = newest.base_url_or_nil().unwrap_or("").to_string();
+        return Some((newest.code.clone(), base_url));
+    }
+    let seed = kernel_last_code.trim();
+    if seed.is_empty() {
+        return None;
+    }
+    // 播种（先落下再加载）：写失败不改结论 —— 那是内核记着的那个码（不是用户打错的），
+    // 下一次启动还会再播一次；macOS 的 `writeHistory` 同样不抛。
+    let entry = shell_core::api::history::HistoryWrite::Used {
+        code: seed.to_string(),
+        base_url: String::new(),
+        note: None,
+    };
+    if let Err(why) = write_history_entry(path, &entry) {
+        shell_core::diagnostics::log("history_write_failed", &[("why", why)]);
+    }
+    Some((seed.to_string(), String::new()))
 }
 
 /// 两份许可全文（规格 §3.4 第十五行）。
@@ -1588,6 +1701,7 @@ mod tests {
     //!    `session.rs` 里那些用例是同一个形状。
 
     use super::*;
+    use shell_core::api::history::HistoryWrite;
     use shell_core::client::{ClientError, CoreClient, LineChannel};
     use shell_core::protocol::{
         DeliveryInfo, FileNode, FileState, FlatEntry, Progress, TreeResult, TreeNode,
@@ -2310,5 +2424,213 @@ mod tests {
             "这些命令是同步的、却会阻塞地问内核 ⇒ 它们跑在主线程上，窗口会「未响应」。\
              处置：把 `#[tauri::command]` 改成 `#[tauri::command(async)]`（签名不用动）。\n{offenders:#?}"
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // 引擎徽标：成功 ⇒ 「运行中」（2026-10-14 现场缺口的接线用例）
+    // ------------------------------------------------------------------------
+
+    /// 一条**固定回一句**的内核通道：回 `transfer_list` 形状的快照回执。
+    ///
+    /// 与 [`Recording`] 的区别只在回执的形状（`enqueue` 的回执解不出
+    /// `TransferListResult`）。`{id}` 占位符换成该条请求的 id（同 `Recording` 的账法）。
+    #[derive(Clone)]
+    struct Saying {
+        reply: String,
+        written: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Saying {
+        fn new(reply: &str) -> Saying {
+            Saying {
+                reply: reply.to_string(),
+                written: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl LineChannel for Saying {
+        fn write_line(&self, line: &str) -> Result<(), ClientError> {
+            self.written.lock().unwrap().push(line.to_string());
+            Ok(())
+        }
+
+        fn read_line(&self) -> Result<Option<String>, ClientError> {
+            let id = self.written.lock().unwrap().len();
+            Ok(Some(self.reply.replace("{id}", &id.to_string())))
+        }
+
+        fn close(&self) {}
+    }
+
+    /// 一条空的传输快照回执（`items: []` + 全零 `global` —— `kernel.rs` 同款夹具）。
+    const AN_EMPTY_SNAPSHOT: &str = r#"{"id":{id},"ok":true,"result":{"items":[],"global":{"download_speed":0,"num_active":0,"num_waiting":0,"num_stopped":0}}}"#;
+
+    /// 🔴 **成功的传输快照 ⇒ 引擎徽标翻「运行中」**（对齐 macOS `fetchTransfers`
+    ///    的 `if engine != .running { engine = .running }`，`AppModel.swift:1642`）。
+    ///
+    /// 2026-10-14 现场（诊断日志 061520）就是这条缺口的形状：`task_action` 有这一行、
+    /// 200 ms 轮询没有 ⇒ **列表明明在下载、徽标停在「引擎未启动」**，而且没有任何
+    /// 东西变红（图标与文案都是既有判据算的，只是输入那一格过期了）。
+    ///
+    /// 判别力：去掉 `Snapshot` 臂那一行 ⇒ 本条红。
+    #[test]
+    fn a_transfer_snapshot_promotes_the_engine_badge_to_running() {
+        let ch = Saying::new(AN_EMPTY_SNAPSHOT);
+        let session = Arc::new(Session::new());
+        session.install_client(
+            Arc::new(CoreClient::new(Box::new(ch))),
+            r#"{"protocol":1}"#.to_string(),
+        );
+        session.set_engine(EngineState::NotStarted);
+
+        let _ = transfers_with(&session);
+
+        assert_eq!(
+            session.view().engine,
+            EngineState::Running,
+            "快照到达 ⇔ 引擎真的在跑 —— 徽标必须跟着翻"
+        );
+    }
+
+    /// 🔴 **全部块入队成功 ⇒ 引擎徽标翻「运行中」**（对齐 macOS 入队尾部的
+    ///    `if allSent { engine = .running }`，`AppModel.swift:1822` —— 成功 ⇒
+    ///    内核在 `op_enqueue` 里已经 `ensure_engine` 过了）。
+    ///
+    /// 判别力：去掉 `enqueue_with` 成功尾部那一行 ⇒ 本条红。
+    #[test]
+    fn a_fully_sent_enqueue_promotes_the_engine_badge_to_running() {
+        let paths = v(&["a.bin", "b.bin"]);
+        let (session, _ch) = a_session_with(LoadState::Loaded(a_batch_of(&paths)));
+        session.set_engine(EngineState::NotStarted);
+
+        let value = enqueue_with(&session, paths);
+
+        assert_eq!(value["ok"], serde_json::json!(true), "{value}");
+        assert_eq!(
+            session.view().engine,
+            EngineState::Running,
+            "全部块都发成功 ⇒ 引擎在跑（内核 ensure_engine 过）"
+        );
+    }
+
+    /// **部分失败不得翻「运行中」**：那一格上刚被 `note_failure` 写下的失败结论
+    /// （`.unavailable` / `.notStarted` / 错误原文）是这次动作的结论，不能被覆盖
+    /// （与 macOS `if allSent` 的条件逐字同款）。
+    #[test]
+    fn a_partially_sent_enqueue_does_not_claim_the_engine_is_running() {
+        let huge = an_over_budget_set();
+        let selection = huge[..huge.len() - 1].to_vec();
+        let (session, _channel) = a_session_failing_at_the_second_chunk(false, &huge);
+        session.set_engine(EngineState::NotStarted);
+
+        let _ = enqueue_with(&session, selection);
+
+        assert_ne!(
+            session.view().engine,
+            EngineState::Running,
+            "只有全部块成功才能断言引擎可用"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // 批次历史：「记住交付码」（规格 §8.3 / 阶段 E-4，2026-10-14 现场缺口）
+    // ------------------------------------------------------------------------
+
+    /// 一个**临时的**历史文件路径（按 `export.rs` 的 `a_temp_dir` 同款账法）。
+    /// 每条用例自己一个名字 ⇒ 并行跑也互不干扰。
+    fn a_temp_history_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "benagen-history-{tag}-{}.json",
+            std::process::id()
+        ))
+    }
+
+    /// 🔴 **一次成功的加载记「又用了一次」，记的是请求里的那个 base_url**
+    ///    （对齐 macOS `AppModel.recordLoadedBatch` —— 不是内核回显的 `info.base_url`：
+    ///    回显那份在"用户没指定"时是内核的**默认**服务器，写进历史再显式发回去，
+    ///    会在内核默认值变化时静默分叉，E-5 明禁）。
+    #[test]
+    fn a_successful_load_is_recorded_with_the_requested_base_url() {
+        let path = a_temp_history_path("record");
+        let _ = std::fs::remove_file(&path);
+
+        record_loaded_batch_in(&path, "C24-8", "https://user.example").expect("写历史不该失败");
+
+        let history = History::load(&path);
+        let newest = history.most_recent().expect("历史里必须有刚记的那一条");
+        assert_eq!(newest.code, "C24-8");
+        assert_eq!(newest.base_url, "https://user.example");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 🔴 **E-4：历史非空 ⇒ 自动加载最近使用的那一条**（内核 `last_code` 一个字都不读 ——
+    ///    权威只有一个，"界面显示 A、内核却自动加载 B"是它要防的分裂）。
+    #[test]
+    fn remembered_code_prefers_the_histories_most_recent() {
+        let path = a_temp_history_path("most-recent");
+        let _ = std::fs::remove_file(&path);
+        write_history_entry(
+            &path,
+            &HistoryWrite::Used {
+                code: "旧-1".into(),
+                base_url: "https://old.example".into(),
+                note: None,
+            },
+        )
+        .expect("写历史不该失败");
+        write_history_entry(
+            &path,
+            &HistoryWrite::Used {
+                code: "新-2".into(),
+                base_url: "https://new.example".into(),
+                note: None,
+            },
+        )
+        .expect("写历史不该失败");
+
+        let got = remembered_code_in(&path, "内核-说-别的").expect("该有码可加载");
+
+        assert_eq!(
+            got,
+            ("新-2".to_string(), "https://new.example".to_string()),
+            "历史非空 ⇒ 用最近一条（base_url 跟着回去），内核 last_code 不参与"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 🔴 **E-4：历史为空 ⇒ 内核 `last_code` 播种一次**（macOS `rememberedCode` 的
+    ///    "先落下再加载"：种子落进历史之后，壳不再读内核那份做决策）。
+    ///    ⚠️ 内核那个值可能带结尾换行（macOS 逐字注明）：trim 之后再当主键用。
+    #[test]
+    fn remembered_code_seeds_the_kernel_last_code_when_history_is_empty() {
+        let path = a_temp_history_path("seed");
+        let _ = std::fs::remove_file(&path);
+
+        let got = remembered_code_in(&path, "C24-8\n").expect("播种之后该有码可加载");
+
+        assert_eq!(
+            got,
+            ("C24-8".to_string(), String::new()),
+            "trim 之后当主键；base_url 空 = 默认服务器"
+        );
+        let history = History::load(&path);
+        let newest = history
+            .most_recent()
+            .expect("播种必须先落盘（之后壳不再读内核那份）");
+        assert_eq!(newest.code, "C24-8");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **什么都没有 ⇒ 一个请求都不发**（"没有任何码可加载"是它的正常态）；
+    /// 也**不许**凭空造一个历史文件。
+    #[test]
+    fn remembered_code_is_silent_when_there_is_nothing_to_remember() {
+        let path = a_temp_history_path("nothing");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(remembered_code_in(&path, "  \n"), None, "空白的 last_code 不是码");
+        assert_eq!(remembered_code_in(&path, ""), None, "空串更不是");
+        assert!(!path.exists(), "没有码可加载时不该造出历史文件");
     }
 }

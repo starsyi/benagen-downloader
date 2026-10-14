@@ -1042,6 +1042,15 @@ fn poll_once(
 ///
 /// 抽出来是因为有两处要它：常规的 [`poll_once`]，以及复核不成立那一支
 /// （那里必须是 [`call_full`] —— 它要按**具体的码**分派，见那个函数的说明）。
+///
+/// ⚠️ **计数全部取自 `items` 的行**，没读 `global`（`getGlobalStat`）——0.2.7 的
+/// `tellStopped` 尾窗（最近 300 条）会让 **>300 个已结束文件**的批次里
+/// `done_files`/`total_files`/字节合计只反映最近这一窗（进度行『已下 X/Y』是近似值）。
+/// `getGlobalStat` 也救不了它：那上面没有按状态分解、没有字节总计，
+/// **要全量得接 `global` + UI 分页**（规格 §5 留给下一轮；行为登记见
+/// `windows/README.md` / `macos/README.md` 的 0.2.7 节）。
+/// **完成判定与最终成败汇总不受影响**——它们分别走 waiting/active 行（窗口外的
+/// 已结束项不活跃）与 `get_tree` 的 `flat`（全量），见 [`converged`] / [`success_tally`]。
 fn tally(tl: &Value) -> (usize, usize, progress::View) {
     let items = items_of(tl);
     let state_of = |i: &Value| {

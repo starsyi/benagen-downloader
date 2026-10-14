@@ -156,12 +156,32 @@ impl TransferPoll {
     /// |---|---|---|
     /// | [`TransferPoll::Absorbed`]（`engine_not_started`） | **翻** | 内核刚说"引擎没起来"，而徽标是用户照着判断"任务在跑"的那一格 |
     /// | [`TransferPoll::NoDelivery`]（`no_delivery`） | 不翻 | 那是"这一批没了"，与引擎在不在跑无关 |
-    /// | [`TransferPoll::Snapshot`] / [`TransferPoll::Failed`] | 不翻 | 成功的快照自己带着状态；失败那一档走另一条路（`commands::note_failure`） |
+    /// | [`TransferPoll::Snapshot`] / [`TransferPoll::Failed`] | 不翻 | 快照那一档走**反方向**（[`Self::promotes_engine_to_running`]）；失败那一档走另一条路（`commands::note_failure`） |
     ///
     /// ⚠️ 它做成 `TransferPoll` 的**方法**（而不是写在命令层那个 `match` 里）：
     ///    判据要能被单测钉住（四档各断一条），命令层只留"翻一下"那一行。
     pub fn flips_engine_to_not_started(&self) -> bool {
         matches!(self, TransferPoll::Absorbed)
+    }
+
+    /// 这一拍的结局**要不要把引擎那一格翻成「运行中」**（`true` = 要）—— 上一条的反方向。
+    ///
+    /// **对齐 macOS**：`fetchTransfers` 拿到快照之后的
+    /// `if engine != .running { engine = .running }`（`AppModel.swift:1642`）——
+    /// 判据是那一行上方的原话："**拿到了快照 ⇔ 内核的引擎真的在跑**
+    /// （`op_transfer_list` 走 `read_engine`，没有引擎它只会回 `engine_not_started`）"。
+    ///
+    /// 🔴 **它曾经整条缺着**（2026-10-14 现场，诊断日志 061520）：四档的旧表里
+    /// `Snapshot` 那一行写着"不翻 | 成功的快照自己带着状态"——那说的是**不翻「未启动」**，
+    /// 被读成了"什么都不用做"。于是列表每一拍都在下载、徽标停在「引擎未启动」，
+    /// 而**没有任何东西会变红**（图标与文案都是既有判据算的，只是输入那一格过期了）。
+    ///
+    /// | 结局 | 翻不翻 | 为什么 |
+    /// |---|---|---|
+    /// | [`TransferPoll::Snapshot`] | **翻** | 快照到达 ⇔ 引擎真的在跑（判据同上） |
+    /// | [`TransferPoll::Absorbed`] / [`TransferPoll::NoDelivery`] / [`TransferPoll::Failed`] | 不翻 | 前两档与"引擎在跑"无关或正相反；失败那一档不证明引擎在跑 |
+    pub fn promotes_engine_to_running(&self) -> bool {
+        matches!(self, TransferPoll::Snapshot(_))
     }
 }
 
@@ -635,6 +655,50 @@ mod tests {
         assert!(
             !transfer_list(&client).flips_engine_to_not_started(),
             "失败那一档走 `note_failure`，不在这里翻"
+        );
+    }
+
+    /// 🔴 **四档各自要不要把引擎那一格翻成「运行中」** —— 上一条的反方向（2026-10-14 补）。
+    ///
+    /// 真机形态（诊断日志 20261014-061520）：轮询每一拍都拿到成功快照、列表在下载，
+    /// 徽标却停在「引擎未启动」—— 因为**成功的快照从来没被接去翻「运行中」**
+    /// （对位 macOS `fetchTransfers` 的 `if engine != .running { engine = .running }`，
+    /// `AppModel.swift:1642`）。那句旧注释"成功的快照自己带着状态"说的是
+    /// **不翻「未启动」**的方向，被误读成了"什么都不用做"。
+    ///
+    /// 判别力：把 `Snapshot` 漏掉（修回原样）⇒ 第一条红；把 `Absorbed` 也判成 `true`
+    /// ⇒ 第二条红 —— 而真机上的表现是"引擎还没起来，徽标倒先说「运行中」"。
+    #[test]
+    fn only_the_snapshot_outcome_promotes_the_engine_slot_to_running() {
+        let ch = Scripted::new(&[&ok_reply(
+            1,
+            r#"{"items":[],"global":{"download_speed":0,"num_active":0,"num_waiting":0,"num_stopped":0}}"#,
+        )]);
+        let client = CoreClient::new(Box::new(ch));
+        assert!(
+            transfer_list(&client).promotes_engine_to_running(),
+            "快照到达 ⇔ 引擎真的在跑（op_transfer_list 走 read_engine，没引擎只会回 engine_not_started）"
+        );
+
+        let ch = Scripted::new(&[&err_reply(1, "engine_not_started", "正常态")]);
+        let client = CoreClient::new(Box::new(ch));
+        assert!(
+            !transfer_list(&client).promotes_engine_to_running(),
+            "内核亲口说「引擎没起来」——不许在同一拍把徽标翻成「运行中」"
+        );
+
+        let ch = Scripted::new(&[&err_reply(1, "no_delivery", "这一批没了")]);
+        let client = CoreClient::new(Box::new(ch));
+        assert!(
+            !transfer_list(&client).promotes_engine_to_running(),
+            "「这一批没了」与引擎在不在跑无关"
+        );
+
+        let ch = Scripted::new(&[&err_reply(1, "engine_rpc_failed", "一次可重试的报错")]);
+        let client = CoreClient::new(Box::new(ch));
+        assert!(
+            !transfer_list(&client).promotes_engine_to_running(),
+            "失败那一档不证明引擎在跑"
         );
     }
 

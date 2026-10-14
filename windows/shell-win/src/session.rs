@@ -51,6 +51,17 @@ pub use shell_core::session_view::SessionView;
 pub type Connector =
     dyn Fn() -> Result<(std::sync::Arc<CoreClient>, String), String> + Send + Sync + 'static;
 
+/// 「记住的交付码」的查询口（对齐 macOS `AppModel.rememberedCode()`，E-4 判据）。
+///
+/// 入参 = 内核 `hello` 回执里的 `last_code`（壳历史为空时的**播种源**）；
+/// 出参 = 要自动加载的 `(code, base_url)`；`None` = 没有任何码可加载，一个请求都不发。
+///
+/// ⚠️ 与 [`Connector`] 同一手法装进来（`main.rs` 起 Tauri 之前）：判据要读**真的**
+///    历史文件（`%APPDATA%`），而测试必须能把整只手换成假的 —— 不注入的话，
+///    `spawn_connect` 的用例会跟着跑真机器上的历史走（那正是"测试看着真环境变色"
+///    的形状）。判据本身在 `commands::remembered_code`（真那只）与用例的闭包（假那些）。
+pub type RememberedLookup = dyn Fn(&str) -> Option<(String, String)> + Send + Sync + 'static;
+
 struct Inner {
     client: Option<Arc<CoreClient>>,
     engine: EngineState,
@@ -60,6 +71,8 @@ struct Inner {
     handshake_reply: Option<String>,
     /// 「找内核 + 握手」的注入点。`None` = 还没装（见 [`Session::connector`]）。
     connector: Option<Arc<Connector>>,
+    /// 「记住的交付码」的查询口（见 [`RememberedLookup`]）。`None` = 还没装 ⇒ 不自动加载。
+    remembered_lookup: Option<Arc<RememberedLookup>>,
     /// **当前那一批是怎么加载进来的**：`(code, base_url)`，`base_url` 是**我们发出去的那一份**。
     ///
     /// ⚠️ **它存在的唯一理由是"内核重启之后要重放这一批"**（见 [`Session::remember_load_request`]）。
@@ -88,12 +101,17 @@ pub struct Session {
     /// `restartIfAllowed`/`retryEngine` 同一套语义（`AppModel.swift:1948-1970`）。
     /// ⚠️ **成功的重启不复位**：那会在"重启也失败"时变成自我续命循环。
     auto_restart_attempted: AtomicBool,
+    /// 启动自动加载「记住的交付码」的预算。**进程级只跑一次**（对齐 macOS 的
+    /// "应用级启动：握手 + 自动加载记住的交付码。只跑一次"）—— 领过就不再领，
+    /// **不复位**：内核重启/重试走的是**重放**（`load_request`），不是这一趟。
+    startup_auto_load_claimed: AtomicBool,
 }
 
 impl Session {
     pub fn new() -> Session {
         Session {
             auto_restart_attempted: AtomicBool::new(false),
+            startup_auto_load_claimed: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 client: None,
                 engine: EngineState::Connecting,
@@ -102,6 +120,7 @@ impl Session {
                 fallback_notice: None,
                 handshake_reply: None,
                 connector: None,
+                remembered_lookup: None,
                 load_request: None,
                 handover: None,
             }),
@@ -258,6 +277,26 @@ impl Session {
         self.inner.lock().expect("会话锁中毒").connector.clone()
     }
 
+    /// 取「记住的交付码」的查询口（`spawn_connect` 的启动那一趟用，见 [`RememberedLookup`]）。
+    pub fn remembered_lookup(&self) -> Option<Arc<RememberedLookup>> {
+        self.inner.lock().expect("会话锁中毒").remembered_lookup.clone()
+    }
+
+    /// 装「记住的交付码」的查询口（`main.rs` 在起 Tauri 之前调，同 [`Self::set_connector`]）。
+    pub fn set_remembered_lookup(&self, lookup: Arc<RememberedLookup>) {
+        self.inner.lock().expect("会话锁中毒").remembered_lookup = Some(lookup);
+    }
+
+    /// 领一次启动自动加载的预算。第一次 `true`，之后永远 `false`（**不复位**）。
+    ///
+    /// ⚠️ 领取点在 `spawn_connect` 的**成功**那一支、且**没有批次要重放**时：
+    ///    首次连接失败不算（"重试"那一次才是真正的启动连接）；有批次要重放时
+    ///    重放赢、也不领（`a_replay_wins_over_the_startup_auto_load` 钉着次序）。
+    ///    领过之后，内核重启/重试一律不再自动加载 —— 那些趟走的是重放，不是启动。
+    pub fn claim_startup_auto_load(&self) -> bool {
+        !self.startup_auto_load_claimed.swap(true, Ordering::SeqCst)
+    }
+
     /// **记下"当前这一批是用什么请求加载进来的"**（`spawn_load` 成功那一支调它）。
     ///
     /// ## 🔴 为什么要记，而且记的必须是**我们发出去**的那一份
@@ -366,6 +405,18 @@ fn remember_for_redaction(client: &CoreClient, code: Option<&str>) {
     client.set_redactions(secrets);
 }
 
+/// `hello` 回执里的 `last_code`（E-4 的播种源）。解不出 ⇒ 空串（不播种，正常态）。
+///
+/// ⚠️ 回执是**内核真发的那两个键**（`{"settings":…,"last_code":…}`，两个 op 都发）——
+///    走 `SettingsResult` 的**有类型**解码（键名对不上就是解不出，不猜、不取半截）。
+///    ⚠️ 空串是合法值（内核还没记过任何码），与"解不出"同归空串：两者对 E-4 的
+///    后果一样（没有种子），不必分开。
+fn hello_last_code(reply: &str) -> String {
+    serde_json::from_str::<shell_core::protocol::SettingsResult>(reply)
+        .map(|result| result.last_code)
+        .unwrap_or_default()
+}
+
 /// 起一条后台线程做一次 `load_delivery`，结果落回 `session.load`（D6）。
 ///
 /// ⚠️ **锁的纪律**：本函数**先**把 `client` 克隆出来（调用方已经克隆过了），
@@ -390,8 +441,14 @@ pub fn spawn_load(session: &Arc<Session>, client: Arc<CoreClient>, code: String,
                     //    再落加载态。下次内核重启时要按这一格重放（见 `remember_load_request`）。
                     //    ⚠️ 顺序无所谓（读者是另一条线程、且它读的是"这一批在不在"），
                     //    但**必须一起写** —— 落了 `Loaded` 而没有记请求，重启之后就静默不重放了。
-                    worker.remember_load_request(code, base_url);
+                    worker.remember_load_request(code.clone(), base_url.clone());
                     worker.set_load(LoadState::Loaded(info));
+                    // 🔴 **成功加载 ⇒ 记进批次历史**（对齐 macOS `AppModel.recordLoadedBatch`，
+                    //    规格 §1.2）：**只在这一支**记（失败的不记 —— 否则历史里会堆满
+                    //    打错的码）；记的是**这次请求用的** `base_url`（E-5）。
+                    //    少了这半边，历史永远是空的 ⇒ 换码面板没有历史行、启动也没有码
+                    //    可自动加载 —— 2026-10-14 现场那条"每次重开都要重输"的另一半根因。
+                    crate::commands::record_loaded_batch(&code, &base_url);
                     // 换目录的交接若还在等一份清单，现在清单到了：就办。
                     if let Some(old_dir) = worker.take_handover() {
                         crate::batch::mark_handover(&worker, old_dir);
@@ -487,6 +544,10 @@ pub fn spawn_connect(session: &Arc<Session>) {
         .spawn(move || match connector() {
             Ok((client, reply)) => {
                 let replay = worker.load_request();
+                // 🔴 **`hello` 回执里的 `last_code` 只有此刻拿得到**（`reply` 随后被
+                //    `install_client` 收走存档）——它是 E-4 的**播种源**（壳历史为空时用）。
+                //    解不出（回执形状不对）⇒ 空串 ⇒ 不播种（`remembered_code` 的正常态）。
+                let kernel_last_code = hello_last_code(&reply);
                 // 🔴 **新连接 = 空的可抹清单**（`set_redactions` 挂在连接上，不是进程全局）
                 //    ⇒ 这里必须**立刻**重推一遍，否则"换了下载目录 ⇒ 重启内核"之后，
                 //    新连接上再没有东西挡着客户目录名了（`remember_for_redaction` 的文档）。
@@ -514,6 +575,21 @@ pub fn spawn_connect(session: &Arc<Session>) {
                 if let Some((code, base_url)) = replay {
                     worker.set_load(LoadState::Loading);
                     spawn_load(&worker, client, code, base_url);
+                // 🔴 **没有批次要重放的那一趟：自动加载「记住的交付码」**
+                //    （规格 §8.3，对齐 macOS `AppModel.loadRememberedDelivery` ——
+                //    **只跑一次**，预算在 [`Session::claim_startup_auto_load`]）。
+                //    2026-10-14 现场：这半边整个**从来没被移植** ⇒ Windows 每次重开
+                //    软件都要重新输一次交付码（macOS 一开就是上一次那批）。
+                //    ⚠️ 判据（用哪个码 / 要不要拿 `last_code` 播种）在注入的那一手
+                //    里面（E-4）；这里只负责"有码就加载"。判据答 `None` 是正常态
+                //    （第一次运行、什么都没记过）—— 一个请求都不发，空态页原样留着。
+                } else if worker.claim_startup_auto_load() {
+                    if let Some(lookup) = worker.remembered_lookup() {
+                        if let Some((code, base_url)) = lookup(&kernel_last_code) {
+                            worker.set_load(LoadState::Loading);
+                            spawn_load(&worker, client, code, base_url);
+                        }
+                    }
                 }
                 // ⚠️ 放在重放**之后**：交接的线程要等"批次重新加载"的结论，而那一格在上面刚被置成
                 //    `Loading`；放在前面的话它会读到换目录之前残留的 `Loaded`，抢先去搬。
@@ -1169,7 +1245,8 @@ mod tests {
         );
     }
 
-    /// ⚠️ **首次连接一条请求都不发**（`Session` 里没有批次 ⇒ 天然不重放，不用特判）。
+    /// ⚠️ **没有「记住的交付码」可加载时，首次连接一条请求都不发**（`Session` 里
+    ///    没有批次 ⇒ 天然不重放；也没装/没答出「记住的码」⇒ 不自动加载，不用特判）。
     ///
     /// 判别力：若有人在 `spawn_connect` 里写成"无条件重放一次"（比如拿一个空码去发），
     /// 这一条立刻红 —— 而真机上的表现是**每次启动都多一发注定失败的请求**，
@@ -1202,5 +1279,112 @@ mod tests {
             channel.requests()
         );
         assert_eq!(session.view().load, LoadState::Idle, "也**不许**动加载态");
+    }
+
+    // ------------------------------------------------------------------------
+    // 启动自动加载「记住的交付码」（规格 §8.3 / 阶段 E-4，2026-10-14 现场缺口）
+    // ------------------------------------------------------------------------
+
+    /// 一份 `hello` 回执的真形状（内核两个 op 都发 `settings` + `last_code` 两键）。
+    const A_HELLO_WITH_LAST_CODE: &str = r#"{"settings":{"parallel":5,"connections":8,"splits":8,"min_split_size":"20M","limit_mbps":0,"max_tries":1,"retry_wait":1},"last_code":"K-9"}"#;
+
+    /// 🔴 **启动自动加载**（对齐 macOS `AppModel.loadRememberedDelivery`，只跑一次）：
+    ///    首次连接、没有批次要重放 ⇒ 把 `hello` 回执里的 `last_code` 交给判据那一层
+    ///    （E-4 的注入点），有码就自动加载它。
+    ///
+    /// 2026-10-14 现场：Windows 从来没人做这件事 ⇒ **每次重开软件都要重新输交付码**。
+    ///
+    /// 判别力（三处都会红）：不接 `hello` 的 `last_code` ⇒ 第 2 条红；判据层答了码
+    /// 却不 `spawn_load` ⇒ 第 3 条红；换了别的码去加载 ⇒ 第 3 条红。
+    #[test]
+    fn the_startup_auto_load_loads_the_remembered_code() {
+        let session = Arc::new(Session::new());
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let lookup_seen = Arc::clone(&seen);
+        session.set_remembered_lookup(Arc::new(move |kernel_last_code: &str| {
+            lookup_seen.lock().unwrap().push(kernel_last_code.to_string());
+            Some(("C24-8".to_string(), "https://user.example".to_string()))
+        }));
+
+        let channel = Scripted::new(&[&ok_reply(1, &delivery_info("C24-8", "", 0))]);
+        let connector: Arc<Connector> = {
+            let channel = channel.clone();
+            Arc::new(move || {
+                Ok((
+                    Arc::new(CoreClient::new(Box::new(channel.clone()))),
+                    A_HELLO_WITH_LAST_CODE.to_string(),
+                ))
+            })
+        };
+        session.set_connector(connector);
+        spawn_connect(&session);
+
+        assert!(
+            wait_until(|| matches!(session.view().load, LoadState::Loaded(_))),
+            "记住的码该被自动加载：{:?}",
+            session.view().load
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["K-9".to_string()],
+            "hello 回执里的 last_code 要原样送到判据那一层（E-4 的播种源）"
+        );
+        let sent = channel.requests();
+        assert_eq!(sent.len(), 1, "该发且只发一次 load_delivery：{sent:?}");
+        assert!(
+            sent[0].contains(r#""code":"C24-8""#),
+            "加载的是记住的那个码：{}",
+            sent[0]
+        );
+        assert!(
+            sent[0].contains("https://user.example"),
+            "base_url 要跟着一起发（E-5）：{}",
+            sent[0]
+        );
+    }
+
+    /// **只跑一次**（macOS 的"应用级启动"同款闸）：第二次起连接（内核重启/重试）
+    /// 不再查「记住的码」—— 那时若有批次，走的是**重放**；没有批次就是用户清掉的，
+    /// 不该再替他加载一遍。
+    #[test]
+    fn the_startup_auto_load_is_claimed_only_once() {
+        let session = Arc::new(Session::new());
+        assert!(session.claim_startup_auto_load(), "第一次领得走");
+        assert!(!session.claim_startup_auto_load(), "第二次领不走");
+    }
+
+    /// **有批次要重放时，重放赢**（它带的是用户当前那一批的 base_url；「记住的码」
+    /// 只在"没有批次"的启动那一趟出场）。
+    #[test]
+    fn a_replay_wins_over_the_startup_auto_load() {
+        let session = Arc::new(Session::new());
+        session.remember_load_request("正在-看的".to_string(), "https://current.example".to_string());
+        let consulted = Arc::new(Mutex::new(false));
+        let consulted_flag = Arc::clone(&consulted);
+        session.set_remembered_lookup(Arc::new(move |_: &str| {
+            *consulted_flag.lock().unwrap() = true;
+            Some(("不该-用的".to_string(), String::new()))
+        }));
+
+        let channel = Scripted::new(&[&ok_reply(1, &delivery_info("正在-看的", "", 0))]);
+        session.set_connector(a_connector(channel.clone()));
+        spawn_connect(&session);
+
+        assert!(
+            wait_until(|| matches!(session.view().load, LoadState::Loaded(_))),
+            "{:?}",
+            session.view().load
+        );
+        let sent = channel.requests();
+        assert_eq!(sent.len(), 1, "只该有重放那一发：{sent:?}");
+        assert!(
+            sent[0].contains(r#""code":"正在-看的""#),
+            "重放的是当前那一批：{}",
+            sent[0]
+        );
+        assert!(
+            !*consulted.lock().unwrap(),
+            "重放那一趟不该去查「记住的码」"
+        );
     }
 }

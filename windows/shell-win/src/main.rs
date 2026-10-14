@@ -297,6 +297,15 @@ fn main() {
         session.set_connector(connector);
     }
 
+    // ---- ④b 装「记住的交付码」那一手（启动自动加载的判据，E-4）---------------
+    //
+    // ⚠️ 与连接器同一手法注入（真判据读 `%APPDATA%` 的历史文件；测试装假的）。
+    //    装在**所有**路径上（连内核可不可行都装）：它是 `spawn_connect` 成功那一趟
+    //    才会去取的东西，装早了无害，漏装了则"记住交付码"静默失效。
+    session.set_remembered_lookup(std::sync::Arc::new(|kernel_last_code: &str| {
+        commands::remembered_code(kernel_last_code)
+    }));
+
     // ---- ⑤ 连内核（后台线程；页面靠轮询 `state()` 看结果）--------------------
     //
     // ⚠️ 一条可起的进程都没有时不发这一趟：那一刻引擎已经是 `Unavailable`，再让连接器

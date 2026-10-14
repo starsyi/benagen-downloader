@@ -141,24 +141,35 @@ impl StubHttp {
 
     /// 动态：每个请求交给 `handler` 现算响应。`handler` 在桩线程里跑，
     /// panic 会让连接被重置（测试失败，但不是静默通过）。
+    ///
+    /// ⚠️ **每条连接一个线程**：`RpcClient` 的快档 / 慢档各有自己的连接池，
+    ///    一次用例里先走慢档再走快档（例如 `Daemon::clear_finished`：`snapshot()` 慢档、
+    ///    `purge_download_result()` 快档）会开出两条并发连接。单线程 accept 会让第二条卡在
+    ///    backlog 里等第一条的读超时，表现为客户端 10 秒「timed out reading response」
+    ///    ——那是桩的形状在报假红，不是被测代码的问题。
     pub fn start_with<F>(handler: F) -> Self
     where
-        F: Fn(&SeenRequest) -> RawResponse + Send + 'static,
+        F: Fn(&SeenRequest) -> RawResponse + Send + Sync + 'static,
     {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定桩端口失败");
         let port = listener.local_addr().expect("取桩端口失败").port();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_in_thread = std::sync::Arc::clone(&seen);
+        let handler = std::sync::Arc::new(handler);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut s) = stream else { continue };
-                while let Some(req) = read_request(&mut s) {
-                    // 先记账再回响应：客户端拿到响应的那一刻，请求必定已经在 `requests()` 里。
-                    seen_in_thread.lock().unwrap().push(req.clone());
-                    if write_response(&mut s, &handler(&req)).is_err() {
-                        break;
+                let seen_conn = std::sync::Arc::clone(&seen_in_thread);
+                let handler_conn = std::sync::Arc::clone(&handler);
+                std::thread::spawn(move || {
+                    while let Some(req) = read_request(&mut s) {
+                        // 先记账再回响应：客户端拿到响应的那一刻，请求必定已经在 `requests()` 里。
+                        seen_conn.lock().unwrap().push(req.clone());
+                        if write_response(&mut s, &handler_conn(&req)).is_err() {
+                            break;
+                        }
                     }
-                }
+                });
             }
         });
         Self { port, seen }
