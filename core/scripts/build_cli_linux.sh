@@ -15,9 +15,9 @@
 #        scp core/scripts/build_cli_linux.sh root@172.20.204.11:/tmp/
 #        ssh root@172.20.204.11 'bash /tmp/build_cli_linux.sh'
 #
-# 产物：$BUILD_ROOT/out/benagen-dl-0.2.7-linux-x86_64（静态、能跑，末尾打印 file/readelf/sha256）
-#       取回：scp root@172.20.204.11:/root/benagen-cli-build/out/benagen-dl-0.2.7-linux-x86_64 \
-#                 dist_cli/benagen-dl-0.2.7-linux-x86_64
+# 产物：$BUILD_ROOT/out/benagen-dl-0.2.8-linux-x86_64（静态、能跑，末尾打印 file/readelf/sha256）
+#       取回：scp root@172.20.204.11:/root/benagen-cli-build/out/benagen-dl-0.2.8-linux-x86_64 \
+#                 dist_cli/benagen-dl-0.2.8-linux-x86_64
 #
 # ---------------------------------------------------------------------------
 # 🔴 生产机纪律（本脚本的每一处路径都受它约束）
@@ -52,7 +52,7 @@
 #
 #   ⚠️ **不包含**一次"拿真交付码真下载"——那需要真的交付码，不该硬编码进构建脚本。
 #      构建之后请手动跑一次，那是"Linux 产物真能用"的最强证据：
-#          cd $BUILD_ROOT && ./out/benagen-dl-0.2.7-linux-x86_64 <真交付码> -o $BUILD_ROOT/dl
+#          cd $BUILD_ROOT && ./out/benagen-dl-0.2.8-linux-x86_64 <真交付码> -o $BUILD_ROOT/dl
 #          echo "退出码=$?"
 #      到不了 download.benagen.com 时，改用桩服务（`BENAGEN_BASE_URL` 指过去），
 #      但**必须有一条真跑通的证据** —— "编出来"不等于"能用"。
@@ -389,9 +389,9 @@ ok "--help 可读（$(printf '%s\n' "$HELP" | head -1)）"
 #    不该跟着消失 —— 否则人得自己去 `target/` 里翻。落位本身不是任何"已通过"的断言，
 #    退出码仍然由下面那道测试决定，红了照样非 0，什么都没被静默放过。
 log "4/5 产物落位"
-cp -f "$BIN" "$OUT/$BIN_NAME-${VERSION:-0.2.7}-linux-x86_64"
+cp -f "$BIN" "$OUT/$BIN_NAME-${VERSION:-0.2.8}-linux-x86_64"
 chmod +x "$OUT/$BIN_NAME-linux-x86_64"
-DST="$OUT/$BIN_NAME-${VERSION:-0.2.7}-linux-x86_64"
+DST="$OUT/$BIN_NAME-${VERSION:-0.2.8}-linux-x86_64"
 printf '    路径   ：%s\n    字节数 ：%s\n    sha256 ：%s\n' \
   "$DST" "$(stat -c '%s' "$DST")" "$(sha256sum "$DST" | awk '{print $1}')"
 
@@ -471,7 +471,7 @@ rm -f "$TEST_LOG"
 log "完成"
 printf '    产物已落位：%s\n' "$DST"
 printf '\n    取回（在 Mac 上）：\n'
-printf "      scp root@%s:%s dist_cli/benagen-dl-${VERSION:-0.2.7}-linux-x86_64\n" "$(hostname)" "$DST"
+printf "      scp root@%s:%s dist_cli/benagen-dl-${VERSION:-0.2.8}-linux-x86_64\n" "$(hostname)" "$DST"
 printf '\n    还剩一件本脚本**不做**的事（见文件头）：拿真交付码真下载一次 ——\n'
 printf '      cd %s && ./out/%s-linux-x86_64 <真交付码> -o %s/dl; echo "退出码=$?"\n' \
   "$BUILD_ROOT" "$BIN_NAME" "$BUILD_ROOT"

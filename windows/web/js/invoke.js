@@ -178,12 +178,18 @@ export const CMD = Object.freeze({
   historyPut: "history_put",
   license: "license",
   about: "about",
-  // ⚠️ **更新提示的三条**（规格 §4），规格 §3.4 那张表里同样没有（同上面几条：那是
-  //    "第二代既有端点"的账，而"更新检查"是这一代新加的整件事）。内核侧的三条由
+  // ⚠️ **更新那四条**（规格 §4 + §2），规格 §3.4 那张表里同样没有（同上面几条：那是
+  //    "第二代既有端点"的账，而"更新检查"是这一代新加的整件事）。内核侧的四条由
   //    `core/src/kernel.rs` 给；壳侧的实现与理由写在 `shell-win/src/commands.rs` 里
-  //    那三条命令的头注（尤其 `open_update_url`：它是一条**窄语义**的命令，
+  //    那四条命令的头注（尤其 `open_update_url`：它是一条**窄语义**的命令，
   //    只放行官方发布页那一个前缀）。
   updateStatus: "update_status",
   updateSetEnabled: "update_set_enabled",
+  // ⚠️ **这一条规格 §2 有、而壳一直到 2026-10-15 都没有**：设置里那颗「立即检测」
+  //    （不受 24 小时节流）。内核早就备好了 `op_check_update_now`，缺的只是这条命令
+  //    与那颗按钮。它的回执是 `headline` + `is_failure` 那几格（与改设置那两条
+  //    **同一组键**、前端同一条渲染路径），判决与那五句话在
+  //    `shell_core::presentation::update_check` 里。
+  updateCheckNow: "update_check_now",
   openUpdateUrl: "open_update_url",
 });

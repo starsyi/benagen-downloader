@@ -79,7 +79,7 @@ pub fn change(change: &DownloadDirChange) -> Value {
     receipt(
         change.headline(),
         change.path_detail(),
-        change.notice_text(),
+        Some(change.notice_text()),
         change.is_failure(),
     )
 }
@@ -96,7 +96,7 @@ pub fn verbose_change(change: &VerboseLoggingChange) -> Value {
     receipt(
         change.headline(),
         change.path_detail(),
-        change.notice_text(),
+        Some(change.notice_text()),
         change.is_failure(),
     )
 }
@@ -106,10 +106,17 @@ pub fn verbose_change(change: &VerboseLoggingChange) -> Value {
 /// ⚠️ 抽出来只有一个理由：**同一组键只许有一份实现** —— 两个回执各写一遍 `json!`
 ///    的结局是"某一格哪天在一边改了、另一边没改"，而前端只有一条渲染路径，
 ///    读到的会是一个 `undefined`（界面安静地少一行，不会有任何东西变红）。
-fn receipt(
+///
+/// ⚠️ 它是 `pub(crate)` 而不是私有的：`api::update::checked`（设置里那颗「立即检测」的
+///    回执）读的是**同一组键**（前端那边就是同一条渲染路径 `settings.js` 的
+///    `paintChangeReceipt`）—— 第三份 `json!` 正是上面那句话要防的事。
+///    ⚠️ 那一处的 `path_detail` 与 `notice_text` 都传 `None`（它是**一句话**的回执，
+///    没有路径行、也不往常驻提示行塞东西）⇒ 两格在 JSON 里是 `null`，前端读到
+///    `null` 与读到"没有这一格"是同一结果（`typeof x === "string"` 那两处判断）。
+pub(crate) fn receipt(
     headline: String,
     path_detail: Option<String>,
-    notice_text: String,
+    notice_text: Option<String>,
     is_failure: bool,
 ) -> Value {
     envelope::ok(json!({

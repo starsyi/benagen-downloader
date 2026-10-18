@@ -16,7 +16,7 @@
 #   `files.js` 把它当作 `ManifestTracking` 的对位），而两边一分叉——谁都不会红。**
 #   ⇒ 判据早就写在那儿了，那个坑还是又长了一遍，最后在真机被用户撞到。
 #
-#   所以本脚本要做两件事，各治一半：
+#   所以本脚本要做三件事，各治一半（第 ③ 件是"手动检测更新"那一波加上来的）：
 #     ① **两份真相源**（`resident_notice` 的 48/80）：Rust 交出去的那两个数
 #        与 CSS 里那两个令牌**必须一致**，而且那份令牌**必须真的被用上**
 #        （否则"Rust 那份是唯一来源"这句话是空头 —— 它根本没到界面上）；
@@ -25,6 +25,9 @@
 #        并且在账上那一条**仍然零调用者**。
 #        ⇒ 账本自己会过期：有人把某一条**接上**了（好事），这一条也会红，
 #          逼着账跟着改（"接上了"与"还挂着"是两件事，账上必须说得出是哪一件）。
+#     ③ **同一份判决的两份跨语言实现，文案逐字一致**：「立即检测」那五句话
+#        在 Rust（Windows 壳）与 Swift（macOS 客户端）各写了一份，客户在两个平台上
+#        必须读到同一句；分叉了它红。
 #
 # ⚠️ **效力边界（如实记账，别把这条读成它做不到的事）**：
 #    · ①判的是**数值**（两个数一不一样）与"令牌有没有被用"，**不是**"运行时真的按它排版"
@@ -32,7 +35,11 @@
 #    · ②判的是**账上那几条**的坐标在场 + 仍然零调用者。**将来新出现的**第三条
 #      "零调用者判据"它**看不见**（那需要一个全量扫描，而全量扫描在 `presentation/`
 #      这个体量上噪声很大：`pub` 项里有一大批只在测试里被调）。这条残留记在
-#      `fixwave-rust-report.md` 与本脚本头部，别当成"全量守卫"。
+#      `fixwave-rust-report.md` 与本脚本头部，别当成"全量守卫"；
+#    · ③判的是**那五句文案本身**两端逐字一致，**不判判决逻辑**（判据顺序、
+#      `last_check_ok` 三档怎么分、哪几档算失败）—— 那一半靠两边的单测
+#      （Rust `update_check.rs` 的 `mod tests` / Swift `UpdateCheckReceiptTests.swift`）。
+#      也就是说：③挡得住"两边说得不一样"，挡不住"两边**一起**判错"。
 #
 #   ⚠️ 至于那几条判据**行为上**对不对，靠的是另一条路：**同一组输入喂给两边**、
 #      结论必须一致。用例表由 Rust 倒出来（`dump_wire_fixtures.rs` 的 `mirrorCases`），
@@ -277,6 +284,74 @@ for entry in MIRRORS:
             f"      或把账改成「已接上，承接点是 X」并说明前端那一份还算不算数。"
         )
 
+# ===========================================================================
+# ③ 「立即检测」那五句话：**两个平台的两份实现必须逐字一致**
+# ===========================================================================
+#
+# 判决逻辑有两份实现（规格 §2 那颗「立即检测」按钮）：
+#   Rust ：`windows/shell-core/src/presentation/update_check.rs`（Windows 壳）
+#   Swift：`macos/Sources/BenagenCoreKit/Presentation/UpdateCheckReceipt.swift`（macOS 客户端）
+# 它们判的是同一件事（内核那一份状态 → 五档之一），而客户在两个平台上读到的必须是
+# **同一句话** —— 分叉了**谁都不会红**：这正是上面 R-5 那个形状（判据在一处、
+# 实现抄成两份、两边一分叉就静默）。
+#
+# ⚠️ **效力边界**：这一段只判**那五句文案本身**两端是否一致，**不判判决逻辑**
+#    （判据顺序、`last_check_ok` 三档怎么分、哪几档算失败）—— 那一半靠两边的单测：
+#    Rust 的 `update_check.rs` 里 `#[cfg(test)] mod tests`，
+#    Swift 的 `macos/Tests/BenagenCoreKitTests/UpdateCheckReceiptTests.swift`。
+#    两处都有一条"没查成**不许**说成已经是最新的"的判别力用例。
+#
+# ⚠️ 两份实现里**版本号是插值**：Rust 写 `{latest}` / `{current}`，
+#    Swift 写 `\(latest)` / `\(st.current)`。比对前先归一成 `{latest}` / `{current}`。
+UPDATE_CHECK_RS = "windows/shell-core/src/presentation/update_check.rs"
+UPDATE_CHECK_SWIFT = "macos/Sources/BenagenCoreKit/Presentation/UpdateCheckReceipt.swift"
+
+# 那五句话的**规范形状**：这张表就是"两份真相源该说什么"的那一份账。
+# 改文案 ⇒ 两个实现与这一张表**一起**改（这张表过期时它会红，而不是静默放过）。
+UPDATE_SENTENCES = [
+    ("开关关着（这一下没查）",
+     "自动检查更新是关着的，刚才没有去查。补救：打开上面那个开关，再点一次「立即检测」。"),
+    ("查成了、有新版", "有新版本 {latest}（当前 {current}）。"),
+    ("查成了、已是最新", "已经是最新的（当前 {current}）。"),
+    ("没查成（没连上发布页）",
+     "没查成：这次没连上发布页。补救：确认这台机器能上网，或者过一会儿再点一次。"),
+    ("说不清（内核没给那一格）",
+     "没查到结果：内核回的这份检查状态不全。补救：重开一次客户端再试。"),
+]
+
+
+def literals(text):
+    """文件里的字符串字面量（单行；不做转义解码 —— 只用来比对中文句子）。"""
+    if text is None:
+        return set()
+    return set(re.findall(r'"([^"\n]*)"', text))
+
+
+def canonical(sentence):
+    """把两边的插值写法归一：Rust `{latest}` ↔ Swift `\\(latest)` / `\\(st.current)`。"""
+    text = sentence
+    for token in ("latest", "current"):
+        text = text.replace("\\(" + token + ")", "{" + token + "}")
+        text = text.replace("\\(" + "st." + token + ")", "{" + token + "}")
+    return text
+
+
+rust_literals = {canonical(s) for s in literals(read(UPDATE_CHECK_RS))}
+swift_literals = {canonical(s) for s in literals(read(UPDATE_CHECK_SWIFT))}
+
+for label, sentence in UPDATE_SENTENCES:
+    for side, pool, rel in (("Rust", rust_literals, UPDATE_CHECK_RS),
+                            ("Swift", swift_literals, UPDATE_CHECK_SWIFT)):
+        if canonical(sentence) not in pool:
+            failures.append(
+                f"「立即检测」那五句话里，**{side} 那一侧说的不是这一句**（{label}）：\n"
+                f"      账上（本脚本 UPDATE_SENTENCES）写的是：{sentence}\n"
+                f"      {rel} 里找不到这一句（归一插值之后逐字比对，一个字符都不许差）。\n"
+                f"      后果：两个平台的客户端对同一个结局说**两句不同的话**，而两边都不会红。\n"
+                f"      补救：两边一起改成同一句（改完记得跑 "
+                f"`bash windows/scripts/make_font_subset.sh --check`：新字必须在字体子集里）。"
+            )
+
 if failures:
     print("", file=sys.stderr)
     print("对位判据没过：", file=sys.stderr)
@@ -292,6 +367,9 @@ print(f"常驻提示行的两个上限：Rust({rust_text}/{rust_list}) == CSS({c
 print(f"对位账：{len(MIRRORS)} 条，三处坐标全部在场、且**都仍然是零生产调用者**"
       f"（其中差分对照 {sum(1 for m in MIRRORS if m['differential'])} 条，"
       f"登记为\"承接点不是抄件\"的 {sum(1 for m in MIRRORS if not m['differential'])} 条）")
-print("对位判据通过：两份真相源一致；每条对位账的坐标在场、账没过期。")
+print(f"「立即检测」那五句话：Rust（{UPDATE_CHECK_RS}）与 "
+      f"Swift（{UPDATE_CHECK_SWIFT}）**逐字一致**（{len(UPDATE_SENTENCES)} 句，"
+      f"归一插值后比对）")
+print("对位判据通过：两份真相源一致；每条对位账的坐标在场、账没过期；那五句话两端一致。")
 sys.exit(0)
 PY

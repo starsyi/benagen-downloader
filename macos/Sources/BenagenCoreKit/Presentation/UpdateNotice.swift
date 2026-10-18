@@ -40,16 +40,33 @@ public struct UpdateStatus: Equatable, Decodable, Sendable {
     public let url: String?
     /// 「启动时检查更新」那个开关的**当前值**（规格 §4）。**默认开**。
     public let enabled: Bool
+    /// 🔴 **上一次检查有没有查成**（线上 `last_check_ok`，本任务新增的那一格）。
+    ///
+    /// * `true` = 查成了（**包括"确实没有新版"**）；
+    /// * `false` = 没查成（网络/发布页不可达，或发布页上最新那条是预发布）；
+    /// * `nil` = 内核**没给这一格**（旧内核）或本次会话**从没查过**。
+    ///
+    /// ⚠️ **三档不许并成两档**：`false` 与 `nil` 是两件事（一个是"查了没成"、一个是
+    ///    "不知道"），而它们**都不等于 `has_newer:false`** —— 那两种情形在
+    ///    `has_newer` 上长得一模一样。设置里那颗「立即检测」按钮的判决
+    ///    （[`UpdateCheckReceipt.of`]）就是照这一格分的；少了它，断网时客户会读到
+    ///    一句**"已经是最新的"**（`shell-core/src/presentation/update_check.rs` 的
+    ///    文件头把这条记成了整件事的理由）。
+    ///
+    /// ⚠️ 缺失（`null` 或这一格不存在）**按 `nil` 降级**，与 `enabled` 同一条口径：
+    ///    一个不认得这一格的旧内核**不许**让整份解码失败。
+    public let lastCheckOk: Bool?
 
     /// 显式构造器。`enabled` 放在**最后且带默认值 `true`**，于是那句"开关默认开"
     /// 在调用点上是看得见的（简报里那三处 4 参调用点也原样可用）。
     public init(hasNewer: Bool, latest: String?, current: String, url: String?,
-                enabled: Bool = true) {
+                enabled: Bool = true, lastCheckOk: Bool? = nil) {
         self.hasNewer = hasNewer
         self.latest = latest
         self.current = current
         self.url = url
         self.enabled = enabled
+        self.lastCheckOk = lastCheckOk
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -60,11 +77,14 @@ public struct UpdateStatus: Equatable, Decodable, Sendable {
         case current
         case url
         case enabled
+        // 同上：线上是 `last_check_ok`，`.convertFromSnakeCase` 之后是 `lastCheckOk`。
+        case lastCheckOk = "lastCheckOk"
     }
 
     /// 手写解码（不是合成的），只为一条：**`enabled` 缺失时按 `true` 降级**
     /// （开关默认开）—— 少这一格**不许**让整份解码失败，否则一个不认得 `enabled`
     /// 的旧内核会让壳连"有没有新版"都读不出来（那是"永远不提示"的另一种长相）。
+    /// `lastCheckOk` 缺失时按 `nil` 降级，理由逐条同款（见那一格的文档）。
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         hasNewer = try c.decode(Bool.self, forKey: .hasNewer)
@@ -72,6 +92,7 @@ public struct UpdateStatus: Equatable, Decodable, Sendable {
         current = try c.decode(String.self, forKey: .current)
         url = try c.decodeIfPresent(String.self, forKey: .url)
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        lastCheckOk = try c.decodeIfPresent(Bool.self, forKey: .lastCheckOk)
     }
 }
 

@@ -34,6 +34,13 @@
 //! ⚠️ 要收口就得把 `whole_tree` 的组装搬进 `api::tree`（那会改命令层的一段既有论证：
 //!    "它要读 `SessionView`"）—— 那是另一件事，**本任务不做**，记在任务 10 报告里。
 
+// ⚠️ 这个属性是**宏的容量**，不是"压掉什么"（2026-10-15 加）：那份 `json!` 顶层对象已经长到
+//    近四十个端点，`json!` 是递归展开的宏 —— 条目再多几条就撞上默认的 128 层
+//    （报错原文："recursion limit reached while expanding `$crate::json_internal!`"）。
+//    它只放宽这一个上限，不影响任何判据；下次撞上时该做的是**把端点分组**，
+//    而不是继续把这个数往上加。
+#![recursion_limit = "256"]
+
 use serde_json::json;
 use std::collections::BTreeSet;
 
@@ -51,6 +58,7 @@ use shell_core::presentation::settings_form::SettingsForm;
 use shell_core::presentation::transfer_row::{
     TransferGlobalSummary, TransferListEmpty, TransferRow,
 };
+use shell_core::presentation::update_check::UpdateCheck;
 use shell_core::presentation::verify_summary::ProgressSummary;
 use shell_core::protocol::{
     DeliveryInfo, EngineState, EnqueueResult, GlobalStat, ListDirResult,
@@ -543,6 +551,51 @@ fn settings_match_cases() -> serde_json::Value {
 const HELLO_WIRE: &str =
     r#"{"protocol":1,"min_split_size_choices":["1M","2M","5M","10M","20M","50M","100M"]}"#;
 
+// ---------------------------------------------------------------------------
+// 手动检测更新（设置里那颗「立即检测」，规格 §2）的夹具
+// ---------------------------------------------------------------------------
+//
+// ⚠️ 下面这五份是**内核会发的那种线上 JSON 文本**（与 `ROOT_WIRE` 一类同源）：
+//    壳那一侧（`presentation::update_check::UpdateCheck::of` 与 `api::update::checked`）
+//    只读不写。`last_check_ok` 是本波次**内核新加的一格**（"这次到底查成了没有"，
+//    见 `core/src/kernel.rs` 的 `Kernel::update_last_check_ok`）——
+//    少了它，"没查成"与"已经是最新的"在界面上**长得一模一样**，而客户点出来的那一下
+//    在断网时就会得到一句"已经是最新的"：**那是界面在撒谎**。
+//
+// 🔴 **五份覆盖五档**（`UpdateCheck` 的五个变体）：三档不配说"已经是最新的"
+//    （开关关着 / 没查成 / 内核没给那一格），加上查成了的两档。
+//    少一份 = 前端那一档没人验 —— 而**少掉的那一档不会让任何东西变红**。
+
+/// 查成了，而且发布页上有更新的版本。
+const UPDATE_STATUS_NEWER_WIRE: &str = r#"{"enabled":true,"checking":false,
+ "current":"0.2.6","latest":"0.2.7","has_newer":true,
+ "url":"https://gitee.com/starsyi/benagen-downloader/releases/download/v0.2.7/BenagenDownloader-0.2.7-Windows-x86_64.exe",
+ "checked_at":1760000000,"last_check_ok":true}"#;
+
+/// 查成了，已经是最新的（**只有这一档**配这么说话）。
+const UPDATE_STATUS_UP_TO_DATE_WIRE: &str = r#"{"enabled":true,"checking":false,
+ "current":"0.2.6","latest":"0.2.6","has_newer":false,"url":"",
+ "checked_at":1760000000,"last_check_ok":true}"#;
+
+/// 没查成：网络/发布页不可达（`last_check_ok:false`，而 `has_newer` 也只能是 false）。
+const UPDATE_STATUS_UNREACHABLE_WIRE: &str = r#"{"enabled":true,"checking":false,
+ "current":"0.2.6","latest":null,"has_newer":false,"url":"",
+ "checked_at":1760000000,"last_check_ok":false}"#;
+
+/// 开关关着：内核**一道请求都不会发**（`run_update_check` 的第一道闸）⇒ 这一下根本没查。
+const UPDATE_STATUS_DISABLED_WIRE: &str = r#"{"enabled":false,"checking":false,
+ "current":"0.2.6","latest":null,"has_newer":false,"url":"",
+ "checked_at":0,"last_check_ok":null}"#;
+
+/// 内核**没给** `last_check_ok` 那一格（旧内核 / 载荷缺格）⇒ 说不清就说不清。
+const UPDATE_STATUS_NO_ANSWER_WIRE: &str = r#"{"enabled":true,"checking":false,
+ "current":"0.2.6","latest":null,"has_newer":false,"url":""}"#;
+
+/// 上面那几份线上原文 → 一份 `Value`（**照内核的形状解，不在夹具里重编**）。
+fn update_status(json: &str) -> serde_json::Value {
+    serde_json::from_str(json).expect("这是内核会发的线上 JSON，必须解得出")
+}
+
 /// **设置窗口**要吃的偏好：**已配置**（未配置那一档由 `preferencesGetDefault` 给）。
 fn preferences() -> Preferences {
     Preferences::new("/Volumes/Data/交付")
@@ -878,6 +931,28 @@ fn main() {
             "/Volumes/Data/只读/诊断日志-20260101-000000",
             "Permission denied (os error 13)",
         )),
+        // ---- 手动检测更新（设置里那颗「立即检测」，规格 §2）----------------------
+        // `update_check_now` 的五档回执。⚠️ 判决与那五句话**全部取自 Rust**
+        // （`UpdateCheck::of` + `api::update::checked`），这里只是把内核会发的
+        // 那五份 `update_status` 原文喂进去 —— 前端那套验收的期望值只许有一个来源。
+        //    🔴 五档里**只有 `updateCheckUpToDate` 那一份**配说"已经是最新的"：
+        //       `updateCheckUnreachable`（没查成）与 `updateCheckNoAnswer`（内核没给那一格）
+        //       都**不许**落到那句上 —— 那正是这一波加 `last_check_ok` 的全部理由。
+        "updateCheckNewer": api::update::checked(&UpdateCheck::of(&update_status(
+            UPDATE_STATUS_NEWER_WIRE,
+        ))),
+        "updateCheckUpToDate": api::update::checked(&UpdateCheck::of(&update_status(
+            UPDATE_STATUS_UP_TO_DATE_WIRE,
+        ))),
+        "updateCheckUnreachable": api::update::checked(&UpdateCheck::of(&update_status(
+            UPDATE_STATUS_UNREACHABLE_WIRE,
+        ))),
+        "updateCheckDisabled": api::update::checked(&UpdateCheck::of(&update_status(
+            UPDATE_STATUS_DISABLED_WIRE,
+        ))),
+        "updateCheckNoAnswer": api::update::checked(&UpdateCheck::of(&update_status(
+            UPDATE_STATUS_NO_ANSWER_WIRE,
+        ))),
         // `about`：正常那一档（短版本优先）+ 两个来源都空的那一档（兜底文案必须非空）。
         "about": api::about::about(&AboutInfo::version(Some("0.1.0"), Some("1"))),
         "aboutFallback": api::about::about(&AboutInfo::version(None, None)),
@@ -1051,6 +1126,65 @@ fn main() {
         fixtures["settingsGet"]["data"]["min_split_size_note"].is_string(),
         "不在集合里 ⇒ 必须有一句说明（不能只让控件落在集合外而不说）：{fixtures}"
     );
+    // ---- 手动检测更新那五份的自检 ----------------------------------------------
+    //
+    // 🔴 这一组守的是**同一句话不许在几档里复用**："已经是最新的"只许出现在
+    //    `UpToDate` 那一档上 —— 它是这条链路的**全部理由**（断网时客户点一下，
+    //    界面上冒出来的那句话必须是"没查成"，不是"已经是最新的"）。
+    //    夹具退化成"五份都回同一句话"时，前端那几条断言会**继续全绿**，所以在这里当场红。
+    let update_keys = [
+        "updateCheckNewer",
+        "updateCheckUpToDate",
+        "updateCheckUnreachable",
+        "updateCheckDisabled",
+        "updateCheckNoAnswer",
+    ];
+    let update_headlines: Vec<&str> = update_keys
+        .iter()
+        .map(|k| {
+            fixtures[*k]["data"]["headline"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{k} 缺 headline：{fixtures}"))
+        })
+        .collect();
+    let distinct: std::collections::BTreeSet<&&str> = update_headlines.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        update_keys.len(),
+        "五档的五句话必须**各不相同**（同一句话覆盖两档 = 有一档没人验）：{update_headlines:?}"
+    );
+    // 只有"查成了、确实没有新版"那一档配说"已经是最新的"。
+    for (key, headline) in update_keys.iter().zip(update_headlines.iter()) {
+        let says_up_to_date = headline.contains("已经是最新的");
+        assert_eq!(
+            says_up_to_date,
+            *key == "updateCheckUpToDate",
+            "「已经是最新的」只许出现在 updateCheckUpToDate 上（{key} 现在是：{headline}）"
+        );
+    }
+    // 三档"不配说已经是最新的"都必须是失败档（前端据此翻图标）——
+    // 而"查成了"的两档不是失败。
+    for key in ["updateCheckUnreachable", "updateCheckDisabled", "updateCheckNoAnswer"] {
+        assert_eq!(
+            fixtures[key]["data"]["is_failure"],
+            json!(true),
+            "{key} 必须是失败档（不许画成一次成功）：{fixtures}"
+        );
+    }
+    for key in ["updateCheckNewer", "updateCheckUpToDate"] {
+        assert_eq!(
+            fixtures[key]["data"]["is_failure"],
+            json!(false),
+            "{key} 是查成了的（不是失败）：{fixtures}"
+        );
+    }
+    // 「有新版本」那一句必须**两个号码都在场**（少了当前版本号，客户没法判断自己落后多少）。
+    let newer = update_headlines[0];
+    assert!(
+        newer.contains("0.2.7") && newer.contains("0.2.6"),
+        "「有新版本」那一句必须同时给出新版本与当前版本：{newer}"
+    );
+
     // 兜底的版本号**绝不返回空串**（空串 = 关于窗口里少一行，谁都不会发现）。
     assert!(
         fixtures["aboutFallback"]["data"]["version"]

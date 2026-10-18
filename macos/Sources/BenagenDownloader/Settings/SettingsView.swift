@@ -522,10 +522,10 @@ private struct DiagnosticsSection: View {
 }
 
 // ---------------------------------------------------------------------------
-// 「启动时检查更新」（规格 §4）
+// 「启动时检查更新」+「立即检测」（规格 §2 / §4）
 // ---------------------------------------------------------------------------
 
-/// 「启动时检查更新」那一个勾选框（规格 §4）。
+/// 「启动时检查更新」那一个勾选框 **+** 「立即检测」那颗按钮（规格 §2 / §4）。
 ///
 /// ⚠️ 它与上面那个「详细日志」开关**不是一回事**：这一格**不重启内核**（开关状态在内核
 ///    自己的 `update.json` 里），所以它既不抢 `busy`、也没有确认框、更不落壳的偏好文件。
@@ -547,13 +547,33 @@ private struct DiagnosticsSection: View {
 ///
 /// ⚠️ 标签是**结构文案**（与数据无关、任何状态下都一样），所以住在**视图**里
 ///    （与「下载到」/「保存」同一条），不由载荷给。
+///
+/// ⚠️ **「立即检测」与那个开关的分工**（规格 §2）：开关管的是"**启动时**要不要自动查、
+///    24 小时节流"；按钮是客户"**现在就想知道**"的出口 —— 它**不受节流限制**，问的是内核
+///    的 `update_check_now`（内核真的会去发一次网络请求）。
+///
+/// ⚠️ **两个回执、两条路，不混**：
+///    · **动作回执**（"刚才那一下查出什么"）落在模型上（`model.updateCheckReceipt`），
+///      因为它必须活过这扇窗 —— 形状与上面「详细日志」那条同款（图标按 `isFailure` 画、
+///      正文走 `BoundedNoticeText`、可收起）；判决与那五句话在 `UpdateCheckReceipt` 里，
+///      **这一层一个字都不加工**（约束 8：视图不映射）。
+///    · **失败原文**（命令本身没发出去）走下面那一行 `failureRow` —— 那是"内核 / 宿主说的
+///      原话"，与动作回执是两件事（同一个结局不许有两种说法，所以不合并）。
 private struct UpdateSection: View {
     @ObservedObject var model: AppModel
 
     /// 最近一次改开关的**失败原文**（`nil` = 没有）。**照登内核 / 系统原文**（约束 3）：
     /// `setUpdateEnabled` 已经把 `CoreError` → 文案的那一步做掉（约束 8：视图不映射错误）。
     /// ⚠️ 与 `SettingsFooter.failure` 同形的本窗回执（同一扇窗里的同步动作，窗口关掉就别留着）。
+    /// ⚠️ 「立即检测」那条命令发不出去时也落在这里（`checkNow()` 的返回值）——
+    ///    与 `AppModel` 那侧同一条口径：**命令没发出去就没有结论**，那时回执会被清掉。
     @State private var failure: String?
+
+    /// 一次「立即检测」在飞：按钮禁用 + 转圈。
+    ///
+    /// ⚠️ 与上面那个导出的 `exporting` **不同，这一格真的画得出来**：`checkUpdateNow` 是
+    ///    `async`（内核那边要发一次网络请求，最坏约 5 秒），主线程在那段时间里是自由的。
+    @State private var checking = false
 
     var body: some View {
         Section {
@@ -561,6 +581,38 @@ private struct UpdateSection: View {
                    isOn: Binding(get: { model.updateStatus?.enabled ?? true },
                                  set: { on in Task { await apply(on) } }))
                 .help("默认打开。每次启动问一次官方仓库有没有新版本（只提示，不下载、不安装）")
+
+            // 「立即检测」（规格 §2）：客户"现在就想知道"的出口 —— 不受 24 小时节流限制。
+            HStack(spacing: 8) {
+                Button("立即检测") { Task { await checkNow() } }
+                    .disabled(checking)
+                    .help("现在就去问一次官方仓库（不受 24 小时节流限制）")
+                if checking { ProgressView().controlSize(.small) }
+                Spacer(minLength: 8)
+            }
+
+            if let receipt = model.updateCheckReceipt {
+                // 动作回执（🔴 五句话都是 `UpdateCheckReceipt` 写的：壳不在这里拼句子）。
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: receipt.isFailure ? "exclamationmark.triangle"
+                                                        : "checkmark.circle")
+                        .foregroundStyle(receipt.isFailure ? Color.red : Color.green)
+                    // ⚠️ 走**有界可滚**的那个正文块（同「详细日志」那条）：
+                    //    `noAnswer` 那一档会把内核给的原样带出来，长度不受我们控制 ——
+                    //    上限管的是高度，不是内容（约束 3：不许截断）。
+                    BoundedNoticeText(text: receipt.text, font: .caption)
+                    Spacer(minLength: 8)
+                    Button {
+                        // 收起的是**模型那一份**（回执的唯一出口）。
+                        model.dismissUpdateCheckReceipt()
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("收起这条提示")
+                }
+            }
+
             if let failure { failureRow(failure) }
         }
         .task { await model.refreshUpdateStatus() }
@@ -569,6 +621,14 @@ private struct UpdateSection: View {
     /// 勾选框的回调。`nil` = 改成了（清掉上一行失败）；非 `nil` = 失败原文（摆出来）。
     private func apply(_ on: Bool) async {
         failure = await model.setUpdateEnabled(on)
+    }
+
+    /// 「立即检测」的回调。`nil` = 查完了（回执已经落在模型上）；非 `nil` = 命令本身没发出去，
+    /// 摆成下面那一行失败原文（约束 3/4）。
+    private func checkNow() async {
+        checking = true
+        defer { checking = false }
+        failure = await model.checkUpdateNow()
     }
 
     /// 一行失败原文 + 一个 `×`（形状与 `SettingsFooter.failure` 逐条同款：可选中复制、可收起）。

@@ -26,8 +26,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use benagen_core::diagnostics;
 use benagen_core::kernel::{
-    dispatch, read_line_capped, spawn_crc_filler, spawn_auto_retry, spawn_landing_watcher, spawn_recovery,
-    spawn_update_check, spawn_verify_worker, write_line, Kernel, LineOutcome, VerifyJob,
+    dispatch, read_line_capped, spawn_auto_retry, spawn_crc_filler, spawn_landing_watcher,
+    spawn_leg_trim, spawn_recovery, spawn_update_check, spawn_verify_worker, write_line, Kernel,
+    LineOutcome, VerifyJob,
 };
 use benagen_core::paths;
 use benagen_core::protocol;
@@ -116,6 +117,10 @@ fn main() {
     spawn_recovery(Arc::clone(&kernel));
     // 失败任务的自动重试（瞬时性错误按退避重新入队，规格 2026-10-12 §7）。
     spawn_auto_retry(Arc::clone(&kernel));
+    // **下载中换腿**（规格 D5 / D8）：10 s 一拍，摘掉慢的 IP 腿、把新解析出的 IP 补上。
+    // 起在 `spawn_auto_retry` 旁边：两者都是「看着正在跑的任务、必要时动它一下」的后台拍，
+    // 差别只在判据。它们不共用一把长锁（RPC 全在锁外），所以起得先后无关。
+    spawn_leg_trim(Arc::clone(&kernel));
     // **后台分批补齐 crc64**（2026-10-08）：清单里空着的 crc64 由它一小批一小批地补，
     // 而不是让某一个命令替整批文件挡在那里（那会把壳的主线程堵住 ⇒ 窗口「未响应」）。
     // 细节与"为什么必须有一条后台线程"见它的文档。

@@ -11,12 +11,21 @@
 //!
 //! 内核的 `url` 在 `has_newer == false` 时**照样可能非空**（`last_seen` 解析得出三段数字
 //! 时就会带一条指向**已装版本**的链接）⇒ 前端**不许**按"`url` 非空"渲染，
-//! 判据必须落在 `has_newer`。那是 `files.js:paintUpdate` 的事，本层只如实透传这两格
+//! 判据必须落在 `has_newer`。那是 `render.js:updateNoticeFromStatus`（壳层那条提示条
+//! 的判据，2026-10-15 从 `files.js:paintUpdate` 搬上来的）的事，本层只如实透传这两格
 //! （透传的意义就是：判据在哪一层、由哪一层说了算，**不在这里替他裁**）。
+//!
+//! ## ⚠️ `update_status` 是透传，而 [`checked`] **不是**
+//!
+//! 上面那件事（后台那条提示条画不画）**全由前端按 `has_newer` 判**；
+//! 而设置里那颗「立即检测」是**一次用户动作**，它的回执得有一句人话 —— 那句话不能由
+//! 前端拼（R-24），所以判决与话术住在 `presentation::update_check`，
+//! 本模块的 [`checked`] 只把那四格套进信封（与 `api::preferences::change` 同一套键）。
 
 use serde_json::Value;
 
 use crate::api::envelope;
+use crate::presentation::update_check::UpdateCheck;
 
 /// 更新状态：`data` 就是内核回的那一份，**不包一层**（与 `enqueue` / `verify` 同口径）。
 ///
@@ -72,6 +81,33 @@ pub fn open_failed(why: &str) -> Value {
 /// 一条不在白名单里的 URL ⇒ **拒绝**（走失败信封，把 [`REFUSED`] 交出去）。
 pub fn refused() -> Value {
     envelope::err(REFUSED)
+}
+
+// ===========================================================================
+// 「立即检测」那一次动作的回执（规格 §2）—— 判决在 presentation，这里只装帧
+// ===========================================================================
+
+/// 一次「立即检测」的回执：**与改设置那两条同一组键**（`headline` / `path_detail` /
+/// `notice_text` / `is_failure`）。
+///
+/// ⚠️ **判决与那五句话一个字都不在这里**：它们住 [`UpdateCheck`]（`presentation::update_check`，
+///    理由写在那个模块的头注里）。本函数是**唯一**那一步的装帧处，而且刻意**复用**
+///    `api::preferences::receipt` —— 前端那边是同一条渲染路径（`settings.js` 的
+///    `paintChangeReceipt` 读那三格），再写第三份 `json!` 的结局就是"某一格哪天在一边
+///    改了、另一边没改"。
+///
+/// ⚠️ `path_detail` 与 `notice_text` 都是 `None`：这条回执是**一句话**，没有路径行
+///    （那一格是给"东西在哪"用的），也不往主区那条常驻提示行塞东西（用户点的按钮就在
+///    本节里，回执落在**同一节** —— 上一轮那个开关的教训，见 `settings.js` 的
+///    `exportDiagnostics` 头注）。JSON 里那两格因此是 `null`，前端读到 `null`
+///    与读到"没有这一格"是同一结果（它按 `typeof … === "string"` 判）。
+///
+/// ⚠️ **这条回执不是"改设置"**：它没有改任何东西、也**不重启内核**（内核那一次检查
+///    只是发一次网络请求 + 落盘一个时间戳）。所以它**不落** `session.last_error`、
+///    也不清它（那是 [`update_status`] 的口径；这一条比它更"用户动作"一点，
+///    但失败仍然是"你刚才那一下没成"，由回执那一格说，不上升成常驻提示）。
+pub fn checked(check: &UpdateCheck) -> Value {
+    crate::api::preferences::receipt(check.headline(), None, None, check.is_failure())
 }
 
 #[cfg(test)]
@@ -161,5 +197,67 @@ mod tests {
         let msg = v["error"]["message"].as_str().expect("失败信封里有 message");
         assert!(msg.contains("ShellExecuteW 返回 2"), "系统原文要逐字带上：{msg}");
         assert!(msg.contains("补救"), "要给一句可执行的下一步：{msg}");
+    }
+
+    /// 🔴 「立即检测」的回执**与改设置那两条同一组键**（前端只有一条渲染路径）。
+    ///
+    /// 判别力：新起一份 `json!`（比如把 `path_detail` 整格省掉、或者另起名叫
+    /// `detail`）⇒ 这一条红。前端那边的 `typeof change.path_detail === "string"`
+    /// 读不到东西时**界面安静地少一行**，不会有任何东西变红 —— 所以这一条必须在这里。
+    #[test]
+    fn the_check_receipt_reuses_the_settings_key_set() {
+        let check = UpdateCheck::of(&json!({
+            "enabled": true, "current": "0.2.7", "latest": "0.2.9",
+            "has_newer": true, "last_check_ok": true
+        }));
+        let v = checked(&check);
+        assert_eq!(v["ok"], json!(true));
+        let data = v["data"].as_object().expect("回执是对象");
+        let mut keys: Vec<&String> = data.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["headline", "is_failure", "notice_text", "path_detail"],
+            "四格与 `api::preferences::receipt` 逐格相同"
+        );
+        assert_eq!(data["path_detail"], json!(null), "这条回执没有路径行");
+        assert_eq!(data["notice_text"], json!(null), "它不往常驻提示行塞东西");
+        assert_eq!(data["is_failure"], json!(false), "有新版本不是失败");
+    }
+
+    /// 🔴 **没查成**那一档的回执：失败档 + 说清是哪一步 + 一句补救。
+    ///
+    /// 判别力：把 `checked` 写成"永远 `is_failure:false` + 只说『已经是最新的』"
+    /// （= 只看 `has_newer` 的那个洞）⇒ 这一条红。客户断网时读到的会是一句假话。
+    #[test]
+    fn the_failed_check_receipt_says_what_happened_and_what_to_do() {
+        let check = UpdateCheck::of(&json!({
+            "enabled": true, "current": "0.2.7", "latest": "0.2.7",
+            "has_newer": false, "last_check_ok": false
+        }));
+        let v = checked(&check);
+        assert_eq!(v["data"]["is_failure"], json!(true));
+        let headline = v["data"]["headline"].as_str().expect("有 headline");
+        assert!(headline.contains("没查成"), "{headline}");
+        assert!(headline.contains("补救"), "{headline}");
+    }
+
+    /// 开关关着时点「立即检测」：那一档照登成失败（`is_failure:true`），
+    /// 而不是**成功 + 什么都不说** —— 点了没查也是"你这一下没成"。
+    #[test]
+    fn a_manual_check_that_never_ran_is_not_a_success() {
+        let check = UpdateCheck::of(&json!({
+            "enabled": false, "current": "0.2.7", "has_newer": false, "last_check_ok": true
+        }));
+        let v = checked(&check);
+        assert_eq!(v["data"]["is_failure"], json!(true));
+        assert!(
+            v["data"]["headline"]
+                .as_str()
+                .expect("有 headline")
+                .contains("没有去查"),
+            "{}",
+            v["data"]["headline"]
+        );
     }
 }

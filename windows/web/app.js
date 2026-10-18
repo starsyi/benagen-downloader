@@ -24,6 +24,7 @@ import {
   codeLabelFromState,
   routeOfState,
   gateFromState,
+  updateNoticeFromStatus,
 } from "./js/render.js";
 
 // ---------------------------------------------------------------------------
@@ -106,6 +107,44 @@ const shell = mountShell({
       }
     );
   },
+  /**
+   * 更新提示条那颗「去下载」（规格 §4）：把**内核给的那条链接**交给系统默认浏览器。
+   *
+   * 🔴 **白名单在 Rust 那条命令里判**（`open_update_url`），前端**一个字都不判** ——
+   *    前端是可被注入的那一侧，承诺它自己会判等于没有承诺（R15）。
+   * ⚠️ 地址用的是**上一次摆进那一格的**那一条（`shell.setUpdateNotice` 写下的
+   *    `dataset.url`），不是当场重算：屏幕上写着哪个版本、点下去就去下哪个版本。
+   * ⚠️ 失败**上屏**（不留静默）：它只有两种来源 —— 那条地址不在白名单里（Rust 拒绝）、
+   *    或者系统没能把浏览器拉起来。两者对客户都是"你点了、什么都没发生"，
+   *    而那是本项目最忌的那一类（约束 4）。走**回执**（不是瞬时错误）：它是
+   *    "你刚才那个动作的结果"那类，由客户自己收起。
+   */
+  onUpdateDownload: (url) => {
+    if (typeof url !== "string" || url === "") return;
+    void call(CMD.openUpdateUrl, { url }).catch((error) => {
+      pushReceipt({
+        id: UPDATE_OPEN_RECEIPT_ID,
+        kind: "error",
+        icon: "exclamationmark.triangle.fill",
+        text: failureText(error),
+        hint: null,
+        retry: false,
+        dismiss: true,
+      });
+    });
+  },
+  /**
+   * 更新提示条那颗「收起」：**本次运行内**不再出现（规格 §4）。
+   *
+   * ⚠️ 这一格记在**本文件**（不是把那个节点就地删掉）：提示条每一拍都会重画，
+   *    删节点只能躲过"下一拍之前"的那一瞬间 —— 与本文件记 `localReceipts` 同一条理由。
+   * ⚠️ 不落盘、不进 localStorage、不记"被忽略的版本"（规格 §4 明确否掉了后者）：
+   *    下次启动会再出现一次，那是**有意**的。
+   */
+  onUpdateDismiss: () => {
+    dismissedUpdate = true;
+    paintUpdateNotice();
+  },
   onNoticeDismiss: (id) => dismissReceipt(id),
 });
 
@@ -162,6 +201,9 @@ let localReceipts = [];
 /** 改下载目录那条回执的 id（`settings.js` 用它，`app.js` 的"收起"出口也用它）。 */
 const DIR_CHANGE_RECEIPT_ID = "download-dir-change";
 
+/** 「去下载」没打开浏览器那条回执的 id（同一个 `id` 只留一条，后到的顶掉先前的）。 */
+const UPDATE_OPEN_RECEIPT_ID = "update-open-failed";
+
 /** 当前生效批次的码（`state().load.summary.code`；没有生效批次时是空串）。
  *  ⚠️ **不编占位符**：取不到就是空串（同 `files.js:codeText` 与
  *  `shell.js:setCodeLabel` 那条口径 —— `—` 也是一个字）。 */
@@ -183,6 +225,59 @@ function dismissReceipt(id) {
   localReceipts = localReceipts.filter((row) => row.id !== id);
   if (localReceipts.length === before) return;
   shell.setNotices(currentNotices());
+}
+
+// ---------------------------------------------------------------------------
+// 更新提示（规格 §4）：**壳级的那一条**
+// ---------------------------------------------------------------------------
+
+/** 最近一次成功拉回来的 `update_status` 载荷（`null` = 还一次都没成功过）。 */
+let lastUpdateStatus = null;
+
+/**
+ * 🔴 **本次运行内客户点过「收起」**（规格 §4：「关掉之后，本次运行内不再出现 ——
+ * 后续的每日检查也不会把它叫回来，直到下次启动」）。
+ *
+ * ⚠️ **模块级、住在本文件**（不是 `shell.js`、也不是哪一屏）：提示条现在挂在壳上，
+ *    换屏（去传输列表看一眼再切回来）不是"重启应用"，收起要跨过换屏活着。
+ * ⚠️ **不落盘、不进 localStorage、不记"被忽略的版本"**（规格 §4 明确否掉了后者）：
+ *    下次启动会再出现一次，那是**有意**的。
+ */
+let dismissedUpdate = false;
+
+/**
+ * 把"这一拍知道的更新状态"画到壳上。
+ *
+ * ⚠️ **判据在 `render.js:updateNoticeFromStatus`**（只有 `has_newer === true` 才算"有新版本"，
+ *    R20），这里只把**收起过没有**叠上去 —— 收起是前端这一侧的事
+ *    （规格 §4 说它是"本次运行内"的，内核对它一无所知）。
+ */
+function paintUpdateNotice() {
+  shell.setUpdateNotice(dismissedUpdate ? null : updateNoticeFromStatus(lastUpdateStatus));
+}
+
+/**
+ * 更新提示那一拍（`update_status`，宽节拍 60 s）。
+ *
+ * 🔴 **它挂在壳上、不挂在任何一屏上**（0.2.8 修的一场）：macOS 那条提示挂在
+ *    `RootView` 的主区里，**任何分区都看得见**；而这一条原来长在文件页模板里、
+ *    它那一拍也归文件页 ⇒ 启动落在空态页、或者客户正站在传输列表上时，
+ *    它**永远不出现** —— "Windows 客户端没有更新提示"正是这么来的。
+ *
+ * ⚠️ **失败一律静默**（规格 §5）：内核在"取不到"时本就回成功（`has_newer:false`），
+ *    所以这一支的失败只可能是"没有内核 / IPC 断了"——那是**别处**（`state()` 的节拍）
+ *    已经在说的一件事。这一条一个字都不上屏，也**不动上一次的结论**：
+ *    把已有的结论擦掉比留着它更不诚实 —— 我们没有新消息，不等于"没有新版"。
+ */
+async function tickUpdate() {
+  let status;
+  try {
+    status = await call(CMD.updateStatus);
+  } catch (error) {
+    return;
+  }
+  lastUpdateStatus = status;
+  paintUpdateNotice();
 }
 
 /**
@@ -483,11 +578,23 @@ syncToolbarDownload();
 //    而是让那三格从第一帧起就由**显式的判据**说了算（而不是由 HTML 的 `hidden` 兜着）。
 syncNavBadges();
 shell.setNotices(currentNotices());
+// 更新提示条的首帧：此刻还没有任何结论（`lastUpdateStatus === null` ⇒ 判据给 `null`）
+// ⇒ **藏起来**。这一句的作用与前两句相同：让那一格从第一帧起就由**显式的判据**说了算，
+// 而不是由 `index.html` 上的那个 `hidden` 兜着（它已经从文件页搬到了壳上）。
+paintUpdateNotice();
 
 // ④ 起轮询。**只有这一条** —— `transfers()` 的 200 ms 与 `verify()` 的 1 s 归
 //    各自那一屏（任务 11/12），它们**只在那一屏可见时**才该跑（规格 §3.5）。
 //    ⚠️ 第 4 个参数 `true` = **不看闸门**（`state` 与 `retry` 是仅有的两个例外）。
 poller.start(CMD.state, INTERVALS_MS.state, tickState, true);
+
+// ⑤ 更新提示那一拍：**壳自己的**（不归任何一屏，理由见 `tickUpdate`）。
+//    ⚠️ 宽节拍（60 s，`INTERVALS_MS.update_status`）：内核自己把它节流到 24 小时，
+//       这一拍只是把结果拿回来画。首拍立刻跑（`poll.js:start` 的既有语义）
+//       ⇒ 开窗一秒钟内就知道有没有新版，不用等一整分钟。
+//    ⚠️ **受闸门管**（不传 `ungated`）：引擎不可用的时候不去打内核 ——
+//       与它原先挂在文件页上时的口径一致（`poll.js:_fire` 第二条）。
+poller.start(CMD.updateStatus, INTERVALS_MS.update_status, tickUpdate);
 
 // 关窗/刷新时停掉全部节拍。⚠️ 这一步**不是**为了省电：Tauri 里 webview 一销毁，
 // 在飞的 `invoke` 会以一次拒绝收场，而那一次拒绝会走 `showTransientFailure` ⇒

@@ -43,6 +43,10 @@ pub struct Snapshot {
     pub multiip_tasks: u64,
     /// 这些任务身上的备胎 URI **总数**（域名 URI 不算）。
     pub multiip_backup_uris: u64,
+    /// 换腿线程从下载中的任务上摘掉的腿**总数**（`plan.del.len()` 逐次累加）。
+    pub leg_trim_del: u64,
+    /// 换腿线程补上的 IP 腿**总数**（`plan.add.len()` 逐次累加）。
+    pub leg_add: u64,
 }
 
 impl Snapshot {
@@ -65,6 +69,8 @@ impl Snapshot {
             ("stall_total_ms", self.stall_total.as_millis().to_string()),
             ("multiip_tasks", self.multiip_tasks.to_string()),
             ("multiip_backup_uris", self.multiip_backup_uris.to_string()),
+            ("leg_trim_del", self.leg_trim_del.to_string()),
+            ("leg_add", self.leg_add.to_string()),
         ]
     }
 
@@ -102,6 +108,8 @@ pub struct Counters {
     stall_total_ms: AtomicU64,
     multiip_tasks: AtomicU64,
     multiip_backup_uris: AtomicU64,
+    leg_trim_del: AtomicU64,
+    leg_add: AtomicU64,
 }
 
 impl Counters {
@@ -166,6 +174,16 @@ impl Counters {
             .fetch_add(backup_uris as u64, Ordering::Relaxed);
     }
 
+    /// 记一次**换腿动作**（摘慢腿、补新 IP 腿）。只在 `changeUri` **成功**后记——
+    /// 失败的那一拍不记，免得日志里出现"摘了 N 条"却实际一条没摘。
+    ///
+    /// 只数条数，不记 URI / 域名 / IP（诊断脱敏，与本模块其它计数同一纪律）。
+    pub fn record_leg_trim(&self, del: usize, add: usize) {
+        self.leg_trim_del
+            .fetch_add(del as u64, Ordering::Relaxed);
+        self.leg_add.fetch_add(add as u64, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             rpc_calls: self.rpc_calls.load(Ordering::Relaxed),
@@ -185,6 +203,8 @@ impl Counters {
             stall_total: Duration::from_millis(self.stall_total_ms.load(Ordering::Relaxed)),
             multiip_tasks: self.multiip_tasks.load(Ordering::Relaxed),
             multiip_backup_uris: self.multiip_backup_uris.load(Ordering::Relaxed),
+            leg_trim_del: self.leg_trim_del.load(Ordering::Relaxed),
+            leg_add: self.leg_add.load(Ordering::Relaxed),
         }
     }
 }
@@ -257,6 +277,7 @@ mod tests {
         c.record_rung(Rung::PauseAllThenResumeAll);
         c.record_stall(Duration::from_secs(200));
         c.record_multiip(2);
+        c.record_leg_trim(3, 2);
         // ⚠️ 逐项比对整份 (键, 值) —— 不是只比键序，也不是只抽查一个值。
         //    判别力：`rung_pause_all` 误读成 `self.rung_swap`、`rpc_worst_ms` 写成
         //    `as_secs()`（6 而不是 6000）、`stall_total_ms` 写成 `as_secs()`、
@@ -281,6 +302,8 @@ mod tests {
                 ("stall_total_ms", "200000".to_string()),
                 ("multiip_tasks", "1".to_string()),
                 ("multiip_backup_uris", "2".to_string()),
+                ("leg_trim_del", "3".to_string()),
+                ("leg_add", "2".to_string()),
             ]
         );
     }
@@ -299,6 +322,18 @@ mod tests {
         let s = c.snapshot();
         assert_eq!(s.multiip_tasks, 2, "带备胎的任务数 = backup_uris>0 的次数");
         assert_eq!(s.multiip_backup_uris, 5, "备胎 URI 总数 = 2+0+3");
+    }
+
+    /// 换腿计数按条数累加（摘与补各一根轴）。
+    /// 判别力：把 `del` 与 `add` 的参数位置写反 ⇒ 两值对调 ⇒ 红。
+    #[test]
+    fn record_leg_trim_accumulates_del_and_add_totals() {
+        let c = Counters::default();
+        c.record_leg_trim(1, 1);
+        c.record_leg_trim(2, 0);
+        let s = c.snapshot();
+        assert_eq!(s.leg_trim_del, 3, "摘掉的腿总数 = 1+2");
+        assert_eq!(s.leg_add, 1, "补上的腿总数 = 1+0");
     }
 
     #[test]
@@ -323,7 +358,7 @@ mod tests {
             ("why".to_string(), "periodic".to_string()),
             "`why` 必须是**第一项**"
         );
-        assert_eq!(got[0].1.len(), 16, "`why` + 15 个字段");
+        assert_eq!(got[0].1.len(), 18, "`why` + 17 个字段");
         let expect: Vec<(String, String)> = c
             .snapshot()
             .fields()

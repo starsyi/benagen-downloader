@@ -156,3 +156,27 @@ export function routeOfState(state) {
 export function gateFromState(state) {
   return state?.allows_requests === true;
 }
+
+/**
+ * `update_status()` → 更新提示条（规格 §4）。**`null` = 这条不该显示。**
+ *
+ * 🔴 **判据只有 `has_newer`，不是"`url` 非空"**（R20）：内核在"没有新版"时
+ *    **照样可能给一条非空的 `url`**（一条指向**已装版本**的链接）⇒ 按"`url` 非空"
+ *    渲染会把客户引去下载他自己已经装着的那个版本。这条判据的**唯一落点就是这里**：
+ *    `shell.js` 与 `app.js` 收到 `null` 就只是不显示，谁也不重判一遍。
+ *
+ * ⚠️ 三格都做 `typeof` 那一步：载荷缺格时**空着**，不编占位符（本文件其余映射口同口径）。
+ *    那两格版本号是**数据文案**，本文件不拼一个字（§3.2）——静态那半句住在
+ *    `index.html` 的结构文案里。
+ * ⚠️ 它**不看 `enabled`**：那个开关管的是"内核要不要发起检查"，而这里回答的是
+ *    "内核已经拿到的结果要不要显示" —— 关掉开关不该把已有的事实抹掉
+ *    （macOS 侧 `UpdateNotice.of` 同样只看 `hasNewer`）。
+ */
+export function updateNoticeFromStatus(status) {
+  if (!status || status.has_newer !== true) return null;
+  return {
+    latest: typeof status.latest === "string" ? status.latest : "",
+    current: typeof status.current === "string" ? status.current : "",
+    url: typeof status.url === "string" ? status.url : "",
+  };
+}

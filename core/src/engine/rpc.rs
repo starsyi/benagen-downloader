@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::legs::{parse_servers, Leg};
 use super::status::{parse_num, RawTask};
 
 /// 单次 RPC 的超时。对应 Go 的 `&http.Client{Timeout: 10 * time.Second}`。
@@ -241,6 +242,40 @@ fn parse_global_stat(raw: serde_json::Value) -> Result<GlobalStat, String> {
         num_waiting: parse_num(&r.num_waiting),
         num_stopped: parse_num(&r.num_stopped),
     })
+}
+
+/// `getUris` 的 `result` → URI 列表（保持线上顺序，**不去重**）。
+///
+/// 形状不对返回 `Err` 而不是空表：空表在调用方眼里是「这个任务没有域名腿」（正常的跳过），
+/// 而形状漂移是另一件事——两者必须可区分，否则将来 aria2 换个形状又会变成一次静默失效。
+fn parse_uris(v: &serde_json::Value) -> Result<Vec<String>, String> {
+    let Some(items) = v.as_array() else {
+        return Err(format!("解析 getUris 返回失败: 期望数组，实际 {v}"));
+    };
+    let mut uris = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(uri) = item.get("uri").and_then(serde_json::Value::as_str) else {
+            return Err(format!("解析 getUris 返回失败: 元素缺 uri 字符串，实际 {item}"));
+        };
+        uris.push(uri.to_string());
+    }
+    Ok(uris)
+}
+
+/// `changeUri` 的返回值 `[removed, added]` → 两个计数。
+///
+/// 读不懂就按 `(0, 0)`：**动作已经发生**，不能因为读不懂计数就把一次成功的换腿判成失败
+/// （调用方会把 `Err` 当"这一拍没换成"）。代价只是诊断少记一条，收益是不会谎报。
+fn change_uri_counts(v: &serde_json::Value) -> (u64, u64) {
+    let count_at = |i: usize| -> u64 {
+        match v.as_array().and_then(|a| a.get(i)) {
+            Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
+            // 线上是数字（实测 `[1,0]`）；接受数字字符串只是防形状漂移，不是假设它是字符串。
+            Some(serde_json::Value::String(s)) => s.trim().parse().unwrap_or(0),
+            _ => 0,
+        }
+    };
+    (count_at(0), count_at(1))
 }
 
 impl RpcClient {
@@ -809,6 +844,83 @@ impl RpcClient {
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .ok_or_else(|| format!("解析 tellStatus 返回失败: 期望 status 字符串，实际 {raw}"))
+    }
+
+    /// `aria2.getServers` —— 读一条 GID 的「腿表」（每个源/镜像此刻的速度）。
+    ///
+    /// 返回的就是判据 [`super::legs`] 的产出：`Vec<Leg>`，`speed` 单位是字节/秒。
+    /// **判决不在这一层**——这一层只把 RPC 的 `result` 交给 [`parse_servers`]。
+    ///
+    /// ⚠️ **`result` 是一层数组**（实测 aria2 1.37.0）：
+    /// `[{"index":"1","servers":[{"uri":…,"downloadSpeed":"1501578"}]}]`，速度是**字符串**。
+    /// 这两点都由 [`parse_servers`]（`core/src/engine/legs.rs`）负责，本方法不碰形状。
+    ///
+    /// ⚠️ **单次尝试、不进 [`is_retryable_read`] 白名单**：调用方是 10 秒一拍的换腿线程
+    /// （`kernel::spawn_leg_trim`，在 `core/src/kernel.rs`）。
+    /// 传输层抖动就等下一拍——**下一拍本来就是天然重试**。重试在这里的代价是负的：
+    /// 每次重试多卡一个 [`RPC_TIMEOUT`]，线程这一拍就漂了，而它重读到的仍是同一份腿表。
+    pub fn servers(&self, gid: &str) -> Result<Vec<Leg>, String> {
+        let v = self.call("aria2.getServers", &[serde_json::json!(gid)])?;
+        Ok(parse_servers(&v))
+    }
+
+    /// `aria2.getUris` —— 读一条 GID 的**完整 URI 列表**（任务登记过的全部源，不要求此刻有连接）。
+    ///
+    /// 为什么必须有它（换腿的域名腿来源）：`getServers` 只列**这一拍真有连接**的 URI，
+    /// 域名腿某一拍没有连接就根本不出现 ⇒ 从腿表里找域名腿会**永远找不到**，
+    /// 该任务的换腿**静默永久跳过**（无错误、无日志，表现只是"特性整条失效"）。
+    /// `getUris` 列的是任务的全部 URI，与"此刻连没连上"无关。
+    ///
+    /// 实测形状（内嵌 aria2 1.37.0；探针：2 条 URI + `split=4` + `max-connection-per-server=4`）：
+    /// `[{"uri":"http://…","status":"used"}, …]`，`status` 只见到 `used` / `waiting` 两种。
+    /// ⚠️ **它按连接槽位列，同一 URI 会出现多次**（4 条连接时同一 URI 出现 2 次，
+    /// 状态可能一 `used` 一 `waiting`）——所以调用方只能 `find` 第一条满足条件的，
+    /// 不能假设"列表里 URI 唯一"，也不该拿它的长度当腿数。
+    ///
+    /// ⚠️ **单次尝试、不进 [`is_retryable_read`] 白名单**：调用方是 10 秒一拍的换腿线程
+    /// （`kernel::spawn_leg_trim`，在 `core/src/kernel.rs`），下一拍就是天然重试——
+    /// 理由与 [`Self::servers`] 逐字相同，不重复。
+    pub fn get_uris(&self, gid: &str) -> Result<Vec<String>, String> {
+        let v = self.call("aria2.getUris", &[serde_json::json!(gid)])?;
+        parse_uris(&v)
+    }
+
+    /// `aria2.changeUri` —— 换腿：删掉 `del` 里的 URI、加上 `add` 里的 URI。
+    ///
+    /// `file_index` 单文件恒为 `1`（本产品的 `addUri` 只交一个 URI ⇒ 恒一条 file 条目）。
+    /// `del`/`add` 是**字符串数组**，顺序原样进 RPC——顺序是调用方（`plan` 的判决）
+    /// 给的，这一层不排序、不去重、不拼串。
+    ///
+    /// ⚠️ **写方法、绝不重试**：不在 [`is_retryable_read`] 白名单里，与
+    /// [`RpcClient::remove`] 等写方法同口径（重试一个非幂等的位置参数，可能把同一条腿
+    /// 删/加两遍）。
+    ///
+    /// ⚠️ **不返回 [`WriteOutcome`]，返回 `Result<(u64, u64), String>`**：`changeUri` 的
+    /// NoAnswer（超时/连接断了，aria2 可能已经照做）在这里**没有分支价值**——
+    /// 调用方 10 秒后会用 `getServers` 重读腿表对账，改没改以那一拍的实际腿表为准。
+    /// 但返回值里的 `[removed, added]` **必须交给调用方**：
+    /// 实测（aria2 1.37.0）`del` 里放引擎不认识的 URI 时**不报错、回 `[0, 0]`**，
+    /// 所以「我方计划删了几条」不等于「引擎真的删了几条」——诊断计数只能按后者记，
+    /// 否则唯一能回答「换腿生效没」的读数就是假的。
+    /// 这也解释了为什么它没有 `_detailed` 变体（对比 [`RpcClient::pause_detailed`]：
+    /// 那里的调用方没有后续对账，必须当场知道「到底改没改」）。
+    pub fn change_uri(
+        &self,
+        gid: &str,
+        file_index: u32,
+        del: &[String],
+        add: &[String],
+    ) -> Result<(u64, u64), String> {
+        let v = self.call(
+            "aria2.changeUri",
+            &[
+                serde_json::json!(gid),
+                serde_json::json!(file_index),
+                serde_json::json!(del),
+                serde_json::json!(add),
+            ],
+        )?;
+        Ok(change_uri_counts(&v))
     }
 
     /// `aria2.remove` —— 移除一个**活动/等待中**的任务。
@@ -1454,6 +1566,315 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
+    // 换腿（读腿表 / 换腿）：`aria2.getServers` 与 `aria2.changeUri`。
+    //
+    // ⚠️ 这两条都是**周期性的后台调用**（换腿线程 `spawn_leg_trim` 10 秒一拍），
+    // 不是界面上的点一下就走的动作；`servers` 因此与 `status()` 同口径——单次尝试、
+    // 不重试（下一拍就是天然重试）。下面三条钉的全是**线上形状**：方法名逐字、
+    // 参数位置与类型、以及写方法绝不重试。
+    // ------------------------------------------------------------------------
+
+    /// `servers` 打在**精确**的方法名上，并把一层数组的真实形状解析成腿表。
+    ///
+    /// 夹具用**真实 aria2 1.37.0 的形状**（一层数组、`downloadSpeed` 是字符串）：
+    /// 换成两层数组或数字速率时，红的会是 `legs.rs` 的既有判据而不是这里——
+    /// 所以夹具必须与线上一致，否则这条测试只是在重复 `legs.rs` 的错误假设。
+    ///
+    /// 判别力：方法名写错（`getServer`）⇒ 第一条断言红；gid 没落在 `params[1]`
+    /// ⇒ 第二条红；`servers` 忘了接 `parse_servers` ⇒ 腿表断言红。
+    #[test]
+    fn servers_sends_exact_method_name_and_parses() {
+        let srv = new_stub_rpc(|_m, _p| {
+            Ok(json!([{
+                "index": "1",
+                "servers": [
+                    {
+                        "uri": "http://1.2.3.4/x",
+                        "currentUri": "http://1.2.3.4/x",
+                        "downloadSpeed": "1501578"
+                    },
+                    {
+                        "uri": "http://5.6.7.8/x",
+                        "currentUri": "http://5.6.7.8/x",
+                        "downloadSpeed": "90000"
+                    }
+                ]
+            }]))
+        });
+        let c = RpcClient::new(&rpc_url(&srv), "s");
+
+        let legs = c.servers("gid-1").expect("servers 不应失败");
+
+        let (method, params) = method_and_params(&srv.requests()[0].body);
+        assert_eq!(method, "aria2.getServers", "方法名必须逐字正确");
+        assert_eq!(
+            params.len(),
+            2,
+            "线上形态是 [token, gid]，实际 {params:?}（多一个/少一个参数 aria2 都会报参数错）"
+        );
+        assert_eq!(params[1], "gid-1", "GID 必须落在 params[1]");
+        assert_eq!(
+            legs,
+            vec![
+                Leg {
+                    uri: "http://1.2.3.4/x".to_string(),
+                    speed: 1_501_578
+                },
+                Leg {
+                    uri: "http://5.6.7.8/x".to_string(),
+                    speed: 90_000
+                },
+            ],
+            "返回的腿表必须与真实形状的应答逐字一致（两条腿的 uri 与 speed）"
+        );
+    }
+
+    /// 引擎态错误（GID 已消失）必须**冒出来**，不许退化成空腿表。
+    ///
+    /// 桩回 400 + `{"code":1,"message":"GID gid-gone is not found"}`——这是 aria2 1.37.0
+    /// 对失效 GID 的真实应答形状。断的是**错误原文被带出来**（GID 与 `not found` 都在）。
+    ///
+    /// ⚠️ 这条守的是**一个静默失效**，不是文案：有人若把 `servers` 改成
+    /// `self.call(...).map(parse_servers).unwrap_or_default()`，编译照样过、类型照样对，
+    /// 但引擎态错误会变成**空腿表** ⇒ 上层的判决以为「这条 GID 没有腿」⇒ 整条换腿特性
+    /// **无声失效**（不报错、不记日志，表现只是「从不换腿」）。换腿是优化不是正确性，
+    /// 所以这种退化不会被别的判据发现——只能在这一层钉住"错误必须冒出来"。
+    ///
+    /// 判别力：把 `servers` 改成 `unwrap_or_default()` ⇒ 本用例第一条断言红
+    /// （`servers` 回 `Ok(空表)` 而不是 `Err`）。
+    #[test]
+    fn servers_surfaces_engine_error() {
+        let srv = new_stub_rpc(|_m, _p| Err((1, "GID gid-gone is not found".to_string())));
+        let c = RpcClient::new(&rpc_url(&srv), "s");
+
+        let e = c
+            .servers("gid-gone")
+            .expect_err("引擎态错误必须冒出来，不得静默退化成空腿表");
+
+        assert!(
+            e.contains("gid-gone"),
+            "错误必须带着失效的 GID（否则无法定位是哪条腿表读砸了），实际: {e:?}"
+        );
+        assert!(
+            e.contains("not found"),
+            "错误必须带着 aria2 的 message 原文（`not found`），实际: {e:?}"
+        );
+    }
+
+    /// `change_uri` 的参数形状：`[token, gid, fileIndex, delUris, addUris]`。
+    ///
+    /// 两处承重：
+    ///  * `fileIndex` 必须是**数字**（线上是 `1`）。本产品单文件 `addUri` ⇒ 恒为 1，
+    ///    但写成字符串 `"1"` 时 aria2 按整数解析位置参数，会回 400。
+    ///    ⚠️ 本用例**故意传 `3`**（不是 1）：传 1 时，把 `json!(file_index)` 写成
+    ///    写死的 `json!(1)` 也照样绿——那正是「参数被偷偷写死」的变异，必须能红。
+    ///    daemon 层那条委托用例同样传 3，两层各自守得住。
+    ///  * `del`/`add` 必须是**字符串数组**、且顺序逐字保留——顺序是调用方
+    ///    （`plan` 的判决）给的，这里不能排序、去重，也不能拼成逗号串。
+    #[test]
+    fn change_uri_sends_exact_params() {
+        let srv = new_stub_rpc(|_m, _p| Ok(json!([1, 1])));
+        let c = RpcClient::new(&rpc_url(&srv), "s");
+        let del = vec![
+            "http://1.2.3.4/x".to_string(),
+            "http://1.2.3.5/y".to_string(),
+        ];
+        let add = vec![
+            "http://9.9.9.9/x".to_string(),
+            "http://8.8.8.8/y".to_string(),
+        ];
+
+        let counts = c
+            .change_uri("gid-1", 3, &del, &add)
+            .expect("change_uri 不应失败");
+
+        assert_eq!(
+            counts,
+            (1, 1),
+            "changeUri 的 [removed, added] 必须原样返回给调用方（诊断只能按引擎的实际计数记）"
+        );
+
+        let (method, params) = method_and_params(&srv.requests()[0].body);
+        assert_eq!(method, "aria2.changeUri", "方法名必须逐字正确");
+        assert_eq!(
+            params.len(),
+            5,
+            "线上形态是 [token, gid, fileIndex, delUris, addUris]，实际 {params:?}"
+        );
+        assert_eq!(params[1], "gid-1", "GID 必须落在 params[1]");
+        assert!(
+            params[2].is_number(),
+            "fileIndex 必须是 JSON 数字，不能是字符串：实际 {:?}",
+            params[2]
+        );
+        assert_eq!(
+            params[2],
+            json!(3),
+            "fileIndex 必须原样透传调用方给的 3——写死成 1 就是偷偷改参数"
+        );
+        assert_eq!(
+            params[3],
+            json!(["http://1.2.3.4/x", "http://1.2.3.5/y"]),
+            "delUris 必须是字符串数组且顺序逐字保留"
+        );
+        assert_eq!(
+            params[4],
+            json!(["http://9.9.9.9/x", "http://8.8.8.8/y"]),
+            "addUris 必须是字符串数组且顺序逐字保留"
+        );
+    }
+
+    /// 🔴 **引擎回 `[0, 0]` 时必须如实返回 `(0, 0)`**，不许拿我方计划冒充结果。
+    ///
+    /// 实测（aria2 1.37.0）：`del` 里放引擎不认识的 URI 时**不报错**、回 `[0, 0]`。
+    /// 旧实现只要 `Ok(())` 就按 `plan.del.len()` / `plan.add.len()` 记账，于是「一条没删」
+    /// 被记成「删了」——唯一能回答「换腿生效没」的诊断读数直接失真。
+    ///
+    /// 判别力：把 `change_uri` 改成 `Ok((del.len() as u64, add.len() as u64))`
+    /// （即回到「按我方计划记账」）⇒ 本条红（会得到 `(1, 1)` 而不是 `(0, 0)`）。
+    #[test]
+    fn change_uri_reports_the_engine_counts_not_our_plan() {
+        let srv = new_stub_rpc(|_m, _p| Ok(json!([0, 0])));
+        let c = RpcClient::new(&rpc_url(&srv), "s");
+        let del = vec!["http://192.0.2.1/nope.bin".to_string()];
+        let add = vec!["http://9.9.9.9/x".to_string()];
+
+        let counts = c
+            .change_uri("gid-1", 1, &del, &add)
+            .expect("引擎不认识这些 URI 也不是错误：它已经应答了");
+
+        assert_eq!(
+            counts,
+            (0, 0),
+            "引擎回 [0,0]（一条都没删/没加）时不许记成删了：诊断必须按引擎的实际结果记"
+        );
+    }
+
+    /// 🔴 **`change_uri` 绝不重试**：写方法不在 [`is_retryable_read`] 白名单里。
+    ///
+    /// 与 `a_non_retryable_write_is_counted_exactly_once` 同构，但钉的是**本方法**：
+    /// 把它接到某条会重试的路径上（或误加进白名单）⇒ 往返计数变 2 ⇒ 红。
+    /// 重试的代价在换腿线程上尤其糟：10 秒一拍，重试把最坏等待翻倍成 2×10 秒。
+    #[test]
+    fn change_uri_is_not_retried_on_transport_failure() {
+        let c = std::sync::Arc::new(crate::diag_counters::Counters::default());
+        let client = RpcClient::new("http://127.0.0.1:1/jsonrpc", "s")
+            .with_counters(std::sync::Arc::clone(&c));
+        let del = vec!["http://1.2.3.4/x".to_string()];
+        let add = vec!["http://9.9.9.9/x".to_string()];
+
+        let e = client
+            .change_uri("gid-1", 1, &del, &add)
+            .expect_err("掐断的连接上 changeUri 必须失败");
+        assert!(e.contains("RPC 请求失败"), "错误文案变了：{e}");
+        let s = c.snapshot();
+        assert_eq!(
+            s.rpc_calls, 1,
+            "change_uri 被重试了 —— 写方法不在 is_retryable_read 白名单里，只许发一次"
+        );
+        assert_eq!(s.rpc_failures, 1);
+    }
+
+    /// 🔴 **`servers` 是读方法，但故意不重试**：它也不在 [`is_retryable_read`] 白名单里。
+    ///
+    /// 与 `change_uri_is_not_retried_on_transport_failure` 同形，钉的是**反直觉的那一半**：
+    /// 白名单里另外四个 `tell*`/`getGlobalStat` 都是读方法，很容易顺手把 `getServers`
+    /// 也加进去——而它必须留在外面。理由是调用方的节奏：换腿线程 **10 秒一拍**，
+    /// 传输层抖动时**下一拍本来就是天然重试**；在这里重试只会让这一拍多卡一个
+    /// [`RPC_TIMEOUT`]，线程跟着漂，而重读到的仍是同一份腿表（甚至同一份过期的）。
+    ///
+    /// 判别力：把 `aria2.getServers` 加进 `is_retryable_read` ⇒ `rpc_calls` 变 2 ⇒ 本条红
+    /// （审查者实测过：加进白名单后既有 6 条腿表用例全绿，即此前无人守这条承诺）。
+    #[test]
+    fn servers_is_not_retried_on_transport_failure() {
+        let c = std::sync::Arc::new(crate::diag_counters::Counters::default());
+        let client = RpcClient::new("http://127.0.0.1:1/jsonrpc", "s")
+            .with_counters(std::sync::Arc::clone(&c));
+
+        let e = client
+            .servers("gid-1")
+            .expect_err("掐断的连接上 getServers 必须失败");
+        assert!(e.contains("RPC 请求失败"), "错误文案变了：{e}");
+        let s = c.snapshot();
+        assert_eq!(
+            s.rpc_calls, 1,
+            "getServers 被重试了 —— 读方法也不许重试：10 秒一拍的下一拍就是天然重试，\
+             重试只多卡一个超时"
+        );
+        assert_eq!(s.rpc_failures, 1);
+    }
+
+    /// `get_uris` 打在**精确**的方法名上，并按实测形状取出 URI 列表。
+    ///
+    /// 夹具是真实抓包（aria2 1.37.0，`split=4` + `max-connection-per-server=4`）：
+    /// `[{"uri":…,"status":"used"}, …]`，**同一 URI 按连接槽位出现多次**。
+    /// 这里有意保留重复：它钉的是「解析器不许去重/不许按长度当腿数」——
+    /// 去重会把 `waiting` 槽位里的域名腿丢掉，而调用方只需要 `find` 第一条。
+    ///
+    /// 判别力：方法名写错 ⇒ 第一条断言红；gid 没落在 `params[1]` ⇒ 第二条红；
+    /// 解析时按 `status == "used"` 过滤 ⇒ URI 列表少了 `waiting` 那条 ⇒ 第三条红。
+    #[test]
+    fn get_uris_sends_exact_method_name_and_parses() {
+        let srv = new_stub_rpc(|_m, _p| {
+            Ok(json!([
+                {"uri": "http://127.0.0.1:8733/big.bin", "status": "used"},
+                {"uri": "http://localhost:8733/big.bin", "status": "used"},
+                {"uri": "http://127.0.0.1:8733/big.bin", "status": "waiting"},
+                {"uri": "http://localhost:8733/big.bin", "status": "waiting"}
+            ]))
+        });
+        let c = RpcClient::new(&rpc_url(&srv), "s");
+
+        let uris = c.get_uris("gid-1").expect("get_uris 不应失败");
+
+        let (method, params) = method_and_params(&srv.requests()[0].body);
+        assert_eq!(method, "aria2.getUris", "方法名必须逐字正确");
+        assert_eq!(
+            params.len(),
+            2,
+            "线上形态是 [token, gid]，实际 {params:?}（getUris 没有 fileIndex 参数）"
+        );
+        assert_eq!(params[1], "gid-1", "GID 必须落在 params[1]");
+        assert_eq!(
+            uris,
+            vec![
+                "http://127.0.0.1:8733/big.bin".to_string(),
+                "http://localhost:8733/big.bin".to_string(),
+                "http://127.0.0.1:8733/big.bin".to_string(),
+                "http://localhost:8733/big.bin".to_string(),
+            ],
+            "URI 列表必须逐字保留线上顺序与重复（同 URI 按连接槽位出现多次）"
+        );
+    }
+
+    /// 🔴 **`get_uris` 是读方法，但故意不重试**：它不在 [`is_retryable_read`] 白名单里。
+    ///
+    /// 与 `servers_is_not_retried_on_transport_failure` 同形、同一理由：调用方是 10 秒一拍的
+    /// 换腿线程，下一拍就是天然重试；在这里重试只会让这一拍多卡一个 [`RPC_TIMEOUT`]。
+    /// 它**故意不进** `retryable_reads_are_exactly_the_read_methods` 的两段列表：
+    /// 那条用例守的是"读方法可重试 / 写方法不可重试"，而本例守的正是"读方法也不重试"。
+    ///
+    /// 判别力：把 `aria2.getUris` 加进 `is_retryable_read` ⇒ `rpc_calls` 变 2 ⇒ 本条红。
+    #[test]
+    fn get_uris_is_not_retried_on_transport_failure() {
+        let c = std::sync::Arc::new(crate::diag_counters::Counters::default());
+        let client = RpcClient::new("http://127.0.0.1:1/jsonrpc", "s")
+            .with_counters(std::sync::Arc::clone(&c));
+
+        let e = client
+            .get_uris("gid-1")
+            .expect_err("掐断的连接上 getUris 必须失败");
+        assert!(e.contains("RPC 请求失败"), "错误文案变了：{e}");
+        let s = c.snapshot();
+        assert_eq!(
+            s.rpc_calls, 1,
+            "getUris 被重试了 —— 读方法也不许重试：10 秒一拍的下一拍就是天然重试，\
+             重试只多卡一个超时"
+        );
+        assert_eq!(s.rpc_failures, 1);
+    }
+
+    // ------------------------------------------------------------------------
     // 传输列表动作（**任务 11 新增，非移植**——Go 内核没有 pause/unpause/remove 的封装，
     // 这一段没有任何可移植的测试源，从零设计）。
     //
@@ -1903,9 +2324,15 @@ mod tests {
             "aria2.removeDownloadResult",
             "aria2.changeGlobalOption",
             "aria2.shutdown",
+            // 换腿：写方法，与上面同口径（重试可能把同一条腿删/加两遍）。
+            "aria2.changeUri",
         ] {
             assert!(!is_retryable_read(m), "{m} 是写方法，**绝不许**重试");
         }
+        // ⚠️ `aria2.getServers` 与 `aria2.getUris` **两段都故意不进**：它们是读方法，但同样
+        //    不许重试（10 秒一拍的下一拍就是天然重试）。别把它们补进上面那段读方法的循环里——
+        //    它们各由 `servers_is_not_retried_on_transport_failure` /
+        //    `get_uris_is_not_retried_on_transport_failure` 单独守。
     }
 
     // ------------------------------------------------------------------------

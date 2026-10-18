@@ -35,6 +35,11 @@ export const SECTIONS = Object.freeze(["files", "transfers", "verify"]);
  *   所以"收起来"这件事必须回到 `app.js` 那一份数组上去做（就地 `row.remove()` 的话，
  *   下一拍那一行会因为键又变了而**复活**）。`state()` 带回来的那些没有 `id`，
  *   仍然是就地移除（它们的权威在载荷里，下一拍本来就由载荷说了算）。
+ * @param {(url: string) => void} handlers.onUpdateDownload 点了更新提示条上那颗
+ *   「去下载」（地址是上一次摆进那一格的那条，见 `setUpdateNotice`）。
+ * @param {() => void} handlers.onUpdateDismiss 点了更新提示条上那颗「收起」。
+ *   ⚠️ 它是**本次运行内**不再出现（规格 §4）——所以这一格由 `app.js` 记着，
+ *   而不是把节点就地删掉（那样下一拍又会画回来）。
  */
 export function mountShell(handlers = {}) {
   const shell = {
@@ -56,6 +61,16 @@ export function mountShell(handlers = {}) {
     _notices: byId("notices"),
     /** 上一次 `setNotices` 的内容签名（`undefined` = 还一次都没设过）。 */
     _noticesKey: undefined,
+    // ---- 更新提示条（规格 §4）：**壳级的**，任何分区都看得见 --------------------
+    //  ⚠️ 它不属于任何一屏（0.2.8 修的一场：原先长在文件页模板里 ⇒ 不站在文件页上
+    //     就永远看不见）。判据在 `render.js:updateNoticeFromStatus`，本文件只摆。
+    _updateBar: byId("update-bar"),
+    _updateLatest: byId("update-bar-latest"),
+    _updateCurrent: byId("update-bar-current"),
+    _updateGo: byId("update-bar-go"),
+    _updateDismiss: byId("update-bar-dismiss"),
+    _updateDownloadHandler: handlers.onUpdateDownload || null,
+    _updateDismissHandler: handlers.onUpdateDismiss || null,
     _batchFields: {
       code: byId("summary-code"),
       expired: byId("summary-expired"),
@@ -92,6 +107,22 @@ export function mountShell(handlers = {}) {
   byId("tb-settings").addEventListener("click", () => {
     if (handlers.onSettingsClick) handlers.onSettingsClick();
   });
+
+  // ---- 更新提示条那两颗按钮 ------------------------------------------------
+  // 「去下载」的地址**不在这里判**：它是 `open_update_url` 的实参，而"哪条地址算官方
+  // 发布页"那条白名单在 Rust 里（`api/update.rs` 的 `openurl`）—— 本文件只把上一次
+  // 摆进来的那一格原样交出去（`setUpdateNotice` 写下的 `dataset.url`）。
+  shell._updateGo.addEventListener("click", () => {
+    if (handlers.onUpdateDownload) {
+      handlers.onUpdateDownload(shell._updateGo.dataset.url || "");
+    }
+  });
+  shell._updateDismiss.addEventListener("click", () => {
+    if (handlers.onUpdateDismiss) handlers.onUpdateDismiss();
+  });
+  // 「收起」那颗的图形由 JS 补（`dom.js:ICONS` 是图形的家）——与常驻提示行同一分工，
+  // 也同一个名字（`index.html` 里只留按钮与它的无障碍名字）。
+  shell._updateDismiss.prepend(icon("notice.dismiss", "notice__icon"));
 
   // -------------------------------------------------------------------------
   // 数据槽位
@@ -300,10 +331,38 @@ export function mountShell(handlers = {}) {
     }
   };
 
+  /**
+   * 更新提示条（规格 §4）。`desc` 为 `null` ⇒ **整条不渲染**。
+   *
+   * @param {{latest: string, current: string, url: string}|null} desc
+   *   ⚠️ **判据在 `render.js:updateNoticeFromStatus`**（只有 `has_newer === true` 才算
+   *      "有新版本"，R20）—— 本函数收到 `null` 就是"不该显示"，**不再自己判一遍**：
+   *      同一条判据有两个真相源，迟早会有一处先改。
+   *
+   * ⚠️ 那两格版本号走 `writeText`（值没变就不碰 DOM）：它们是**可选中复制**的原文
+   *    （客户要报给业务方"我这是 0.2.7"），与本文件其余 setter 同一条纪律。
+   * ⚠️ 「去下载」的地址**不留在这份 JS 状态里**，而是写进 `dataset.url`：点击时读的
+   *    就是上一次摆进来的那一个 —— 与"屏幕上写着哪个版本、点下去就去下哪个版本"
+   *    是同一份数据，不会出现"提示条已经换成 0.2.9、点下去还是 0.2.8 的链接"。
+   */
+  shell.setUpdateNotice = (desc) => {
+    if (!desc) {
+      if (!shell._updateBar.hidden) shell._updateBar.hidden = true;
+      writeText(shell._updateLatest, "");
+      writeText(shell._updateCurrent, "");
+      delete shell._updateGo.dataset.url;
+      return;
+    }
+    writeText(shell._updateLatest, desc.latest);
+    writeText(shell._updateCurrent, desc.current);
+    const url = typeof desc.url === "string" ? desc.url : "";
+    if ((shell._updateGo.dataset.url || "") !== url) shell._updateGo.dataset.url = url;
+    if (shell._updateBar.hidden) shell._updateBar.hidden = false;
+  };
+
   shell.setSection(SECTIONS[0]);
   return shell;
 }
-
 /**
  * 造一条常驻提示行。
  *

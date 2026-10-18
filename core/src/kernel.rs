@@ -40,10 +40,12 @@ use serde_json::{json, Map, Value};
 use crate::autoretry;
 use crate::delivery::{Manifest, UreqTransport};
 use crate::engine::daemon::{Daemon, DaemonOptions};
+use crate::engine::legs::leg_is_ip_literal;
 use crate::engine::rpc::WriteOutcome;
 use crate::engine::status::{Task, TaskState};
 use crate::engine::supervisor::{Ladder, Liveness, Progress, Rung, TaskProgress, Thresholds};
 use crate::intent::{self, Intent};
+use crate::legtrim;
 use crate::migrate;
 use crate::planner::{Kind, Options as PlanOptions, Planner};
 use crate::protocol::{codes, TransferItem};
@@ -135,6 +137,22 @@ pub struct Kernel {
     /// **手动查那颗按钮唯一的反馈**：正在查时为真。壳在**另一条连接**上轮询
     /// `update_status` 时看得到它 —— 所以置真/置假必须发生在**锁内**（见 [`run_update_check`]）。
     update_checking: bool,
+
+    /// **上一次检查到底查成没有**：`Some(true)` 查成了、`Some(false)` 没查成、
+    /// `None` = **从没查过**（三档不许并成两档 —— "没查过"与"没查成"要说得出不一样）。
+    ///
+    /// 🔴 **为什么非要有这一格**：手动查那颗按钮要**当场**回答"有没有新版本"，
+    ///    而"没查成"（断网 / 发布页挂了）与"查成了、确实没有新的"在
+    ///    [`update::State::last_seen`] 上**长得一模一样**（两件事都不改它）——
+    ///    只按 `has_newer` 判的话，断网时那颗按钮会对客户说**"已经是最新的"**，
+    ///    那是**谎报**。规格 §5 那条"失败一律静默"说的是**界面上不许冒看不懂的报错**，
+    ///    不是**替客户把没查成说成查成了**。
+    ///
+    /// ⚠️ **与 `update_checking` 同层：运行状态，不落盘**（`update.json` 里那三格是持久状态）。
+    ///    这一格只在"刚点完那颗按钮"的那一次对话里有意义；上一次开机的检查结果与
+    ///    **这一次**点按钮的结果没关系，落盘只会让壳读到一份过期结论
+    ///    （而每一次点按钮都会自己产生一份新的：`update_check_now` 查完才回状态）。
+    update_last_check_ok: Option<bool>,
 
     /// 已校验文件的记录（跨会话，落盘）。
     state: FileState,
@@ -261,6 +279,8 @@ impl Kernel {
             update_path,
             update,
             update_checking: false,
+            // 从没查过 —— 与 `Some(false)`（查了没查成）不是一回事，见字段上的注释。
+            update_last_check_ok: None,
             state,
             verify: verify::CheckResult::default(),
             complete: BTreeSet::new(),
@@ -968,6 +988,9 @@ pub fn spawn_update_check(kernel: Arc<Mutex<Kernel>>) {
 /// 真查一次并落盘。**锁外做网络**；只有"置标志"与"写结果"这两下进锁。
 ///
 /// 两条路径共用它：后台线程（[`spawn_update_check`]）与手动查（[`op_check_update_now`]）。
+///
+/// ⚠️ **这里只做 I/O，判决全部在 [`record_check_result`]**：本机的测试跑不出网络
+///    （也不该跑），所以"这一格怎么记"必须留在打得到的地方 —— 见那条函数的注释。
 fn run_update_check(kernel: &Arc<Mutex<Kernel>>) {
     {
         let mut k = lock(kernel);
@@ -980,8 +1003,21 @@ fn run_update_check(kernel: &Arc<Mutex<Kernel>>) {
     }
     let latest = update::fetch_latest(&update::UreqFetcher::new());
     let mut k = lock(kernel);
+    record_check_result(&mut k, latest, now_secs());
+}
+
+/// 把**一次检查的结果**记下来（锁内跑；与网络那一半分开是为了能在本机断言）。
+///
+/// ⚠️ `latest` 是 `None` 有两处来源 —— 网络/解析失败，或"发布页上最新那条是预发布"
+///    （`fetch_latest` 的口径）—— 两处都表示**这次没拿到一个可比较的版本号**，
+///    所以在 [`Kernel::update_last_check_ok`] 上**只能记"没查成"**。
+///    壳那一侧的后果仅此一句"没查成"，不会替客户编出"已是最新"。
+fn record_check_result(k: &mut Kernel, latest: Option<String>, now: i64) {
     k.update_checking = false;
-    k.update.last_checked_at = now_secs();
+    // 🔴 先记"查成没查成"，再谈版本号：这一格是手动查那颗按钮**唯一**能分辨
+    //    "没查成"与"没有新版"的依据（见字段上的注释）。
+    k.update_last_check_ok = Some(latest.is_some());
+    k.update.last_checked_at = now;
     // ⚠️ **失败时不覆盖 `last_seen`**：一次网络抖动不该把"上次看到有新版本"抹掉，
     //    那会让提示在网络恢复前先消失一下。失败就保持原样。
     if let Some(v) = latest {
@@ -1100,6 +1136,223 @@ pub fn spawn_auto_retry(kernel: Arc<Mutex<Kernel>>) {
             }
         })
         .expect("起自动重试线程失败");
+}
+
+// ---------------------------------------------------------------------------
+// 下载中换腿（规格 D5 / D8；纯判据在 `legtrim.rs`、腿表解析在 `engine/legs.rs`）
+// ---------------------------------------------------------------------------
+
+/// 拍间隔：10 s（规格 D5）。
+///
+/// 为什么不是更短：每拍对每个任务至少发一次 `getServers`，而 aria2 的腿速率是 1 s 粒度
+/// 的滑动平均——拍子比测量窗口还短只会读到半成品，判据（连续 2 拍慢）也会被噪声触发。
+/// 也不是更长：摘腿要等 5 拍（暖机 3 + 去抖 2），10 s 一拍才让「一次误判的代价」停在
+/// 一分钟量级。
+const LEG_TRIM_TICK: Duration = Duration::from_secs(10);
+
+/// 每 6 拍（60 s）重新解析一次域名，补新 IP（规格 D8）。
+///
+/// 域名腿是唯一的解析入口：提交时解析出的 IP 集合会过期（镜像扩缩容、线路切换），
+/// 而判据只能在**已有候选**里挑，所以候选必须周期刷新。为什么要 60 s：解析是网络 I/O，
+/// 每拍都做等于给这条后台线程加一份无界的 DNS 负担；而按 DNS TTL 的量级，一分钟内
+/// 新 IP 基本也该可见了。
+const LEG_RESOLVE_EVERY: u64 = 6;
+
+/// 解析一条**域名腿**的候选 IP。测试用 `TEST_LOOKUP` 注入假解析（单测不许碰网络），
+/// 生产走真解析。
+///
+/// 为什么要这条缝而不是直接写死真解析：这段代码的**全部**价值就是「解析出的 IP 会被造成
+/// 腿」，不注入就只能测到「什么都没发生」那一半。与 [`resolve_ips`] 同一份纪律。
+///
+/// 生产侧走 [`delivery::resolve_for_base`]（`system_lookup` 是私有的）：它顺带带上
+/// scheme 门与 IP 字面量门——域名腿本身不可能是 IP 字面量，门形同兜底。
+fn resolve_leg_ips(leg_uri: &str) -> Vec<std::net::IpAddr> {
+    #[cfg(test)]
+    {
+        let lookup = TEST_LOOKUP.with(|t| *t.borrow());
+        if let Some(lookup) = lookup {
+            return delivery::resolve_for_base_with(lookup, leg_uri);
+        }
+    }
+    delivery::resolve_for_base(leg_uri)
+}
+
+/// 起换腿线程（图形客户端的内核用；命令行工具只起 worker、没有这条协议循环，
+/// 与 [`spawn_auto_retry`] 的接线口径一致，不起）。
+///
+/// 形状照 [`spawn_auto_retry`]：`loop { sleep; tick }`。拍号、判据状态、解析缓存都活在
+/// 闭包里——它们是**这一次下载过程的历史**，进 `Kernel` 只会让每个 RPC 都跟着持锁读写。
+pub fn spawn_leg_trim(kernel: Arc<Mutex<Kernel>>) {
+    thread::Builder::new()
+        .name("leg-trim".to_string())
+        .spawn(move || {
+            let mut beat: u64 = 0;
+            let mut states: BTreeMap<String, legtrim::TrimState> = BTreeMap::new();
+            let mut resolved: BTreeMap<String, (u64, Vec<std::net::IpAddr>)> = BTreeMap::new();
+            loop {
+                thread::sleep(LEG_TRIM_TICK);
+                // 第 1 拍在启动 10 s 后：刚提交的任务还没有速率样本，早了只能读到 0。
+                beat += 1;
+                leg_trim_tick(&kernel, &mut states, &mut resolved, beat);
+            }
+        })
+        .expect("起换腿线程失败");
+}
+
+/// 跑一拍换腿，返回这一拍真正提交成功的动作数。
+///
+/// 三条纪律：
+/// 1. **RPC 全在锁外**：进锁只拷两个 `Arc` 句柄（引擎 + 计数器），拷完立刻出锁。
+///    `getServers` / `getUris` / `changeUri` 都是几十毫秒量级的网络往返，持锁会让协议循环停摆。
+/// 2. **任何失败都只是「这一拍不动作」**：引擎刚被换掉、任务刚收尾、`getUris` 读不到、
+///    `changeUri` 被拒，一律不 panic、不重试、不写日志刷屏——下一拍的 `getServers` 是事实来源，会对账。
+/// 3. `beat` 是**参数**：线程里 +1 递推，测试里直接给数，不碰真实时钟。
+fn leg_trim_tick(
+    kernel: &Arc<Mutex<Kernel>>,
+    states: &mut BTreeMap<String, legtrim::TrimState>,
+    resolved: &mut BTreeMap<String, (u64, Vec<std::net::IpAddr>)>,
+    beat: u64,
+) -> usize {
+    // 锁内只做拷贝。
+    let (d, counters) = {
+        let k = lock(kernel);
+        let Some(d) = k.daemon.clone() else {
+            return 0;
+        };
+        (d, Arc::clone(&k.counters))
+    };
+    // `active()` 只发 `tellActive`，表里本就只有活跃任务；仍按状态滤一遍，让「应当正在
+    // 下载」的定义只有 `active_tasks` 一处。`Waiting` 也收：它含真排队与手动暂停，
+    // 而对这两个换腿都无害（`changeUri` 只是改 URI 列表，不碰进度）——
+    // 真正的门是下面「必须已有 IP 腿」，暂停中的任务同样满足才说明它当初带了备胎。
+    let Ok(tasks) = d.active() else {
+        return 0;
+    };
+    let gids: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.state == TaskState::Active || t.state == TaskState::Waiting)
+        .map(|t| t.gid.clone())
+        .collect();
+    let mut actions = 0usize;
+    for gid in &gids {
+        // 引擎可能刚被换掉（GID 还在旧实例里）⇒ 这个任务这一拍跳过。
+        let Ok(legs) = d.servers(gid) else {
+            continue;
+        };
+        if legs.is_empty() {
+            continue;
+        }
+        // 🔴 **门槛：必须已经有一条 IP 字面量腿。**
+        // 只有域名腿意味着当初提交时没带 `Host` 头（`planner::plan_file` 只在真有 IP 备胎
+        // 时才塞 `header`）。这种任务上加 IP 腿会把请求打到裸 IP 却不带 Host，对象存储按
+        // Host 分桶，取不到文件。宁可不动——少摘一次，不制造一个 404。
+        if !legs.iter().any(|leg| leg_is_ip_literal(&leg.uri)) {
+            continue;
+        }
+        // 域名腿既是**解析入口**，也是 `Host` 头的来源（`host_header_for` 取的就是 base 的
+        // authority）。一条都没有 ⇒ 不知道 Host 是什么，造出来的 IP 腿也用不了。
+        //
+        // 🔴 必须从 `getUris`（任务的**完整** URI 列表）里找，**不能从腿表里找**：
+        // `getServers` 只列「这一拍真有连接」的 URI，域名腿这一拍没连接就根本不出现
+        // ⇒ 从腿表里 find 会永远找不到 ⇒ 该任务**静默永久跳过**（无错误、无日志，
+        // 表现只是这条特性整条失效）。`getServers` 列的是「用过的源」，不是「任务的源」。
+        let Ok(uris) = d.get_uris(gid) else {
+            // 引擎可能刚被换掉 / 任务刚收尾：这一拍跳过，下一拍再说。
+            continue;
+        };
+        let Some(domain_leg) = uris.into_iter().find(|u| !leg_is_ip_literal(u)) else {
+            // 任务本身没有域名腿（提交时只给了 IP 字面量）：没有 Host 来源，也无从解析。
+            continue;
+        };
+        // 解析缓存的键是**来源**（`scheme://host[:port]`），不是完整文件 URI，理由见
+        // [`origin_of`]：交付码与路径每个文件都不同，用文件 URI 当键等于每文件各解析一次，
+        // 缓存还会跨批次只增不减。取不出来源 ⇒ 这个任务这一拍跳过（与"没有域名腿"同处理）。
+        let Some(origin) = origin_of(&domain_leg) else {
+            continue;
+        };
+        // 何时重新解析：缓存里没有这个来源，或者到了重解析那一拍。
+        let need_resolve = match resolved.get(&origin) {
+            None => true,
+            // 同一拍里多个任务共用同一个来源时只解析一次：否则 60 s 那一拍会敲 N 次 DNS。
+            Some((at, _)) => *at != beat && beat % LEG_RESOLVE_EVERY == 0,
+        };
+        if need_resolve {
+            // 解析失败/空结果是「这一拍没有新候选」，不是错误：旧候选仍然可用。
+            let ips = resolve_leg_ips(&domain_leg);
+            // 上限只是**防呆**：域名腿的来源量级是个位数（同一次交付最多几条域名腿），
+            // 正常永远够不到 64。真要撞上（例如将来支持大量不同 host 的 metalink），
+            // 全清比 LRU 便宜且不会留下"以为有缓存其实已过期"的条目——只是一次白敲 DNS。
+            if resolved.len() > 64 {
+                resolved.clear();
+            }
+            resolved.insert(origin.clone(), (beat, ips));
+        }
+        let Some((_, ips)) = resolved.get(&origin) else {
+            continue;
+        };
+        // 造候选腿：换主机、保留端口/路径。再过一道 IP 字面量门（防 helper 将来被改成
+        // 返回域名），并跳过已经在腿表里的——重复 URI 白占一个位置，也让「补了哪些」
+        // 在日志里看不出真动作。
+        let mut candidates: Vec<String> = Vec::new();
+        for ip in ips {
+            let Some(uri) = delivery::uri_with_host(&domain_leg, ip) else {
+                continue;
+            };
+            if !leg_is_ip_literal(&uri)
+                || legs.iter().any(|leg| leg.uri == uri)
+                || candidates.contains(&uri)
+            {
+                continue;
+            }
+            candidates.push(uri);
+        }
+        let Some(plan) = states
+            .entry(gid.clone())
+            .or_default()
+            .plan(beat, &legs, &candidates)
+        else {
+            continue;
+        };
+        // 失败 ⇒ **丢弃这一拍**。`plan` 已经把摘掉的腿登记进冷却，所以下一拍不会立刻重来；
+        // 而真正的事实来源是下一次 `getServers`——对不上账，判据自然什么也不做。
+        //
+        // 诊断按**引擎的实际计数**记（`[removed, added]`），不按 `plan.del/add` 的长度：
+        // 实测 `changeUri` 对不认识的 URI 不报错、回 `[0, 0]`，"我方计划删了两条"不等于
+        // "引擎真的删了两条"；按计划记会让唯一能回答"换腿生效没"的读数失真。
+        if let Ok((removed, added)) = d.change_uri(gid, 1, &plan.del, &plan.add) {
+            counters.record_leg_trim(removed as usize, added as usize);
+            actions += 1;
+        }
+    }
+    // 拍末清理：任务结束/被删就丢掉它的判据状态。这是本线程**唯一**的长期增长点。
+    // 解析缓存不主动清理：键是来源（几条），量级可忽略；清了只会让下一拍白敲 DNS。
+    // 上限兜底在插入处（`resolved.len() > 64` 就全清）。
+    let live: BTreeSet<&str> = gids.iter().map(|gid| gid.as_str()).collect();
+    states.retain(|gid, _| live.contains(gid.as_str()));
+    actions
+}
+
+/// 从一条文件 URI 取出**来源**（`scheme://host[:port]`）——解析缓存的键。
+///
+/// 为什么不能用完整文件 URI 当键：交付码与路径每个文件都不同，1 万文件的批次会让缓存常驻
+/// 1 万条、跨批次只增不减；而「同一拍多个任务共用一条域名腿只解析一次」也永远不成立
+/// （每个文件 URI 都不同）⇒ 每 6 拍 × 活跃文件数次阻塞 DNS。来源的量级是个位数。
+///
+/// 只认 `http(s)://<authority>...`：取 `://` 之后、第一个 `/`、`?`、`#` 之前的那段。
+/// 取不出来（非 http(s)、没有 authority、带 userinfo）⇒ `None`，调用方跳过这个任务：
+/// 猜一个来源去解析比不解析更坏（会把别人的 IP 造成这条腿）。
+fn origin_of(uri: &str) -> Option<String> {
+    let (scheme, rest) = uri.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    // `split` 至少产出一段，取不到就是空串——空 authority 在下面被挡掉。
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
 }
 
 /// 现在（unix 秒）。时钟回拨由 `update::should_check` 那一支兜住。
@@ -3378,6 +3631,10 @@ pub fn op_update_status(k: &mut Kernel) -> Result<Value, ErrorBody> {
         "has_newer": has_newer,
         "url": url,
         "checked_at": k.update.last_checked_at,
+        // ⚠️ 这一格**不在**上面的"取不到就回成功"那条口径里：`has_newer:false` 仍然是
+        //    成功（界面上不许冒报错，规格 §5），但**"这次到底查成没有"必须说得出来**
+        //    （手动查那颗按钮靠它分辨"没查成"与"没有新版"，见 `update_last_check_ok`）。
+        "last_check_ok": k.update_last_check_ok,
     }))
 }
 
@@ -3401,6 +3658,9 @@ pub fn op_update_set_enabled(k: &mut Kernel, params: &Value) -> Result<Value, Er
 ///    的"锁外取数 / 锁内安装"同源。
 ///    **dispatch 那一行因此写成 `"update_check_now" => op_check_update_now(kernel),`**
 ///    （末参数是 `kernel` 本身，不是 `with_kernel` 的闭包）。
+///
+/// ⚠️ 回给壳的是**查完之后**那份状态，里面带着 [`Kernel::update_last_check_ok`]：
+///    设置里那颗按钮拿它分辨"没查成"与"已经是最新的"（见那只字段上的注释）。
 pub fn op_check_update_now(kernel: &Arc<Mutex<Kernel>>) -> Result<Value, ErrorBody> {
     run_update_check(kernel);
     with_kernel(kernel, op_update_status)
@@ -5164,6 +5424,237 @@ mod tests {
         TEST_LOOKUP.with(|t| *t.borrow_mut() = None);
     }
 
+    /// `origin_of` 取的是「来源」而不是文件 URI：`scheme://authority`，路径/交付码全丢掉。
+    ///
+    /// 这是解析缓存的键——用文件 URI 当键会让 1 万文件的批次常驻 1 万条，
+    /// 且「同拍多任务共用一条域名腿只解析一次」永远不成立。
+    ///
+    /// 判别力：实现写成「原样返回 uri」⇒ 前两条红；只取 host 不拼 scheme ⇒ 第一条红；
+    /// 把 `?`/`#` 也算进 authority ⇒ 第二条红（来源里混进 query 就解析不到域名了）。
+    #[test]
+    fn origin_of_keeps_scheme_and_authority() {
+        assert_eq!(
+            origin_of("http://download.benagen.com/AbC123/data/f.bin"),
+            Some("http://download.benagen.com".to_string()),
+            "普通 host：路径与交付码必须被丢掉，只留 scheme://host"
+        );
+        assert_eq!(
+            origin_of("https://download.benagen.com:8443/AbC123/x.bin?token=1"),
+            Some("https://download.benagen.com:8443".to_string()),
+            "带端口：端口必须保留；query 不许混进来源"
+        );
+        assert_eq!(
+            origin_of("http://download.benagen.com#frag"),
+            Some("http://download.benagen.com".to_string()),
+            "没有路径时 fragment 也不许混进来源"
+        );
+    }
+
+    /// 取不出来源 ⇒ `None`（调用方跳过这个任务），绝不猜一个去解析。
+    ///
+    /// 判别力：把非 http 也放过去 ⇒ 第一条红；把空 authority 拼成 `http://` ⇒ 后两条红。
+    #[test]
+    fn origin_of_rejects_non_http_and_missing_authority() {
+        for uri in [
+            // 非 http(s)：换腿/解析都不支持这些 scheme。
+            "ftp://download.benagen.com/x.bin",
+            "file:///tmp/x.bin",
+            // 没有 `://` 的裸串与残缺形态。
+            "download.benagen.com/x.bin",
+            "http:/x.bin",
+            // 有 `://` 但没有 authority（空 host）。
+            "http:///x.bin",
+        ] {
+            assert_eq!(
+                origin_of(uri),
+                None,
+                "{uri} 取不出来源时必须回 None：猜一个来源去解析会把别人的 IP 造成这条腿"
+            );
+        }
+    }
+
+    /// 粘合：下载中连推 4 拍（暖机 3 拍 + 第 4 拍判决）⇒ 第 4 拍摘掉最慢的 IP 腿、
+    /// 补上这次解析出的 IP 腿；前 3 拍一动不动。
+    ///
+    /// 判别力：删掉 `leg_trim_tick` 里的 `change_uri` ⇒ 一拍都没有 ⇒ 红；把 `del`/`add`
+    /// 传反 ⇒ 两条断言对调 ⇒ 红；把判决提到暖机之前 ⇒ 前 3 拍就有动作 ⇒ 红；
+    /// 去掉「必须已有 IP 腿」那道门 ⇒ 本用例仍绿（它本来就带 IP 腿），门由下一条用例钉住。
+    #[test]
+    fn leg_trim_tick_trims_the_slow_leg_and_adds_a_resolved_ip_on_the_fourth_beat() {
+        const SLOW: &str = "http://10.9.0.1/C/f.bin";
+        const NEW_IP: &str = "http://203.0.113.9/C/f.bin";
+
+        // 桩解析：只回一个 IP，好让「补上的是哪条」可断言（真解析会碰网络，单测不许）。
+        fn stub_lookup(_host: &str, _port: u16) -> Vec<std::net::IpAddr> {
+            vec!["203.0.113.9".parse().expect("合法 IP")]
+        }
+        TEST_LOOKUP.with(|t| *t.borrow_mut() = Some(stub_lookup));
+
+        let writes: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&writes);
+        // 桩引擎：tellActive 回一个活跃任务，getServers 回「2 慢 IP 腿 + 1 快 IP 腿 + 域名腿」，
+        // changeUri 把位置参数记下来。
+        //
+        // 速率是按阈值反推的：4 条腿 [50 KB/s, 200 KB/s, 4 MB/s, 3 MB/s] 的中位数取较小
+        // 中间值 = 200 KB/s ⇒ 阈值 = max(66 KB/s, 128 KiB/s) = 128 KiB/s。于是 200 KB/s 虽
+        // 仍是全组第二慢，但高于下限 ⇒ **留着**；只有 50 KB/s 那条该摘。写成别的数就会
+        // 变成「摘两条」或「一条都不摘」。
+        let srv = StubHttp::start_with(move |req| {
+            let body: Value = serde_json::from_str(&req.body).unwrap_or(Value::Null);
+            let result = match body["method"].as_str().unwrap_or_default() {
+                "aria2.tellActive" => json!([{
+                    "gid": "g1",
+                    "status": "active",
+                    "totalLength": "1000000",
+                    "completedLength": "1000",
+                    "downloadSpeed": "0",
+                    "connections": "4",
+                }]),
+                "aria2.getServers" => json!([{
+                    "index": "1",
+                    "servers": [
+                        {"uri": "http://10.9.0.1/C/f.bin", "downloadSpeed": "50000"},
+                        {"uri": "http://10.9.0.2/C/f.bin", "downloadSpeed": "200000"},
+                        {"uri": "http://10.9.0.3/C/f.bin", "downloadSpeed": "4000000"},
+                        {"uri": "http://download.example.com/C/f.bin", "downloadSpeed": "3000000"},
+                    ],
+                }]),
+                // 任务的完整 URI 列表（域名腿在这里，不在腿表里也能找到）。
+                "aria2.getUris" => json!([
+                    {"uri": "http://10.9.0.1/C/f.bin", "status": "used"},
+                    {"uri": "http://10.9.0.2/C/f.bin", "status": "used"},
+                    {"uri": "http://10.9.0.3/C/f.bin", "status": "used"},
+                    {"uri": "http://download.example.com/C/f.bin", "status": "used"},
+                ]),
+                "aria2.changeUri" => {
+                    seen.lock().expect("记录锁").push(body["params"].clone());
+                    // 引擎实际删了 1 条、加了 1 条：诊断必须按这个数记。
+                    json!([1, 1])
+                }
+                _ => json!({}),
+            };
+            RawResponse::new(200)
+                .header("Connection", "close")
+                .body(json!({"jsonrpc": "2.0", "id": "1", "result": result}).to_string())
+        });
+
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), dir.join("s.json"))));
+        lock(&kernel).daemon = Some(Arc::new(crate::engine::daemon::stub_daemon(
+            &srv.base(),
+            "s",
+            BTreeMap::new(),
+        )));
+
+        let mut states: BTreeMap<String, legtrim::TrimState> = BTreeMap::new();
+        let mut resolved: BTreeMap<String, (u64, Vec<std::net::IpAddr>)> = BTreeMap::new();
+        for beat in 1..=3 {
+            let n = leg_trim_tick(&kernel, &mut states, &mut resolved, beat);
+            assert_eq!(n, 0, "第 {beat} 拍还在暖机，不该动作");
+        }
+        assert!(
+            writes.lock().expect("记录锁").is_empty(),
+            "暖机期间不得发 changeUri"
+        );
+
+        let n = leg_trim_tick(&kernel, &mut states, &mut resolved, 4);
+        let got = writes.lock().expect("记录锁").clone();
+        TEST_LOOKUP.with(|t| *t.borrow_mut() = None);
+
+        assert_eq!(n, 1, "第 4 拍应当提交一次换腿");
+        assert_eq!(got.len(), 1, "总共只该发一次 changeUri，且在第 4 拍: {got:?}");
+        // 线上参数是 `[token:<secret>, gid, fileIndex, del, add]`（令牌由 RPC 层插在最前），
+        // 所以这里从 1 开始取。
+        assert_eq!(got[0][1], json!("g1"), "换的是这个 gid");
+        assert_eq!(got[0][2], json!(1), "单文件任务恒传 fileIndex=1");
+        assert_eq!(
+            got[0][3],
+            json!([SLOW]),
+            "只该摘掉最慢（50 KB/s）那条腿；域名腿与正常腿不动"
+        );
+        assert_eq!(got[0][4], json!([NEW_IP]), "应当补上新解析出的 IP 腿");
+
+        let s = lock(&kernel).counters.snapshot();
+        assert_eq!(s.leg_trim_del, 1, "摘掉的腿总数 = 1");
+        assert_eq!(s.leg_add, 1, "补上的腿总数 = 1");
+    }
+
+    /// 门槛：**只有域名腿**的任务一拍也不该动——它提交时没带 `Host` 头，加 IP 腿只会 404。
+    /// 判别力：删掉 `leg_trim_tick` 里那道「至少一条 IP 字面量腿」的门 ⇒ 第 4 拍会发
+    /// `changeUri` 并敲一次 DNS ⇒ 两条断言都红。
+    #[test]
+    fn leg_trim_tick_leaves_a_domain_only_task_alone() {
+        static LOOKED_UP: AtomicBool = AtomicBool::new(false);
+        fn stub_lookup(_host: &str, _port: u16) -> Vec<std::net::IpAddr> {
+            LOOKED_UP.store(true, Ordering::SeqCst);
+            vec!["203.0.113.9".parse().expect("合法 IP")]
+        }
+        TEST_LOOKUP.with(|t| *t.borrow_mut() = Some(stub_lookup));
+
+        let writes: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&writes);
+        let srv = StubHttp::start_with(move |req| {
+            let body: Value = serde_json::from_str(&req.body).unwrap_or(Value::Null);
+            let result = match body["method"].as_str().unwrap_or_default() {
+                "aria2.tellActive" => json!([{
+                    "gid": "g1",
+                    "status": "active",
+                    "totalLength": "1000",
+                    "completedLength": "0",
+                    "downloadSpeed": "0",
+                    "connections": "1",
+                }]),
+                // 只有域名腿（提交时没带备胎 ⇒ 没有 Host 头）。
+                "aria2.getServers" => json!([{
+                    "index": "1",
+                    "servers": [
+                        {"uri": "http://download.example.com/C/f.bin", "downloadSpeed": "1000"},
+                    ],
+                }]),
+                "aria2.getUris" => json!([
+                    {"uri": "http://download.example.com/C/f.bin", "status": "used"},
+                ]),
+                "aria2.changeUri" => {
+                    seen.lock().expect("记录锁").push(body["params"].clone());
+                    json!([1, 1])
+                }
+                _ => json!({}),
+            };
+            RawResponse::new(200)
+                .header("Connection", "close")
+                .body(json!({"jsonrpc": "2.0", "id": "1", "result": result}).to_string())
+        });
+
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), dir.join("s.json"))));
+        lock(&kernel).daemon = Some(Arc::new(crate::engine::daemon::stub_daemon(
+            &srv.base(),
+            "s",
+            BTreeMap::new(),
+        )));
+
+        let mut states: BTreeMap<String, legtrim::TrimState> = BTreeMap::new();
+        let mut resolved: BTreeMap<String, (u64, Vec<std::net::IpAddr>)> = BTreeMap::new();
+        let mut actions = 0;
+        for beat in 1..=6 {
+            actions += leg_trim_tick(&kernel, &mut states, &mut resolved, beat);
+        }
+        let looked_up = LOOKED_UP.load(Ordering::SeqCst);
+        TEST_LOOKUP.with(|t| *t.borrow_mut() = None);
+
+        assert_eq!(actions, 0, "只有域名腿的任务不该被换腿");
+        assert!(
+            writes.lock().expect("记录锁").is_empty(),
+            "不该发 changeUri"
+        );
+        assert!(
+            !looked_up,
+            "门槛就该挡在解析之前：没有 IP 腿时连 DNS 都不该敲"
+        );
+    }
+
     /// 🔴 替换引擎的窗口期（引擎暂缺、未换码）里，后台队列必须等待，而不是被清空（本批第 3 条）。
     /// 判别力：把 `feed_once` 的"引擎暂缺"分支改回 `clear()` ⇒ 窗口里队列消失 ⇒ 红。
     #[test]
@@ -5777,6 +6268,92 @@ mod tests {
         assert_eq!(v["has_newer"], serde_json::json!(false));
         assert_eq!(v["enabled"], serde_json::json!(true), "默认开");
         assert!(v["current"].as_str().is_some_and(|s| !s.is_empty()));
+        // 「从没查过」是**第三档**，不是「没查成」：壳拿它区分"我还没查过"与"查了没成"。
+        assert_eq!(
+            v["last_check_ok"],
+            serde_json::json!(null),
+            "还没查过时这一格必须是 null —— 与 Some(false)（查了没查成）合并的话，\
+             手动查那颗按钮第一次点之前就会先对客户说一句『没查成』"
+        );
+    }
+
+    /// 🔴 **手动查那颗按钮的判据**：`last_check_ok` 说得出"没查成"与"没有新版"的区别。
+    ///
+    /// 这一条是**关键判据**：没有它，断网时那颗按钮只能看着 `has_newer:false` 说
+    /// "已经是最新的"——那是谎报（见 `Kernel::update_last_check_ok` 的注释）。
+    ///
+    /// ⚠️ 判决那一半（[`record_check_result`]）**直接喂结果**，不起网络：本机的测试
+    ///    跑不到发布页，也不该跑（网络判据在 `update.rs` 的 stub fetcher 那一档里）。
+    #[test]
+    fn a_failed_check_is_told_apart_from_one_that_found_nothing_new() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).unwrap();
+        let mut k = Kernel::new(dir.join("dl"), dir.join("s.json"));
+
+        // ① 先查成一次、且看到一个新的版本
+        record_check_result(&mut k, Some("99.0.0".to_string()), 100);
+        let v = op_update_status(&mut k).unwrap();
+        assert_eq!(v["last_check_ok"], serde_json::json!(true), "查成了");
+        assert_eq!(v["has_newer"], serde_json::json!(true), "99 比当前版本高");
+        assert_eq!(v["checked_at"], serde_json::json!(100));
+
+        // ② 这次没查成（断网）：`last_seen` **不许**被抹，但必须说出来是"没查成"
+        record_check_result(&mut k, None, 200);
+        let v = op_update_status(&mut k).unwrap();
+        assert_eq!(
+            v["last_check_ok"],
+            serde_json::json!(false),
+            "查失败必须记成 false：这一格是壳唯一能区分『没查成』与『没有新版』的地方"
+        );
+        assert_eq!(
+            v["latest"],
+            serde_json::json!("99.0.0"),
+            "一次网络抖动不许把上次看到的版本抹掉（否则提示会先消失一下）"
+        );
+        assert_eq!(
+            v["checked_at"],
+            serde_json::json!(200),
+            "失败也要推新时间：不然每 60 秒重查一次发布页"
+        );
+
+        // ③ 这次查成了、而且确实没有新版：`Some(true)` + `has_newer:false`
+        record_check_result(&mut k, Some("0.0.1".to_string()), 300);
+        let v = op_update_status(&mut k).unwrap();
+        assert_eq!(v["last_check_ok"], serde_json::json!(true));
+        assert_eq!(
+            v["has_newer"],
+            serde_json::json!(false),
+            "这一格为假时『查成没查成』才是关键 —— 两种情形的 has_newer 都是 false"
+        );
+        assert_eq!(v["checked_at"], serde_json::json!(300));
+    }
+
+    /// `last_check_ok` 是**运行状态，不落盘**：换一个 Kernel 读同一个目录 ⇒ 回到 `None`。
+    ///
+    /// ⚠️ 这一条钉的是**取舍**，不是"顺手"：上一次开机的检查结果与**这一次**点按钮的结果
+    ///    没关系，落盘只会让壳读到一份过期结论。
+    #[test]
+    fn the_check_result_is_not_persisted() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).unwrap();
+        let mut k = Kernel::new(dir.join("dl"), dir.join("s.json"));
+        record_check_result(&mut k, Some("0.0.1".to_string()), 100);
+        assert_eq!(
+            op_update_status(&mut k).unwrap()["last_check_ok"],
+            serde_json::json!(true)
+        );
+        let mut k2 = Kernel::new(dir.join("dl"), dir.join("s.json"));
+        assert_eq!(
+            op_update_status(&mut k2).unwrap()["last_check_ok"],
+            serde_json::json!(null),
+            "这一格不许进 update.json"
+        );
+        // 而同一个目录里**该落盘的那三格**照样读得回来（对照组：不是"什么都没落盘"）
+        assert_eq!(
+            op_update_status(&mut k2).unwrap()["latest"],
+            serde_json::json!("0.0.1"),
+            "last_seen 是持久状态"
+        );
     }
 
     /// 开关写下去之后读得回来，并且落到了盘上。

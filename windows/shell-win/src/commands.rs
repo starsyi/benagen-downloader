@@ -64,6 +64,7 @@ use shell_core::presentation::kernel_death::CallFailure;
 use shell_core::presentation::transfer_row::{
     TransferGlobalSummary, TransferListEmpty, TransferReveal, TransferRow,
 };
+use shell_core::presentation::update_check::UpdateCheck;
 use shell_core::presentation::verify_summary::{ProgressSummary, VerifySummary};
 use shell_core::protocol::{EngineState, LoadState, Settings, TaskAction};
 use shell_core::storage::history::History;
@@ -121,10 +122,14 @@ pub fn invoke_handler<R: tauri::Runtime>(
         enqueue,
         transfers,
         verify,
-        // 更新提示的三条（规格 §4；R15）。⚠️ 不在规格 §3.4 那张表里 —— 那一张是
-        // "第二代既有端点"的账，而"更新检查"是这一代新加的整件事（内核侧的三条同理）。
+        // 更新提示的**四条**（规格 §4；R15）。⚠️ 不在规格 §3.4 那张表里 —— 那一张是
+        // "第二代既有端点"的账，而"更新检查"是这一代新加的整件事（内核侧的四条同理）。
+        // ⚠️ 第四条（`update_check_now`，设置里那颗「立即检测」）**规格 §2 有、壳里一直没有**
+        //    —— 内核早就把它备好了（`core/src/kernel.rs:3404` 的 `op_check_update_now`，
+        //    不受 24 小时节流），缺的只是这一条命令与前端那颗按钮。
         update_status,
         update_set_enabled,
+        update_check_now,
         // ⚠️ **窄语义**的一条（R15）：只放行官方发布页那一个前缀、只做"交给默认浏览器"
         //    这一件事。它不是通用的 `open_url`（理由写在它自己的文档里）。
         open_update_url,
@@ -696,6 +701,44 @@ pub fn update_set_enabled(app: tauri::State<'_, Shell>, enabled: bool) -> Value 
         Ok(kernel_value) => {
             app.session.set_last_error(None);
             api::update::update_status(&kernel_value)
+        }
+        Err(why) => {
+            note_failure(&app.session, &why);
+            api::failure(&why)
+        }
+    }
+}
+
+/// 「立即检测」：设置里那颗手动检查的按钮（规格 §2）—— **一次用户动作**，回执有一句人话。
+///
+/// ## 🔴 它回答的正是 [`update_status`] 回答不了的那个问题
+///
+/// 内核的 `update_status` 在"这次没查成"与"查成了、确实没有新版"两种情形下**长得一样**
+/// （`has_newer:false`：网络抖动、Gitee 不可达、发布页上最新那条是预发布，全部落在它上面）。
+/// 对那条**后台**提示条这是对的（规格 §5：没人做动作，界面不该冒话），但对**客户点出来的**
+/// 这一下就成了假话 —— 断网时那颗按钮只会说"已经是最新的"。⇒ 内核因此多了一格
+/// `last_check_ok`（见 `core/src/kernel.rs` 的 `Kernel::update_last_check_ok`），
+/// **判决与那五句话**住在 `shell_core::presentation::update_check`，本命令只把
+/// `update_check_now` 回来的那一份交给它装帧（`api::update::checked`）。
+///
+/// ⚠️ **它自己不问 `enabled`**：开关关着时内核那一条**一道请求都不发**就直接返回
+///    （既有行为，注释称"规格 §5"），`UpdateCheck::of` 把这一档如实报成
+///    "刚才没有去查" + 补救 —— **不许**报成"已经是最新的"（那是同一句假话的另一个入口）。
+///
+/// ⚠️ **失败照登**（`note_failure`）：与 [`update_status`] 那条"静默的后台动作"**不同**，
+///    这一条是用户点出来的 ⇒ 没有内核 / 传输断了必须让用户知道自己那一下没成
+///    （同 [`update_set_enabled`] 那一档）。而内核**自己的**失败不进这里：
+///    它落进 `last_check_ok:false`、由那句回执说（那是"没查成"，不是"命令没发出去"）。
+#[tauri::command(async)]
+pub fn update_check_now(app: tauri::State<'_, Shell>) -> Value {
+    let Some(client) = app.session.client() else {
+        return api::envelope::err(api::NO_KERNEL);
+    };
+    match kernel::update_check_now(&client) {
+        Ok(kernel_value) => {
+            app.session.set_last_error(None);
+            let check = UpdateCheck::of(&kernel_value);
+            api::update::checked(&check)
         }
         Err(why) => {
             note_failure(&app.session, &why);
@@ -2364,10 +2407,12 @@ mod tests {
         //   本波次 +3：`update_status` / `update_set_enabled`（都问内核 ⇒ `(async)`）
         //   与 `open_update_url`（**不问内核**，只做一次系统调用 ⇒ 保持同步、跑在
         //   收 IPC 的那条线程上 —— 它不许阻塞，也不该为它开一条线程池线程）。
+        //   2026-10-15 +1：`update_check_now`（问内核、且内核那一条里要发网络请求
+        //   ⇒ `(async)`，理由见它自己的文档）。
         assert_eq!(
             decls.len(),
-            24,
-            "命令数变了（期望 24）：{decls:?} —— 新增命令时请一并想清楚它该不该开在主线程上"
+            25,
+            "命令数变了（期望 25）：{decls:?} —— 新增命令时请一并想清楚它该不该开在主线程上"
         );
 
         let mut offenders = Vec::new();

@@ -383,6 +383,27 @@ pub fn update_set_enabled(
         .map_err(|e| CallFailure::of(&e))
 }
 
+/// 「立即检测」：**不受 24 小时节流**的一次手动检查（无参，`params: null`）。
+///
+/// ⚠️ 回的那一份与 [`update_status`] **同形**，但**多了一格** `last_check_ok`
+///    （`None` = 从没查过）：内核的 `op_check_update_now` 先跑完检查、再把那一份状态回过来
+///    ⇒ 这一格说的正是"**你刚才那一下**查成没有"。设置里那颗按钮的回执全靠它
+///    （没有它，断网时只能按 `has_newer:false` 说一句"已经是最新的" —— 那是假话，
+///    理由逐条写在 `shell_core::presentation::update_check` 的头注里）。
+///
+/// ⚠️ **它仍然没有"内核报了错"那一档**（与 [`update_status`] 同理：内核那一条 RPC
+///    自己把失败吞进 `last_check_ok`，返回的始终是成功信封）。这里可能失败的情形
+///    只剩"没有内核 / 传输断了"，那是所有 `kernel::*` 共有的那一档。
+///
+/// ⚠️ **超时不用专门加档**：这一条在**内核里**跑网络 I/O（最坏几秒，`fetch_latest` 自带
+///    超时），走 [`CoreClient::DEFAULT_CALL_TIMEOUT`]（150 秒）有数量级余量 ——
+///    它**不是** `LONG_CALL_METHODS` 那一家族（那五个的门槛是最坏几十秒 × N）。
+pub fn update_check_now(client: &CoreClient) -> Result<serde_json::Value, CallFailure> {
+    client
+        .call("update_check_now", serde_json::Value::Null)
+        .map_err(|e| CallFailure::of(&e))
+}
+
 /// 「内核**回了**、而壳解不动它的形状」那句话。
 ///
 /// ⚠️ **这不是内核报的错**（内核报的错原文逐字照登）。措辞与
@@ -863,5 +884,25 @@ mod tests {
         assert!(sent.contains(r#""method":"update_set_enabled""#), "method 不在请求里：{sent}");
         assert!(sent.contains(r#""enabled":false"#), "enabled 要在顶层、且是布尔：{sent}");
         assert!(!sent.contains("settings"), "别套一层 settings：{sent}");
+    }
+
+    /// 🔴 `update_check_now` 发的是**方法名 `update_check_now` + `params:null`**。
+    ///
+    /// 判别力：这条判据钉的是**线上那个名字**。内核的分派表那一行是
+    /// `"update_check_now" => op_check_update_now(kernel)`（`core/src/kernel.rs`），
+    /// 而规格/计划里那张表把它写作 **`check_update_now`**（顺序不同）——
+    /// 两边对不上时内核回 `unknown_method`：**壳这一侧看不出是名字写错了**
+    /// （它只会说"没查成"），所以名字必须在这里被钉住。
+    #[test]
+    fn update_check_now_sends_null_params() {
+        let ch = Scripted::new(&[&ok_reply(
+            1,
+            r#"{"enabled":true,"checking":false,"current":"0.2.7","latest":"0.2.9","has_newer":true,"url":"https://x/y.exe","checked_at":7,"last_check_ok":true}"#,
+        )]);
+        let client = CoreClient::new(Box::new(ch.clone()));
+        expect_ok(update_check_now(&client), "update_check_now");
+        let sent = ch.last_request();
+        assert!(sent.contains(r#""method":"update_check_now""#), "线上那个名字：{sent}");
+        assert!(sent.contains(r#""params":null"#), "无参方法要发 `params:null`：{sent}");
     }
 }

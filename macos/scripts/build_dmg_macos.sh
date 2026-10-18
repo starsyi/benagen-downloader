@@ -7,8 +7,8 @@
 #
 # 产物名**自解释**（F-3）：本阶段出**两个独立包**（不做通用二进制，见阶段 F 计划），
 # 客户必须一眼看出下哪个：
-#     BenagenDownloader-0.2.7-AppleSilicon.dmg   ← arm64
-#     BenagenDownloader-0.2.7-Intel.dmg          ← x86_64
+#     BenagenDownloader-<版本>-AppleSilicon.dmg   ← arm64
+#     BenagenDownloader-<版本>-Intel.dmg          ← x86_64
 #
 # ⚠️ **架构是"读"出来的，不是"传"进来的**：脚本对包内那三个二进制逐个 `lipo -archs`，
 #    三者必须是**同一个单架构**，再由它决定文件名。于是"名字说 Intel、里面其实是
@@ -54,8 +54,8 @@
 #   bash macos/scripts/build_app_macos.sh [arm64|x86_64]
 #   bash macos/scripts/build_dmg_macos.sh
 #
-#   两个架构各跑一遍这两条，就得到 BenagenDownloader-0.2.7-AppleSilicon.dmg 与
-#   BenagenDownloader-0.2.7-Intel.dmg —— 见 macos/README.md「出 Intel 包」。
+#   两个架构各跑一遍这两条，就得到 BenagenDownloader-<版本>-AppleSilicon.dmg 与
+#   BenagenDownloader-<版本>-Intel.dmg —— 见 macos/README.md「出 Intel 包」。
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -132,7 +132,7 @@ for f in "$MAIN" "$CORE" "$ARIA2C"; do
   #    于是"三个必须同架构"**静默退化成**"三个都等于第一个**非空**值"——
   #    第一个读不出的二进制被跳过、它的架构**从来没被验过**，而产物名照样照后两个定下来
   #    （复现过：把壳换成非 Mach-O 可执行文件，脚本照样打印"包是单架构 arm64 ⇒ 产物名
-  #    BenagenDownloader-0.2.7-AppleSilicon.dmg"，失败点被推迟到盘内自验、退出码才非 0，
+  #    BenagenDownloader-<版本>-AppleSilicon.dmg"，失败点被推迟到盘内自验、退出码才非 0，
   #    而且 dist/ 里留下一张**名字与内容不符**的半成品 —— 验收动作恰好就是在这个目录里
   #    逐个 lipo 复查）。判据与 `build_app_macos.sh` 的 `verify_arch()` **逐字对齐**：
   #    **读不出 = 失败**。两处标准必须一致：否则同一份字节会出现"打包脚本说行、装盘脚本说不行"，
@@ -153,7 +153,28 @@ done
 
 # 版本段进产物名（2026-10-14，用户要求：Release 附件一眼可辨）。
 # 与 `core/src/update.rs::asset_name` 同格式：BenagenDownloader-<版本>-<平台>.dmg
-BENAGEN_VERSION="${VERSION:-0.2.7}"
+#
+# ⚠️ **版本号是"读"出来的，不是"传"进来的**（2026-10-18 改）——与上面架构那条同一条纪律。
+#    以前这里写 `BENAGEN_VERSION="${VERSION:-0.2.6}"`：硬编码的默认值**没人负责升它**，
+#    0.2.7、0.2.8 两轮升号都漏了这个文件，于是 0.2.8 的包被命名成 0.2.6
+#    （实测：包内 Info.plist 是 0.2.8，盘名是 0.2.6 ⇒ 名字与内容不符，正是本脚本最恨的那种）。
+#    现在真源只有一个：包内 `CFBundleShortVersionString`（由 build_app_macos.sh 按 VERSION 写进去）。
+#    `VERSION=` 环境变量只用来**核对**，不一致当场判死（不再有"抄参数"这条路）。
+PLIST="$APP/Contents/Info.plist"
+if [ ! -f "$PLIST" ]; then
+  echo "错误：包内缺 Info.plist（$PLIST）—— 这个 .app 不完整，先重建。" >&2
+  exit 2
+fi
+BENAGEN_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" 2>/dev/null | tr -d '[:space:]')"
+if [ -z "$BENAGEN_VERSION" ]; then
+  echo "错误：Info.plist 里读不到 CFBundleShortVersionString —— 产物名不许猜。" >&2
+  exit 2
+fi
+if [ -n "${VERSION:-}" ] && [ "$VERSION" != "$BENAGEN_VERSION" ]; then
+  echo "错误：VERSION=$VERSION 与包内版本 $BENAGEN_VERSION 不一致。" >&2
+  echo "      产物名必须与盘里那一位相同；要么重出 .app，要么别传 VERSION。" >&2
+  exit 2
+fi
 
 # 架构 → 产物名。这里是 F-3 的全部：**名字必须让人看出该下哪个**。
 case "$ONLY_ARCH" in

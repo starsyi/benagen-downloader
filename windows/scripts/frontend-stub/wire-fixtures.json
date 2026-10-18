@@ -1525,6 +1525,51 @@
     },
     "ok": true
   },
+  "updateCheckDisabled": {
+    "data": {
+      "headline": "自动检查更新是关着的，刚才没有去查。补救：打开上面那个开关，再点一次「立即检测」。",
+      "is_failure": true,
+      "notice_text": null,
+      "path_detail": null
+    },
+    "ok": true
+  },
+  "updateCheckNewer": {
+    "data": {
+      "headline": "有新版本 0.2.7（当前 0.2.6）。",
+      "is_failure": false,
+      "notice_text": null,
+      "path_detail": null
+    },
+    "ok": true
+  },
+  "updateCheckNoAnswer": {
+    "data": {
+      "headline": "没查到结果：内核回的这份检查状态不全。补救：重开一次客户端再试。",
+      "is_failure": true,
+      "notice_text": null,
+      "path_detail": null
+    },
+    "ok": true
+  },
+  "updateCheckUnreachable": {
+    "data": {
+      "headline": "没查成：这次没连上发布页。补救：确认这台机器能上网，或者过一会儿再点一次。",
+      "is_failure": true,
+      "notice_text": null,
+      "path_detail": null
+    },
+    "ok": true
+  },
+  "updateCheckUpToDate": {
+    "data": {
+      "headline": "已经是最新的（当前 0.2.6）。",
+      "is_failure": false,
+      "notice_text": null,
+      "path_detail": null
+    },
+    "ok": true
+  },
   "verboseLoggingSetChanged": {
     "data": {
       "headline": "详细日志已打开（内核已按详细档重启）",

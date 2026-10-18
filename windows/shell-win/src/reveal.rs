@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 
 use shell_core::api::reveal::Outcome;
+use shell_core::platform::PLATFORM;
 use shell_core::presentation::transfer_row::TransferReveal;
 
 /// 走一遍「显示」：算路径（判据在 `shell-core`）→ 交给系统。
@@ -38,13 +39,18 @@ use shell_core::presentation::transfer_row::TransferReveal;
 ///    环境由调用方给）。取 home 的**回落值是空串** —— 宿主上没有 `NSHomeDirectory()` 的
 ///    对应物，而"猜一个"更糟：取不到就是取不到，它会走 [`Outcome::RootUnknown`]
 ///    如实说"算不出它在哪"，而**不会**拼出一个基准是进程当前工作目录的相对路径。
+///
+/// ⚠️ **`PLATFORM` 只注入一次**（就是下面这一行）：路径的分隔符与"算不算绝对"都由它定，
+///    而那是 2026-10 那条"定位不到"的根因 —— shell-core 把清单路径按 `/` 拼了出来，
+///    交给 `explorer.exe` 之后被它当成了选项（判据的完整论证在
+///    `shell_core::platform::path_separator`）。**本文件仍然一个路径字符都不拼**。
 pub fn reveal(
     manifest_path: Option<&str>,
     environment: &BTreeMap<String, String>,
     download_dir: &str,
 ) -> Outcome {
     let home = TransferReveal::home(environment, "");
-    match shell_core::api::reveal::local_path(manifest_path, &home, download_dir) {
+    match shell_core::api::reveal::local_path(PLATFORM, manifest_path, &home, download_dir) {
         Outcome::Ready(path) => match select_in_file_manager(&path) {
             Ok(()) => Outcome::Ready(path),
             Err(why) => Outcome::Failed(why),
@@ -168,15 +174,20 @@ mod tests {
     fn the_judgement_half_is_reachable_without_touching_the_os() {
         // 配过下载目录 ⇒ Ready（本函数**不看** home）。
         assert_eq!(
-            shell_core::api::reveal::local_path(Some("a/b.txt"), "/Users/x", "/data/交付"),
+            shell_core::api::reveal::local_path(
+                PLATFORM,
+                Some("a/b.txt"),
+                "/Users/x",
+                "/data/交付"
+            ),
             Outcome::Ready("/data/交付/a/b.txt".to_string())
         );
         assert_eq!(
-            shell_core::api::reveal::local_path(None, "/Users/x", "/data"),
+            shell_core::api::reveal::local_path(PLATFORM, None, "/Users/x", "/data"),
             Outcome::NoManifestPath
         );
         assert_eq!(
-            shell_core::api::reveal::local_path(Some("a.txt"), "", ""),
+            shell_core::api::reveal::local_path(PLATFORM, Some("a.txt"), "", ""),
             Outcome::RootUnknown
         );
     }

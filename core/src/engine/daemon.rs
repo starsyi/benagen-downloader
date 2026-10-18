@@ -52,6 +52,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
+use super::legs::Leg;
 use super::rpc::{GlobalStat, RpcClient, WriteOutcome};
 use super::status::{raw_status_to_state, Task, TaskState};
 
@@ -1025,6 +1026,54 @@ impl Daemon {
     /// 继续全部被暂停的任务（传输页「一键开始」的第一半；第二半是内核补回队列）。
     pub fn unpause_all(&self) -> Result<(), String> {
         self.client.unpause_all()
+    }
+
+    // -----------------------------------------------------------------------
+    // 换腿（**非移植**：Go 内核没有 getServers/changeUri 的封装）
+    // -----------------------------------------------------------------------
+
+    /// 读一条 GID 的腿表（每条 URI 此刻的速度），供换腿线程判决。
+    ///
+    /// 薄委托：[`RpcClient::servers`] 负责 RPC 与解析；判决（`plan`，纯函数）在
+    /// `core/src/legtrim.rs`，**不在这一层**。
+    ///
+    /// ⚠️ 调用方是 10 秒一拍的换腿线程（`kernel::spawn_leg_trim`，在 `core/src/kernel.rs`；
+    /// 生产入口 `core/src/main.rs` 与 `spawn_auto_retry` 并排起它）。单次尝试、不重试——
+    /// 这条理由留在 [`RpcClient::servers`] 的 doc 里，这里不重复。
+    pub fn servers(&self, gid: &str) -> Result<Vec<Leg>, String> {
+        self.client.servers(gid)
+    }
+
+    /// 读一条 GID 的**完整 URI 列表**（任务登记过的全部源，与此刻有没有连接无关）。
+    ///
+    /// 换腿的域名腿必须从这里取：`servers` 只列「这一拍真有连接」的 URI，域名腿没连接时
+    /// 根本不出现（旧实现因此会**静默永久跳过**该任务）。形状与重复语义见
+    /// [`RpcClient::get_uris`] 的 doc。
+    ///
+    /// 为什么没有 `file_index` 形参（与 [`Self::change_uri`] 不同）：`aria2.getUris` 的
+    /// 线上参数只有 `[gid]`，没有位置参数可传。**本产品每条任务都是单文件 `addUri`**，
+    /// `file_index` 恒为 1 这一口径在 `change_uri` 那边，本方法是它读的那一侧。
+    pub fn get_uris(&self, gid: &str) -> Result<Vec<String>, String> {
+        self.client.get_uris(gid)
+    }
+
+    /// 换腿：删掉 `del` 里的 URI、加上 `add` 里的 URI（同一条 GID、同一个 fileIndex）。
+    ///
+    /// `file_index`：**本产品每条任务都是单文件 `addUri`，`file_index` 恒传 1**；
+    /// 形参留着是为了和 aria2 的位置参数一一对应，不表示这一层支持多文件。
+    ///
+    /// 薄委托：[`RpcClient::change_uri`]。写方法、绝不重试；
+    /// 返回值是引擎回的 `[removed, added]`（**实际**改了几条，不是我们计划改几条；
+    /// 引擎不认识 `del` 里的 URI 时回 `[0, 0]` 且不报错）。
+    /// 为什么没有 `_detailed` 版本（不需要 [`WriteOutcome`]）也见那边的 doc。
+    pub fn change_uri(
+        &self,
+        gid: &str,
+        file_index: u32,
+        del: &[String],
+        add: &[String],
+    ) -> Result<(u64, u64), String> {
+        self.client.change_uri(gid, file_index, del, add)
     }
 
     /// 移除一个任务，并**忘掉它的 GID 映射**。
@@ -2740,6 +2789,115 @@ mod tests {
         assert_eq!(
             params[1]["max-overall-download-limit"], "1M",
             "全局选项没有送达，实际 {params:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 换腿的薄委托：`servers` / `get_uris` / `change_uri`
+    //
+    // 为什么用 stub 而不是真 aria2（先例：`apply_global_sends_change_global_option`）：
+    // 这两条测的是**委托本身**——同一个 client、参数原样传下去。让真 aria2 起一个下载
+    // 再换腿，既慢，又会把「委托写错」和「引擎行为」混进同一条红的。委托写错的形状
+    // 还特别静默：换腿线程以为自己在工作，实际每次打到别的方法或别的 GID。
+    // -----------------------------------------------------------------------
+
+    /// `Daemon::servers` 只是把 gid 原样交给 `RpcClient::servers`（同一根桩上可见）。
+    ///
+    /// 判别力：委托里把 gid 换成 `""`、或者干脆忘了转发 ⇒ 第二条断言红；
+    /// 打到别的方法 ⇒ 第一条断言红；返回值没透传 ⇒ 腿表断言红。
+    #[test]
+    fn daemon_servers_delegates_to_get_servers() {
+        let srv = StubHttp::start_with(|_req| {
+            rpc_ok(serde_json::json!([{
+                "index": "1",
+                "servers": [{
+                    "uri": "http://1.2.3.4/x",
+                    "currentUri": "http://1.2.3.4/x",
+                    "downloadSpeed": "123456"
+                }]
+            }]))
+        });
+        let d = stub_daemon(&srv.base(), "s", BTreeMap::new());
+
+        let legs = d.servers("gid-delegate").expect("servers 委托不应失败");
+
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1, "servers 应恰好发一趟 RPC，实际 {}", reqs.len());
+        let (method, params) = method_and_params(&reqs[0].body);
+        assert_eq!(method, "aria2.getServers", "委托必须打到 aria2.getServers");
+        assert_eq!(
+            params.get(1).and_then(|v| v.as_str()),
+            Some("gid-delegate"),
+            "gid 必须原样传到 params[1]，实际 {params:?}"
+        );
+        assert_eq!(
+            legs,
+            vec![Leg {
+                uri: "http://1.2.3.4/x".to_string(),
+                speed: 123_456
+            }],
+            "委托的返回值必须就是 client 解析出的腿表"
+        );
+    }
+
+    /// `Daemon::change_uri` 只是把 gid / fileIndex / del / add 原样交下去。
+    ///
+    /// fileIndex 特意传 `3` 而不是 `1`：单文件场景恒为 1，若委托里写死 1，
+    /// 传 1 的测试就抓不到——传 3 才能证明它真的透传了调用方的入参。
+    /// del/add 的顺序也钉住：`plan` 的判决给的就是这个顺序，委托无权重排。
+    #[test]
+    fn daemon_change_uri_delegates_to_change_uri() {
+        let srv = StubHttp::start_with(|_req| rpc_ok(serde_json::json!([2, 1])));
+        let d = stub_daemon(&srv.base(), "s", BTreeMap::new());
+        let del = vec![
+            "http://1.2.3.4/x".to_string(),
+            "http://1.2.3.5/y".to_string(),
+        ];
+        let add = vec!["http://9.9.9.9/x".to_string()];
+
+        let counts = d
+            .change_uri("gid-delegate", 3, &del, &add)
+            .expect("change_uri 委托不应失败");
+
+        assert_eq!(
+            counts,
+            (2, 1),
+            "委托必须把引擎的 [removed, added] 原样带回（顺序不许对调、不许按计划长度改）"
+        );
+
+        let reqs = srv.requests();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "change_uri 是写方法 ⇒ 恰好一趟 RPC（不重试），实际 {}",
+            reqs.len()
+        );
+        let (method, params) = method_and_params(&reqs[0].body);
+        assert_eq!(method, "aria2.changeUri", "委托必须打到 aria2.changeUri");
+        assert_eq!(
+            params.len(),
+            5,
+            "线上形态是 [token, gid, fileIndex, delUris, addUris]，实际 {params:?}"
+        );
+        assert_eq!(
+            params.get(1).and_then(|v| v.as_str()),
+            Some("gid-delegate"),
+            "gid 必须原样传到 params[1]，实际 {params:?}"
+        );
+        assert_eq!(
+            params.get(2),
+            Some(&serde_json::json!(3)),
+            "fileIndex 必须原样透传（这里是 3，不是写死的 1），实际 {params:?}"
+        );
+        assert_eq!(
+            params.get(3),
+            Some(&serde_json::json!(["http://1.2.3.4/x", "http://1.2.3.5/y"])),
+            "delUris 必须原样、按序传下去"
+        );
+        assert_eq!(
+            params.get(4),
+            Some(&serde_json::json!(["http://9.9.9.9/x"])),
+            "addUris 必须原样、按序传下去"
         );
     }
 

@@ -15,6 +15,13 @@ pub const DEFAULT_BASE_URL: &str = "http://download.benagen.com";
 /// 交付页文件名，客户端用它提示客户
 pub const PAGE_NAME: &str = "index.html";
 
+/// 最多下发给 aria2 的 IPv4 备胎数（域名 URI 不计入）。
+///
+/// 为什么是 16：1 条域名 URI + 16 条备胎 = 17 ≥ `splits` 上限 16
+/// （校验见 `settings.rs:111`，加载侧回退见 `settings.rs:324`）⇒ 每个分片都能落在
+/// 不同腿上，域名腿不白占名额。再往上加只会把 aria2 的 URI 表撑大，换不来更多分片。
+pub const MAX_BACKUP_URIS: usize = 16;
+
 /// 随机码长度（服务端为 20）
 const CODE_LEN: usize = 20;
 
@@ -139,7 +146,7 @@ pub(crate) fn file_url_on(base: &str, code: &str, path: &str) -> String {
 /// 域名 URI 打头 + IP 备胎（规格 §5.1）。`ips` 为空 ⇒ 只有域名 URI。
 /// 每个 IP 的 URI 形如 `http://<ip>[:端口][/base路径]/<code>/<path>`；
 /// **只接受 http 的 base**，https 的 base 在上一层就被掐掉（resolve_for_base 返回空），
-/// 这里再兜一道。备胎**上限 5 个**（预检裁决 5）。
+/// 这里再兜一道。备胎**上限 [`MAX_BACKUP_URIS`] 个**（理由见常量注释）。
 pub fn uri_list(m: &Manifest, path: &str, ips: &[std::net::IpAddr]) -> Vec<String> {
     let base = base(&m.base_url); // 空 ⇒ DEFAULT_BASE_URL，与 file_url 同一回退
     let primary = file_url_on(&base, &m.code, path);
@@ -155,9 +162,9 @@ pub fn uri_list(m: &Manifest, path: &str, ips: &[std::net::IpAddr]) -> Vec<Strin
         Some(i) if is_port_digits(&authority[i + 1..]) => &authority[i..],
         _ => "",
     };
-    let mut out = Vec::with_capacity(1 + ips.len().min(5));
+    let mut out = Vec::with_capacity(1 + ips.len().min(MAX_BACKUP_URIS));
     out.push(primary);
-    for ip in ips.iter().take(5) {
+    for ip in ips.iter().take(MAX_BACKUP_URIS) {
         // IPv6 的 Display 不带方括号，必须手动包——否则拼出 `http://2001:db8::1/…` 是畸形 URI。
         let host = match ip {
             std::net::IpAddr::V4(v4) => v4.to_string(),
@@ -167,6 +174,84 @@ pub fn uri_list(m: &Manifest, path: &str, ips: &[std::net::IpAddr]) -> Vec<Strin
         out.push(file_url_on(&backup_base, &m.code, path));
     }
     out
+}
+
+/// 把一条 URI 的主机换成给定 IP，其余（端口、路径、查询串）**原样保留**。
+///
+/// 用于换腿线程：`aria2.getServers` 交回的腿可能是域名 URI，而我们要拿新解析出的 IP
+/// 造一条可加入的腿——拼出来的串必须与当初 `uri_list` 造的 IP 备份**同一形状**，
+/// 否则 aria2 会把同一份文件当成两条不同的 URI（重复下载/校验错位）。
+///
+/// 只接受 `http://host[:port]/…`：
+/// - 非 http（https 换主机名会打坏 SNI 与证书校验，与 [`uri_list`] 的备份同一道门）⇒ `None`；
+/// - 没有 authority / 端口不合法 / 带 userinfo / 方括号不闭合 ⇒ `None`（**认不出就不动**，
+///   这是安全方向：本函数的调用方一出 `None` 就只是"这一拍不动作"）；
+/// - 主机**已经**是同一个 IP ⇒ `None`——换出来会与输入逐字节相同，调用方应当把它当
+///   "无需动作"，而不是往 `changeUri` 里塞一条重复 URI（那只会白占一个并发位）。
+pub fn uri_with_host(uri: &str, ip: &std::net::IpAddr) -> Option<String> {
+    let rest = uri.strip_prefix("http://")?;
+    // 与 `uri_list` 共用同一份 authority 切分（`split_base`）：`:` 之后到第一个 `/`
+    // 是 `host[:port]`，从 `/` 起是路径。查询串可能紧跟在 authority 后
+    // （`http://h?x=1`，没有路径），所以 authority 里出现 `?`/`#` 时也要切掉，
+    // 切下来的部分与路径一起原样拼回。
+    let (authority_head, base_path) = split_base(rest);
+    let cut = authority_head
+        .find(['?', '#'])
+        .unwrap_or(authority_head.len());
+    let authority = &authority_head[..cut];
+    let query = &authority_head[cut..];
+    if authority.is_empty() {
+        return None;
+    }
+    // 带 userinfo 的 URI 本产品从不生成（凭据走 `header`/`referer`），
+    // 认不出它的主机边界就不动——别把 `user:pass@` 当成主机名的一部分替换。
+    if authority.contains('@') {
+        return None;
+    }
+    // `bracketed` 记「这个 host 原本在方括号里」——方括号内的冒号是**地址的一部分**，
+    // 不是端口分隔符，所以下面那道「host 不许含 `:`」的畸形门不能套在它身上。
+    let (host, port_suffix, bracketed) = if let Some(after_open) = authority.strip_prefix('[') {
+        // IPv6 方括号形态：`[::1]` 或 `[::1]:8080`。缺右括号 ⇒ 畸形。
+        let end = after_open.find(']')?;
+        let host = &after_open[..end];
+        let after = &after_open[end + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) if is_port_digits(p) => after,
+            Some(_) => return None,
+            None if after.is_empty() => "",
+            // 方括号后还跟着别的东西（`[::1]x`）——不是我们认识的形状。
+            None => return None,
+        };
+        (host, port, true)
+    } else {
+        match authority.rfind(':') {
+            Some(i) if is_port_digits(&authority[i + 1..]) => {
+                (&authority[..i], &authority[i..], false)
+            }
+            // 冒号后不是合法端口 ⇒ 畸形。**包括裸 IPv6**（`http://2001:db8::1/`）：
+            // 它没有方括号，任何切法都是猜，不如不动作。
+            Some(_) => return None,
+            None => (authority, "", false),
+        }
+    };
+    if host.is_empty() || (!bracketed && host.contains(':')) {
+        return None;
+    }
+    // 主机已经是同一个 IP ⇒ `None`（理由见文档注释）。
+    if host
+        .parse::<std::net::IpAddr>()
+        .map(|cur| cur == *ip)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    // IPv6 的 Display 不带方括号，必须手动包——与 `uri_list` 的备份构造同一纪律，
+    // 否则拼出 `http://2001:db8::1:8080/…` 这种把端口吞进地址的畸形 URI。
+    let host = match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    Some(format!("http://{host}{port_suffix}{query}{base_path}"))
 }
 
 /// 把 base 切成 `(authority, base路径)`：scheme（`://`）后第一个 `/` 之前是 authority
@@ -241,7 +326,7 @@ pub fn resolve_for_base(base_url: &str) -> Vec<std::net::IpAddr> {
 /// 1. base 为空 ⇒ 按 [`DEFAULT_BASE_URL`] 处理（与 [`base`] 同一回退）；
 /// 2. scheme 非 `http://` ⇒ `[]`（https 整体关闭——裸 IP 破坏 SNI 与证书校验，R3）；
 /// 3. host 是 IP 字面量（含 `[::1]` 形态）⇒ `[]`（造备胎只是自重复）；
-/// 4. `lookup(host, port)`：只留 IPv4、去重保序、**截 5 个**；lookup 失败/空 ⇒ `[]`
+/// 4. `lookup(host, port)`：只留 IPv4、去重保序、**截 [`MAX_BACKUP_URIS`] 个**；lookup 失败/空 ⇒ `[]`
 ///    （优雅降级为域名-only——容错机制自己不许变成新的故障源）。
 pub(crate) fn resolve_for_base_with(
     lookup: impl Fn(&str, u16) -> Vec<std::net::IpAddr>,
@@ -255,7 +340,7 @@ pub(crate) fn resolve_for_base_with(
     if is_ip_literal(host) {
         return Vec::new(); // 规则 3：IP 字面量门
     }
-    // 规则 4：只留 IPv4、去重保序、截 5 个
+    // 规则 4：只留 IPv4、去重保序、截 MAX_BACKUP_URIS 个
     let mut out: Vec<std::net::IpAddr> = Vec::new();
     for ip in lookup(host, port) {
         if !matches!(ip, std::net::IpAddr::V4(_)) {
@@ -265,7 +350,7 @@ pub(crate) fn resolve_for_base_with(
             continue;
         }
         out.push(ip);
-        if out.len() >= 5 {
+        if out.len() >= MAX_BACKUP_URIS {
             break;
         }
     }
@@ -991,17 +1076,27 @@ mod tests {
         assert_eq!(got[0], "http://download.benagen.com/23999-JF/a.txt");
     }
 
-    /// 备胎**上限 5 个**（预检裁决 5）：7 个 IP ⇒ 域名 + 5 = 6 条。
+    /// 备胎**上限 16 个**：20 个 IP ⇒ 域名 + 16 = 17 条。
+    /// 16 与 `splits` 上限对齐（`settings.rs:111`）：17 条候选够 16 个分片各占一条腿。
     #[test]
-    fn uri_list_caps_backups_at_five() {
+    fn uri_list_caps_backups_at_sixteen() {
         let m = manifest("C", "http://download.benagen.com");
-        let ips: Vec<std::net::IpAddr> =
-            (1..=7).map(|i| ip(&format!("10.0.0.{i}"))).collect();
+        let ips: Vec<std::net::IpAddr> = (1..=20).map(|i| ip(&format!("10.0.0.{i}"))).collect();
+        // 直接把 20 个原始 IP 交给 uri_list：截断必须由 uri_list 自己做。
+        // 若先过 resolve_for_base_with（它也截 16 条），uri_list 里的 take 删掉测试照样绿。
         let got = uri_list(&m, "f.txt", &ips);
-        assert_eq!(got.len(), 6, "备胎上限 5：7 个 IP 应得 1+5=6 条，实际 {got:?}");
+        assert_eq!(
+            got.len(),
+            17,
+            "备胎上限是 16 条；20 个 IP 应得 1+16=17 条，实际 {got:?}"
+        );
         // 裁掉的是**尾部**，不是头部——排在前面的备胎优先级更高
         assert_eq!(got[1], "http://10.0.0.1/C/f.txt");
-        assert_eq!(got[5], "http://10.0.0.5/C/f.txt");
+        assert_eq!(got[16], "http://10.0.0.16/C/f.txt");
+        assert!(
+            !got.iter().any(|u| u.contains("10.0.0.17")),
+            "第 17 个 IP 起必须被截断，实际 {got:?}"
+        );
     }
 
     /// authority 有端口则备胎保留端口（IP 换掉 host，端口不动）。
@@ -1097,6 +1192,79 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // `uri_with_host`：换腿线程造 IP 腿用的纯拼装。必须与 `uri_list` 的备胎
+    // **同一形状**，否则同一份文件会被 aria2 当成两条不同的 URI。
+    // -------------------------------------------------------------------
+
+    /// IPv4：只换主机，端口、路径、查询串逐字保留。
+    #[test]
+    fn uri_with_host_keeps_port_path_and_query_for_ipv4() {
+        let got = uri_with_host("http://download.benagen.com:8080/AbC/f.txt?k=1", &ip("203.0.113.9"));
+        assert_eq!(
+            got,
+            Some("http://203.0.113.9:8080/AbC/f.txt?k=1".to_string()),
+            "换 IPv4 必须保留端口、路径与查询串"
+        );
+    }
+
+    /// IPv6 必须套方括号（与 `uri_list` 的备胎同一纪律），端口留在方括号外。
+    #[test]
+    fn uri_with_host_brackets_ipv6() {
+        let v6: std::net::IpAddr = "2001:db8::1".parse().expect("合法 V6");
+        assert_eq!(
+            uri_with_host("http://download.benagen.com/C/f.txt", &v6),
+            Some("http://[2001:db8::1]/C/f.txt".to_string()),
+            "IPv6 主机必须包成方括号形态"
+        );
+        assert_eq!(
+            uri_with_host("http://download.benagen.com:8080/C/f.txt", &v6),
+            Some("http://[2001:db8::1]:8080/C/f.txt".to_string()),
+            "IPv6 的端口必须留在方括号外"
+        );
+        // 反向：原来是方括号 IPv6 主机，换成一个不同的 IPv4 —— 方括号里的冒号不是端口，
+        // 不能被「host 不许含 `:`」的畸形门误伤。
+        assert_eq!(
+            uri_with_host("http://[2001:db8::2]:8080/C/f.txt", &ip("203.0.113.9")),
+            Some("http://203.0.113.9:8080/C/f.txt".to_string()),
+            "方括号 IPv6 主机换成 IPv4 时端口与路径都要保留"
+        );
+    }
+
+    /// 非 http / 畸形 authority ⇒ `None`（认不出就不动，调用方只是"这一拍不动作"）。
+    #[test]
+    fn uri_with_host_rejects_non_http_and_malformed() {
+        let v4 = ip("203.0.113.9");
+        for input in [
+            "https://download.benagen.com/C/f.txt", // https：换主机名会打坏 SNI/证书
+            "not a uri",                            // 没有 scheme
+            "http:///C/f.txt",                      // 没有 authority
+            "http://",                              // 空串
+            "http://host:/C/f.txt",                 // 尾冒号：端口不合法
+            "http://[::1/C/f.txt",                  // 方括号不闭合
+            "http://user:pass@host/C/f.txt",        // 带 userinfo：认不出主机边界
+            "http://2001:db8::1/C/f.txt",           // 裸 IPv6：没有方括号，切法全靠猜
+        ] {
+            assert_eq!(uri_with_host(input, &v4), None, "畸形/非 http 串应当返回 None");
+        }
+    }
+
+    /// 主机已经是同一个 IP ⇒ `None`（换出来与输入逐字节相同，别制造重复 URI）。
+    #[test]
+    fn uri_with_host_rejects_host_already_that_ip() {
+        assert_eq!(
+            uri_with_host("http://203.0.113.9:8080/AbC/f.txt", &ip("203.0.113.9")),
+            None,
+            "主机已是同一个 IPv4 ⇒ 无需动作"
+        );
+        let v6: std::net::IpAddr = "2001:db8::1".parse().expect("合法 V6");
+        assert_eq!(
+            uri_with_host("http://[2001:db8::1]/C/f.txt", &v6),
+            None,
+            "主机已是同一个 IPv6（方括号形态）⇒ 无需动作"
+        );
+    }
+
+    // -------------------------------------------------------------------
     // `resolve_for_base` / `host_header_for`（规格 §5.3）：scheme 门、IP 字面量门、
     // lookup 注入。lookup 是**唯一**的网络 I/O 点，单测给假 lookup，不碰网络。
     // -------------------------------------------------------------------
@@ -1145,27 +1313,20 @@ mod tests {
         assert_eq!(got, Vec::<std::net::IpAddr>::new(), "lookup 空 ⇒ 优雅降级域名-only");
     }
 
-    /// 只留 IPv4、去重保序、截 5 个。
+    /// 只留 IPv4、去重保序、截 16 个。
     /// 判别力：去掉 IPv4 过滤 ⇒ V6 进备胎 ⇒ aria2 恒 --disable-ipv6 连不上；
-    ///         去掉截断 ⇒ 7 个全进 ⇒ 超过预检裁决的 5 个上限。
+    ///         去掉截断 ⇒ 20 个 v4 全进 ⇒ 超过 16 条备胎上限，把 aria2 的 URI 表撑大。
     #[test]
-    fn resolve_for_base_takes_ipv4_only_and_caps_at_five() {
+    fn resolve_for_base_takes_ipv4_only_and_caps_at_sixteen() {
         let v6: std::net::IpAddr = "2001:db8::1".parse().expect("合法 V6");
-        let mixed = vec![
-            ip("10.0.0.1"),
-            v6,
-            ip("10.0.0.2"),
-            ip("10.0.0.1"), // 重复
-            ip("10.0.0.3"),
-            ip("10.0.0.4"),
-            ip("10.0.0.5"),
-            ip("10.0.0.6"), // 第 6 个 v4，应被截掉
-        ];
+        let mut mixed = vec![v6, ip("10.0.0.1")]; // V6 与重复项都必须被滤掉，不占名额
+        mixed.extend((1..=20).map(|i| ip(&format!("10.0.0.{i}")))); // 1 是重复
         let got = resolve_for_base_with(fake_lookup(mixed), "http://download.benagen.com");
+        let want: Vec<std::net::IpAddr> =
+            (1..=16).map(|i| ip(&format!("10.0.0.{i}"))).collect();
         assert_eq!(
-            got,
-            vec![ip("10.0.0.1"), ip("10.0.0.2"), ip("10.0.0.3"), ip("10.0.0.4"), ip("10.0.0.5")],
-            "只留 IPv4、去重保序、截 5 个"
+            got, want,
+            "只留 IPv4、去重保序、截 16 个——16 是 split 上限，腿数必须够"
         );
     }
 

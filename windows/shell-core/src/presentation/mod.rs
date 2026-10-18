@@ -34,6 +34,7 @@ pub mod kernel_death;
 pub mod resident_notice;
 pub mod settings_form;
 pub mod transfer_row;
+pub mod update_check;
 pub mod verify_summary;
 
 /// 行状态的**语义色**。枚举，**不是具体的颜色值**——本 crate 不引入任何绘制依赖，

@@ -4,6 +4,7 @@
 //! 本任务只建立两者共用的那两块纯函数地基。
 
 pub mod daemon;
+pub mod legs;
 pub mod rpc;
 pub mod status;
 pub mod supervisor;

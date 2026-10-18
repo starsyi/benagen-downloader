@@ -210,6 +210,29 @@
          它们的值**现在根本不在载荷里** ⇒ 这里无从渲染，也**不许**编一句出来。 -->
     <div class="notices" id="notices"></div>
 
+    <!-- ---- 更新提示（规格 §4）-------------------------------------------------
+         🔴 **它住在壳层、不在任何一屏里**（0.2.8 修的一场）：macOS 那条挂在
+            `RootView` 的主区里，**任何分区都看得见**；这一条原本长在文件页模板里
+            ⇒ 启动落在空态页、或者客户正站在传输列表上时，它**永远不出现**
+            ——而"Windows 客户端没有更新提示"正是这么来的。判据一个字没变（见下），
+            变的只是它长在哪儿。
+         ⚠️ 位置：排在常驻提示行**之下**、主区之上。提示行说的是"发生了什么"
+            （引擎横幅排最上），这一条说的是"这个世界有个新版本"。
+         ⚠️ 文案的**静态部分住在这里**（结构文案），可变的**版本号来自内核**：
+            `shell.js:setUpdateNotice` 只把 `latest` / `current` 两格摆进下面两个空
+            span —— **JS 一个汉字都不拼**（§3.2），版本号是 ASCII，也由内核保证是
+            "三段数字"。
+         🔴 判据只有 `has_newer`（R20）：内核的 `url` 在"没有新版"时**照样可能非空**
+            （它带着一条指向**已装版本**的链接）⇒ 按"`url` 非空"渲染会把客户引去下载
+            自己已经装着的版本。判据落在 `render.js:updateNoticeFromStatus`。
+         ⚠️ 那颗「收起」的图形由 JS 补（`dom.js:ICONS` 是图形的家），这里只留按钮
+            与它的无障碍名字 —— 一颗只有 × 的按钮对读屏来说是空的。 -->
+    <div class="update-bar" id="update-bar" hidden>
+      <span class="update-bar__text selectable">有新版本 <span id="update-bar-latest"></span>（当前 <span id="update-bar-current"></span>）</span>
+      <button class="notice__action" id="update-bar-go" type="button">去下载</button>
+      <button class="notice__dismiss" id="update-bar-dismiss" type="button" aria-label="收起"></button>
+    </div>
+
     <!-- 屏宿主：任务 10/11/12 的东西挂在这里面（接口契约见 `js/screens/registry.js`）。 -->
     <section class="page" id="page"></section>
   </main>
@@ -387,23 +410,6 @@
           <path d="M4 4l8 8M12 4l-8 8"/>
         </svg>
       </button>
-    </div>
-
-    <!-- 更新提示（规格 §4）：**独立元素、独立可见性**，与下面 `files-notice`（回执条）
-         互不影响 —— 两者的生命周期不同（回执条是"你刚才那个动作的结果"，这条是
-         "这个世界有个新版本"），共用一个元素会互相覆盖。
-         ⚠️ 文案的**静态部分住在这里**（结构文案），可变的**版本号来自内核**：
-         `files.js:paintUpdate` 只把 `latest` / `current` 两格摆进下面两个空 span ——
-         **JS 一个汉字都不拼**（§3.2），版本号是 ASCII 也由内核保证是"三段数字"。
-         🔴 判据只有 `has_newer`（R20）：内核的 `url` 在"没有新版"时**照样可能非空**
-            （它带着一条指向**已装版本**的链接）⇒ 按"`url` 非空"渲染会把客户引去下载
-            自己已经装着的版本。判据落在 `files.js`。
-         ⚠️ 那颗「收起」的图形由 JS 补（`dom.js:ICONS` 是图形的家），这里只留按钮
-            与它的无障碍名字 —— 一颗只有 × 的按钮对读屏来说是空的。 -->
-    <div class="files__notice files__notice--update" id="files-update" hidden>
-      <span class="files__notice-text selectable">有新版本 <span id="files-update-latest"></span>（当前 <span id="files-update-current"></span>）</span>
-      <button class="notice__action" id="files-update-go" type="button">去下载</button>
-      <button class="notice__dismiss" id="files-update-dismiss" type="button" aria-label="收起"></button>
     </div>
 
     <div class="files__head" id="files-head">
@@ -973,6 +979,26 @@
           <input type="checkbox" id="set-update" checked>
           <span class="set__check-label" id="set-update-label">启动时检查更新</span>
         </label>
+        <!-- 「立即检测」（规格 §2）：**不受 24 小时节流**的一次手动检查。
+             ⚠️ 内核对这一条**早就备好了**（`op_check_update_now`），缺的只是这颗按钮与
+             壳里那一条命令 —— 所以它是"补上规格里已经定了、两端都还没接的那一半"。
+             ⚠️ **按钮与它的回执都住在本节里**（同上面那个导出诊断那一节的理由：
+             用户点的是这一节里的按钮，确认就该出现在**同一节**里）。
+             ⚠️ 回执那几格（`headline` / `is_failure`）**全部来自载荷**
+             （`api::update::checked` ← 判决与那五句话在 `presentation::update_check`）——
+             本文件里一个字都不是这次动作的文案，JS 也不许造（§3.2）。
+             ⚠️ 它与上面那个勾选框**不是一件事**：勾选框说"以后要不要自动查"，
+             这颗按钮说"现在查一次"（开关关着时点了会得到一句"没有去查" + 补救，
+             而不是"已经是最新的"—— 那一档由内核与判决那一层说了算）。 -->
+        <div class="set__row">
+          <button class="set__btn" id="set-update-now" type="button">立即检测</button>
+        </div>
+        <div class="set__receipt" id="set-update-receipt" hidden>
+          <span class="dlg__receipt-icon" id="set-update-receipt-icon"></span>
+          <span class="set__receipt-text" id="set-update-receipt-text"></span>
+          <span class="set__spacer"></span>
+          <span class="set__dismiss" id="set-update-receipt-dismiss"></span>
+        </div>
       </section>
 
       <section class="set__section">

@@ -171,6 +171,15 @@ let exportPayload = null;
 // ⚠️ 它是修复轮 2 加的：真机是 Windows，路径里**一个 `/` 都没有** —— 显示行与改目录
 //    的回执都要按最后一个分隔符切，而只认 `/` 的实现在 POSIX 夹具上**看不出差别**。
 let prefPayload = null;
+// 「立即检测」那一次动作的回执（`null` = 用夹具里**有新版本**那一档）。
+// ⚠️ 它是**可变**的：五档要各看一遍（有新版本 / 已经是最新的 / 没查成 / 开关关着 /
+//    内核没给那一格）。五份都取自夹具（由 Rust 现倒）—— 与 `diagnostics_export`
+//    那三档逐字同款的理由：期望值只许有一个来源。
+let updateNowPayload = null;
+// 壳层那条**更新提示条**读的那一份（`update_status`，每 60 秒一拍）。
+// ⚠️ 默认是**空载荷**（`has_newer` 缺席 ⇒ 提示条不显示）—— 只有"点完立即检测
+//    提示条跟着出现"那一条用例会把它设成"有新版本"那一份。
+let updateStatusPayload = null;
 // 那一条链路的 Windows 目标目录（`preferences_set` 的受控 stub 认它）。
 const WIN_TARGET = "D:\\交付\\交付_新盘";
 
@@ -231,6 +240,15 @@ async function invoke(cmd, args) {
   // 由 Rust 现倒）—— 与 `verbose_logging_set` 那一条逐字同款的理由：夹具与真载荷
   // 只许有一个来源，这里不编一句话。
   if (cmd === "diagnostics_export") return exportPayload || FIX.diagnosticsExportDone;
+  // 「立即检测」（规格 §2）：五档回执都**取自夹具**（由 Rust 现倒：
+  // `UpdateCheck::of` + `api::update::checked`）—— 与上面那两条逐字同款的理由，
+  // 这里**一个字都不编**（那五句是给客户看的话，它们的家在
+  // `shell-core/src/presentation/update_check.rs`）。
+  if (cmd === "update_check_now") return updateNowPayload || FIX.updateCheckNewer;
+  // `update_status`（壳层那条提示条读的那一份）。⚠️ 默认回一份**空载荷**（`has_newer`
+  // 缺席 ⇒ 提示条不显示）；只有"点完立即检测、提示条跟着出现"那一条用例会把它
+  // 设成"有新版本"那一份。
+  if (cmd === "update_status") return updateStatusPayload || { ok: true, data: {} };
   if (cmd === "about") return FIX.about;
   if (cmd === "license") return licenseFixture || (licenseFixture = await licensePayload());
   return { ok: true, data: {} };
@@ -491,6 +509,51 @@ async function runAll() {
   click(q("#tb-settings"));
   await sleep(400);
   check("③a 点「设置」⇒ 窗口打开（不是点了没反应）", shown("#set-root"));
+
+  // 🔴 **矮视口守卫（0.2.8 现场事故）**
+  //
+  //   现场：设置窗口里「关于 / 开源许可… / 保存」那一条**永远看不见**，滚也滚不到，
+  //   唯一"看起来好了"的办法是把主窗口拉得比内容还高。成因是**两个数分家**：
+  //   外层 `.modal__panel` 按 `88vh` 裁（`overflow:hidden`），里面的 `.win` 却不限高、
+  //   按内容长到 575px ⇒ 面板把下半截切掉；被切掉的那截里正是页脚。
+  //   而且 `.win__body` 的 `overflow:auto` 也永不触发 —— 它从没被压矮过。
+  //
+  //   这里把面板**人为压到 260px**（等价于"视口变小了"），量三件事：
+  //     · `.win` 不越出面板（`max-height` 与面板同源 + `min-height:0` 让它肯收缩）；
+  //     · 页脚整条**在面板之内**（"关于"那一条真的看得见）；
+  //     · 正文**真能滚**（`scrollHeight > clientHeight`），而不是被裁掉。
+  //   ⚠️ 判别力：把 `panels.css` 里 `.win` 的 `min-height:0;` 删掉 ⇒ 本条红
+  //      （窗口宁可溢出也不收缩）；删 `max-height` 时 `sameSource` 那条红
+  //      （它守"两个上限是同一个数"）。两者分工：`min-height` 管"能压矮"，
+  //      `max-height` 管"与面板同源"。
+  {
+    const panel = q("#set-root").closest(".modal__panel");
+    const win = q("#set-root");
+    const body = q("#set-root .win__body");
+    const foot = q("#set-root .win__foot");
+    const saved = panel.getAttribute("style");
+    // ⚠️ 同源守卫要在**压矮之前**读：压矮那一下是 `!important`，会让面板的 computed
+    //    上限变成 260px，与 `.win` 的 88vh 天然不等 —— 那时读就成了假红。
+    const winMax = getComputedStyle(win).maxHeight;
+    const panelMax = getComputedStyle(panel).maxHeight;
+    const sameSource = winMax !== "none" && winMax === panelMax;
+    panel.style.setProperty("max-height", "260px", "important");
+    const pr = panel.getBoundingClientRect();
+    const wr = win.getBoundingClientRect();
+    const fr = foot.getBoundingClientRect();
+    const winInside = wr.bottom <= pr.bottom + 1;
+    const footInside = fr.bottom <= pr.bottom + 1 && fr.top >= pr.top - 1;
+    const scrolls = body.scrollHeight > body.clientHeight + 1;
+    if (saved === null) panel.removeAttribute("style"); else panel.setAttribute("style", saved);
+    // 三个几何量守"压矮之后仍然可用"；`sameSource` 守"两个上限同源"——后者是大视口
+    // 下唯一还站得住的判据（那时面板与窗口都够高，几何量全绿，但两个数可以已经分家）。
+    check("③a2 面板矮下去时：窗口不越界 / 页脚在面板内 / 正文真能滚 / 两处上限同源" +
+      "（0.2.8 事故守卫）",
+      winInside && footInside && scrolls && sameSource,
+      `win底=${wr.bottom.toFixed(1)} 面板底=${pr.bottom.toFixed(1)} 页脚底=${fr.bottom.toFixed(1)}` +
+      ` 正文=${body.scrollHeight}/${body.clientHeight} 上限=${winMax}/${panelMax}`);
+  }
+
   // ⚠️ 再等一拍：那颗「保存」的可用性读的是**壳每拍灌进来的闸门**
   //    （`state().allows_requests`），而它要等下一拍 `state` 才到（`SettingsView` 的
   //    `.disabled` 同理）。等不够的话下面那条"改了才可按"会因为闸门还没到而红。
@@ -598,6 +661,137 @@ async function runAll() {
     `窗口=${shown("#set-root")} checked=${q("#set-verbose").checked}`);
   // 收尾：夹具那"一份已经落盘"的记忆清掉（后面几组读的还是夹具原样那一份）。
   verbosePayload = null;
+
+  // ---- 「立即检测」（规格 §2）------------------------------------------------
+  //
+  // 🔴 **这一组的全部理由是一句可能的假话**：内核的 `update_status` 在"这次没查成"
+  //    与"查成了、确实没有新版"两种情形下**长得一模一样**（`has_newer:false`）。
+  //    对那条**后台**提示条来说这是对的（客户没做动作，界面不该冒话，规格 §5）——
+  //    但设置里那颗按钮**是客户点出来的**：他问的是"有没有新版本"，而在断网时
+  //    只按 `has_newer` 判就只剩"已经是最新的"（**界面在撒谎**，约束 4）。
+  //    ⇒ 所以下面有**三档"没查成"**（没连上 / 开关关着 / 内核没给那一格），
+  //      每一档都要求：说出**载荷里那句**、图标翻成失败档、且**绝不说"已经是最新的"**。
+  //    ⚠️ 五份载荷都取自夹具（由 Rust 现倒）—— 这里一个字都不编。
+  const updateSection = q("#set-update-check").closest("section");
+  check("③更新1 🔴 那颗按钮与它的回执**都在更新这一节里**（不是画到别节去）",
+    !!updateSection
+      && updateSection.contains(q("#set-update-now"))
+      && updateSection.contains(q("#set-update-receipt")),
+    `更新节里的按钮=${!!updateSection && updateSection.contains(q("#set-update-now"))} `
+      + `回执=${!!updateSection && updateSection.contains(q("#set-update-receipt"))}`);
+  check("③更新2 按钮的文案是**结构文案**（逐字来自 index.html，不随数据变）",
+    txt("#set-update-now") === "立即检测", JSON.stringify(txt("#set-update-now")));
+  check("③更新3 还没点过 ⇒ 回执那一行不显示（不是一开窗就挂着一条空的）",
+    !shown("#set-update-receipt"));
+
+  click(q("#set-update-now"));
+  await sleep(700);
+  check("③更新4 点它 ⇒ 发一次 `update_check_now`（**无参数**：查一次就是查一次）",
+    calls("update_check_now").length === 1
+      && JSON.stringify(calls("update_check_now")[0].args) === "{}",
+    JSON.stringify(calls("update_check_now")));
+  check("③更新5 查成了 + 有新版本 ⇒ 回执逐字是载荷那句（**不加工**），图标不是失败档",
+    shown("#set-update-receipt")
+      && txt("#set-update-receipt-text").includes(FIX.updateCheckNewer.data.headline)
+      && !q("#set-update-receipt-icon").classList.contains("is-failure"),
+    txt("#set-update-receipt-text"));
+
+  // 🔴 **没查成**那一档（本组存在的理由）：它必须说"没查成"，**不许**说"已经是最新的"。
+  updateNowPayload = FIX.updateCheckUnreachable;
+  click(q("#set-update-now"));
+  await sleep(700);
+  check("③更新6 🔴 没查成 ⇒ 逐字是载荷里那句「没查成…」、图标翻成失败档",
+    shown("#set-update-receipt")
+      && txt("#set-update-receipt-text").includes(FIX.updateCheckUnreachable.data.headline)
+      && q("#set-update-receipt-icon").classList.contains("is-failure"),
+    txt("#set-update-receipt-text"));
+  check("③更新7 🔴🔴 没查成那一档**绝不说「已经是最新的」**（这一波的全部理由："
+    + "两种情形在载荷里长得一样，只有多出来那一格 `last_check_ok` 分得开）",
+    !txt("#set-update-receipt-text").includes("已经是最新的"),
+    txt("#set-update-receipt-text"));
+
+  // 查成了、确实没有新版 ⇒ **只有这一档**说"已经是最新的"（上面那条的对照）。
+  updateNowPayload = FIX.updateCheckUpToDate;
+  click(q("#set-update-now"));
+  await sleep(700);
+  check("③更新8 查成了 + 没有新版 ⇒ 才说「已经是最新的」（同一条链路的对照）",
+    shown("#set-update-receipt")
+      && txt("#set-update-receipt-text").includes(FIX.updateCheckUpToDate.data.headline)
+      && txt("#set-update-receipt-text").includes("已经是最新的")
+      && !q("#set-update-receipt-icon").classList.contains("is-failure"),
+    txt("#set-update-receipt-text"));
+
+  // 开关关着 ⇒ 内核**一道请求都不会发** ⇒ 这一下根本没查（也不许说"没查成"或"最新"）。
+  updateNowPayload = FIX.updateCheckDisabled;
+  click(q("#set-update-now"));
+  await sleep(700);
+  check("③更新9 开关关着 ⇒ 说「没有去查」+ 补救（既不是「没查成」、也不是「已经是最新的」）",
+    shown("#set-update-receipt")
+      && txt("#set-update-receipt-text").includes(FIX.updateCheckDisabled.data.headline)
+      && q("#set-update-receipt-icon").classList.contains("is-failure"),
+    txt("#set-update-receipt-text"));
+
+  // 内核**没给**那一格（旧内核 / 载荷缺格）⇒ 说不清就说不清，**不许**当成查成了。
+  updateNowPayload = FIX.updateCheckNoAnswer;
+  click(q("#set-update-now"));
+  await sleep(700);
+  check("③更新10 内核没给那一格 ⇒ 说「没查到结果」，**不许**当成查成了",
+    shown("#set-update-receipt")
+      && txt("#set-update-receipt-text").includes(FIX.updateCheckNoAnswer.data.headline)
+      && q("#set-update-receipt-icon").classList.contains("is-failure")
+      && !txt("#set-update-receipt-text").includes("已经是最新的"),
+    txt("#set-update-receipt-text"));
+
+  // 🔴 **点完要补一拍**：这一条命令改了内核手里那一份更新状态，而**壳层那条提示条**
+  //    读的是同一份（`update_status`，每 60 秒一拍）。少了 `pollNow()`，用户点完
+  //    "有新版本"还得等下一次轮询才在壳层看见那条提示条 —— "我按了按钮、界面却不
+  //    跟着动"是这一节最忌的形状。
+  //    ⚠️ 这一条**两端一起判**：命令被再拉了一次（`update_status` 计数增加）
+  //      **且**壳层那条提示条真的出现了（跨出设置窗口、主区里的那一条）。
+  updateNowPayload = FIX.updateCheckNewer;
+  updateStatusPayload = {
+    ok: true,
+    data: {
+      has_newer: true,
+      latest: "0.2.7",
+      current: "0.2.6",
+      url: "https://gitee.com/starsyi/benagen-downloader/releases/download/v0.2.7/x.exe",
+    },
+  };
+  const statusBefore = calls("update_status").length;
+  const barBefore = shown("#update-bar");
+  click(q("#set-update-now"));
+  await sleep(900);
+  check("③更新11 🔴 点完 ⇒ 补一拍 `update_status`，且**壳层**那条提示条跟着出现"
+    + "（不补这一拍，用户点完还得等下一次轮询）",
+    calls("update_status").length > statusBefore && shown("#update-bar"),
+    `update_status ${statusBefore}→${calls("update_status").length} 次；`
+      + `提示条 ${barBefore}→${shown("#update-bar")}；正文=${txt("#update-bar")}`);
+  check("③更新12 那条提示条上的号码逐字来自载荷（0.2.7 / 0.2.6），与回执各说各的那一份",
+    txt("#update-bar-latest") === "0.2.7" && txt("#update-bar-current") === "0.2.6",
+    `${txt("#update-bar-latest")} / ${txt("#update-bar-current")}`);
+  updateStatusPayload = null;
+
+  // 回执的「收起」把它收起来（与上面两条回执同一套画法：监听挂在**里面那颗按钮**上）。
+  click(q("#set-update-receipt-dismiss button"));
+  await sleep(300);
+  check("③更新13 「收起」把回执收起来（收起之后不显示）", !shown("#set-update-receipt"));
+
+  // 命令本身发不出去（宿主里没有这条命令）⇒ 走那次既有的失败行、原文逐字（约束 3/4），
+  // 且**清掉上一次那份回执**：这一下没有任何结论，两句话并排挂着就是一次误导。
+  failures = { update_check_now: "宿主里没有这条命令" };
+  click(q("#set-update-now"));
+  await sleep(500);
+  check("③更新14 命令发不出去 ⇒ 走既有的失败行、原文逐字（约束 3/4）",
+    shown("#set-failure") && txt("#set-failure-text") === "宿主里没有这条命令",
+    txt("#set-failure-text"));
+  check("③更新15 命令发不出去 ⇒ 上一次那份回执**被清掉**（这一下没有任何结论，"
+    + "留着它会与失败行并排、读起来像上一次的结论仍然成立）",
+    !shown("#set-update-receipt"));
+  failures = {};
+  click(q("#set-failure-dismiss button"));
+  await sleep(200);
+  updateNowPayload = null;
 
   // ---- 「导出诊断日志…」（任务 4，规格 §2.5 / §2.7）--------------------------
   //

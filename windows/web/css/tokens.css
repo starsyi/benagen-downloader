@@ -133,6 +133,14 @@
   --notice-text-max-h: 48px;
   --notice-list-max-h: 80px;
 
+  /* 模态面板的高度上限：`.modal__panel` 与它里面的 `.win` **共用这一个数**。
+     ⚠️ 两处必须是同一个数，这是 0.2.8 一次真实事故换来的：面板被限在 88vh、
+        而里面的 `.win` 仍按内容长高（没有上限），于是面板把下半截裁掉 ——
+        「关于 / 开源许可… / 保存」那一条**永远看不见**，而且 `.win__body` 的
+        `overflow:auto` 永远不触发（它没被压矮过，自然没有滚动条）。
+        窗口高度调到"比内容还高"才看起来正常 —— 那正是这条不变量被绕过的样子。 */
+  --modal-max-h: 88vh;
+
   /* ---- 动效（清点 §5.5 的 .spring(response:0.3, dampingFraction:0.7) 近似）-- */
   --anim-spring: cubic-bezier(.32,.72,0,1);
   --anim-dur: 300ms;

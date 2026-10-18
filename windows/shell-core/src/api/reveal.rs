@@ -19,6 +19,7 @@
 use serde_json::{json, Value};
 
 use crate::api::envelope;
+use crate::platform::Platform;
 use crate::presentation::transfer_row::TransferReveal;
 
 /// 一次「在资源管理器中显示」的结局。
@@ -51,21 +52,28 @@ pub enum Outcome {
 ///    `Downloads/Benagen`（一个相对路径），而相对路径的基准是**进程的当前工作目录**
 ///    （双击启动时是 exe 所在目录）—— 拿它去开资源管理器，用户看到的是"什么都没发生"
 ///    或者一个毫不相干的文件夹。那正是本项目最恨的静默失效。
-///    ⚠️ 判据用的是 `std::path::Path::is_absolute`（**本靶**的文件系统语义），
-///    **不是**"里面有没有 `/`"这种近似——后者会把 `C:\…` 之外的写法判错。
+///    ⚠️ 判据现在是 [`crate::platform::is_absolute`]（**目标平台**的语义），
+///    **不再**是 `std::path::Path::is_absolute`（**宿主**的语义）：后者在 macOS 上问
+///    `C:\Users\x` 会回"不是绝对的"，于是 Windows 那一支在本机永远不可断言
+///    （判据搬家的完整论证写在 `platform.rs` 那一处）。
 ///
 /// ⚠️ 闸开在 `local_path` **之外**、而不是改它：那个函数是既有判据（有单测、
 ///    与 macOS 逐字对位），本层的职责是"要不要用它"，不是"改它"。
-pub fn local_path(manifest_path: Option<&str>, home: &str, download_dir: &str) -> Outcome {
+pub fn local_path(
+    platform: Platform,
+    manifest_path: Option<&str>,
+    home: &str,
+    download_dir: &str,
+) -> Outcome {
     // 先分清"这一行有没有文件"与"落盘根算不算得出来"——两句话不一样（见 `Outcome`）。
     if TransferReveal::manifest_path(manifest_path).is_none() {
         return Outcome::NoManifestPath;
     }
-    let root = TransferReveal::download_root(home, download_dir);
-    if !std::path::Path::new(&root).is_absolute() {
+    let root = TransferReveal::download_root(platform, home, download_dir);
+    if !crate::platform::is_absolute(platform, &root) {
         return Outcome::RootUnknown;
     }
-    match TransferReveal::local_path(manifest_path, home, download_dir) {
+    match TransferReveal::local_path(platform, manifest_path, home, download_dir) {
         Some(path) => Outcome::Ready(path),
         None => Outcome::NoManifestPath,
     }
@@ -127,12 +135,12 @@ mod tests {
     #[test]
     fn a_configured_download_directory_wins_over_the_home_default() {
         assert_eq!(
-            local_path(Some("PFX/sub/a.txt"), HOME, "/data/交付"),
+            local_path(Platform::Other, Some("PFX/sub/a.txt"), HOME, "/data/交付"),
             Outcome::Ready("/data/交付/PFX/sub/a.txt".to_string())
         );
         // 配过目录时 home 就算是空的也照样算得出来（那一格不参与）。
         assert_eq!(
-            local_path(Some("a.txt"), "", "/data/交付"),
+            local_path(Platform::Other, Some("a.txt"), "", "/data/交付"),
             Outcome::Ready("/data/交付/a.txt".to_string())
         );
     }
@@ -141,8 +149,33 @@ mod tests {
     #[test]
     fn an_unconfigured_download_directory_falls_back_to_the_kernel_default() {
         assert_eq!(
-            local_path(Some("PFX/sub/a.txt"), HOME, ""),
+            local_path(Platform::Other, Some("PFX/sub/a.txt"), HOME, ""),
             Outcome::Ready("/Users/x/Downloads/Benagen/PFX/sub/a.txt".to_string())
+        );
+    }
+
+    /// 🔴 **Windows 那一支的两条：路径是 `\`，而"算不算绝对"按 Windows 的规矩判。**
+    ///
+    /// 判别力（两条都在 macOS 上执行）：
+    ///   * 把 `platform::path_separator` 的 Windows 那一支改回 `'/'` ⇒ 这一条红；
+    ///   * 把前置闸换回 `std::path::Path::is_absolute`（宿主语义）⇒ 这一条也红
+    ///     （在 macOS 上 `C:\Users\x` 会被判成"不是绝对的"，于是 Windows 上每一条
+    ///     「在资源管理器中显示」都会回一句"算不出它在哪"——那正是一个在开发机上
+    ///     看不见、到了客户机上才炸的缺陷）。
+    #[test]
+    fn the_windows_branch_is_judged_by_windows_rules_on_any_host() {
+        assert_eq!(
+            local_path(Platform::Windows, Some("sub/a.txt"), r"C:\Users\x", ""),
+            Outcome::Ready(r"C:\Users\x\Downloads\Benagen\sub\a.txt".to_string())
+        );
+        assert_eq!(
+            local_path(Platform::Windows, Some("a.txt"), r"C:\Users\x", r"D:\交付"),
+            Outcome::Ready(r"D:\交付\a.txt".to_string())
+        );
+        // 反面：Windows 上算不出根时**照样**是 RootUnknown（不是恒 Ready）。
+        assert_eq!(
+            local_path(Platform::Windows, Some("a.txt"), "", ""),
+            Outcome::RootUnknown
         );
     }
 
@@ -150,7 +183,7 @@ mod tests {
     #[test]
     fn the_manifest_path_goes_through_untouched() {
         assert_eq!(
-            local_path(Some("a//b/中文 名.bin"), HOME, "/data"),
+            local_path(Platform::Other, Some("a//b/中文 名.bin"), HOME, "/data"),
             Outcome::Ready("/data/a//b/中文 名.bin".to_string())
         );
     }
@@ -161,8 +194,14 @@ mod tests {
     /// 而真机上的表现是"每一行没有路径的任务都在点开之后弹一句看不懂的错"。
     #[test]
     fn a_row_without_a_path_is_its_own_outcome_not_a_failure() {
-        assert_eq!(local_path(None, HOME, "/data"), Outcome::NoManifestPath);
-        assert_eq!(local_path(Some(""), HOME, "/data"), Outcome::NoManifestPath);
+        assert_eq!(
+            local_path(Platform::Other, None, HOME, "/data"),
+            Outcome::NoManifestPath
+        );
+        assert_eq!(
+            local_path(Platform::Other, Some(""), HOME, "/data"),
+            Outcome::NoManifestPath
+        );
     }
 
     /// 🔴 **落盘根算不出来那一档**：没配下载目录 + 取不到 home ⇒ **不猜**（不许拼相对路径）。
@@ -173,11 +212,17 @@ mod tests {
     /// 用户在资源管理器里看到的是一个毫不相干的地方 —— 或者干脆什么都没发生。
     #[test]
     fn an_unknown_root_is_refused_instead_of_building_a_relative_path() {
-        assert_eq!(local_path(Some("a.txt"), "", ""), Outcome::RootUnknown);
-        assert_eq!(local_path(Some("a.txt"), "relative/home", ""), Outcome::RootUnknown);
+        assert_eq!(
+            local_path(Platform::Other, Some("a.txt"), "", ""),
+            Outcome::RootUnknown
+        );
+        assert_eq!(
+            local_path(Platform::Other, Some("a.txt"), "relative/home", ""),
+            Outcome::RootUnknown
+        );
         // ⚠️ 反方向：配过下载目录时**照样**算得出来（`RootUnknown` 不是恒真的兜底）。
         assert!(matches!(
-            local_path(Some("a.txt"), "", "/data/交付"),
+            local_path(Platform::Other, Some("a.txt"), "", "/data/交付"),
             Outcome::Ready(_)
         ));
     }

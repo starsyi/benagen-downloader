@@ -116,6 +116,13 @@ export function openSettings(ctx, hooks) {
   // 「启动时检查更新」（规格 §4）。标签是**结构文案**（住在 `index.html`，本文件不碰）；
   // 这里只管那个勾 ——它的值来自**内核**（`update_status.enabled`）。
   const updateEl = byIdIn(root, "set-update");
+  // 「立即检测」（规格 §2）那颗按钮 + **它自己的**回执行（住在同一节里，同导出那一条）。
+  // ⚠️ 它的回执那几格全部来自载荷（`api::update::checked`），本文件只决定画成什么样。
+  const updateNowEl = byIdIn(root, "set-update-now");
+  const updateReceiptEl = byIdIn(root, "set-update-receipt");
+  const updateReceiptIconEl = byIdIn(root, "set-update-receipt-icon");
+  const updateReceiptTextEl = byIdIn(root, "set-update-receipt-text");
+  const updateReceiptDismissEl = byIdIn(root, "set-update-receipt-dismiss");
   const exportEl = byIdIn(root, "set-export");
   const exportReceiptEl = byIdIn(root, "set-export-receipt");
   const exportReceiptIconEl = byIdIn(root, "set-export-receipt-icon");
@@ -137,7 +144,7 @@ export function openSettings(ctx, hooks) {
   // 「收起」那颗 ×：走 `dialogs.js:dismissButton`（克隆模板 + **补上那个 ×**）。
   // ⚠️ 只克隆、不补图形的话，那是一颗**没有内容的小方块** —— 看得见（悬停才有一点底色）、
   //    但在客户眼里与"这里坏了"分不开。这一条是审查抓出来的（五个地方同一个错）。
-  for (const host of [dirReceiptDismissEl, exportReceiptDismissEl, failureDismissEl]) {
+  for (const host of [dirReceiptDismissEl, exportReceiptDismissEl, updateReceiptDismissEl, failureDismissEl]) {
     host.append(dismissButton(() => host.__dismiss()));
   }
 
@@ -169,6 +176,15 @@ export function openSettings(ctx, hooks) {
    *    "哪一颗正在等系统"这件事在代码里读得出来。
    */
   let exporting = false;
+  /**
+   * 一次「立即检测」在飞（规格 §2）。
+   *
+   * ⚠️ 它挡的**不是系统对话框**（这一条不问系统要东西），而是**连点**：
+   *    内核那一条要发一次网络请求（最坏几秒），期间再点一次会排到同一条内核通道后面
+   *    （`client.rs` 的单飞闸门）—— 用户看到的是"点了没反应"，而真相是排着队。
+   *    挡住它、并在按钮上按在飞状态说明（`aria-busy`），比让客户连点五下诚实。
+   */
+  let checkingUpdate = false;
   /** 引擎闸门（`state().allows_requests`，壳每一拍灌进来）。 */
   let gateOpen = false;
   /**
@@ -194,6 +210,9 @@ export function openSettings(ctx, hooks) {
   };
   exportReceiptDismissEl.__dismiss = () => {
     exportReceiptEl.hidden = true;
+  };
+  updateReceiptDismissEl.__dismiss = () => {
+    updateReceiptEl.hidden = true;
   };
 
   // ---------------------------------------------------------------------------
@@ -586,16 +605,31 @@ export function openSettings(ctx, hooks) {
     updateEl.checked = !(data && data.enabled === false);
   }
 
-  /** 把一条改目录的回执落到窗口里那一行上（图标是**绘制**，文字全部来自载荷）。 */
-  function paintChangeReceipt(change) {
-    dirReceiptEl.hidden = false;
-    clear(dirReceiptIconEl);
+  /**
+   * 把一条回执落到**某一节**那一行上（图标是**绘制**，文字全部来自载荷）。
+   *
+   * ⚠️ 抽出来是因为到 2026-10-15 这里已经有**三条**回执读**同一组键**
+   *    （下载目录 / 详细日志 / 立即检测 —— 还有导出那一条同形但它多一格 `privacy_note`）：
+   *    `api::preferences::receipt` 那一侧的注释说得很清楚，"同一组键只许有一份实现"，
+   *    前端这边同一条纪律 —— 三份复制粘贴的结局是某一格哪天在一边改了、另两边没改，
+   *    而**不会有什么东西变红**（少的那一行只是安静地不出现）。
+   *
+   * ⚠️ 它只画**标题 + 可选的一行路径**（那条路径的契约：单行 + 中间截断 + 悬停看全文）。
+   *    多出来的行（导出的 `privacy_note`）由调用方在它之后再往 `els.text` 上追加 ——
+   *    本函数不猜"你还有没有别的东西要画"。
+   *
+   * 返回那三格（`headline` / `detail` / `failure`）：调用方要用它们做别的事
+   * （改目录那条要把同一件事推到主区那条常驻行上）。
+   */
+  function paintReceipt(els, change) {
+    els.receipt.hidden = false;
+    clear(els.icon);
     const failure = change && change.is_failure === true;
-    dirReceiptIconEl.className = failure ? "dlg__receipt-icon is-failure" : "dlg__receipt-icon";
+    els.icon.className = failure ? "dlg__receipt-icon is-failure" : "dlg__receipt-icon";
     // ⚠️ 这两个名字是**绘制**层的选择（`dom.js:ICONS` 是图形的家）：载荷给的是
     //    `is_failure` 这个**语义档**，本文件只决定它画成什么 ——
     //    与 `render.js:noticesFromState` 里"banner 的 kind → 哪个图标"逐字同一分工。
-    dirReceiptIconEl.append(
+    els.icon.append(
       icon(
         failure ? "exclamationmark.triangle.fill" : "checkmark.circle.fill",
         "dlg__receipt-svg"
@@ -603,8 +637,8 @@ export function openSettings(ctx, hooks) {
     );
     const headline = change && typeof change.headline === "string" ? change.headline : "";
     const detail = change && typeof change.path_detail === "string" ? change.path_detail : "";
-    clear(dirReceiptTextEl);
-    dirReceiptTextEl.append(h("span", { class: "dlg__receipt-headline selectable", text: headline }));
+    clear(els.text);
+    els.text.append(h("span", { class: "dlg__receipt-headline selectable", text: headline }));
     if (detail) {
       // 路径单独一行、可悬停看全文（`headline` 里**不含**路径 —— 那正是两格分开的理由）。
       // ⚠️ **中间截断**（`app_preferences` 的 `path_detail` 逐字："单行 + 中间截断 +
@@ -615,8 +649,17 @@ export function openSettings(ctx, hooks) {
       const pathEl = h("span", { class: "dlg__receipt-path selectable", title: detail });
       pathEl.append(h("span", { class: "mid__head", text: pathHead }));
       pathEl.append(h("span", { class: "mid__tail", text: pathTail }));
-      dirReceiptTextEl.append(pathEl);
+      els.text.append(pathEl);
     }
+    return { headline, detail, failure };
+  }
+
+  /** 把一条改目录的回执落到窗口里那一行上。 */
+  function paintChangeReceipt(change) {
+    const { headline, detail, failure } = paintReceipt(
+      { receipt: dirReceiptEl, icon: dirReceiptIconEl, text: dirReceiptTextEl },
+      change
+    );
     if (hooks.onReceipt) {
       hooks.onReceipt({
         id: "download-dir-change",
@@ -663,46 +706,80 @@ export function openSettings(ctx, hooks) {
   /**
    * 把一次导出的回执落到本节那一行上（图标是**绘制**，文字全部来自载荷）。
    *
-   * ⚠️ 四格与改设置那两条**同形**（`headline` / `path_detail` / `is_failure`：前端只有
-   *    一条渲染路径的写法在这里照抄了一遍结构），多出来的第五格 `privacy_note` 是
-   *    规格 §2.7 要求的**第二处明说** —— 它**只在成功那一档有值**（没导出东西的时候
-   *    没有什么可提醒的），所以是"有才画"。
+   * ⚠️ 前三格与改设置那两条**同形**（`headline` / `path_detail` / `is_failure`）——
+   *    2026-10-15 起画法是**同一份** `paintReceipt`（那三条各写一遍结构的时代结束了）。
+   *    多出来的第五格 `privacy_note` 是规格 §2.7 要求的**第二处明说** ——
+   *    它**只在成功那一档有值**（没导出东西的时候没有什么可提醒的），所以是"有才画"，
+   *    而且**由本函数追加**（`paintReceipt` 不管"你还有没有别的东西要画"）。
+   *
+   * ⚠️ **中间截断那两个分隔符的判据在本机看得见**：夹具里那一条（`diagnosticsExportDone`）
+   *    **就是 Windows 形状的**（`D:\导出\诊断日志-…`，故意的）⇒
+   *    `panels-harness.html` 的 ③导出6 会在有人把共用的那一份退回 `"/"` 时红
+   *    （实测：`["D:\\导出\\诊断日志-…",""]`）。
    */
   function paintExportReceipt(change) {
-    exportReceiptEl.hidden = false;
-    clear(exportReceiptIconEl);
-    const failure = change && change.is_failure === true;
-    exportReceiptIconEl.className = failure ? "dlg__receipt-icon is-failure" : "dlg__receipt-icon";
-    exportReceiptIconEl.append(
-      icon(failure ? "exclamationmark.triangle.fill" : "checkmark.circle.fill", "dlg__receipt-svg")
+    paintReceipt(
+      { receipt: exportReceiptEl, icon: exportReceiptIconEl, text: exportReceiptTextEl },
+      change
     );
-    const headline = change && typeof change.headline === "string" ? change.headline : "";
-    const detail = change && typeof change.path_detail === "string" ? change.path_detail : "";
-    clear(exportReceiptTextEl);
-    exportReceiptTextEl.append(
-      h("span", { class: "dlg__receipt-headline selectable", text: headline })
-    );
-    if (detail) {
-      // 路径单独一行、中间截断 + 悬停看全文（与改目录那条**同一套**：
-      // `path_detail` 的契约就是"单行 + 中间截断 + 悬停"）。
-      // ⚠️ **两个分隔符都要认**（`/` 与 `\`）：真机是 Windows，那边的路径里**一个 `/`
-      //    都没有** ⇒ 只传 `"/"` 的话 `middleSplit` 会回 `[整条, ""]`
-      //    （`dom.js:107` 的兜底）⇒ **用户最需要看到的那一格（目标文件夹的名字）
-      //    恰好落进会被压缩的前一段**。这一屏存在的唯一目的就是告诉用户"东西在哪"，
-      //    所以这里按真机形状写。
-      //    ✅ **本机看得见**：夹具里那一条（`diagnosticsExportDone`）**就是 Windows 形状的**
-      //    （`D:\导出\诊断日志-…`，故意的）⇒ `panels-harness.html` 的 ③导出6 会
-      //    在有人把这里退回 `"/"` 时红（实测：`["D:\\导出\\诊断日志-…",""]`）。
-      const [pathHead, pathTail] = middleSplit(detail, "/\\");
-      const pathEl = h("span", { class: "dlg__receipt-path selectable", title: detail });
-      pathEl.append(h("span", { class: "mid__head", text: pathHead }));
-      pathEl.append(h("span", { class: "mid__tail", text: pathTail }));
-      exportReceiptTextEl.append(pathEl);
-    }
     const note = change && typeof change.privacy_note === "string" ? change.privacy_note : "";
     if (note) {
       exportReceiptTextEl.append(h("span", { class: "set__note selectable", text: note }));
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 立即检测更新（规格 §2）
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 「立即检测」：**不受 24 小时节流**的一次手动检查（内核早就备好了 `update_check_now`，
+   * 壳一直到 2026-10-15 才把这条命令与这颗按钮接上）。
+   *
+   * 🔴 **它存在的理由是那句可能的假话**：内核的 `update_status` 在"这次没查成"与
+   *    "查成了、确实没有新版"两种情形下**长得一样**（`has_newer:false`）。后台那条提示条
+   *    对此无所谓（没人做动作就不冒话，规格 §5），但**客户点出来的**这一下只按
+   *    `has_newer` 判就只剩"已经是最新的" —— 断网时那是**界面在撒谎**。
+   *    判决与那五句话住在 `shell_core::presentation::update_check`（内核为此多了一格
+   *    `last_check_ok`），**本文件一个字的文案都不写**（R-24），只把载荷原样摆上去。
+   *
+   * ⚠️ **回执落在本节里**（同导出那一条的理由）：用户点的是这一节里的按钮。
+   * ⚠️ **点完还要补一拍**（`pollNow`）：这一条会**改掉内核手里那一份更新状态**
+   *    （`last_checked_at` / `last_seen` / `last_check_ok`），而壳层那条提示条读的正是
+   *    同一份（`update_status`，每 60 秒一拍）—— 不补这一拍，用户点完"有新版本"
+   *    还得等下一次轮询才看见那条提示条（甚至更久：桌面版在设置窗口开着时那一条
+   *    也是每 60 秒才动一次）。**"我按了按钮，界面却不跟着动"是这一节最忌的形状。**
+   *
+   * ⚠️ **命令本身发不出去**（宿主里没有这条命令）走 `showFailure` 那条既有路径；
+   *    而"没查成""开关关着"都是**回执里那一档**（它们是成功信封 + `is_failure`），
+   *    与导出那条的分工逐字相同。
+   */
+  async function checkUpdateNow() {
+    if (checkingUpdate) return;
+    checkingUpdate = true;
+    updateNowEl.setAttribute("aria-busy", "true");
+    try {
+      const change = await ctx.call(ctx.CMD.updateCheckNow);
+      paintUpdateReceipt(change);
+      ctx.poller.pollNow();
+    } catch (error) {
+      // 🔴 **命令本身都发不出去 ⇒ 这一下没有任何结论**：把上一次那份回执也清掉。
+      //    留着它会与下面那条失败行并排挂着，读起来像"刚才那一次的结论仍然成立"——
+      //    而它说的是**上一次**（可能几天前）那一份，两句话并排就是一次误导。
+      updateReceiptEl.hidden = true;
+      showFailure(failureText(error));
+    } finally {
+      checkingUpdate = false;
+      updateNowEl.removeAttribute("aria-busy");
+    }
+  }
+
+  /** 把一次「立即检测」的回执落到本节那一行上（同一份画法，文字全部来自载荷）。 */
+  function paintUpdateReceipt(change) {
+    paintReceipt(
+      { receipt: updateReceiptEl, icon: updateReceiptIconEl, text: updateReceiptTextEl },
+      change
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -805,6 +882,10 @@ export function openSettings(ctx, hooks) {
   // （与上面那个不同），所以没有 `busy` 那道闸。
   updateEl.addEventListener("change", () => {
     void setUpdateEnabled(updateEl.checked);
+  });
+  // 「立即检测」：一次手动检查（与上面那个勾选框是两件事 —— 那颗说"以后"，这颗说"现在"）。
+  updateNowEl.addEventListener("click", () => {
+    void checkUpdateNow();
   });
   // 「导出诊断日志…」：**一次系统对话框 + 一次拷贝**，回执落在本节里那颗按钮下面
   // （与上面那个勾选框同一节 —— 见 `exportDiagnostics` 的文档）。

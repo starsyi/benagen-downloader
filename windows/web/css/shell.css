@@ -366,6 +366,51 @@
   color: var(--c-secondary);
 }
 
+/* ---- 更新提示条（规格 2026-10-09 §4）----------------------------------------
+ *
+ * 🔴 **它住在壳里，不归任何一屏**（0.2.8 修的一场）：macOS 那条提示挂在
+ *    `RootView` 主区的 `VStack` 里（`RootView.swift:111-115`），**任何分区都看得见**；
+ *    而它原来长在文件页模板里、那一拍也归文件页 ⇒ 启动落在空态页、或者客户正站在
+ *    传输列表上时，它**永远不出现** —— "Windows 客户端没有更新提示"正是这么来的。
+ * ⚠️ 它与上面那排常驻提示行**不是同一个东西**（规格 §4 明写"独立、但复用样式"）：
+ *    提示行由 `app.js` 的 `currentNotices()` 整批替换；这一条有自己的可见性判据
+ *    （只有"有新版本"才算，还要叠上客户点过没收起），所以是**独立元素、独立一格**。
+ * ⚠️ 本文件不出现字面色值（全取 `tokens.css`）；高度也不许由数据长度决定
+ *    —— 所以文案那一格走**有界可滚**（与 `.notice__text` 同一条纪律）。
+ */
+.update-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-8);
+  padding: var(--pad-bar-y) var(--pad-bar-x);
+  background: var(--bg-notice);
+}
+.update-bar__text {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-callout);
+  font-weight: 600;
+  max-height: var(--notice-text-max-h);
+  overflow-y: auto;
+}
+/* 「去下载」那颗。⚠️ 原画法在 `css/screens/files.css`（"只出现在本屏"），
+   提示条搬上壳之后它就**不再只出现在那一屏**了 —— 所以整套搬进来，屏里那份删掉。
+   与 `.notice__retry` / `.notice__dismiss` 同一套画法（同尺寸、同圆角、同 hover）。 */
+.notice__action {
+  flex: none;
+  font: inherit;
+  font-size: var(--text-callout);
+  background: transparent;
+  border: 1px solid var(--c-separator);
+  border-radius: var(--r-6);
+  padding: var(--sp-2) var(--sp-8);
+  cursor: pointer;
+  color: var(--c-label);
+}
+.notice__action:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+
 /* ---- 屏宿主 -----------------------------------------------------------------
    任务 10/11/12 的东西挂在 `#page` 里；每一屏自己顶满这一格。
 

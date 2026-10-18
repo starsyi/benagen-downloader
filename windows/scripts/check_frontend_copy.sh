@@ -338,6 +338,8 @@ WHITELIST = {
                                         " ＋ 文件页底栏的两个（`SelectionBar.swift:51,56` 那两处 Text(\"·\")）"),
     ("windows/web/index.html", "交付码"): (3, "工具栏那一格的静态标签（有生效批次时让位给真码 —— 真码来自 `summary.code`）"
                                                 "＋ 空态屏输入框的占位符（`placeholder`）＋ 任务 13 换码面板输入框的占位符（`SwitchDeliverySheet.swift` 的 `TextField(\"交付码\")`）"),
+    ("windows/web/index.html", "立即检测"): (1, "设置窗口「更新」那一节里那颗按钮的名字（规格 §2 的手动查；macOS 侧 `SettingsView.swift` 的 `Button(\"立即检测\")` 是**同一句**）。"
+                                                        "⚠️ 它是**结构**（与数据无关、任何状态下都一样的一句话），而**判决与那五句话**由 Rust（`presentation/update_check.rs`）与 Swift（`UpdateCheckReceipt.swift`）给，两端逐字对位由 `check_presentation_mirrors.sh` 的第 ③ 段判 —— 这一格只是那颗按钮上的字"),
     ("windows/web/index.html", "设置"): (2, "工具栏那颗按钮的名字（`RootView.swift` 的「设置」）＋ 任务 13 设置窗口的标题（`SettingsView.swift` 那一扇窗）"),
     ("windows/web/index.html", "重试"): (4, "常驻提示行 `tpl-notice-retry` 里那颗按钮的字"
                                             "＋ 空态屏失败态那颗「重试」（`empty__retry`）"

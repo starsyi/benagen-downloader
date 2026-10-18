@@ -1970,3 +1970,69 @@ Intel 那份直接复用了 `dist/` 里已经修过 minOS 的 x86_64 包。
 
 - [ ] 传输列表『已完成/失败』行显示**最近 300 条**（`tellStopped` 尾窗，2026-10-14 起）；总数在摘要里全量（`getGlobalStat`）；排队行仍是队头 1000 条。⚠️ **命令行工具（benagen-dl）的进度行计数仍取自行**（`tally()`）：>300 个已结束文件的批次里『已下 X/Y』与字节数只反映最近 300 条窗口；**完成判定与最终成败汇总不受影响**（分别走 waiting/active 行与 `get_tree` 全量）——正路是 UI 分页轮把它接到计数上。
 - [ ] **0.2.5→0.2.6 的入队节奏差异**：0.2.5 一次 `addUri` 灌完整批（686 个 464 ms）；0.2.6 起同步前 100 + 后台 20 个/200 ms（`4d93d08a`）。若 0.2.6/0.2.7 真机复测仍有『入队后噎住』，再调 `FIRST_BATCH`/`FEED_BATCH`——本轮不盲调。
+
+### 0.2.7 客户反馈修复（2026-10-15）验收登记（macOS 侧）
+
+- [ ] **设置里新增「立即检测」**（规格 §2 的手动查；用户裁定**两端都加**，保持对位）。内核**本来就有** `update_check_now`（`core/src/kernel.rs:3404`，不受 24 小时节流），macOS 侧此前只有「启动时检查更新」那个开关、没有手动那条路。
+  · 新增 `macos/Sources/BenagenCoreKit/Presentation/UpdateCheckReceipt.swift`：**同一份判决的第二份实现**（五档 `Disabled`/`Newer`/`UpToDate`/`Unreachable`/`NoAnswer` + 那五句话 —— 与 Rust 那份**逐字相同**，由 `windows/scripts/check_presentation_mirrors.sh` 第 ③ 段钉住；变异探针：Swift 侧改一个字 ⇒ exit 3 并指名"没查成"那一句）。
+  · `UpdateStatus` 多一格 `lastCheckOk: Bool?`（显式 `CodingKeys` 的 camelCase 映射不变；**这一格缺失按 `nil` 降级** ⇒ 旧内核的载荷仍然解得出，只是那一档会如实说"内核回的这份检查状态不全"）。
+  · `AppModel.checkUpdateNow() async -> UpdateCheckReceipt`：`call("update_check_now", .null)` → 解码 → `updateStatus` 与 `updateCheckReceipt` **一起落**（回执落在**模型**上，理由与 `downloadDirChange` 逐字相同：那句话必须活过设置那一扇窗）；另有 `dismissUpdateCheckReceipt()`。
+  · `SettingsView` 的「更新」那一节里加了那颗按钮与它自己的回执行（成功 `checkmark.circle` / 失败 `exclamationmark.triangle`；正文 `BoundedNoticeText`、可选中）。
+  读数：`bash macos/scripts/test.sh` ⇒ **580 passed / 0 failed**（新增 12 条：`BenagenCoreKitTests/UpdateCheckReceiptTests.swift` 8 条 + `UpdateStatusTests.swift` 4 条）。
+  变异探针（判决那一半）：把 `of()` 里"**先看 `lastCheckOk`**"那一段整个拆掉（退回"只看 `has_newer`"）⇒ 3 条红：`没查成时绝不说已经是最新的`、`内核没给那一格时说不清`、`五档各有各的那句话`。
+  ⚠️ 已知边界：本机只有命令行工具链，`swift test` 要在测试进程里建临时目录 ⇒ 跑法是 `swift test --disable-sandbox`（`macos/scripts/test.sh` 已处理；沙箱开着时失败信息看不出根因）。真机逐条勾：开关**关着**时点 ⇒「自动检查更新是关着的，刚才没有去查。补救：打开上面那个开关，再点一次「立即检测」。」；**断网**时点 ⇒「没查成：这次没连上发布页。补救：确认这台机器能上网，或者过一会儿再点一次。」；**有新版** ⇒「有新版本 …（当前 …）。」且主区那条提示条同时出现；**无新版** ⇒「已经是最新的（当前 …）。」。
+- [ ] 与 Windows 的一处**有意差异**：Windows 那条「有新版本」提示条这一轮也搬到了壳层（**任何分区**含传输列表/校验/设置与空态页都看得见），与 macOS 挂在 `RootView` 主区的位置**对位**；两端的 `[×]` 都只是**本次运行内**不再出现（不落盘，重启恢复）。
+
+### 0.2.8 下载提速：多边缘并行 + 下载中换腿（2026-10-18）验收登记
+
+> 规格：`docs/superpowers/specs/2026-10-18-download-edge-selection-design.md`（N1–N5 现状 / F1–F7 实测 /
+> D1–D10 决策 / I1–I6 不变量 / X1–X7 不做 / R1–R6 风险 / V1–V6 验收）。
+> 计划与提交序列：`docs/superpowers/plans/2026-10-18-download-edge-selection.md`（T1–T7）。
+
+- [x] **根因（本机实测，不是推断）**：`split=N` 的真实语义是「**同时用 N 条腿、每条腿 1 条连接**」
+  （`core/tests/legs_e2e.rs` 的农场三次复现：4 条限速边缘、`split=4` ⇒ 每条腿恰好 1 条连接、总速 = 各腿限速之和）。
+  ⇒ 引擎**只按 `--uri-selector=inorder` 的顺序取腿、不按快慢挑、下载中途从不换边**（`feedback` 逐行对照证明它不是杠杆）；
+  客户那台 1.7 MB/s 的形状因此是「8 条连接全压在同一条慢腿上 ⇒ 单流 ≈0.21 MB/s/连接」，调 `并行文件数/单文件连接数/分片数` 三个旋钮都不会改善。
+  叠加事实：候选 IP 原来被 `delivery::MAX_BACKUP_URIS = 5` 截断，`Via` 头显示客户（江西）被调度到江苏/山东/湖北的边缘（跨省跨运营商），腿之间的差是 5–8 倍量级。
+- [x] **改法（T1–T6，分支 `feat/download-edge-selection`，15 个提交；已快进 master）**：
+  · T1 `MAX_BACKUP_URIS` 5→16（`core/src/delivery.rs`）；
+  · T2 纯读层 `core/src/engine/legs.rs`（`Leg`、`parse_servers`、`median`、`trim_threshold` = `max(中位数/3, 128 KiB/s)`、`leg_is_ip_literal`）；
+  · T3 `RpcClient/Daemon::{servers, change_uri}`（`getServers` **单次尝试、不重试**——下一拍就是天然重试，有两条计数器用例守着；`changeUri` 的 `fileIndex` 恒传 1，本产品每条任务单文件）；
+  · T4 跨拍判决 `core/src/legtrim.rs`（暖机 3 拍、连续 2 拍慢才摘、域名腿永不摘、至少留 2 条、被摘的 URI 冷却 12 拍 ≈120 s、全慢不摘）；
+  · T5 定时拍线程 `kernel::spawn_leg_trim`（`core/src/kernel.rs`，10 s 一拍；每 6 拍重解析一次域名补新 IP；RPC 全在锁外；`core/src/main.rs` 与 `spawn_auto_retry` 并排起它）；两个诊断计数 `leg_trim_del` / `leg_add`；
+  · 提交路径**一个字没改**（D4：任务先开始下载，再在下载中换腿），`--uri-selector`、`max-connection-per-server` 也没改（D2/D3）。
+- [x] **本机读数（现取）**：
+  · `cd core && cargo test -q` ⇒ **576 passed / 0 failed**（534 lib + 4 cli_e2e + 36 e2e + 2 legs_e2e；最后一行是 1 条既有 ignored）；
+    其中 `cli_e2e`/`e2e` 要执行 `/bin/ps` 观测 aria2c 进程，本机 DSH 沙箱默认拒绝（`Operation not permitted`），这两套须以更宽权限跑——**不是代码失败**，沙箱下它们会以 `ps 不可用` 红；
+  · `cd core && cargo test -q --test legs_e2e -- --test-threads=1` ⇒ **2 passed / 0 failed**，合计 ≈13–21 s，连跑 3 次稳定；
+  · 端到端观测量（真 aria2 1.37.0 + 4 条限速假边缘 + 2 条候选）：第 4 拍动作（暖机 3 拍后第一拍），`del` 恰为两条 10 KB/s 边缘、
+    `add` 恰为两条候选；换腿前总速 **≈617 KiB/s** ⇒ 换腿后 **≈1175 KiB/s（1.90×）**；下一次 `getServers` 里 `del` 消失、`add` 在列；
+    8 MiB 文件 8.73 s 下完，落盘文件 `crc64xz` 与夹具**逐字节一致**（换腿不损坏数据）；候选边缘 `hits() > 0`（真被连上）。
+  · 对照：4 条等速边缘推 8 拍，`plan` 一次都不 `Some`（等速/全慢不摘的现场形状）。
+- [ ] **真机 / 现场 CDN 待验**（本机只有假边缘，量的是「机制对不对」，不是「客户那条链路能到多少」）：
+  让客户在**江西**那台机器上用新走法下一批 70 GB bam，对照三件事：① `~/Library/Application Support/BenagenDownloader/aria2.log` 里
+  `changeUri` 前后的 `downloadSpeed`；② 摘要里的总速曲线（应出现一次台阶）；③ 与迅雷同段的字节/秒差距是否收窄。
+  验收口径沿用附 F 的「先认 sha256、再认文件名」，不承诺绝对速度（CDN 计费与运营策略不在本仓控制内）。
+- [ ] **命令行工具（`benagen-dl`）本轮不接这条线程**（`core/src/cli/mod.rs` 只起 worker/verify/landing；`spawn_auto_retry`/`spawn_recovery`
+  同样没接，是既有口径，不是新增差异）。要接的话是 `cli/mod.rs` 一行 + 一条 CLI 侧复查；本轮不扩。
+- [x] **两端都随 0.2.8 重出**（2026-10-18，本工作树内构建）：改动全在 `core/`（内核 + 引擎），两个壳共用同一份内核 ⇒ 同一只包行为一致。
+  macOS 侧另有两件同在 0.2.8 里的 0.2.7 轮修复（设置里的「立即检测」、更新提示条对位），登记见上一节。产物读数见本节末「本版产物」。
+
+- [x] **附带修掉一个发版链上的隐患**：`macos/scripts/build_dmg_macos.sh:156` 原来是
+  `BENAGEN_VERSION="${VERSION:-0.2.6}"` —— 硬编码默认值没人负责升，**0.2.7 与 0.2.8 两轮升号都漏了它**，
+  实测把 0.2.8 的 `.app`（Info.plist 确实是 0.2.8）装成了 `BenagenDownloader-0.2.6-AppleSilicon.dmg`
+  ⇒ 盘名与内容不符，正是本脚本历来自证要防的那一类。改法沿用脚本对架构的那条纪律——**名字从产物读出来**：
+  版本号取包内 `CFBundleShortVersionString`；`VERSION=` 只用于核对，不一致当场 exit 2
+  （负向实测：`VERSION=0.2.6 bash macos/scripts/build_dmg_macos.sh` ⇒「VERSION=0.2.6 与包内版本 0.2.8 不一致」，不出盘）。
+
+- [x] **本版产物（2026-10-18，本工作树内构建）**：
+  ```
+  bash macos/scripts/build_app_macos.sh            # arm64
+  bash macos/scripts/build_app_macos.sh x86_64     # Intel（PATH 里 cargo 须是 rustup 那份）
+  bash macos/scripts/build_dmg_macos.sh            # 每个架构各跑一次，架构从包内 lipo 推出来
+  BenagenDownloader-0.2.8-AppleSilicon.dmg   5,105,884 B   sha256 488c073048e340c397c3e1f0510917a83f24459c5981b1e00d0629de4317ce32
+  BenagenDownloader-0.2.8-Intel.dmg          5,320,673 B   sha256 0038b5f9e238aee9f43439fa2baa63d589b819a66ad75e50e3c5de1e15b7f9e6
+  ```
+  盘内自验（脚本自己挂载一遍）：包内三个二进制与 Info.plist 的 minOS 都在 13.0 之内、单架构、
+  `已损坏修复.command` 与 `/Applications` 符号链接齐全。⚠️ 同既有口径：**不签名、不公证**；
+  x86_64 那一份只在本机经 Rosetta 跑过，不等于在真 Intel 上验过。

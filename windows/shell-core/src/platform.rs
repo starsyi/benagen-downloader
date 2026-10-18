@@ -65,12 +65,68 @@ pub const fn env_var_name(platform: Platform) -> &'static str {
     }
 }
 
+/// **纯函数**：`platform` 上，路径里那一级分隔符。
+///
+/// ⚠️ **这条判据的来历是一次真实的定位失败**（"在资源管理器中显示"点了没反应，只在
+///    Windows 上）：那一刻交给资源管理器的**是一个字符串参数**，而解析它的是**那个程序**，
+///    不是宿主 —— MS-DOS 一脉的程序把 `/` 当**选项引导符**（GNU Emacs bug#66514 里
+///    Eli Zaretskii 的原话："MS-Windows programs frequently treat the forward slash as the
+///    option character"；Qt 的 `Use backslashes for UNC paths` 是同一条）。于是
+///    `/select,"C:\Users\x/Downloads/Benagen/a.bin"` 被它切成几截、**不报错**，
+///    只打开一个默认窗口 —— 而"点了什么都没定位到"正是约束 4 明禁的静默失效。
+///    macOS 那一支（`open -R`）拿到的路径本来就是纯 `/`，所以这个缺陷**只在 Windows 上显形**，
+///    在开发机上永远看不出（同 [`env_var_name`] 那条"本机测不到"的论证）。
+///
+/// ⚠️ **方向是"内核怎么落地、壳就怎么写"**：内核用 `PathBuf::join` 拼默认下载目录
+///    （`core/src/paths.rs` 的 `download_dir_for`），在 Windows 靶上出来的就是 `\`。
+///    壳这一侧镜像它 —— 这条耦合由 `transfer_row.rs` 的
+///    `a_windows_path_uses_backslashes_for_the_file_manager` 钉住（那条用例在**任意宿主上**
+///    都断言 Windows 那一支的逐字形状）。
+pub const fn path_separator(platform: Platform) -> char {
+    match platform {
+        Platform::Windows => '\\',
+        Platform::Other => '/',
+    }
+}
+
+/// **纯函数**：`c` 在 `platform` 上算不算分隔符。
+///
+/// ⚠️ Windows 上 `/` 与 `\` **都是**分隔符（内核的 `PathBuf` 在那一靶上同样两个都认），
+///    其余平台上 `\` 是一个**普通的文件名字符**（所以那里的路径一个字符都不许动）。
+///    本函数只用来去掉**壳自己拼出来的**那个末尾分隔符，不是拿来解析路径的。
+pub const fn is_path_separator(platform: Platform, c: char) -> bool {
+    c == path_separator(platform) || (matches!(platform, Platform::Windows) && c == '/')
+}
+
+/// **纯函数**：`path` 在 `platform` 上是不是一条**绝对**路径。
+///
+/// ⚠️ 判据搬到这里的理由同 [`env_var_name`]：`std::path::Path::is_absolute` 用的是
+///    **宿主**的文件系统语义，而调用方（`api::reveal::local_path` 的前置闸）问的是
+///    **目标平台**的事 —— 在 macOS 上问 `C:\Users\x` 它回 `false`，
+///    于是"Windows 上这条路算不算绝对"在本机**永远不可断言**，两条分支里只有一条被测到。
+///
+/// ⚠️ 写法是**字符串判据**，不是 OS 调用：盘符（`C:\` / `C:/`）与 UNC（`\\server\share`）
+///    两种绝对形式。
+pub fn is_absolute(platform: Platform, path: &str) -> bool {
+    match platform {
+        Platform::Other => path.starts_with('/'),
+        Platform::Windows => {
+            let bytes = path.as_bytes();
+            let drive = bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && (bytes[2] == b'\\' || bytes[2] == b'/');
+            drive || path.starts_with(r"\\")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! 上游没有对应物（上游只跑在一个平台上）。这里钉的是**"平台差异被参数化"这件事**：
     //! 两支都要在**任意宿主上**有断言 —— 这正是搬进本模块之前缺失的那半条判别力。
 
-    use super::{env_var_name, Platform, PLATFORM};
+    use super::{env_var_name, is_absolute, is_path_separator, path_separator, Platform, PLATFORM};
 
     /// 两支逐字钉死，**在任何宿主上都执行**。
     ///
@@ -113,5 +169,67 @@ mod tests {
             Platform::Other
         };
         assert_eq!(PLATFORM, want);
+    }
+
+    /// 🔴 两支逐字钉死，**在任何宿主上都执行**。
+    ///
+    /// 判别力（这是缺陷 1 的那一条）：把 Windows 那一支改回 `'/'`（也就是修之前的写法），
+    /// 这一条立刻红 —— 而它对应的真机现象是"点了『在资源管理器中显示』，资源管理器开了，
+    /// 但没选中任何文件"（explorer.exe 把 `/` 当选项引导符，路径被切成几截、**不报错**）。
+    #[test]
+    fn the_path_separator_pins_both_branches_on_any_host() {
+        assert_eq!(
+            path_separator(Platform::Windows),
+            '\\',
+            "交给 explorer 的参数必须用 `\\`（它按 MS-DOS 的约定把 `/` 当选项引导符）"
+        );
+        assert_eq!(
+            path_separator(Platform::Other),
+            '/',
+            "其余平台（含交付形态之外的宿主）就是 `/`"
+        );
+        assert_ne!(
+            path_separator(Platform::Windows),
+            path_separator(Platform::Other),
+            "两个平台同一个分隔符的话，这条判据就白设了"
+        );
+    }
+
+    /// Windows 上 `/` 与 `\` 都算分隔符；其余平台上 `\` **是普通字符**。
+    ///
+    /// 判别力：把 `is_path_separator` 写成"只认 `path_separator` 那一个"，
+    /// 用户配了一个 `D:/交付` 时末尾那个 `/` 就留在路径里（拼出 `D:/交付\a.bin`）；
+    /// 反过来，若让它无条件认 `\`，macOS 上一个名字里真带 `\` 的文件会被削掉尾字符。
+    #[test]
+    fn only_windows_treats_the_forward_slash_as_a_separator_too() {
+        assert!(is_path_separator(Platform::Windows, '/'));
+        assert!(is_path_separator(Platform::Windows, '\\'));
+        assert!(is_path_separator(Platform::Other, '/'));
+        assert!(
+            !is_path_separator(Platform::Other, '\\'),
+            "`\\` 在其余平台上是一个普通文件名字符"
+        );
+    }
+
+    /// 绝对路径的判据两支都钉住，且**不借宿主的文件系统语义**。
+    ///
+    /// 判别力：把 `is_absolute` 换回 `std::path::Path::is_absolute`，
+    /// 最后那一条（Windows 的 `C:\Users\x`）在 macOS 上立刻红 —— 而那正是"在开发机上
+    /// 永远测不到 Windows 那一支"的老毛病。
+    #[test]
+    fn the_absolute_rule_is_the_platforms_own_not_the_hosts() {
+        assert!(is_absolute(Platform::Windows, r"C:\Users\x"));
+        assert!(is_absolute(Platform::Windows, "C:/Users/x"));
+        assert!(is_absolute(Platform::Windows, r"\\server\share"));
+        assert!(!is_absolute(Platform::Windows, r"Users\x"));
+        assert!(!is_absolute(Platform::Windows, "C:"));
+        assert!(!is_absolute(Platform::Windows, ""));
+
+        assert!(is_absolute(Platform::Other, "/Users/x"));
+        assert!(!is_absolute(Platform::Other, "Users/x"));
+        assert!(
+            is_absolute(Platform::Windows, r"C:\Users\x"),
+            "Windows 上这条路是绝对的 —— 宿主是 macOS 时它照样得是绝对的"
+        );
     }
 }

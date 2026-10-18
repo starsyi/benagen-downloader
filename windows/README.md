@@ -958,3 +958,99 @@ bash windows/scripts/test.sh          # 全绿 ⇒ EXIT=0
 
 - [ ] 传输列表『已完成/失败』行显示**最近 300 条**（`tellStopped` 尾窗，2026-10-14 起）；总数在摘要里全量（`getGlobalStat`）；排队行仍是队头 1000 条。⚠️ **命令行工具（benagen-dl）的进度行计数仍取自行**（`tally()`）：>300 个已结束文件的批次里『已下 X/Y』与字节数只反映最近 300 条窗口；**完成判定与最终成败汇总不受影响**（分别走 waiting/active 行与 `get_tree` 全量）——正路是 UI 分页轮把它接到计数上。
 - [ ] **0.2.5→0.2.6 的入队节奏差异**：0.2.5 一次 `addUri` 灌完整批（686 个 464 ms）；0.2.6 起同步前 100 + 后台 20 个/200 ms（`4d93d08a`）。若 0.2.6/0.2.7 真机复测仍有『入队后噎住』，再调 `FIRST_BATCH`/`FEED_BATCH`——本轮不盲调。
+
+### 0.2.7 客户反馈修复（2026-10-15）验收登记
+
+现场报了两条（Windows 客户端）：①传输列表『已完成』行的「在资源管理器中显示」定位不到文件；②0.2.6 起 macOS 有「有新版本」提示、Windows 没有；并要求设置里加一颗「立即检测」。两条都查到了**机制**（不是猜），修法各自带读数与变异探针。真机逐条勾：
+
+- [ ] **①「在资源管理器中显示」应当打开那个文件所在的目录并选中它**。
+  根因：`windows/shell-core/src/presentation/transfer_row.rs` 的 `TransferReveal::download_root` / `local_path` 用**写死的 `/`** 拼路径，而 `windows/shell-win/src/reveal.rs` 把它原样塞进 `explorer.exe` 的参数：`/select,"C:\Users\<用户>/Downloads/Benagen/<清单相对路径>"`。explorer 把**正斜杠当选项引导符**（与 GNU Emacs bug#66514、Qt `Use backslashes for UNC paths` 同类），于是它把那个参数切成几截、**不报错**、开一个默认窗口 —— 正是现场看到的样子。macOS / Linux 那一支走 `open -R`，路径是纯 `/` ⇒ 这个缺陷**只在 Windows 上显形**。
+  修法：平台当参数往下传（照 `platform::env_var_name` 那条既有范式）：`windows/shell-core/src/platform.rs` 新增 `path_separator` / `is_path_separator` / `is_absolute` 三个纯函数；`TransferReveal::download_root` / `local_path` 收 `Platform`；`api::reveal::local_path` 的"绝对路径"前置闸改用 `platform::is_absolute`（**它以前用的是宿主语义** `std::path::Path::new(&root).is_absolute()` —— 在 macOS 上问 `C:\Users\x` 永远回 false，所以 Windows 那一支在本机**一条判据都写不出来**）；注入点只有 `windows/shell-win/src/reveal.rs` 的一行 `PLATFORM`。收口在 `local_path` 末尾**整条**路径：`Platform::Windows => joined.replace('/', "\\")` —— 必须收整条而不只是清单那一段，因为**客户配的下载目录里也可能有 `/`**（只换清单那一段时我自己的新用例就红在 `left: Some("D:/交付\a.bin")`）。
+  判据读数：`cargo test -p shell-core --lib` **564 passed / 0 failed**（其中新增 `the_path_separator_pins_both_branches_on_any_host`、`only_windows_treats_the_forward_slash_as_a_separator_too`、`the_absolute_rule_is_the_platforms_own_not_the_hosts`、`a_windows_path_uses_backslashes_for_the_file_manager`、`the_windows_branch_is_judged_by_windows_rules_on_any_host`）；`cargo test -p shell-win --lib` **114 passed / 2 ignored / 0 failed**。
+  变异探针（判别力）：把 `path_separator(Windows)` 改回 `'/'` ⇒ **4 条红**，其中 `the_download_root_is_the_configured_directory_or_the_kernels_default` 打出的就是缺陷签名 `left: "C:\Users\x/Downloads/Benagen"`；把前置闸换回宿主语义 ⇒ `the_windows_branch_is_judged_by_windows_rules_on_any_host` 红（`left: RootUnknown` vs `right: Ready("C:\Users\x\Downloads\Benagen\sub\a.txt")`）。
+  ⚠️ 已知边界（诚实记账）：本机是 macOS，**没有真 explorer** ⇒ Windows 那一支靠纯函数断言（Windows 路径规则在任意宿主上可断言），"explorer 真的选中了那个文件"只能真机验。文件被移走/删掉时，`ShellExecuteW` 仍然回成功（explorer 照旧打开窗口），这一轮**没有**加"先 stat 一下文件在不在"那一步（改的是分隔符，不是行为面）—— 若真机复测发现这一档的静默值得报，那是一条独立的改动。
+
+- [ ] **②「有新版本」提示条在**任何**分区（含传输列表、校验、设置）与空态页都看得见**。
+  根因：提示条本体（`windows/web/index.html` 的 `#files-update`）住在 `tpl-screen-files` 模板里，而它那一拍轮询（`ctx.poller.start(UPDATE_TICK, …)`）在**文件页**的 `mount()` 里起、`unmount()` 里停 ⇒ 只有文件页挂着的时候才看得到；开机落在空态页、或客户停在传输列表（他当时正好在试①）就**永远不出现**。macOS 那条挂在 `RootView` 的主区（任何分区可见）⇒ 两端行为分叉。
+  修法：搬上壳层 —— 新增 `#update-bar`（`windows/web/index.html`，住在常驻提示行下方、屏宿主上方）；`js/shell.js` 加 `shell.setUpdateNotice(desc)`（判据不住在这里）；判据在 `js/render.js` 的 `updateNoticeFromStatus(status)`（**只有 `has_newer`**，R20）；`app.js` 起那一拍（`poller.start(CMD.updateStatus, INTERVALS_MS.update_status, tickUpdate)`，**受闸门管**）+ 「去下载」失败上常驻提示行 + 「收起」按本次运行记；`js/screens/files.js` 里那一路（`UPDATE_TICK`/`paintUpdate`/`fetchUpdate`/五个 els/两行 poller）**全部删掉**；样式从 `css/screens/files.css` 搬到 `css/shell.css`（`.update-bar` + 那个 `.notice__action`）。
+  判据读数：`bash windows/scripts/check_files_screen.sh` ⇒ `files:sub ok=38 fail=0`、`files:keep ok=22 fail=0`、`files:update ok=11 fail=0`（`files-harness.html` 的 `runUpdate()` 从 7 条长到 11 条，含两条**结构**判据：`#page #update-bar === null` 与 `#files-update === null`）。
+  变异探针：把那一拍重新绑回文件页（mount 里 `poller.start("update_status", …)` + unmount 里 stop）⇒ `files:update ok=8 fail=3`，红的正是"传换屏回来之后提示条仍然藏着/没有版本号/没记住链接"三条，而两条结构判据**仍然绿** —— 说明红的是"那一拍到不了壳"这件事本身。
+
+- [ ] **③（新增功能）设置里那颗「立即检测」**：四档回执各说一句话。
+  内核**本来就有** `update_check_now`（`core/src/kernel.rs:3404`，不受 24 小时节流），但两个客户端都没有那颗按钮、Windows 壳连命令都没注册。更要紧的是：`update_status` 在「**没查成**」与「查成了、确实没有新版」两种情形下**长得一模一样**（`has_newer:false`）⇒ 照原样做按钮，断网时客户会读到一句「已经是最新的」=**界面在撒谎**（约束 4）。所以这一轮多加了一格：
+  · 内核：`Kernel::update_last_check_ok: Option<bool>`（**运行状态、不落盘**、不动 `update.json` 的 schema；三档 `Some(true)`/`Some(false)`/`None` **不许并成两档**）+ `record_check_result()` 抽出 + `op_update_status` 多一格 `"last_check_ok"`；
+  · 判决：`windows/shell-core/src/presentation/update_check.rs`（五档 `Disabled`/`Newer`/`UpToDate`/`Unreachable`/`NoAnswer` + `headline()` + `is_failure()`；判据顺序 = 开关 → 这次查成没有 → 才轮到版本号）；`api::update::checked` 复用设置那套四格回执（`api::preferences::receipt` 由私有改 `pub(crate)`，第三个参数改 `Option<String>`；线上 JSON 一字未变）；
+  · 壳：`update_check_now` 命令（第 **25** 条、`(async)`）+ 前端 `#set-update-now` 与本节回执（`settings.js` 的 `checkUpdateNow()`：重入护栏、`aria-busy`、成功后 `pollNow()` 让壳层那条也跟上；**命令本身发不出去时把上一次那份回执清掉** —— 留着它会与失败原文并排挂着，读起来像"上一次的结论仍然成立"）；
+  · macOS 对位（**用户裁定：两端都加**）：`macos/Sources/BenagenCoreKit/Presentation/UpdateCheckReceipt.swift`（同一份判决的第二份实现，那五句话**逐字相同**）+ `AppModel.checkUpdateNow()` / `updateCheckReceipt`（回执落在**模型**上，理由与 `downloadDirChange` 逐字相同：那句话必须活过设置窗口）+ `SettingsView` 的按钮与回执行；`UpdateNotice.swift` 的 `UpdateStatus` 多一格 `lastCheckOk: Bool?`（缺失按 `nil` 降级）。
+  判据读数：`core` `cargo test --lib` **495 passed / 0 failed**（新增 `a_failed_check_is_told_apart_from_one_that_found_nothing_new`、`the_check_result_is_not_persisted`）；`shell-core` **564 passed**、`shell-win` **114 passed / 2 ignored**；`check_panels_screen.sh` ⇒ `CHECK panels current ok=155 fail=0`；`macos/scripts/test.sh` ⇒ **580 passed**（新增 12 条：`UpdateCheckReceiptTests.swift` 8 条 + `UpdateStatusTests.swift` 4 条）；`check_presentation_mirrors.sh` 第 ③ 段（**两端那五句话逐字一致**，变异探针：Swift 侧改一个字 ⇒ exit 3、指名"没查成"那一句）。
+  变异探针（判决那一半）：把 `of()` 里"先看 `last_check_ok`"那一段整个拆掉（退回"只看 `has_newer`"）⇒ macOS 侧 3 条红（`没查成时绝不说已经是最新的` / `内核没给那一格时说不清` / `五档各有各的那句话`）；内核侧把 `Some(false)` 改成恒 `Some(true)` ⇒ `a_failed_check_is_told_apart_from_one_that_found_nothing_new` 红；把初始化改成 `Some(false)` ⇒ `the_check_result_is_not_persisted` 与 `update_status_is_success_even_when_there_is_nothing_to_report` 两条红。
+  真机逐条勾：开关**关着**时点那颗按钮 ⇒「自动检查更新是关着的，刚才没有去查。补救：打开上面那个开关，再点一次「立即检测」。」；断网时点 ⇒「没查成：这次没连上发布页。补救：确认这台机器能上网，或者过一会儿再点一次。」；有新版 ⇒「有新版本 v…（当前 v…）。」；无新版 ⇒「已经是最新的（当前 v…）。」。
+  ⚠️ 已知边界：`last_check_ok` **不落盘** ⇒ 重启客户端后那一格回到 `null`（重建前的那一次结果不带过去），而按钮没点过之前界面**一个字都不说**（这正是不落盘的理由：它描述的是"你刚点的那一下"）。
+
+- [ ] **附带的两笔账**（不是本轮的修复目标，但改到了树上，如实登记）：
+  1. `windows/Cargo.lock` 被 `cargo` 刷成 0.2.7：`898ac87a`（"版本号升到 0.2.7"）改了四个 `Cargo.toml` 却**没有重新生成锁文件** ⇒ 在任何新工作树里跑一次 cargo 都会把它刷一遍（本地 crate `shell-core`/`shell-win` 那两行）。本轮把刷新后的那份留在树里（否则每次构建都留一个脏文件）。
+  2. **规格文档缺陷**：`docs/superpowers/specs/2026-10-09-client-update-notice-design.md` 那张命令表把手动查写作 `check_update_now`，而内核分派表是 **`update_check_now`**（`core/src/kernel.rs:1699`）。实现**以内核为准**；写错时内核回 `unknown_method`、而壳只会说"没查成" ⇒ 两边各有一条测试钉着这个名字（`update_check_now_sends_null_params` / `点立即检测成功后把结论落进状态与回执`）。规格那一行待改。
+  3. 一条**踩过的坑**（写给下一位改文案的人）：`make_font_subset.sh --check` 的要求集包含**测试里的 assert 消息字符串**（只剥注释）—— 本轮两次被它拦下（`净`/`辨`、以及 `绿`），补救都是**改文案**（不是往 `EXEMPT_CODEPOINTS` 里塞）。新写的界面字或 assert 文案先跑一次 `bash windows/scripts/make_font_subset.sh --check`。
+
+**本轮测试版产物（2026-10-15，本工作树内构建，供真机验上面三条）**
+
+```
+bash windows/scripts/build_windows.sh          # 退出码 0
+路径：   windows/dist/BenagenDownloader-0.2.7-Windows-x86_64.exe
+体积：   37017844 B（36151 KB；内嵌内核 10406912 B，占 28%）
+sha256： 8be628f2c9b5f474e7c57ab0f2c215f66ba42e4ff1b8d098f58c35e2a75f59ce
+版本资源：0.2.7（quad 0.2.7.0）
+可复现：连链两次逐字节相同（脚本第 4d 步）⇒ 上面这个 sha256 就是"同树重建也得到的那一个"
+```
+
+⚠️ 两条**必须连着读**的话：
+
+1. 它的**文件名与已发布的 0.2.7 资产同名**（`BENAGEN_VERSION` 默认 0.2.7），但**字节不同**（那份是发版前的树）。
+   真机验收请认 sha256、别认文件名；发给客户之前要先决定"这算 0.2.7 的重发还是 0.2.8"。
+2. 因为内嵌版本就是 **0.2.7**，而 Gitee 上最新的发布也是 **v0.2.7** ⇒ 按这个包验「有新版本」提示条时，
+   它**如实**会显示「已经是最新的（当前 0.2.7）」（这本身就是"没查成"与"确实没新版"被分开之后的样子）。
+   想在真机上看到那条提示条**出现在任何分区**，用内核自己的状态播种法（不用等新版本）：
+
+   ```jsonc
+   // %APPDATA%\BenagenDownloader\update.json（Windows；macOS 是
+   // ~/Library/Application Support/BenagenDownloader/update.json）
+   { "enabled": true, "last_checked_at": <今天的 Unix 秒>, "last_seen": "9.9.9" }
+   ```
+   播完**重开客户端**：`has_newer` 为真 ⇒ 提示条应出现在**任何分区**（含传输列表/校验/设置）与空态页；
+   点「收起」只按本次运行记；再点设置里的「立即检测」会对 Gitee 真查一次 ⇒ 应改口说「已经是最新的（当前 0.2.7）」
+   —— 这一对观感正是本轮要的：**没查成**与**确实没新版**再也不会长得一样。
+
+### 0.2.8 发版（2026-10-18）：三件聚合 —— 资源管理器定位 / 更新提示与立即检测 / 下载提速
+
+0.2.8 是**一次聚合发版**，把两轮改动装进同一只包、两端（Windows / macOS）一起出：
+
+1. **0.2.7 客户反馈那一轮**（上一节的 ①②③）：传输列表「在资源管理器中显示」定位不到文件、Windows 上「有新版本」
+   提示条只在文件页可见、设置里新增的「立即检测」。这三条**本版不改代码**，随包生效——它们的实现与判据读数是
+   上一节登记的同一份（`TransferReveal` 用 `\` 收整条路径并平台参数化；提示条搬到壳层 `#update-bar`；
+   `update_check_now` 那条手动查的第五格 `last_check_ok`）。
+2. **0.2.8 下载提速**：多边缘并行 + 下载中换腿（`core/src/legtrim.rs` 等，规格与读数见 `macos/README.md` 的 0.2.8 节）。
+   下载逻辑全在内核里，Windows 壳没有自己的那份 ⇒ 同一份内核，行为一致。
+
+真机逐条勾（三条的"该看到什么"分别写在上一节与 `macos/README.md` 0.2.8 节，这里只列顺序）：
+
+- [ ] ① 传输列表『已完成』行点「在资源管理器中显示」⇒ **打开文件所在目录并选中它**（不是打开一个默认窗口）。
+- [ ] ② 开机落在**空态页**时那条「有新版本」提示条也看得见（换到传输列表/校验/设置一并在），点「收起」只按本次运行记。
+- [ ] ③ 设置里点「立即检测」⇒ 断网时说的是「没查成…」、不是「已经是最新的」（开关关着时说的是第三句）。
+- [ ] ④ 下一批 70 GB bam ⇒ 摘要里的总速应出现**一次台阶**（10 s 一拍、两拍去抖，最快约 30 s 生效）。
+
+⚠️ 一条**发版顺序**上的实话：0.2.7 及更早的 Windows 客户端里，提示条那一版是**坏的**（只在文件页可见）⇒
+**它们不会主动提示 0.2.8**。这一批客户要**手动装一次** 0.2.8；从 0.2.8 起提示条才在任意分区可见，
+下一次发版（0.2.9 或更高）才能真正把他们"叫上来"。
+
+**本版产物（2026-10-18，本工作树内构建）**
+
+```
+bash windows/scripts/build_windows.sh          # 退出码 0
+路径：   windows/dist/BenagenDownloader-0.2.8-Windows-x86_64.exe
+体积：   37098524 B（36229 KB；内嵌内核 10485760 B，占 28%）
+sha256： 55620981b098badfbed947928374fc0f11d3b85f1c5bd695c8c4835d73c91d4d
+版本资源：0.2.8（quad 0.2.8.0）
+可复现：连链两次逐字节相同（脚本第 4d 步）⇒ 上面这个 sha256 就是"同树重建也得到的那一个"
+```
+
+真机验收认 sha256、不认文件名（`dist/` 里可能还躺着更早的同名/异名包）。

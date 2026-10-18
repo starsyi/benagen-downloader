@@ -41,7 +41,7 @@
 #   bash windows/scripts/build_windows.sh
 #
 # 环境变量（都可选）：
-#   VERSION=0.2.7   覆盖版本号（默认 0.2.7，与 `macos/scripts/build_app_macos.sh` 同口径）
+#   VERSION=0.2.8   覆盖版本号（默认 0.2.8，与 `macos/scripts/build_app_macos.sh` 同口径）
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -51,10 +51,10 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TARGET="x86_64-pc-windows-gnu"
 # `[[bin]] name`（`shell-win/Cargo.toml`）——cargo 的产物名就是它 + `.exe`。
 BIN_NAME="BenagenDownloader"
-# 版本号（规格 W-7：版本资源里要能看到版本号）。默认 0.2.7 与 macOS 侧同口径。
+# 版本号（规格 W-7：版本资源里要能看到版本号）。默认 0.2.8 与 macOS 侧同口径。
 # ⚠️ 它同时喂给 `shell-win/build.rs`（写进 .rc）、交付形态文件名、与第 5 步的自验
 #    （grep 交付形态里的那一串）——**同一个**变量，不然"自验"就是拿脚本自己编的数核自己。
-BENAGEN_VERSION="${VERSION:-0.2.7}"
+BENAGEN_VERSION="${VERSION:-0.2.8}"
 export BENAGEN_VERSION
 # 交付形态的名字（规格 §11.4：产物名自解释；2026-10-14 起带版本段，
 # 与 `core/src/update.rs::asset_name` 同格式——那是「有新版本」下载链接的契约）。

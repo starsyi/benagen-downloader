@@ -61,7 +61,7 @@
   border-radius: var(--r-12);
   box-shadow: 0 12px 40px rgba(0, 0, 0, .22);
   max-width: 92vw;
-  max-height: 88vh;
+  max-height: var(--modal-max-h);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -301,6 +301,15 @@
   flex-direction: column;
   min-width: 520px;
   max-width: 90vw;
+  /* ⚠️ 这两个不是修饰，是 0.2.8 一次真实事故的修复（现场：设置窗口里「关于」那一条
+     永远看不见，除非把主窗口拉得比内容还高）：
+     · `max-height` 与 `.modal__panel` 共用同一个令牌 —— 面板按 `--modal-max-h` 裁、
+       而 `.win` 不限高时它会按**内容**长到 575px，面板只留 88vh，剩下的被
+       `overflow:hidden` 切掉，页脚（关于 / 开源许可 / 保存）就永远在窗口外；
+     · `min-height: 0` 让它在面板里**可以被压矮**（flex 项的默认最小高度是内容高度，
+       不加这一条，`max-height` 压下来时它宁可溢出也不收缩）。 */
+  min-height: 0;
+  max-height: var(--modal-max-h);
 }
 
 .win__head {
@@ -349,6 +358,12 @@
   gap: var(--sp-16);
   padding: var(--sp-16) var(--sp-20);
   overflow: auto;
+  /* 页眉 / 正文 / 页脚三段里，**只有正文**伸缩：`flex: 1 1 auto` 抢下剩余高度，
+     `min-height: 0` 允许它被压到内容以下（那时 `overflow:auto` 才真正出滚动条）。
+     ⚠️ 少了 `min-height`，它会坚持"内容多高我就多高"，滚动条永远不出现 ——
+        那正是 0.2.8 之前的样子（页脚被挤到面板外，滚也滚不到）。 */
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .win__foot {

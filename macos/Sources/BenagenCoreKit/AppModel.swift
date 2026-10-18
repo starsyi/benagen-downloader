@@ -276,6 +276,18 @@ public final class AppModel: ObservableObject {
     /// ⚠️ **不落盘**：下次启动会再出现一次，那是**有意**的（规格 §4 明说不采用
     ///    "记住忽略的版本"）。真不想看到它的人用设置里那个开关。
     @Published public private(set) var updateNoticeDismissed: Bool = false
+    /// 最近一次**「立即检测」**的结果（`nil` = 还没点过，或用户已经收起了那一行）。
+    ///
+    /// ⚠️ **落点必须在模型上，理由与 `downloadDirChange` 逐字相同：那句话必须活过那扇窗**
+    ///    ——「立即检测」那颗按钮长在设置窗口里，而回执要回答的正是"刚才那一下查成没查成"
+    ///    （`disabled` 那一档还会**指路**："打开上面那个开关，再点一次「立即检测」"）。
+    ///    放在视图的 `@State` 上，窗口一关那句话就没了 —— 而客户刚点的那颗按钮**就在那扇窗里**。
+    ///
+    /// ⚠️ 与 [`updateStatus`] 的分工：那个是**内核当前状态**（主区那条提示条只读它），
+    ///    这个是**一条已经发生过的动作的回执**（与 `downloadNotice` / `lastSwitchOutcome`
+    ///    同一性质）。判决与那五句话一个字都不在这里 —— 在 [`UpdateCheckReceipt`] 里。
+    ///    收起走 [`dismissUpdateCheckReceipt()`]。
+    @Published public private(set) var updateCheckReceipt: UpdateCheckReceipt?
 
     // MARK: - 握手超时（任务 4b）
 
@@ -1730,6 +1742,51 @@ public final class AppModel: ObservableObject {
         } catch {
             return Self.message(of: error)
         }
+    }
+
+    /// 设置页那颗「立即检测」（规格 §2：手动查一次，**不受 24 小时节流限制**）。
+    ///
+    /// ⚠️ 命令名是 **`update_check_now`** —— 内核分派表那一行（`core/src/kernel.rs` 的
+    ///    `"update_check_now" => op_check_update_now(kernel)`）。规格 §2 的表里写作
+    ///    `check_update_now`（两个词顺序不同）：**以内核为准**，写错时内核回 `unknown_method`，
+    ///    而这一侧只会说"没查成"（Windows 壳那边有同名测试
+    ///    `update_check_now_sends_null_params` 钉着同一个名字）。
+    ///
+    /// ⚠️ **它不等同于 [`refreshUpdateStatus`]**：那一条只是把内核**已有的**结论取回来
+    ///    （`update_status`），这一条会让内核**真的去发一次网络请求**，回执里因此多出一格
+    ///    `last_check_ok`（"这次成功 / 失败 / 从没查过"）。少了那一格，客户没法把
+    ///    "已经是最新的"与"没查成"分开 —— 而那正是这个按钮存在的理由（规格 §2 的验收面）。
+    ///
+    /// ⚠️ **不要加进 `longCallMethods`**：内核那一侧的注释写明最坏约 5 秒（一次发布页接口调用），
+    ///    默认的调用超时（120 秒）远远够用；600 秒那一档是给"最坏几十秒 × N"的批量动作留的。
+    ///
+    /// ⚠️ 与 [`setUpdateEnabled`] 同款：**用返回值刷新界面**，成功时连回执一起写上；
+    ///    失败时**一个字都不改** `updateStatus`、也不假装查过 —— 回执清掉，把原文交给调用方
+    ///    摆到屏幕上（客户自己点的按钮，失败要说话；这与 §5 那条"检查取不到时静默"不冲突：
+    ///    那条针对的是**客户没做任何动作**的后台取数）。
+    @discardableResult
+    public func checkUpdateNow() async -> String? {
+        do {
+            // 客户发起的动作 ⇒ 走 `absorbing`（transport 失败要像别处一样触发内核崩溃处置）。
+            let fresh = try await absorbing {
+                try await call("update_check_now", .null).decoded(UpdateStatus.self)
+            }
+            updateStatus = fresh
+            updateCheckReceipt = UpdateCheckReceipt.of(fresh)
+            return nil
+        } catch {
+            // 🔴 **命令本身都发不出去 ⇒ 这一下没有任何结论**：把上一次那份回执也清掉。
+            //    留着它会与调用方摆出的失败原文并排挂着，读起来像"刚才那一次的结论仍然成立"
+            //    —— 而它说的是**上一次**（可能几天前）那一份，两句话并排就是一次误导。
+            updateCheckReceipt = nil
+            return Self.message(of: error)
+        }
+    }
+
+    /// 收起「立即检测」那行回执（与 [`dismissDownloadDirChange()`] 同一条：
+    /// **用户主动**收起不算静默失效，下一次检测会重新写上它）。
+    public func dismissUpdateCheckReceipt() {
+        updateCheckReceipt = nil
     }
 
     // MARK: - 下载与任务动作

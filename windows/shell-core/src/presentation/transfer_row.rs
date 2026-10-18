@@ -22,6 +22,7 @@
 
 use serde::Serialize;
 use crate::client::ClientError;
+use crate::platform::Platform;
 use crate::presentation::engine_status::EngineStatusPresentation;
 use crate::presentation::error_text::error_text;
 use crate::presentation::format::{ByteFormat, PercentFormat, SpeedFormat};
@@ -541,6 +542,13 @@ impl TransferListPoll {
 ///
 /// ⚠️ **W-6（形态）**：同 [`TransferListPoll`] —— 简报写 `struct`，这里取**源**与本 crate
 ///    惯例的**空 `enum`**（理由写在那一处的注释里）。
+///
+/// ⚠️ **分隔符必须按目标平台写**（2026-10 修的那条"定位不到"）：拼出来的这一条**不是**
+///    给宿主自己的文件 API 用的，它是**交给另一个程序的一个字符串参数** ——
+///    Windows 上是 `explorer.exe /select,"…"`，而那个程序按 MS-DOS 的约定把 `/` 当
+///    选项引导符，路径里只要还有 `/` 就会被它切成几截（**不报错**，只开一个默认窗口）。
+///    所以这里的 `/` 与 `\` 由 [`crate::platform::path_separator`] 决定，
+///    两支都能在任意宿主上断言（判据在 `platform.rs`，理由是那条"本机测不到"的老账）。
 pub enum TransferReveal {}
 
 impl TransferReveal {
@@ -623,39 +631,79 @@ impl TransferReveal {
     ///    这里**不做任何规范化**（不去 `..`、不展开软链接、不改大小写）：它就是内核
     ///    argv 上那一格（`--download-dir`），壳替它解释一遍只会让"壳以为的路径"与
     ///    "内核实际写的路径"悄悄分叉 —— 而分歧的代价是**定位到别处**
-    ///    （同 `AppPreferences` 的 `normalized` 那条纪律）。只去掉末尾多余的 `/`
-    ///    （那是**壳自己的**拼接产物，不是内核原文，不受约束 3 管）。
-    pub fn download_root(home: &str, download_dir: &str) -> String {
+    ///    （同 `AppPreferences` 的 `normalized` 那条纪律）。只去掉末尾多余的分隔符
+    ///    （那是**壳自己的**拼接产物，不是内核原文，不受约束 3 管）——
+    ///    ⚠️ **"分隔符"由 [`crate::platform::is_path_separator`] 判**：Windows 上 `/` 与 `\`
+    ///    都算，所以用户配了 `D:/交付/` 或 `D:\交付\` 都不会拼出 `D:/交付\a.bin`。
+    ///
+    /// ⚠️ `platform` 是**参数**（不是在这里读 `PLATFORM`）：同 [`Self::home_variable`] 那条
+    ///    论证 —— Windows 那一支要在任意宿主上可断言，见
+    ///    `a_windows_path_uses_backslashes_for_the_file_manager`。
+    pub fn download_root(platform: Platform, home: &str, download_dir: &str) -> String {
+        let separator = crate::platform::path_separator(platform);
         if !download_dir.is_empty() {
-            return Self::trimming_trailing_slashes(download_dir);
+            return Self::trimming_trailing_separators(platform, download_dir);
         }
-        let h = Self::trimming_trailing_slashes(home);
-        let prefix = if h.is_empty() || h.ends_with('/') {
+        let h = Self::trimming_trailing_separators(platform, home);
+        let prefix = if h.is_empty() || h.ends_with(separator) {
             h
         } else {
-            h + "/"
+            h + &separator.to_string()
         };
-        prefix + Self::DOWNLOAD_ROOT_RELATIVE_TO_HOME
+        // 常量写成 `/` 形（它是内核那条 `<home>/Downloads/Benagen` 的可读镜像），
+        // 落到目标平台上换成那一级分隔符。
+        prefix + &Self::DOWNLOAD_ROOT_RELATIVE_TO_HOME.replace('/', &separator.to_string())
     }
 
     /// 清单路径 → 落盘绝对路径；没有路径时 `None`（调用方据此**禁用**那一项）。
-    pub fn local_path(manifest_path: Option<&str>, home: &str, download_dir: &str) -> Option<String> {
+    ///
+    /// ⚠️ **在 Windows 上把整条字符串里的 `/` 都换成 `\`**：内核的清单路径**一律**用 `/`
+    ///    （`PFX/sub/a.txt`，见 `core/src/engine/daemon.rs` 的 `path_map`），而这条拼出来的
+    ///    字符串是**交给 explorer.exe 的参数** —— 里面留一个 `/`，它就会把那一段当选项
+    ///    （用户自己配的下载目录 `D:/交付` 同理）。
+    ///    ⚠️ 这不违反约束 3（"清单路径逐字"）：约束 3 管的是**文件的身份**
+    ///    （不取最后一段、不解码、不折叠 `//`），而这里只换**分隔符的写法** ——
+    ///    同一个文件，换一种写法；其余平台上这一句是**恒等变换**
+    ///    （`the_reveal_path_is_joined_onto_the_download_root` 逐字钉着它）。
+    pub fn local_path(
+        platform: Platform,
+        manifest_path: Option<&str>,
+        home: &str,
+        download_dir: &str,
+    ) -> Option<String> {
         let rel = Self::manifest_path(manifest_path)?;
-        // 这里是**壳自己的**路径拼接，不受约束 3 管：末尾多一个 `/` 只是拼出 `//`，
-        // 先去干净（清单路径那一段一个字符都不动）。
-        let root = Self::download_root(home, download_dir);
+        let separator = crate::platform::path_separator(platform);
+        // 这里是**壳自己的**路径拼接，不受约束 3 管：末尾多一个分隔符只是拼出 `//`
+        // 或 `\\`，先去干净（清单路径那一段一个字符都不动）。
+        let root = Self::download_root(platform, home, download_dir);
         let prefix = if root.is_empty() {
             String::new()
         } else {
-            root + "/"
+            root + &separator.to_string()
         };
-        Some(prefix + rel)
+        let joined = prefix + rel;
+        // ⚠️ **最后一道收口**：整条字符串按目标平台的写法过一次（不是只过清单那一段）——
+        //    用户配的下载目录里也可能写着 `D:/交付`，而**任何一个 `/`** 都会被
+        //    explorer.exe 当成选项引导符（见 `platform::path_separator` 的论证）。
+        //    其余平台**原样返回**：那边 `\` 是一个合法的文件名字符，一个字符都不许动。
+        Some(match platform {
+            Platform::Other => joined,
+            Platform::Windows => joined.replace('/', "\\"),
+        })
     }
 
-    /// 去掉末尾的 `/`（`/` 本身与空串除外 —— 把它去没了就不是一条路径了）。
-    fn trimming_trailing_slashes(path: &str) -> String {
+    /// 去掉末尾的分隔符（它本身与空串除外 —— 把它去没了就不是一条路径了）。
+    ///
+    /// ⚠️ 只去末尾：`D:/a/b/` 是壳自己的拼接产物，中间的 `/` 是用户原文，一个都不动。
+    fn trimming_trailing_separators(platform: Platform, path: &str) -> String {
         let mut trimmed = path;
-        while trimmed.chars().count() > 1 && trimmed.ends_with('/') {
+        while trimmed.chars().count() > 1
+            && trimmed
+                .chars()
+                .last()
+                .map(|c| crate::platform::is_path_separator(platform, c))
+                .unwrap_or(false)
+        {
             trimmed = &trimmed[..trimmed.len() - 1];
         }
         trimmed.to_string()
@@ -1461,16 +1509,17 @@ mod tests {
         //    解析出来的是进程 cwd（双击启动时是 `/`）下的一个不存在的文件
         //    —— 一处点了没反应的失效。
         assert_eq!(
-            TransferReveal::local_path(Some("sub dir/QC 图.png"), "/Users/x", "").as_deref(),
+            TransferReveal::local_path(Platform::Other, Some("sub dir/QC 图.png"), "/Users/x", "")
+                .as_deref(),
             Some("/Users/x/Downloads/Benagen/sub dir/QC 图.png")
         );
         assert_eq!(
-            TransferReveal::local_path(Some("a.bin"), "/Users/x", "").as_deref(),
+            TransferReveal::local_path(Platform::Other, Some("a.bin"), "/Users/x", "").as_deref(),
             Some("/Users/x/Downloads/Benagen/a.bin")
         );
         // 根末尾的 `/` 不产生双斜杠（这是**壳自己的**路径，不是内核原文，不受约束 3 管）。
         assert_eq!(
-            TransferReveal::local_path(Some("a.bin"), "/Users/x/", "").as_deref(),
+            TransferReveal::local_path(Platform::Other, Some("a.bin"), "/Users/x/", "").as_deref(),
             Some("/Users/x/Downloads/Benagen/a.bin")
         );
     }
@@ -1483,19 +1532,71 @@ mod tests {
         //    少了这一条，那次「定位到磁盘上的文件」会指向一个不存在的文件，正是约束 4 明禁的
         //    静默失效（用户改了目录之后，这一处是**唯一**会被悄悄弄坏的东西）。
         assert_eq!(
-            TransferReveal::local_path(Some("a.bin"), "/Users/x", "/Volumes/Data/交付").as_deref(),
+            TransferReveal::local_path(
+                Platform::Other,
+                Some("a.bin"),
+                "/Users/x",
+                "/Volumes/Data/交付"
+            )
+            .as_deref(),
             Some("/Volumes/Data/交付/a.bin")
         );
         assert_eq!(
-            TransferReveal::local_path(Some("a.bin"), "/Users/x", "/Volumes/Data/交付/")
-                .as_deref(),
+            TransferReveal::local_path(
+                Platform::Other,
+                Some("a.bin"),
+                "/Users/x",
+                "/Volumes/Data/交付/"
+            )
+            .as_deref(),
             Some("/Volumes/Data/交付/a.bin"),
             "末尾的 `/` 同样不产生双斜杠"
         );
         // 与内核默认值**逐字不同**的两侧都要看得见（这条用例的判别力就在这里）。
         assert_ne!(
-            TransferReveal::local_path(Some("a.bin"), "/Users/x", ""),
-            TransferReveal::local_path(Some("a.bin"), "/Users/x", "/Volumes/Data/交付")
+            TransferReveal::local_path(Platform::Other, Some("a.bin"), "/Users/x", ""),
+            TransferReveal::local_path(Platform::Other, Some("a.bin"), "/Users/x", "/Volumes/Data/交付")
+        );
+    }
+
+    /// 🔴 **缺陷 1 的判据：Windows 上交出去的那一条路径里一个 `/` 都不许留。**
+    ///
+    /// 判别力：把 `platform::path_separator` 的 Windows 那一支改回 `'/'`（修之前的写法），
+    /// 下面三条立刻红 —— 而真机上的表现是"点了『在资源管理器中显示』，资源管理器**开了**，
+    /// 但没选中那个文件"（explorer.exe 把 `/` 当选项引导符，路径被切成几截、**不报错**）。
+    ///
+    /// ⚠️ 这一条**在 macOS 上照样跑**（平台是参数，不是 `cfg!` 选出来的）——
+    ///    否则这个缺陷在本机永远测不到，正是 `platform.rs` 头部那条论证要的东西。
+    #[test]
+    fn a_windows_path_uses_backslashes_for_the_file_manager() {
+        assert_eq!(
+            TransferReveal::local_path(
+                Platform::Windows,
+                Some("PFX/sub/QC 图.bin"),
+                r"C:\Users\x",
+                ""
+            )
+            .as_deref(),
+            Some(r"C:\Users\x\Downloads\Benagen\PFX\sub\QC 图.bin"),
+            "默认根 + 清单路径，两段的分隔符都要是 `\\`"
+        );
+        assert_eq!(
+            TransferReveal::local_path(Platform::Windows, Some("a.bin"), r"C:\Users\x", r"D:\交付\")
+                .as_deref(),
+            Some(r"D:\交付\a.bin"),
+            "用户配的目录末尾那个 `\\` 也不产生双分隔符"
+        );
+        assert_eq!(
+            TransferReveal::local_path(Platform::Windows, Some("a.bin"), r"C:\Users\x", "D:/交付/")
+                .as_deref(),
+            Some(r"D:\交付\a.bin"),
+            "Windows 上 `/` 也是分隔符：末尾照样去掉"
+        );
+        let windows = TransferReveal::local_path(Platform::Windows, Some("a/b.bin"), r"C:\Users\x", "")
+            .expect("有路径就该拼得出来");
+        assert!(
+            !windows.contains('/'),
+            "交给 explorer 的参数里留一个 `/` 就会被当选项：{windows}"
         );
     }
 
@@ -1505,21 +1606,26 @@ mod tests {
         // 判据本身（两个分支各一条），以及"未配置"与"配了一个正好等于默认值的目录"
         // 在这层是**同一件事** —— 区分它们是 argv 那一侧的事（E-5：未配置 ⇒ 不传）。
         assert_eq!(
-            TransferReveal::download_root("/Users/x", ""),
+            TransferReveal::download_root(Platform::Other, "/Users/x", ""),
             "/Users/x/Downloads/Benagen"
         );
         assert_eq!(
-            TransferReveal::download_root("/Users/x/", ""),
+            TransferReveal::download_root(Platform::Other, "/Users/x/", ""),
             "/Users/x/Downloads/Benagen",
             "home 末尾的 `/` 不产生双斜杠"
         );
         assert_eq!(
-            TransferReveal::download_root("/Users/x", "/Volumes/Data/交付"),
+            TransferReveal::download_root(Platform::Other, "/Users/x", "/Volumes/Data/交付"),
             "/Volumes/Data/交付"
         );
         assert_eq!(
-            TransferReveal::download_root("/Users/x", "/Volumes/Data/交付/"),
+            TransferReveal::download_root(Platform::Other, "/Users/x", "/Volumes/Data/交付/"),
             "/Volumes/Data/交付"
+        );
+        // Windows 那一支：内核的默认根在那一靶上就是 `\`（`PathBuf::join` 拼出来的）。
+        assert_eq!(
+            TransferReveal::download_root(Platform::Windows, r"C:\Users\x", ""),
+            r"C:\Users\x\Downloads\Benagen"
         );
     }
 
@@ -1533,7 +1639,7 @@ mod tests {
         });
         assert_eq!(r.can_reveal_in_finder(), false);
         assert_eq!(
-            TransferReveal::local_path(r.manifest_path.as_deref(), "/Users/x", ""),
+            TransferReveal::local_path(Platform::Other, r.manifest_path.as_deref(), "/Users/x", ""),
             None
         );
         assert_eq!(
@@ -1544,7 +1650,10 @@ mod tests {
             .can_reveal_in_finder(),
             false
         );
-        assert_eq!(TransferReveal::local_path(Some(""), "/Users/x", ""), None);
+        assert_eq!(
+            TransferReveal::local_path(Platform::Other, Some(""), "/Users/x", ""),
+            None
+        );
         assert_eq!(
             row(Fixture {
                 path: Some("a.bin".to_string()),

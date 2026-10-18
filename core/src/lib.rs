@@ -14,6 +14,7 @@ pub mod diagnostics;
 pub mod engine;
 pub mod intent;
 pub mod kernel;
+pub mod legtrim;
 pub mod migrate;
 pub mod paths;
 pub mod planner;

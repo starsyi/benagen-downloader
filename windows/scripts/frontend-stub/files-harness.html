@@ -450,50 +450,75 @@ async function runKept() {
     JSON.stringify(enqDir.args.paths) === JSON.stringify([SUB_ROWS[0].path]), JSON.stringify(enqDir.args));
 }
 
-// ---- 场景 update：更新提示的**判据只有 has_newer**（R20 / R26）------------------
+// ---- 场景 update：提示条的**判据只有 has_newer**（R20）+ **它在壳上、不归文件页** ----
 //
 // 🔴 为什么必须存在（R61：一个**专门为某个失效模式立的裁决**，却只有手工断言，等于没落地）：
-//    内核在"没有新版"时**照样会给一条非空的 url**（一条指向**已装版本**的链接）。
-//    前端若写成「`url` 非空就显示」，客户会被引去下载**自己已经装着的**那个版本（R20）。
-//    这一场喂的就是那一格（`{has_newer:false, url:<非空>}`），再借一次**换屏**把
-//    `has_newer` 翻成 true 当**正对照** —— 少了它，"把提示条改成恒隐藏"也能让 ① 绿。
+//    ① 内核在"没有新版"时**照样会给一条非空的 url**（一条指向**已装版本**的链接）。
+//       前端若写成「`url` 非空就显示」，客户会被引去下载**自己已经装着的**那个版本（R20）。
+//       这一场喂的就是那一格（`{has_newer:false, url:<非空>}`），再把它翻成 true 当**正对照**
+//       —— 少了它，"把提示条改成恒隐藏"也能让 ① 绿。
+//    ② 0.2.8 修的那一场（"Windows 客户端没有更新提示"）：那条提示原来长在**文件页模板**里、
+//       它那一拍也归文件页 ⇒ 启动落在空态页、或者客户正站在**传输列表**上时，它**永远不出现**。
+//       ⇒ 正对照**必须在传输列表上**做：只在文件页上断言"看得见"等于没测到那个失效模式。
 async function runUpdate() {
   await sleep(1600);
 
   // ---- ① 内核给了非空 url、但没有新版 ⇒ 那条提示条**必须藏着** -------------------
-  const bar = doc().querySelector("#files-update");
+  const bar = doc().querySelector("#update-bar");
   check("① 提示条在场（不然下面那条断言的是空气）", !!bar,
-    bar ? "在场" : "没有 #files-update 这个元素");
+    bar ? "在场" : "没有 #update-bar 这个元素");
   check("① `has_newer:false` 且 `url` 非空（" + STALE_UPDATE_URL + "）⇒ 提示条**藏着**"
       + "（判据只有 has_newer，R20）",
     !!bar && bar.hidden === true, "hidden=" + (bar ? String(bar.hidden) : "（没有这个元素）"));
+  // 🔴 结构（与"有没有新版"无关，任何时刻都该成立）：提示条**住在壳里**、**不是 `#page` 的孩子**
+  //    —— 那正是"换屏拆掉 `.screen` 也拆不掉它"的机制。文件页里那份（`#files-update`）
+  //    必须已经搬走：两处都在的话，客户会看到两条一样的提示。
+  check("① 提示条住在壳里（不是 `#page` 的孩子 ⇒ 换屏拆不掉它）",
+    doc().querySelector("#page #update-bar") === null, "它在 #page 里");
+  check("① 文件页里那份已经搬走（只有一个家，不许两条提示）",
+    doc().querySelector("#files-update") === null, "文件页里还有一个 #files-update");
 
-  // ---- ② 正对照：把 has_newer 翻成 true、换屏重挂 ⇒ 提示条**显示** ---------------
-  //    `switchAwayAndBack` 会让这一屏**重挂** ⇒ files.js 那一拍**再拉一次** update_status。
+  // ---- ② 正对照：翻成 true、**在传输列表上**逼出下一拍 ⇒ 提示条**显示** -----------
+  //    ⚠️ 逼那一拍走**真用户动作**：传输列表那颗「刷新」→ `poller.pollNow()`
+  //       （`transfers.js` 的既有用法：某个用户动作之后立刻补一拍）。
+  //    ⚠️ **不能**再拿 `switchAwayAndBack()` 当正对照的驱动：更新那一拍**已经不再归某一屏**，
+  //       换屏不会重拉它 —— 那**正是**这一场要证明的事；而修之前它靠的恰恰是"重挂文件页
+  //       ⇒ 重新拉一次"，所以旧写法在新结构下会退化成恒真。
   updateHasNewer = true;
-  await switchAwayAndBack();
-  const bar2 = doc().querySelector("#files-update");
-  check("② 正对照：`has_newer:true` ⇒ 提示条**显示**（不是「永远藏着」）",
+  click(doc().querySelector("#nav-transfers"));
+  await sleep(1200);
+  const bar2 = doc().querySelector("#update-bar");
+  check("② 换到传输列表之后：提示条**还在**（壳级元素，不随屏拆掉重挂）",
+    !!bar2, bar2 ? "在场" : "（没有这个元素）");
+  click(doc().querySelector("#transfers-refresh"));
+  await sleep(600);
+  check("② 正对照：`has_newer:true` ⇒ **在传输列表上照样显示**"
+      + "（不是「永远藏着」、也不是「只在文件页看得见」）",
     !!bar2 && bar2.hidden === false, "hidden=" + (bar2 ? String(bar2.hidden) : "（没有这个元素）"));
   check("② 两个版本号逐字来自内核（JS 一个汉字都不拼）",
     !!bar2
-      && bar2.querySelector("#files-update-latest").textContent === "0.2.5"
-      && bar2.querySelector("#files-update-current").textContent === "0.2.4",
-    "latest=「" + (bar2 ? bar2.querySelector("#files-update-latest").textContent : "?")
-      + "」current=「" + (bar2 ? bar2.querySelector("#files-update-current").textContent : "?") + "」");
+      && bar2.querySelector("#update-bar-latest").textContent === "0.2.5"
+      && bar2.querySelector("#update-bar-current").textContent === "0.2.4",
+    "latest=「" + (bar2 ? bar2.querySelector("#update-bar-latest").textContent : "?")
+      + "」current=「" + (bar2 ? bar2.querySelector("#update-bar-current").textContent : "?") + "」");
   check("② 「去下载」那颗记下了内核给的那条 url（原文，前端不拼）",
-    !!bar2 && bar2.querySelector("#files-update-go").dataset.url === STALE_UPDATE_URL,
-    bar2 ? bar2.querySelector("#files-update-go").dataset.url : "（没有这个元素）");
+    !!bar2 && bar2.querySelector("#update-bar-go").dataset.url === STALE_UPDATE_URL,
+    bar2 ? bar2.querySelector("#update-bar-go").dataset.url : "（没有这个元素）");
 
   // ---- ③ 「收起」= 本次运行内不再出现（规格 §4）--------------------------------
-  click(bar2.querySelector("#files-update-dismiss"));
+  click(bar2.querySelector("#update-bar-dismiss"));
   await sleep(300);
   check("③ 点「收起」⇒ 立刻藏起来", bar2.hidden === true, "hidden=" + String(bar2.hidden));
-  // ⚠️ 换屏也**不许**把它叫回来（`dismissedUpdate` 是模块级的，活过重挂）——
-  //    这一条同时钉住"收起不是只改一次 DOM、而是本次运行的状态"。
-  await switchAwayAndBack();
-  const bar3 = doc().querySelector("#files-update");
-  check("③ 换屏之后**仍然藏着**（收起活过重挂：本次运行内不再出现）",
+  // ⚠️ 再逼一拍（还在传输列表上）、再换回文件页，**两条路都不许**把它叫回来 ——
+  //    这一条同时钉住"收起不是只改一次 DOM，而是本次运行的状态"（`dismissedUpdate`）。
+  click(doc().querySelector("#transfers-refresh"));
+  await sleep(600);
+  check("③ 再逼一拍之后**仍然藏着**（收起不是只躲过下一次重画）",
+    bar2.hidden === true, "hidden=" + String(bar2.hidden));
+  click(doc().querySelector("#nav-files"));
+  await sleep(1400);
+  const bar3 = doc().querySelector("#update-bar");
+  check("③ 换回文件页之后**仍然藏着**（收起活过换屏：本次运行内不再出现）",
     !!bar3 && bar3.hidden === true, "hidden=" + (bar3 ? String(bar3.hidden) : "（没有这个元素）"));
 }
 
