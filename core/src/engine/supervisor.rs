@@ -258,7 +258,20 @@ impl Ladder {
     /// 五段的顺序是承重的，别重排 —— 每一段都在挡一种"每拍重复触发"：
     /// ① 刚换过引擎 ⇒ 先给它时间；② 不该动就别动；③ 档 2 做过之后只有两条出路
     /// （等满 → 换引擎，或应答恢复 → 重开一轮）；④ 档 1 的冷却；⑤ 才轮到决定。
-    pub fn next(&mut self, now: Instant, a: &Liveness, stalled_tasks: usize, engine_moving: bool) -> Rung {
+    /// `engine_busy` = 引擎进程**自己**在动（写盘 / 烧 CPU，见 [`crate::procstat::is_busy`]）。
+    ///
+    /// ⚠️ 它是**唯一不经过 RPC 的活口证据**：RPC 探活失败时，`a.is_unresponsive()` 与
+    ///    `engine_moving` 都只能看见"不回话"，分不出"忙得回不上话"与"真死了"。现场日志里
+    ///    就是分不出这一点的代价 —— 引擎一边每秒写几 MB 到几十 MB、一边被判死，档 2 暂停全部、
+    ///    档 3 关掉一个正在写盘的引擎并重新入队 234 个任务，75 分钟里换了 3 次直到放弃。
+    pub fn next(
+        &mut self,
+        now: Instant,
+        a: &Liveness,
+        stalled_tasks: usize,
+        engine_moving: bool,
+        engine_busy: bool,
+    ) -> Rung {
         let t = self.thresholds;
 
         // ① 刚换过引擎：等满 `pre_swap_wait` 再重新开始判断。
@@ -289,6 +302,16 @@ impl Ladder {
             return Rung::Observe;
         }
         self.healthy_since = None;
+
+        // ②½ **探活不通，但进程还在动 ⇒ 它在干活，只是回不上话。**
+        //    这一支必须挡住档 2 与档 3（不只档 3）：暂停全部与换引擎都是**对引擎动手**，
+        //    而"回不上话"在忙的时候是**正常现象**（写盘把协议循环堵住），不是故障证据。
+        //    ⚠️ 只挡"不应答"这一支：`stalled_tasks >= 2 && !engine_moving` 那条说的是
+        //       "应答正常但没人前进"（限速成涓流），那时的 `engine_busy` 恒为真（一直在写盘），
+        //       拿它一并挡掉就等于把档 1 彻底废掉。
+        if unresponsive && engine_busy {
+            return Rung::Observe;
+        }
 
         // ③ 档 2 已经做过：只有两种出路。
         if let Some(paused_at) = self.last_pause_all {
@@ -459,7 +482,7 @@ mod tests {
         for s in 0..300u64 {
             let at = now + Duration::from_secs(s);
             let a = if s % 2 == 0 { &ok } else { &bad };
-            l.next(at, a, 0, true);
+            l.next(at, a, 0, true, false);
             assert!(
                 l.healthy_for(at).map_or(true, |h| h < t.pre_swap_wait),
                 "第 {s} 拍不许攒出一个完整的复位窗口"
@@ -476,7 +499,7 @@ mod tests {
         let now = Instant::now();
         for s in 0..=121u64 {
             let at = now + Duration::from_secs(s);
-            l.next(at, &Liveness::default(), 0, true);
+            l.next(at, &Liveness::default(), 0, true, false);
         }
         let end = now + Duration::from_secs(121);
         assert!(
@@ -598,21 +621,21 @@ mod tests {
         let mut l = Ladder::default();
         let now = Instant::now();
         let a = Liveness::default();
-        assert_eq!(l.next(now, &a, 0, true), Rung::Observe);
+        assert_eq!(l.next(now, &a, 0, true, false), Rung::Observe);
     }
 
     #[test]
     fn one_stalled_task_asks_for_a_single_reconnect() {
         let mut l = Ladder::default();
         let now = Instant::now();
-        assert_eq!(l.next(now, &Liveness::default(), 1, false), Rung::ReconnectOne);
+        assert_eq!(l.next(now, &Liveness::default(), 1, false, false), Rung::ReconnectOne);
     }
 
     #[test]
     fn several_stalled_tasks_ask_for_pause_all() {
         let mut l = Ladder::default();
         let now = Instant::now();
-        assert_eq!(l.next(now, &Liveness::default(), 4, false), Rung::PauseAllThenResumeAll);
+        assert_eq!(l.next(now, &Liveness::default(), 4, false, false), Rung::PauseAllThenResumeAll);
     }
 
     /// 两个任务卡住而其余仍在动：这是档 1 的情形（认出并重连那一个），**不许**暂停全部。
@@ -624,7 +647,7 @@ mod tests {
     fn two_stuck_tasks_while_the_engine_is_still_moving_do_not_trigger_pause_all() {
         let mut l = Ladder::default();
         let now = Instant::now();
-        assert_eq!(l.next(now, &Liveness::default(), 2, true), Rung::ReconnectOne);
+        assert_eq!(l.next(now, &Liveness::default(), 2, true, false), Rung::ReconnectOne);
     }
 
     /// 两个任务卡住且全局也停了：这才是档 2 的前提。
@@ -632,7 +655,7 @@ mod tests {
     fn two_stuck_tasks_and_a_stopped_engine_do_trigger_pause_all() {
         let mut l = Ladder::default();
         let now = Instant::now();
-        assert_eq!(l.next(now, &Liveness::default(), 2, false), Rung::PauseAllThenResumeAll);
+        assert_eq!(l.next(now, &Liveness::default(), 2, false, false), Rung::PauseAllThenResumeAll);
     }
 
     #[test]
@@ -641,7 +664,7 @@ mod tests {
         let now = Instant::now();
         let mut a = Liveness::default();
         a.record_fail(); a.record_fail(); a.record_fail();
-        assert_eq!(l.next(now, &a, 0, true), Rung::PauseAllThenResumeAll);
+        assert_eq!(l.next(now, &a, 0, true, false), Rung::PauseAllThenResumeAll);
     }
 
     /// 档 1 之后必须有冷却：② 的爬坡会新增连接，新连接起步慢，
@@ -650,9 +673,9 @@ mod tests {
     fn a_reconnect_is_followed_by_a_cooldown() {
         let mut l = Ladder::default();
         let now = Instant::now();
-        assert_eq!(l.next(now, &Liveness::default(), 1, false), Rung::ReconnectOne);
+        assert_eq!(l.next(now, &Liveness::default(), 1, false, false), Rung::ReconnectOne);
         // 冷却期内再问，什么都不做
-        assert_eq!(l.next(now + Duration::from_secs(1), &Liveness::default(), 1, false), Rung::Observe);
+        assert_eq!(l.next(now + Duration::from_secs(1), &Liveness::default(), 1, false, false), Rung::Observe);
     }
 
     /// 档 2 之后**必须等满** `pre_swap_wait` 才允许换引擎（规格 §3.2 档 3 的代价最大）。
@@ -662,11 +685,55 @@ mod tests {
         let now = Instant::now();
         let mut a = Liveness::default();
         a.record_fail(); a.record_fail(); a.record_fail();
-        assert_eq!(l.next(now, &a, 0, true), Rung::PauseAllThenResumeAll);
+        assert_eq!(l.next(now, &a, 0, true, false), Rung::PauseAllThenResumeAll);
         // 刚做完档 2：还没到等待上限 ⇒ 不许换
-        assert_eq!(l.next(now + Duration::from_secs(60), &a, 0, true), Rung::Observe);
+        assert_eq!(l.next(now + Duration::from_secs(60), &a, 0, true, false), Rung::Observe);
         // 等满了且仍然不应答 ⇒ 才轮到换引擎
-        assert_eq!(l.next(now + Duration::from_secs(121), &a, 0, true), Rung::ReplaceEngine);
+        assert_eq!(l.next(now + Duration::from_secs(121), &a, 0, true, false), Rung::ReplaceEngine);
+    }
+
+    /// 探活不通、但引擎进程**还在写盘** ⇒ 一步都不许动。
+    ///
+    /// 判别力：删掉 ②½ 那一支 ⇒ 两条都会红（第一条变 `PauseAllThenResumeAll`、
+    /// 第二条变 `ReplaceEngine`）。这两个动作在"忙"的时候都是纯损失：
+    /// 暂停全部会把正在写的任务全按住，换引擎会关掉一个正在写盘的进程。
+    #[test]
+    fn a_busy_engine_is_neither_paused_nor_replaced() {
+        let mut l = Ladder::default();
+        let now = Instant::now();
+        let mut a = Liveness::default();
+        a.record_fail(); a.record_fail(); a.record_fail();
+        assert_eq!(l.next(now, &a, 0, true, true), Rung::Observe, "它在写盘，不是死了");
+        assert_eq!(
+            l.next(now + Duration::from_secs(600), &a, 0, true, true),
+            Rung::Observe,
+            "十分钟都不回话也一样：只要进程还在写，就不该动它"
+        );
+    }
+
+    /// 走过档 2 之后等满了、引擎仍不应答：**忙 ⇒ 不换；闲 ⇒ 换**。
+    /// 这一条把 ②½ 与档 3 的先后说清楚：判据在档 2 的等待之后仍要再判一次。
+    #[test]
+    fn the_busy_verdict_is_rechecked_after_the_pause_wait() {
+        let now = Instant::now();
+        let mut a = Liveness::default();
+        a.record_fail(); a.record_fail(); a.record_fail();
+
+        let mut busy = Ladder::default();
+        assert_eq!(busy.next(now, &a, 0, true, false), Rung::PauseAllThenResumeAll);
+        assert_eq!(
+            busy.next(now + Duration::from_secs(121), &a, 0, true, true),
+            Rung::Observe,
+            "等满之后它已经在写盘了 ⇒ 不许换"
+        );
+
+        let mut idle = Ladder::default();
+        assert_eq!(idle.next(now, &a, 0, true, false), Rung::PauseAllThenResumeAll);
+        assert_eq!(
+            idle.next(now + Duration::from_secs(121), &a, 0, true, false),
+            Rung::ReplaceEngine,
+            "同样的时刻、同样的不应答，只是它没在动 ⇒ 这时换引擎才对"
+        );
     }
 
     /// 换引擎之后，若引擎**又**不应答，**不许**立刻再换一次（那是无限换引擎）。
@@ -676,12 +743,12 @@ mod tests {
         let now = Instant::now();
         let mut a = Liveness::default();
         a.record_fail(); a.record_fail(); a.record_fail();
-        l.next(now, &a, 0, true);                                   // 档 2
-        assert_eq!(l.next(now + Duration::from_secs(121), &a, 0, true), Rung::ReplaceEngine);
-        assert_eq!(l.next(now + Duration::from_secs(122), &a, 0, true), Rung::Observe,
+        l.next(now, &a, 0, true, false);                                   // 档 2
+        assert_eq!(l.next(now + Duration::from_secs(121), &a, 0, true, false), Rung::ReplaceEngine);
+        assert_eq!(l.next(now + Duration::from_secs(122), &a, 0, true, false), Rung::Observe,
                    "刚换过，必须重新走一遍等待");
         // 换引擎在 now+121，等满 pre_swap_wait(120 秒) 之后是 now+241。
-        assert_eq!(l.next(now + Duration::from_secs(242), &a, 0, true), Rung::PauseAllThenResumeAll,
+        assert_eq!(l.next(now + Duration::from_secs(242), &a, 0, true, false), Rung::PauseAllThenResumeAll,
                    "换过之后必须重新走一遍档 2，不能直接再换一次");
     }
 
@@ -692,11 +759,11 @@ mod tests {
         let now = Instant::now();
         let mut a = Liveness::default();
         a.record_fail(); a.record_fail(); a.record_fail();
-        assert_eq!(l.next(now, &a, 0, true), Rung::PauseAllThenResumeAll);
-        assert_eq!(l.next(now + Duration::from_secs(10), &Liveness::default(), 0, true),
+        assert_eq!(l.next(now, &a, 0, true, false), Rung::PauseAllThenResumeAll);
+        assert_eq!(l.next(now + Duration::from_secs(10), &Liveness::default(), 0, true, false),
                    Rung::Observe);
         let later = now + Duration::from_secs(500);
-        assert_eq!(l.next(later, &a, 0, true), Rung::PauseAllThenResumeAll,
+        assert_eq!(l.next(later, &a, 0, true, false), Rung::PauseAllThenResumeAll,
                    "新一轮故障必须先走档 2");
     }
 
@@ -707,8 +774,8 @@ mod tests {
     fn pause_all_is_not_reissued_on_every_tick() {
         let mut l = Ladder::default();
         let now = Instant::now();
-        assert_eq!(l.next(now, &Liveness::default(), 4, false), Rung::PauseAllThenResumeAll);
-        assert_eq!(l.next(now + Duration::from_secs(5), &Liveness::default(), 4, false), Rung::Observe,
+        assert_eq!(l.next(now, &Liveness::default(), 4, false, false), Rung::PauseAllThenResumeAll);
+        assert_eq!(l.next(now + Duration::from_secs(5), &Liveness::default(), 4, false, false), Rung::Observe,
                    "档 2 刚做过，等待期内不许再做一次");
     }
 
@@ -721,11 +788,11 @@ mod tests {
         bad.record_fail(); bad.record_fail(); bad.record_fail();
         let ok = Liveness::default();
 
-        assert_eq!(l.next(now, &bad, 0, true), Rung::PauseAllThenResumeAll);
-        assert_eq!(l.next(now + Duration::from_secs(1), &ok, 0, true), Rung::Observe);
-        assert_eq!(l.next(now + Duration::from_secs(2), &bad, 0, true), Rung::Observe,
+        assert_eq!(l.next(now, &bad, 0, true, false), Rung::PauseAllThenResumeAll);
+        assert_eq!(l.next(now + Duration::from_secs(1), &ok, 0, true, false), Rung::Observe);
+        assert_eq!(l.next(now + Duration::from_secs(2), &bad, 0, true, false), Rung::Observe,
                    "一拍健康不足以结束本轮故障；等待期内不许重下档 2");
-        assert_eq!(l.next(now + Duration::from_secs(121), &bad, 0, true), Rung::ReplaceEngine,
+        assert_eq!(l.next(now + Duration::from_secs(121), &bad, 0, true, false), Rung::ReplaceEngine,
                    "抖动不该让阶梯永远停在档 2");
     }
 }

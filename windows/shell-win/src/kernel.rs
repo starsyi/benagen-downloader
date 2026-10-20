@@ -59,6 +59,7 @@ use shell_core::protocol::{
 ///
 /// 规则与上游一致：`base_url` **空串不带这个键**；内核报错走 `error_text`（唯一映射）。
 pub fn load_delivery(
+    lang: shell_core::i18n::Lang,
     client: &CoreClient,
     code: &str,
     base_url: &str,
@@ -67,16 +68,18 @@ pub fn load_delivery(
     if !base_url.is_empty() {
         params["base_url"] = serde_json::json!(base_url);
     }
-    let value = client.call("load_delivery", params).map_err(|e| CallFailure::of(&e))?;
+    let value = client.call("load_delivery", params).map_err(|e| CallFailure::of(lang, &e))?;
     serde_json::from_value(value)
         .map_err(|e| CallFailure::shell(shell_cannot_decode("load_delivery", "DeliveryInfo", &e)))
 }
 
 /// 取整棵树（`flat` / `default_selected` / `progress`）。
-pub fn get_tree(client: &CoreClient) -> Result<TreeResult, CallFailure> {
+pub fn get_tree(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient) -> Result<TreeResult, CallFailure> {
     let value = client
         .call("get_tree", serde_json::json!({}))
-        .map_err(|e| CallFailure::of(&e))?;
+        .map_err(|e| CallFailure::of(lang, &e))?;
     serde_json::from_value(value)
         .map_err(|e| CallFailure::shell(shell_cannot_decode("get_tree", "TreeResult", &e)))
 }
@@ -87,10 +90,12 @@ pub fn get_tree(client: &CoreClient) -> Result<TreeResult, CallFailure> {
 ///    认的是**结构化错误码**，所以内核那一支要把 `ClientError` **原样**带回来
 ///    —— 转成字符串再拼回去就等于把那个码丢了（`file_browser.rs` 第一版栽过这个坑，
 ///    而用例还全绿）。
-pub fn list_dir(client: &CoreClient, path: &str) -> Result<ListDirResult, DirLoadFailure> {
+pub fn list_dir(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient, path: &str) -> Result<ListDirResult, DirLoadFailure> {
     let value = client
         .call("list_dir", serde_json::json!({ "path": path }))
-        .map_err(|e| DirLoadFailure::of(&e, path))?;
+        .map_err(|e| DirLoadFailure::of(lang, &e, path))?;
     serde_json::from_value(value).map_err(|e| DirLoadFailure {
         message: shell_cannot_decode("list_dir", "ListDirResult", &e),
         path: path.to_string(),
@@ -106,10 +111,12 @@ pub fn list_dir(client: &CoreClient, path: &str) -> Result<ListDirResult, DirLoa
 ///    C-3 那道保护在本代一度**没有任何一端在守**（判据只有 `portcheck.sh` 那个对等检查
 ///    工具在跑）。把"是谁"写在这里，是为了"本函数不碰"与"总得有人碰"之间不再出现一个
 ///    谁都不认领的缺口。
-pub fn enqueue(client: &CoreClient, paths: &[String]) -> Result<EnqueueResult, CallFailure> {
+pub fn enqueue(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient, paths: &[String]) -> Result<EnqueueResult, CallFailure> {
     let value = client
         .call("enqueue", serde_json::json!({ "paths": paths }))
-        .map_err(|e| CallFailure::of(&e))?;
+        .map_err(|e| CallFailure::of(lang, &e))?;
     serde_json::from_value(value)
         .map_err(|e| CallFailure::shell(shell_cannot_decode("enqueue", "EnqueueResult", &e)))
 }
@@ -186,7 +193,9 @@ impl TransferPoll {
 }
 
 /// 发一拍 `transfer_list`（`params` 是 `null`：内核的 `op_transfer_list` 不读参数）。
-pub fn transfer_list(client: &CoreClient) -> TransferPoll {
+pub fn transfer_list(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient) -> TransferPoll {
     match client.call("transfer_list", serde_json::json!(null)) {
         Ok(value) => match serde_json::from_value::<TransferListResult>(value) {
             Ok(result) => TransferPoll::Snapshot(result),
@@ -213,12 +222,12 @@ pub fn transfer_list(client: &CoreClient) -> TransferPoll {
             }
         }
         // 内核真的死了那一档走共享判定，**不**当瞬时错误照登。
-        Err(e) => match KernelDeath::reason_of(&e) {
+        Err(e) => match KernelDeath::reason_of(lang, &e) {
             Some(reason) => TransferPoll::Failed(CallFailure::KernelGone {
                 reason,
-                text: TransferActionFailure::message_of(&e),
+                text: TransferActionFailure::message_of(lang, &e),
             }),
-            None => TransferPoll::Failed(CallFailure::Text(TransferActionFailure::message_of(&e))),
+            None => TransferPoll::Failed(CallFailure::Text(TransferActionFailure::message_of(lang, &e))),
         },
     }
 }
@@ -229,6 +238,7 @@ pub fn transfer_list(client: &CoreClient) -> TransferPoll {
 ///    **不带那个键**（内核用 `params.get("gid").unwrap_or("")` 取它，空串与"键不在"
 ///    在那边是同一件事）。
 pub fn task_action(
+    lang: shell_core::i18n::Lang,
     client: &CoreClient,
     action: TaskAction,
     gid: Option<String>,
@@ -249,17 +259,19 @@ pub fn task_action(
     client
         .call("task_action", serde_json::Value::Object(params))
         .map(|_| ())
-        .map_err(|e| CallFailure::of(&e))
+        .map_err(|e| CallFailure::of(lang, &e))
 }
 
 /// 内核此刻使用的下载目录（`get_download_dir`）。
 ///
 /// 换下载目录之前要记下旧目录：偏好里「未配置」时落盘根是**内核的默认值**，
 /// 壳不知道它是哪儿——只有内核知道。
-pub fn download_dir(client: &CoreClient) -> Result<String, CallFailure> {
+pub fn download_dir(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient) -> Result<String, CallFailure> {
     let value = client
         .call("get_download_dir", serde_json::Value::Null)
-        .map_err(|e| CallFailure::of(&e))?;
+        .map_err(|e| CallFailure::of(lang, &e))?;
     serde_json::from_value::<DownloadDirResult>(value)
         .map(|r| r.dir)
         .map_err(|e| {
@@ -269,18 +281,22 @@ pub fn download_dir(client: &CoreClient) -> Result<String, CallFailure> {
 
 /// 让（新）内核把 `from` 目录里已下载的文件搬进当前下载目录（`migrate_start`）。
 /// 立刻返回，进度走 [`migrate_status`]。
-pub fn migrate_start(client: &CoreClient, from: &str) -> Result<(), CallFailure> {
+pub fn migrate_start(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient, from: &str) -> Result<(), CallFailure> {
     client
         .call("migrate_start", serde_json::json!({ "from": from }))
         .map(|_| ())
-        .map_err(|e| CallFailure::of(&e))
+        .map_err(|e| CallFailure::of(lang, &e))
 }
 
 /// 搬运进度（`migrate_status`）。
-pub fn migrate_status(client: &CoreClient) -> Result<MigrateStatus, CallFailure> {
+pub fn migrate_status(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient) -> Result<MigrateStatus, CallFailure> {
     let value = client
         .call("migrate_status", serde_json::Value::Null)
-        .map_err(|e| CallFailure::of(&e))?;
+        .map_err(|e| CallFailure::of(lang, &e))?;
     serde_json::from_value(value)
         .map_err(|e| CallFailure::shell(shell_cannot_decode("migrate_status", "MigrateStatus", &e)))
 }
@@ -293,10 +309,12 @@ pub fn migrate_status(client: &CoreClient) -> Result<MigrateStatus, CallFailure>
 ///    与 macOS 的一处**有意差异**：那边握手时把设置一起读进内存（`performHandshake`），
 ///    我们这里每次按需问一遍 —— 我们的 `Session` 里**没有**设置这一格，
 ///    加一格就要回答"它什么时候失效"，而"每次问一遍"是一个不需要回答的问题。
-pub fn get_settings(client: &CoreClient) -> Result<SettingsResult, CallFailure> {
+pub fn get_settings(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient) -> Result<SettingsResult, CallFailure> {
     let value = client
         .call("get_settings", serde_json::Value::Null)
-        .map_err(|e| CallFailure::of(&e))?;
+        .map_err(|e| CallFailure::of(lang, &e))?;
     serde_json::from_value(value)
         .map_err(|e| CallFailure::shell(shell_cannot_decode("get_settings", "SettingsResult", &e)))
 }
@@ -331,23 +349,27 @@ pub fn get_settings(client: &CoreClient) -> Result<SettingsResult, CallFailure> 
 ///    内核回 `invalid_params`，而壳这边看起来一切正常（本项目最恨的形状）。
 ///    ⚠️ [`task_action`] 那条**保持原样**（就地 `format!`）：它编的是用户输入里的
 ///    动作，那条路真的会失败、也真的走得到，所以它不需要这个"可测落点"的绕行。
-pub fn set_settings(client: &CoreClient, settings: &Settings) -> Result<SettingsResult, CallFailure> {
+pub fn set_settings(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient, settings: &Settings) -> Result<SettingsResult, CallFailure> {
     // ⚠️ 编码失败 ⇒ 回一句**可读的人话**（与 `task_action` 那条同款措辞），**绝不 panic**：
     //    panic 会让前端那条 `invoke` 永远等不到回话（静默挂住）。
     let params = SettingsForm::set_settings_params(settings)
         .map_err(|e| CallFailure::shell(SettingsForm::encode_failure_text(&e)))?;
     let value = client
         .call("set_settings", params)
-        .map_err(|e| CallFailure::of(&e))?;
+        .map_err(|e| CallFailure::of(lang, &e))?;
     serde_json::from_value(value)
         .map_err(|e| CallFailure::shell(shell_cannot_decode("set_settings", "SettingsResult", &e)))
 }
 
 /// 取一次 `verify_status`（无参方法发 `params: null`）。
-pub fn verify_status(client: &CoreClient) -> Result<VerifyStatus, CallFailure> {
+pub fn verify_status(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient) -> Result<VerifyStatus, CallFailure> {
     let value = client
         .call("verify_status", serde_json::Value::Null)
-        .map_err(|e| CallFailure::of(&e))?;
+        .map_err(|e| CallFailure::of(lang, &e))?;
     serde_json::from_value(value)
         .map_err(|e| CallFailure::shell(shell_cannot_decode("verify_status", "VerifyStatus", &e)))
 }
@@ -360,10 +382,12 @@ pub fn verify_status(client: &CoreClient) -> Result<VerifyStatus, CallFailure> {
 ///    ⚠️ 回的是 `serde_json::Value` 而不是一个 `protocol.rs` 里的镜像类型：内核这一条
 ///    随更新检查新增、**不在** `protocol.rs` 的既有镜像里，而前端要的键名与内核 `json!`
 ///    里逐字相同 ⇒ 透传即可（理由写在 `shell_core::api::update` 的文件头）。
-pub fn update_status(client: &CoreClient) -> Result<serde_json::Value, CallFailure> {
+pub fn update_status(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient) -> Result<serde_json::Value, CallFailure> {
     client
         .call("update_status", serde_json::Value::Null)
-        .map_err(|e| CallFailure::of(&e))
+        .map_err(|e| CallFailure::of(lang, &e))
 }
 
 /// 写「启动时检查更新」那个开关（`update_set_enabled`，入参 `{"enabled": bool}`）。
@@ -372,6 +396,7 @@ pub fn update_status(client: &CoreClient) -> Result<serde_json::Value, CallFailu
 ///    `op_update_status` 的那一份）—— 与 `set_settings` 回"归一化之后那一份"同口径：
 ///    前端只有一条渲染路径，不必再发一条 `update_status` 去刷新。
 pub fn update_set_enabled(
+    lang: shell_core::i18n::Lang,
     client: &CoreClient,
     enabled: bool,
 ) -> Result<serde_json::Value, CallFailure> {
@@ -380,7 +405,7 @@ pub fn update_set_enabled(
             "update_set_enabled",
             serde_json::json!({ "enabled": enabled }),
         )
-        .map_err(|e| CallFailure::of(&e))
+        .map_err(|e| CallFailure::of(lang, &e))
 }
 
 /// 「立即检测」：**不受 24 小时节流**的一次手动检查（无参，`params: null`）。
@@ -398,10 +423,38 @@ pub fn update_set_enabled(
 /// ⚠️ **超时不用专门加档**：这一条在**内核里**跑网络 I/O（最坏几秒，`fetch_latest` 自带
 ///    超时），走 [`CoreClient::DEFAULT_CALL_TIMEOUT`]（150 秒）有数量级余量 ——
 ///    它**不是** `LONG_CALL_METHODS` 那一家族（那五个的门槛是最坏几十秒 × N）。
-pub fn update_check_now(client: &CoreClient) -> Result<serde_json::Value, CallFailure> {
+/// 双域名竞速的解析过程（`delivery_progress`）。
+///
+/// ⚠️ **只读**装饰命令：句子由内核按当前语言拼好（`kernel.rs::op_delivery_progress`），
+///    壳只把 `lines` 原样交给前端 —— 前端不拼句子（§3.2）。
+pub fn delivery_progress(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient,
+) -> Result<serde_json::Value, CallFailure> {
+    client
+        .call("delivery_progress", serde_json::Value::Null)
+        .map_err(|e| CallFailure::of(lang, &e))
+}
+
+/// 自动重启的进度（`restart_progress`）。
+///
+/// ⚠️ **只读**，与 `transfer_list` 同一条纪律：拿不到就当"没有进度"，不许把
+///    一次读失败说成"引擎没响应"（那会让界面自己吓自己）。
+pub fn restart_progress(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient,
+) -> Result<serde_json::Value, CallFailure> {
+    client
+        .call("restart_progress", serde_json::Value::Null)
+        .map_err(|e| CallFailure::of(lang, &e))
+}
+
+pub fn update_check_now(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient) -> Result<serde_json::Value, CallFailure> {
     client
         .call("update_check_now", serde_json::Value::Null)
-        .map_err(|e| CallFailure::of(&e))
+        .map_err(|e| CallFailure::of(lang, &e))
 }
 
 /// 「内核**回了**、而壳解不动它的形状」那句话。
@@ -512,7 +565,7 @@ mod tests {
     fn load_delivery_omits_base_url_when_it_is_empty() {
         let ch = Scripted::new(&[&ok_reply(1, r#"{"code":"R.x","page_url":"","base_url":"","created_at":"","expires_at":"","expired":false,"total_files":0,"total_bytes":0,"tree":{}}"#)]);
         let client = CoreClient::new(Box::new(ch.clone()));
-        expect_ok(load_delivery(&client, "R.x", ""), "load_delivery");
+        expect_ok(load_delivery(shell_core::i18n::Lang::Zh, &client, "R.x", ""), "load_delivery");
         let sent = ch.last_request();
         assert!(sent.contains(r#""method":"load_delivery""#));
         assert!(sent.contains(r#""code":"R.x""#));
@@ -524,7 +577,7 @@ mod tests {
     fn load_delivery_carries_base_url_when_it_is_given() {
         let ch = Scripted::new(&[&ok_reply(1, r#"{"code":"R.x","page_url":"","base_url":"http://u/","created_at":"","expires_at":"","expired":false,"total_files":0,"total_bytes":0,"tree":{}}"#)]);
         let client = CoreClient::new(Box::new(ch.clone()));
-        expect_ok(load_delivery(&client, "R.x", "http://u/"), "load_delivery");
+        expect_ok(load_delivery(shell_core::i18n::Lang::Zh, &client, "R.x", "http://u/"), "load_delivery");
         assert!(ch.last_request().contains(r#""base_url":"http://u/""#));
     }
 
@@ -533,7 +586,7 @@ mod tests {
     fn a_kernel_error_keeps_the_kernel_wording_verbatim() {
         let ch = Scripted::new(&[&err_reply(1, "no_delivery", "这一批不存在或已过期")]);
         let client = CoreClient::new(Box::new(ch));
-        let why = load_delivery(&client, "R.x", "").unwrap_err();
+        let why = load_delivery(shell_core::i18n::Lang::Zh, &client, "R.x", "").unwrap_err();
         assert_eq!(why.text(), "这一批不存在或已过期");
     }
 
@@ -543,7 +596,7 @@ mod tests {
     fn the_kernel_disconnected_code_is_recognised_as_kernel_death() {
         let ch = Scripted::new(&[&err_reply(1, "engine_disconnected", "引擎已断开")]);
         let client = CoreClient::new(Box::new(ch));
-        let why = load_delivery(&client, "R.x", "").unwrap_err();
+        let why = load_delivery(shell_core::i18n::Lang::Zh, &client, "R.x", "").unwrap_err();
         // ⚠️ **不写 `{why:?}`**：`CallFailure` 没有 `Debug`（原因见 `TransferPoll` 上面那段），
         //    而给它加 `Debug` 会超出"只加一个访问器"的裁定。
         //    这里用**那个访问器本身**（`text()`，本任务新增的唯一一处 shell-core 改动）
@@ -565,7 +618,7 @@ mod tests {
     fn get_tree_sends_an_empty_object() {
         let ch = Scripted::new(&[&ok_reply(1, r#"{"tree":{},"flat":[],"default_selected":[],"progress":{"total_bytes":0,"done_bytes":0,"speed":0,"percent":0}}"#)]);
         let client = CoreClient::new(Box::new(ch.clone()));
-        expect_ok(get_tree(&client), "get_tree");
+        expect_ok(get_tree(shell_core::i18n::Lang::Zh, &client), "get_tree");
         assert!(ch.last_request().contains(r#""params":{}"#));
     }
 
@@ -574,7 +627,7 @@ mod tests {
     fn list_dir_passes_the_manifest_path_through_untouched() {
         let ch = Scripted::new(&[&ok_reply(1, r#"{"path":"a//b/中文","entries":[]}"#)]);
         let client = CoreClient::new(Box::new(ch.clone()));
-        list_dir(&client, "a//b/中文").unwrap();
+        list_dir(shell_core::i18n::Lang::Zh, &client, "a//b/中文").unwrap();
         assert!(ch.last_request().contains(r#""path":"a//b/中文""#), "路径被加工过了");
     }
 
@@ -584,7 +637,7 @@ mod tests {
     fn a_path_not_found_falls_back_to_the_parent_level() {
         let ch = Scripted::new(&[&err_reply(1, "path_not_found", "没有这个目录")]);
         let client = CoreClient::new(Box::new(ch));
-        let why = list_dir(&client, "01.RawData/sub").unwrap_err();
+        let why = list_dir(shell_core::i18n::Lang::Zh, &client, "01.RawData/sub").unwrap_err();
         assert_eq!(why.path, "01.RawData");
         assert!(why.did_fall_back());
     }
@@ -594,7 +647,7 @@ mod tests {
     fn any_other_error_stays_where_it_is() {
         let ch = Scripted::new(&[&err_reply(1, "no_delivery", "这一批没了")]);
         let client = CoreClient::new(Box::new(ch));
-        let why = list_dir(&client, "01.RawData").unwrap_err();
+        let why = list_dir(shell_core::i18n::Lang::Zh, &client, "01.RawData").unwrap_err();
         assert_eq!(why.path, "01.RawData");
         assert!(!why.did_fall_back());
     }
@@ -604,7 +657,7 @@ mod tests {
     fn enqueue_sends_the_paths_it_is_given() {
         let ch = Scripted::new(&[&ok_reply(1, r#"{"added":[],"rejected":[]}"#)]);
         let client = CoreClient::new(Box::new(ch.clone()));
-        expect_ok(enqueue(&client, &["a".to_string()]), "enqueue");
+        expect_ok(enqueue(shell_core::i18n::Lang::Zh, &client, &["a".to_string()]), "enqueue");
         assert!(ch.last_request().contains(r#""paths":["a"]"#));
     }
 
@@ -627,14 +680,14 @@ mod tests {
         // ⚠️ `matches!` 而不是 `assert_eq!`：`TransferPoll` **一个 derive 都没有**
         //    （理由见它上面那段）。
         assert!(
-            matches!(transfer_list(&client), TransferPoll::Absorbed),
+            matches!(transfer_list(shell_core::i18n::Lang::Zh, &client), TransferPoll::Absorbed),
             "`engine_not_started` 是「还没添加过任务」——**批次好好的**，不许作废它"
         );
 
         let ch = Scripted::new(&[&err_reply(1, "no_delivery", "这一批没了")]);
         let client = CoreClient::new(Box::new(ch));
         assert!(
-            matches!(transfer_list(&client), TransferPoll::NoDelivery),
+            matches!(transfer_list(shell_core::i18n::Lang::Zh, &client), TransferPoll::NoDelivery),
             "`no_delivery` 是「这一批没了」——它必须**自成一档**（调用方要作废当前批次）"
         );
     }
@@ -651,14 +704,14 @@ mod tests {
         let ch = Scripted::new(&[&err_reply(1, "engine_not_started", "正常态")]);
         let client = CoreClient::new(Box::new(ch));
         assert!(
-            transfer_list(&client).flips_engine_to_not_started(),
+            transfer_list(shell_core::i18n::Lang::Zh, &client).flips_engine_to_not_started(),
             "内核说「引擎没起来」⇒ 引擎那一格要跟着翻（否则它停在「运行中」，用户以为任务在跑）"
         );
 
         let ch = Scripted::new(&[&err_reply(1, "no_delivery", "这一批没了")]);
         let client = CoreClient::new(Box::new(ch));
         assert!(
-            !transfer_list(&client).flips_engine_to_not_started(),
+            !transfer_list(shell_core::i18n::Lang::Zh, &client).flips_engine_to_not_started(),
             "「这一批没了」与引擎在不在跑无关 —— 不许顺手把那一格翻成「未启动」"
         );
 
@@ -668,13 +721,13 @@ mod tests {
             r#"{"items":[],"global":{"download_speed":0,"num_active":0,"num_waiting":0,"num_stopped":0}}"#,
         )]);
         let client = CoreClient::new(Box::new(ch));
-        assert!(!transfer_list(&client).flips_engine_to_not_started());
+        assert!(!transfer_list(shell_core::i18n::Lang::Zh, &client).flips_engine_to_not_started());
 
         // 失败那一档也不翻（那是另一条路：`note_failure`）。
         let ch = Scripted::new(&[&err_reply(1, "engine_rpc_failed", "一次可重试的报错")]);
         let client = CoreClient::new(Box::new(ch));
         assert!(
-            !transfer_list(&client).flips_engine_to_not_started(),
+            !transfer_list(shell_core::i18n::Lang::Zh, &client).flips_engine_to_not_started(),
             "失败那一档走 `note_failure`，不在这里翻"
         );
     }
@@ -697,28 +750,28 @@ mod tests {
         )]);
         let client = CoreClient::new(Box::new(ch));
         assert!(
-            transfer_list(&client).promotes_engine_to_running(),
+            transfer_list(shell_core::i18n::Lang::Zh, &client).promotes_engine_to_running(),
             "快照到达 ⇔ 引擎真的在跑（op_transfer_list 走 read_engine，没引擎只会回 engine_not_started）"
         );
 
         let ch = Scripted::new(&[&err_reply(1, "engine_not_started", "正常态")]);
         let client = CoreClient::new(Box::new(ch));
         assert!(
-            !transfer_list(&client).promotes_engine_to_running(),
+            !transfer_list(shell_core::i18n::Lang::Zh, &client).promotes_engine_to_running(),
             "内核亲口说「引擎没起来」——不许在同一拍把徽标翻成「运行中」"
         );
 
         let ch = Scripted::new(&[&err_reply(1, "no_delivery", "这一批没了")]);
         let client = CoreClient::new(Box::new(ch));
         assert!(
-            !transfer_list(&client).promotes_engine_to_running(),
+            !transfer_list(shell_core::i18n::Lang::Zh, &client).promotes_engine_to_running(),
             "「这一批没了」与引擎在不在跑无关"
         );
 
         let ch = Scripted::new(&[&err_reply(1, "engine_rpc_failed", "一次可重试的报错")]);
         let client = CoreClient::new(Box::new(ch));
         assert!(
-            !transfer_list(&client).promotes_engine_to_running(),
+            !transfer_list(shell_core::i18n::Lang::Zh, &client).promotes_engine_to_running(),
             "失败那一档不证明引擎在跑"
         );
     }
@@ -729,7 +782,7 @@ mod tests {
         let ch = Scripted::new(&[&err_reply(1, "engine_disconnected", "引擎已断开")]);
         let client = CoreClient::new(Box::new(ch));
         assert!(matches!(
-            transfer_list(&client),
+            transfer_list(shell_core::i18n::Lang::Zh, &client),
             TransferPoll::Failed(CallFailure::KernelGone { .. })
         ));
     }
@@ -745,7 +798,7 @@ mod tests {
     fn task_action_sends_the_wire_name_and_omits_an_empty_gid() {
         let ch = Scripted::new(&[&ok_reply(1, r#"{"action":"clear_finished"}"#)]);
         let client = CoreClient::new(Box::new(ch.clone()));
-        expect_ok(task_action(&client, TaskAction::ClearFinished, None), "task_action");
+        expect_ok(task_action(shell_core::i18n::Lang::Zh, &client, TaskAction::ClearFinished, None), "task_action");
         let sent = ch.last_request();
         assert!(sent.contains(r#""action":"clear_finished""#), "动作名不是线上字面量：{sent}");
         assert!(!sent.contains("gid"), "没有 gid 时**不许**带这个键");
@@ -772,7 +825,7 @@ mod tests {
             r#"{"settings":{"parallel":8,"connections":16,"splits":16,"min_split_size":"20M","limit_mbps":0,"max_tries":3,"retry_wait":1},"last_code":"C24-8"}"#,
         )]);
         let client = CoreClient::new(Box::new(ch.clone()));
-        let result = expect_ok(get_settings(&client), "get_settings");
+        let result = expect_ok(get_settings(shell_core::i18n::Lang::Zh, &client), "get_settings");
         assert_eq!(result.last_code, "C24-8");
         assert_eq!(result.settings.min_split_size, "20M");
         let sent = ch.last_request();
@@ -800,8 +853,9 @@ mod tests {
             limit_mbps: 12_345,
             max_tries: 7,
             retry_wait: 3,
+            language: "system".to_string(),
         };
-        let echoed = expect_ok(set_settings(&client, &sent_settings), "set_settings");
+        let echoed = expect_ok(set_settings(shell_core::i18n::Lang::Zh, &client, &sent_settings), "set_settings");
         // 回执里是**内核归一化之后**的那一份（本用例里恰好与发出去的一致）。
         assert_eq!(echoed.settings, sent_settings);
         assert_eq!(echoed.last_code, "");
@@ -831,6 +885,7 @@ mod tests {
         let ch = Scripted::new(&[&err_reply(1, "invalid_params", "并行文件数必须在 1–64 之间，当前 99")]);
         let client = CoreClient::new(Box::new(ch));
         let why = set_settings(
+            shell_core::i18n::Lang::Zh,
             &client,
             &Settings {
                 parallel: 99,
@@ -840,6 +895,7 @@ mod tests {
                 limit_mbps: 0,
                 max_tries: 3,
                 retry_wait: 1,
+            language: "system".to_string(),
             },
         )
         .err()
@@ -851,7 +907,7 @@ mod tests {
     fn verify_status_sends_null_params() {
         let ch = Scripted::new(&[&ok_reply(1, r#"{"ok":[],"bad":[],"missing":[],"size_mismatch":[],"unverifiable":[],"unreadable":[],"all_good":true}"#)]);
         let client = CoreClient::new(Box::new(ch.clone()));
-        expect_ok(verify_status(&client), "verify_status");
+        expect_ok(verify_status(shell_core::i18n::Lang::Zh, &client), "verify_status");
         let sent = ch.last_request();
         // ⚠️ **顺序**：先断言 method **在**，再断言 `params:null` —— 反过来的话，
         //    `last_request()` 返回空串时那条否定形式的断言会**假绿**。
@@ -864,7 +920,7 @@ mod tests {
     fn update_status_sends_null_params() {
         let ch = Scripted::new(&[&ok_reply(1, r#"{"enabled":true,"checking":false,"current":"0.2.4","latest":"0.2.5","has_newer":true,"url":"u","checked_at":1}"#)]);
         let client = CoreClient::new(Box::new(ch.clone()));
-        expect_ok(update_status(&client), "update_status");
+        expect_ok(update_status(shell_core::i18n::Lang::Zh, &client), "update_status");
         let sent = ch.last_request();
         // ⚠️ 顺序同 `verify_status` 那条（先判 method 在，再判 `params:null`）。
         assert!(sent.contains(r#""method":"update_status""#), "method 不在请求里：{sent}");
@@ -879,7 +935,7 @@ mod tests {
     fn update_set_enabled_sends_a_top_level_bool() {
         let ch = Scripted::new(&[&ok_reply(1, r#"{"enabled":false,"checking":false,"current":"0.2.4","latest":null,"has_newer":false,"url":null,"checked_at":0}"#)]);
         let client = CoreClient::new(Box::new(ch.clone()));
-        expect_ok(update_set_enabled(&client, false), "update_set_enabled");
+        expect_ok(update_set_enabled(shell_core::i18n::Lang::Zh, &client, false), "update_set_enabled");
         let sent = ch.last_request();
         assert!(sent.contains(r#""method":"update_set_enabled""#), "method 不在请求里：{sent}");
         assert!(sent.contains(r#""enabled":false"#), "enabled 要在顶层、且是布尔：{sent}");
@@ -900,7 +956,7 @@ mod tests {
             r#"{"enabled":true,"checking":false,"current":"0.2.7","latest":"0.2.9","has_newer":true,"url":"https://x/y.exe","checked_at":7,"last_check_ok":true}"#,
         )]);
         let client = CoreClient::new(Box::new(ch.clone()));
-        expect_ok(update_check_now(&client), "update_check_now");
+        expect_ok(update_check_now(shell_core::i18n::Lang::Zh, &client), "update_check_now");
         let sent = ch.last_request();
         assert!(sent.contains(r#""method":"update_check_now""#), "线上那个名字：{sent}");
         assert!(sent.contains(r#""params":null"#), "无参方法要发 `params:null`：{sent}");

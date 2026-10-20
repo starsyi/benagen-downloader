@@ -40,6 +40,26 @@ struct EmptyState: View {
         .padding(20)
         // 规格 §7.2：状态切换用弹簧动画（加载中 → 失败 → 表单）。
         .animation(.spring(response: 0.3, dampingFraction: 0.7), value: model.loadState)
+        // 解析进度（T7）：**只在加载中**跑那一拍。行由内核成好（按当前语言），
+        // 壳逐行摆，不拼句子、不翻译。
+        .task(id: isBusy) {
+            guard isBusy else { return }
+            await deliveryProgressLoop()
+        }
+    }
+
+    /// 加载期间的解析进度：1 s 一拍（核心里那一步本来就以秒计，再快只是白问）。
+    /// `delivery_progress` 取不到时模型给空数组 —— 这些行是**只读装饰**，
+    /// 解析本身失败会走 `loadState == .failed`，那里的错误才带「重试」。
+    private func deliveryProgressLoop() async {
+        while !Task.isCancelled {
+            await model.refreshDeliveryProgress()
+            do {
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            } catch {
+                return
+            }
+        }
     }
 
     // MARK: - 顶部说明
@@ -155,14 +175,29 @@ struct EmptyState: View {
     @ViewBuilder private var status: some View {
         switch model.loadState {
         case .loading:
-            HStack(spacing: 8) {
-                ProgressView()
-                    .controlSize(.small)
-                // 进行中要说清楚**在做什么**：`busyReason` 那句就是（约束 4）。
-                if let busy = model.busyReason {
-                    Text(busy)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    // 进行中要说清楚**在做什么**：`busyReason` 那句就是（约束 4）。
+                    if let busy = model.busyReason {
+                        Text(busy)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                // 解析进度：**内核给的行，逐行原样显示**（每行已经是当前语言的一整句，
+                // 壳不拼接、不换语序、不加序号）。
+                if !model.deliveryProgressLines.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(model.deliveryProgressLines, id: \.self) { line in
+                            Text(line)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
         case .failed(let why):

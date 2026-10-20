@@ -315,7 +315,7 @@ final class ClientFactory: @unchecked Sendable {
 /// ⚠️ 不是 `private`：`AppModelTimeoutTests.swift`（任务 4b）共用这套线上夹具 ——
 ///    两份各自抄一份，迟早会分叉成"这条测试跑的是另一种 hello"。
 enum Wire {
-    static let hello = #"{"protocol":1,"min_split_size_choices":["1M","2M","100M"]}"#
+    static let hello = #"{"protocol":2,"min_split_size_choices":["1M","2M","100M"]}"#
     static let settings = #"{"parallel":8,"connections":16,"splits":16,"min_split_size":"20M","limit_mbps":0,"max_tries":3,"retry_wait":1}"#
     static let getSettings = #"{"settings":\#(settings),"last_code":"C24-8"}"#
     /// `set_settings` 的回执：内核回的是**归一化后的那一份**（`parallel` 与发的不同，
@@ -439,7 +439,7 @@ private func runningModel(_ fake: FakeCore,
 @MainActor
 @Test func startSendsTheProtocolVersionInHello() async {
     // ⚠️ `hello` **不是无参方法**：设计规格 §5.1 的原文是
-    // `{"id":1,"method":"hello","params":{"protocol":1}}`，缺了它内核回 invalid_params。
+    // `{"id":1,"method":"hello","params":{"protocol":2}}`，缺了它内核回 invalid_params。
     let fake = FakeCore()
     fake.stub("hello", Wire.hello)
     fake.stub("get_settings", Wire.getSettings)

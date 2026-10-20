@@ -228,7 +228,7 @@ MIRRORS = [
     },
     {
         "name": "SettingsForm::dirty_banner（保存条那两句横幅）",
-        "rust": ("windows/shell-core/src/presentation/settings_form.rs", "pub const UNSAVED_BANNER"),
+        "rust": ("windows/shell-core/src/presentation/settings_form.rs", "pub fn unsaved_banner"),
         "caller_probe": "dirty_banner",
         # 两句**文案**确实发出去了（`api/settings.rs` 的 `banner.{unsaved,clean}`），
         # 前端只负责挑一句。所以这一格的"承接点"是**载荷**，不是某一行 JS。
@@ -283,6 +283,66 @@ for entry in MIRRORS:
             f"      补救（二选一）：把这一条从账上删掉（它已经被接上了，这是好事），\n"
             f"      或把账改成「已接上，承接点是 X」并说明前端那一份还算不算数。"
         )
+
+# ===========================================================================
+# ④ 八类错误的三句话：**Windows 与 macOS 两份实现必须逐字一致**
+# ===========================================================================
+#
+# 来历与 ③ 同一条（R-5 的形状）：判据与句子各写两份
+#   Windows：`windows/shell-core/src/presentation/error_card.rs`
+#   macOS  ：`macos/Sources/BenagenCoreKit/Presentation/ErrorCard.swift`
+# 客户在 Windows 上读到「目标磁盘放不下这次的数据，或者没有写权限。」，
+# 在 macOS 上读到另一句 —— 两边都不会红，而那就是"同一件事两个说法"。
+#
+# ⚠️ 效力边界同 ③：这里只判**文案**，不判排序与去重（那一半靠两边单测）。
+ERROR_CARD_RS = "windows/shell-core/src/presentation/error_card.rs"
+ERROR_CARD_SWIFT = "macos/Sources/BenagenCoreKit/Presentation/ErrorCard.swift"
+
+# 八类 × 三句的**中文**（英文也要一致，但英文与中文同表，故一并列）。
+# ⚠️ 这张表是"两份真相源该说什么"的那一份账：改文案 ⇒ 三个实现一起改。
+ERROR_SENTENCES = [
+    ("连不上服务器", "这次没连上服务器：网络断了、被防火墙拦了，或对端暂时不可用。",
+     "重试；还不行就换一个网络。"),
+    ("域名解析失败", "域名没解析出地址：DNS 配错了，或这台机器的网络还没就绪。",
+     "重试；还不行就换一个网络。"),
+    ("服务器拒绝了这次请求", "服务器回了一个拒绝：交付码可能不对、链接过期了，或那一侧限流。",
+     "核对交付码，稍后再重试。"),
+    ("目标磁盘写得太慢", "目标磁盘写得比下载慢：下载会跟着慢，长时间写不动还会看起来像卡住。",
+     "换到内置盘，或把「并行文件数」调到 1–2。"),
+    ("目标磁盘空间不足或不可写", "目标磁盘放不下这次的数据，或者没有写权限。",
+     "换一个下载目录，或清理出空间。"),
+    ("下载引擎没有响应", "下载引擎连续几次没有回应，自动重启的预算也用完了。",
+     "重启客户端；仍然失败就导出诊断日志。"),
+    ("下载引擎启动失败或已退出", "下载引擎没能起来，或者起来之后退出了。",
+     "重启客户端；仍然失败就导出诊断日志。"),
+    ("文件校验没有通过", "下载完的内容与清单里的校验值对不上。",
+     "重新下载这个文件。"),
+]
+
+error_failures = []
+windows_text = read(ERROR_CARD_RS)
+macos_text = read(ERROR_CARD_SWIFT)
+if macos_text is None:
+    error_failures.append(
+        f"找不到 macOS 那一份错误卡：{ERROR_CARD_SWIFT}\n"
+        f"      八类错误的句子必须两端一致，而这一份**不在场**就没法比。"
+    )
+else:
+    for title, explain, action in ERROR_SENTENCES:
+        for label, sentence in (("标题", title), ("解释", explain), ("动作", action)):
+            if sentence not in windows_text:
+                error_failures.append(
+                    f"Windows 那一侧说的不是这一句（{title} / {label}）：{sentence}\n"
+                    f"      {ERROR_CARD_RS} 里找不到它。"
+                )
+            if sentence not in macos_text:
+                error_failures.append(
+                    f"macOS 那一侧说的不是这一句（{title} / {label}）：{sentence}\n"
+                    f"      {ERROR_CARD_SWIFT} 里找不到它。\n"
+                    f"      后果：同一件事两个平台两种说法，而两边都不会红。"
+                )
+
+failures.extend(error_failures)
 
 # ===========================================================================
 # ③ 「立即检测」那五句话：**两个平台的两份实现必须逐字一致**
@@ -370,6 +430,9 @@ print(f"对位账：{len(MIRRORS)} 条，三处坐标全部在场、且**都仍�
 print(f"「立即检测」那五句话：Rust（{UPDATE_CHECK_RS}）与 "
       f"Swift（{UPDATE_CHECK_SWIFT}）**逐字一致**（{len(UPDATE_SENTENCES)} 句，"
       f"归一插值后比对）")
-print("对位判据通过：两份真相源一致；每条对位账的坐标在场、账没过期；那五句话两端一致。")
+print(f"八类错误那 {len(ERROR_SENTENCES)}×3 句话：Windows（{ERROR_CARD_RS}）与 "
+      f"macOS（{ERROR_CARD_SWIFT}）**逐字一致**")
+print("对位判据通过：两份真相源一致；每条对位账的坐标在场、账没过期；"
+      "那五句话与八类错误的三句话两端一致。")
 sys.exit(0)
 PY

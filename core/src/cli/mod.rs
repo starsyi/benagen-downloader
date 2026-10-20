@@ -31,6 +31,8 @@ use crate::kcodes;
 use crate::kernel::{
     dispatch, spawn_landing_watcher, spawn_verify_worker, ErrorBody, Kernel, Request, VerifyJob,
 };
+use crate::i18n::{text, Lang};
+use crate::protocol;
 use crate::settings;
 
 use self::args::{Action, Options};
@@ -50,12 +52,18 @@ use self::exit::ExitCode;
 /// （`sha256` 返回 `[u8; 32]`），所以这里的切片不会越界。`N` 走内核那个常量
 /// （`EMBED_HASH_PREFIX_LEN`），**不在壳里再写一个 12**——两处各写一遍，
 /// 改了一处就会变成"客户手上那串对不上缓存目录里的文件名"，而且不报错。
-pub fn version_line() -> String {
+pub fn version_line(lang: Lang) -> String {
     let sha = engine::daemon::embed_hash_hex();
-    format!(
-        "benagen-dl {}（内嵌 aria2c {}）",
-        env!("CARGO_PKG_VERSION"),
-        &sha[..engine::daemon::EMBED_HASH_PREFIX_LEN]
+    text::tf(
+        lang,
+        text::MsgKey::CliVersion,
+        &[
+            ("version", env!("CARGO_PKG_VERSION")),
+            (
+                "aria2c",
+                &sha[..engine::daemon::EMBED_HASH_PREFIX_LEN],
+            ),
+        ],
     )
 }
 
@@ -126,6 +134,14 @@ fn install_sigint() {
 /// 将来 `dispatch` 里加了方法级守卫，CLI 不会漏掉。
 ///
 /// 失败时**逐字打印内核原文**（全局约束 8：壳不加工内核文案），再把它翻译成退出码。
+/// 界面语言：与内核**同一个进程**，直接读它已解析好的那一格。
+///
+/// ⚠️ 不在这里看 `LANG`：那会让"设置里选了英文、但终端是中文 locale"的客户
+///    看到两种语言混着输出（内核说英文、壳说中文）。
+fn ui_lang(kernel: &Arc<Mutex<Kernel>>) -> Lang {
+    kernel.lock().unwrap_or_else(PoisonError::into_inner).language
+}
+
 fn call(
     kernel: &Arc<Mutex<Kernel>>,
     n: u64,
@@ -159,10 +175,20 @@ fn call_full(
     if resp.ok {
         Ok(resp.result.unwrap_or(Value::Null))
     } else {
-        let body = resp
-            .error
-            .unwrap_or_else(|| ErrorBody::new("unknown", "内核没有给出错误详情"));
-        eprintln!("benagen-dl: {}（{}）", body.message, body.code);
+        let lang = ui_lang(kernel);
+        let body = resp.error.unwrap_or_else(|| {
+            ErrorBody::new("unknown", text::t(lang, text::MsgKey::CliNoErrorDetail))
+        });
+        // ⚠️ 只有**外框**（`benagen-dl: …（code）`）走表；`body.message` 是内核原文，
+        // 逐字填进 `{message}`，一个字都不加工（全局约束 8）。
+        eprintln!(
+            "{}",
+            text::tf(
+                lang,
+                text::MsgKey::CliKernelError,
+                &[("message", &body.message), ("code", &body.code)],
+            )
+        );
         Err((exit::of_error(&body), body.code))
     }
 }
@@ -170,10 +196,16 @@ fn call_full(
 /// 一次运行的全程。**每一支都在这里收口**（返回值直接就是进程退出码）。
 pub fn run(argv: Vec<String>) -> ExitCode {
     // ① 解析。--help/--license/--version 在这里就返回（三个"打印点"不碰网络、不碰引擎）。
+    //    ⚠️ 语言来源**只在这里取一次**：`--lang` > `BENAGEN_DL_LANG` > 系统 locale
+    //    （`args::pick_lang`）。解析失败时那条消息已经按选定的语言成句（见 `args`）。
+    let system_locale = crate::i18n::system_locale();
+    let env_lang = std::env::var("BENAGEN_DL_LANG").ok();
     let action = match args::parse(
         &argv,
         std::env::var_os("HOME").map(PathBuf::from),
         std::env::var("BENAGEN_BASE_URL").ok(),
+        env_lang.as_deref(),
+        &system_locale,
     ) {
         Ok(a) => a,
         Err(e) => {
@@ -184,12 +216,12 @@ pub fn run(argv: Vec<String>) -> ExitCode {
         }
     };
     let opts = match action {
-        Action::Help => {
-            println!("{}", args::HELP);
+        Action::Help(lang) => {
+            println!("{}", args::help(lang));
             return ExitCode::Ok;
         }
-        Action::Version => {
-            println!("{}", version_line());
+        Action::Version(lang) => {
+            println!("{}", version_line(lang));
             return ExitCode::Ok;
         }
         Action::License => {
@@ -224,6 +256,23 @@ pub fn run(argv: Vec<String>) -> ExitCode {
     );
     let kernel = Arc::new(Mutex::new(k));
 
+    // ②-续 把选定的语言交给内核：**走既有的 `hello`**（`hello.language` 在 `op_hello`
+    //    里是最高优先级），不新造协议、也不走 `set_settings`（那个**写盘**，
+    //    与 `-j/-x/-s` 只改内存的既有纪律相悖）。
+    //    此后内核给客户看的每一句、以及壳的收尾行，都是这门语言。
+    if let Err(code) = call(
+        &kernel,
+        0,
+        "hello",
+        json!({ "protocol": protocol::PROTOCOL_VERSION, "language": opts.lang.tag() }),
+    ) {
+        eprintln!("benagen-dl: {}", code.message(opts.lang));
+        return code;
+    }
+    // 壳这一侧后续的话都读内核那一格（`ui_lang` 的注释：不在这里另看 `LANG`，
+    // 否则"设置里选了英文、终端是中文 locale"的客户会看到两种语言混着输出）。
+    let lang = ui_lang(&kernel);
+
     // ③ 起那两个后台 worker（少一个 ⇒ 校验永远不收敛，spec §5 的 ⚠️）。
     //    与 `benagen-core` 的 `main()` 是同一对函数、同一条拓扑。
     let (tx, rx) = mpsc::channel::<VerifyJob>();
@@ -243,15 +292,22 @@ pub fn run(argv: Vec<String>) -> ExitCode {
     };
     if let Some(d) = daemon {
         if let Err(e) = d.close() {
-            eprintln!("benagen-dl: 关闭下载引擎时出错: {e}");
+            eprintln!(
+                "{}",
+                text::tf(
+                    lang,
+                    text::MsgKey::CliEngineCloseFailed,
+                    &[("err", &e.to_string())],
+                )
+            );
         }
     }
 
-    // ⑥ 最后收一句中文（spec §2）：内核原文刚才已经逐字打在**前一行**（`call()` 里），
+    // ⑥ 最后收一句（spec §2）：内核原文刚才已经逐字打在**前一行**（`call()` 里），
     //    这一句只说"这是哪一步坏的、接下来怎么办"（`ExitCode::message`）。
     //    成功时不打——成功那一行已经把目录、文件数说清楚了，多一句是噪声。
     if code != ExitCode::Ok {
-        eprintln!("benagen-dl: {}", code.message());
+        eprintln!("benagen-dl: {}", code.message(lang));
     }
     code
 }
@@ -440,14 +496,13 @@ fn after_bad_recheck(added: usize, active: usize) -> Option<ExitCode> {
 /// 却宣称加了 —— 那是**把没发生的事说成发生了**，与"把自己的话标成内核原文"同一类。
 /// 判据只有一处（这里读的就是 `after_bad_recheck` 读过的那个 `added`），
 /// 所以两支的事实不可能与那一句对不上。
-fn recheck_note(added: usize) -> &'static str {
-    if added > 0 {
-        "benagen-dl: 复核时发现这批文件已经不再完整（有文件不在盘上或被改动过）\
-         —— 已经把缺的重新加入下载，继续等。"
+fn recheck_note(added: usize, lang: Lang) -> String {
+    let key = if added > 0 {
+        text::MsgKey::CliRecheckAdded
     } else {
-        "benagen-dl: 复核时发现这批文件已经不再完整（有文件不在盘上或被改动过）\
-         —— 这次没有新加的任务（已经有任务在跑），继续等。"
-    }
+        text::MsgKey::CliRecheckNotAdded
+    };
+    text::t(lang, key).to_string()
 }
 
 /// 校验失败**现在就能下结论吗**（纯函数，R-2）。
@@ -565,32 +620,38 @@ fn made_progress(
 /// ⚠️ **两个调用点共用这一份**（启动时那一次、复核不成立补发那一次，裁定 R27）：
 /// 措辞与判据都只有一处，不会各写一套。丢掉 `rejected` 就是**静默少交**——
 /// 那些文件既没进队列、也不会出现在任何一类校验结果里，客户永远等不到它们。
-fn report_rejections(rejected: &[Value]) -> Option<ExitCode> {
+fn report_rejections(rejected: &[Value], lang: Lang) -> Option<ExitCode> {
     if rejected.is_empty() {
         return None;
     }
     eprintln!(
-        "\nbenagen-dl: 有 {} 个文件没能进入下载队列（下面的行是内核原文）：",
-        rejected.len()
+        "\n{}",
+        text::tf(
+            lang,
+            text::MsgKey::CliRejectedHeader,
+            &[("count", &rejected.len().to_string())],
+        )
     );
-    for line in rejection_lines(rejected) {
+    for line in rejection_lines(rejected, lang) {
         eprintln!("  {line}");
     }
     Some(ExitCode::Incomplete)
 }
 
-fn rejection_lines(rejected: &[Value]) -> Vec<String> {
+fn rejection_lines(rejected: &[Value], lang: Lang) -> Vec<String> {
     rejected
         .iter()
         .map(|r| {
             let path = r
                 .get("path")
                 .and_then(Value::as_str)
-                .unwrap_or("（内核没给路径）");
+                .unwrap_or(text::t(lang, text::MsgKey::CliNoPathFromKernel));
             let reason = r.get("reason").and_then(Value::as_str).unwrap_or("");
             if reason.is_empty() {
                 path.to_string()
             } else {
+                // `path` 与 `reason` 都是内核原文，中间那一段是"数据 + 数据"，
+                // 不是一句话的拼装（翻译只管前者那两类占位文案）。
                 format!("{path} —— {reason}")
             }
         })
@@ -633,10 +694,24 @@ fn verify_counts(v: &Value) -> VerifyCounts {
 }
 
 /// 六类计数的**人话**（停滞那行与校验失败那行共用一种写法）。
-fn counts_text(c: &VerifyCounts) -> String {
-    format!(
-        "通过 {}，不符 {}，缺失 {}，大小不符 {}，读不了 {}，无法校验 {}",
-        c.ok, c.bad, c.missing, c.size_mismatch, c.unreadable, c.unverifiable
+fn counts_text(c: &VerifyCounts, lang: Lang) -> String {
+    let ok = c.ok.to_string();
+    let bad = c.bad.to_string();
+    let missing = c.missing.to_string();
+    let size_mismatch = c.size_mismatch.to_string();
+    let unreadable = c.unreadable.to_string();
+    let unverifiable = c.unverifiable.to_string();
+    text::tf(
+        lang,
+        text::MsgKey::CliVerifyCounts,
+        &[
+            ("ok", ok.as_str()),
+            ("bad", bad.as_str()),
+            ("missing", missing.as_str()),
+            ("size_mismatch", size_mismatch.as_str()),
+            ("unreadable", unreadable.as_str()),
+            ("unverifiable", unverifiable.as_str()),
+        ],
     )
 }
 
@@ -691,6 +766,8 @@ fn verify_stalled(idle: Duration, has_active_tasks: bool) -> bool {
 /// 下载 + 校验，返回退出码。**与收尾解耦**，这样每条出口都只是 `return`
 /// （收尾只有 [`run`] 一处，不可能漏）。
 fn download_and_verify(kernel: &Arc<Mutex<Kernel>>, opts: &Options) -> ExitCode {
+    // 客户可见的每一句都走这一门语言（内核那一格，`hello` 刚设过）。
+    let lang = ui_lang(kernel);
     let mut n = 1u64;
     let mut next = || {
         n += 1;
@@ -726,7 +803,7 @@ fn download_and_verify(kernel: &Arc<Mutex<Kernel>>, opts: &Options) -> ExitCode 
     // （路径不安全 / `addUri` 失败）。丢掉它既违反"不得静默少交"，也**必然导致不收敛**
     // ——那一批里少了几个任务，判据永远够不到总数，配上"校验阶段不许退出"就是永久挂住。
     let rejected = items_of_key(&enqueued, "rejected");
-    if let Some(code) = report_rejections(&rejected) {
+    if let Some(code) = report_rejections(&rejected, lang) {
         return code;
     }
 
@@ -756,7 +833,7 @@ fn download_and_verify(kernel: &Arc<Mutex<Kernel>>, opts: &Options) -> ExitCode 
         if INTERRUPTED.load(Ordering::SeqCst) {
             // 状态文件本来就是每拍原子写，所以这里**不做任何落盘**——
             // "再跑一次会接着下"靠的是已经落盘的那份状态。
-            eprintln!("\nbenagen-dl: 被 Ctrl-C 中断 —— 再跑一次同样的命令会接着下");
+            eprintln!("\n{}", text::t(lang, text::MsgKey::CliInterrupted));
             return ExitCode::Interrupted;
         }
 
@@ -812,10 +889,16 @@ fn download_and_verify(kernel: &Arc<Mutex<Kernel>>, opts: &Options) -> ExitCode 
                 // 字节走 `progress::bytes`——与进度行同一个格式化口径（不另写换算）。
                 let (files, batch_bytes) = success_tally(&fresh_tree);
                 println!(
-                    "benagen-dl: 全部完成并校验通过 —— {} 个文件，{}，{}",
-                    files,
-                    progress::bytes(batch_bytes),
-                    opts.download_dir.display()
+                    "benagen-dl: {}",
+                    text::tf(
+                        lang,
+                        text::MsgKey::CliAllDone,
+                        &[
+                            ("files", &files.to_string()),
+                            ("bytes", &progress::bytes(batch_bytes)),
+                            ("dir", &opts.download_dir.display().to_string()),
+                        ],
+                    )
                 );
                 return ExitCode::Ok;
             }
@@ -850,7 +933,7 @@ fn download_and_verify(kernel: &Arc<Mutex<Kernel>>, opts: &Options) -> ExitCode 
             // `all_good` 仍真、`accounted < total` ⇒ 没有这一下就又是一次**静默等待**，
             // 而且丢掉 `rejected` 本身就是"静默少交"。
             let rejected_now = items_of_key(&picked, "rejected");
-            if let Some(code) = report_rejections(&rejected_now) {
+            if let Some(code) = report_rejections(&rejected_now, lang) {
                 return code;
             }
 
@@ -885,16 +968,21 @@ fn download_and_verify(kernel: &Arc<Mutex<Kernel>>, opts: &Options) -> ExitCode 
                 Err((c, _)) => return c,
             };
             if let Some(code) = verdict {
+                eprintln!("\n{}", text::t(lang, text::MsgKey::CliRecheckMismatch));
                 eprintln!(
-                    "\nbenagen-dl: 复核说这批文件不完整，而内核说没有待下载的文件 —— 两边对不上，停下。"
+                    "{}",
+                    text::tf(
+                        lang,
+                        text::MsgKey::CliNowCounts,
+                        &[("counts", &counts_text(&c, lang))],
+                    )
                 );
-                eprintln!("  现在：{}", counts_text(&c));
                 return code;
             }
             // 继续轮询，节拍自然恢复。⚠️ 收的这一句按 `added` **分两支**（见 `recheck_note`）：
             // 没加进去的那一支不许说"已经加入下载了"。
             eprintln!();
-            eprintln!("{}", recheck_note(added));
+            eprintln!("{}", recheck_note(added, lang));
         }
 
         // ── 第二段：传输侧。**需要引擎**，所以只在"还没收敛"之后才走 ──────────────
@@ -904,7 +992,7 @@ fn download_and_verify(kernel: &Arc<Mutex<Kernel>>, opts: &Options) -> ExitCode 
         };
 
         if !opts.quiet {
-            let s = progress::line(&view);
+            let s = progress::line(&view, lang);
             if tty {
                 // TTY：原地刷新，不掉历史
                 print!("\r{s}");
@@ -947,9 +1035,20 @@ fn download_and_verify(kernel: &Arc<Mutex<Kernel>>, opts: &Options) -> ExitCode 
                 // 这里原先写的是"（下面的行是内核原文）"，而紧接着的输出其实是**壳自己的**
                 // `ExitCode::message()` —— 壳的话被贴上了"内核原文"的标签，两行还同前缀，
                 // 客户分不出谁说的。`error_message` 那条现成的路就在手边（`stalled_lines`）。
-                eprintln!("\nbenagen-dl: 有 {} 个文件没能下完：", failed);
+                eprintln!(
+                    "\nbenagen-dl: {}",
+                    text::tf(
+                        lang,
+                        text::MsgKey::CliIncomplete,
+                        &[("failed", &failed.to_string())],
+                    )
+                );
                 let items = transfer_items(kernel, next());
-                for line in stalled_lines(&items, "（内核没有给出失败原因）") {
+                for line in stalled_lines(
+                    &items,
+                    text::t(lang, text::MsgKey::CliNoFailureReason),
+                    lang,
+                ) {
                     eprintln!("  {line}");
                 }
                 return ExitCode::Incomplete;
@@ -957,7 +1056,14 @@ fn download_and_verify(kernel: &Arc<Mutex<Kernel>>, opts: &Options) -> ExitCode 
             // ⚠️ 判据是 `!all_good` 本身（**不是**手数那几类，修复轮 1 的 ②），
             // 而且**要连续两拍都成立**（修复轮 2 的 R-2，见 `failure_is_conclusive`）。
             if failure_is_conclusive(prev_failure, now_failure) {
-                eprintln!("\nbenagen-dl: 校验没通过 —— {}", counts_text(&c));
+                eprintln!(
+                    "\nbenagen-dl: {}",
+                    text::tf(
+                        lang,
+                        text::MsgKey::CliVerifyFailed,
+                        &[("counts", &counts_text(&c, lang))],
+                    )
+                );
                 return ExitCode::VerifyFailed;
             }
             // 没有活跃任务、也没问题项，但还没验完（或还没定下来）⇒ 校验 worker 正在跑
@@ -976,9 +1082,13 @@ fn download_and_verify(kernel: &Arc<Mutex<Kernel>>, opts: &Options) -> ExitCode 
         // 这就是"校验阶段不许退出"从"纪律"变成"类型"的地方：**没有第二个臂可写错**。
         if let Some(code) = stall_action(last_progress.elapsed(), active > 0) {
             // 下载阶段：真的卡住了，停。（文案与判据都**照旧**，一个字没改。）
-            eprintln!("\nbenagen-dl: 连续 10 分钟没有任何进展，停下。停着的是：");
+            eprintln!("\n{}", text::t(lang, text::MsgKey::CliStallHeading));
             let items = transfer_items(kernel, next());
-            for line in stalled_lines(&items, "（传输列表里没有还在进行中的条目）") {
+            for line in stalled_lines(
+                &items,
+                text::t(lang, text::MsgKey::CliNoActiveTransfer),
+                lang,
+            ) {
                 eprintln!("  {line}");
             }
             return code;
@@ -994,7 +1104,7 @@ fn download_and_verify(kernel: &Arc<Mutex<Kernel>>, opts: &Options) -> ExitCode 
             last_report = Instant::now();
             let items = transfer_items(kernel, next());
             eprintln!();
-            for line in verify_stall_lines(&items, &c, last_progress.elapsed()) {
+            for line in verify_stall_lines(&items, &c, last_progress.elapsed(), lang) {
                 eprintln!("{line}");
             }
         }
@@ -1103,25 +1213,28 @@ fn tally(tl: &Value) -> (usize, usize, progress::View) {
 ///
 /// ⚠️ **只有"说明"，没有"结论"**：这一刻我们**不知道**它会不会验完，所以不写
 /// "失败了""卡住了"这种话——那是壳替内核编结论。说清事实，把出口指给客户，就这样。
-fn verify_stall_lines(items: &[Value], counts: &VerifyCounts, idle: Duration) -> Vec<String> {
-    let mut out = vec![format!(
-        "benagen-dl: 下载都已经结束，卡在校验阶段 —— 已经 {} 分钟没有任何变化：",
-        idle.as_secs() / 60
+fn verify_stall_lines(
+    items: &[Value],
+    counts: &VerifyCounts,
+    idle: Duration,
+    lang: Lang,
+) -> Vec<String> {
+    let minutes = (idle.as_secs() / 60).to_string();
+    let mut out = vec![text::tf(
+        lang,
+        text::MsgKey::CliVerifyStallHeading,
+        &[("minutes", minutes.as_str())],
     )];
     out.extend(
-        stalled_lines(items, &counts_text(counts))
+        stalled_lines(items, &counts_text(counts, lang), lang)
             .into_iter()
             .map(|l| format!("  {l}")),
     );
-    out.push(
-        "benagen-dl: 大文件的 crc64 校验可能要很久（单个文件不可再分）。\
-         按 Ctrl-C 可以停下，再跑一次会接着下。"
-            .to_string(),
-    );
+    out.push(text::t(lang, text::MsgKey::CliVerifyStallTail).to_string());
     out
 }
 
-fn stalled_lines(items: &[Value], fallback: &str) -> Vec<String> {
+fn stalled_lines(items: &[Value], fallback: &str, lang: Lang) -> Vec<String> {
     let lines: Vec<String> = items
         .iter()
         .filter(|i| {
@@ -1134,7 +1247,7 @@ fn stalled_lines(items: &[Value], fallback: &str) -> Vec<String> {
             let path = i
                 .get("path")
                 .and_then(Value::as_str)
-                .unwrap_or("（内核没给路径）");
+                .unwrap_or(text::t(lang, text::MsgKey::CliNoPathFromKernel));
             let err = i
                 .get("error_message")
                 .and_then(Value::as_str)
@@ -1165,18 +1278,29 @@ mod tests {
     /// 实现形态，不是这条测试的判据——判据是"行里出现的是**前 12 位**"。
     #[test]
     fn the_version_line_carries_the_version_and_a_truncated_digest() {
-        let line = version_line();
         let sha = engine::daemon::embed_hash_hex();
-        assert!(
-            line.contains(env!("CARGO_PKG_VERSION")),
-            "版本号不在里面：{line}"
-        );
-        assert!(line.contains(&sha[..12]), "摘要前 12 位不在里面：{line}");
-        assert!(
-            !line.contains(&sha[12..24]),
-            "摘要没有被截断（第 13–24 位也出现了）：{line}"
-        );
-        assert!(!line.contains('\n'), "这是一行，不带换行：{line}");
+        for lang in [Lang::Zh, Lang::En] {
+            let line = version_line(lang);
+            assert!(
+                line.contains(env!("CARGO_PKG_VERSION")),
+                "{lang:?}：版本号不在里面：{line}"
+            );
+            assert!(
+                line.contains(&sha[..12]),
+                "{lang:?}：摘要前 12 位不在里面：{line}"
+            );
+            assert!(
+                !line.contains(&sha[12..24]),
+                "{lang:?}：摘要没有被截断（第 13–24 位也出现了）：{line}"
+            );
+            assert!(!line.contains('\n'), "{lang:?}：这是一行，不带换行：{line}");
+            if lang == Lang::En {
+                assert!(
+                    !line.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                    "英文版本行里混进了中文：{line}"
+                );
+            }
+        }
     }
 
     /// 收敛判据：`all_good` **单独**不许算数（spec §5 点名的那个陷阱）。
@@ -1517,11 +1641,18 @@ mod tests {
     #[test]
     fn the_recheck_note_only_claims_what_actually_happened() {
         // ① 真加进去了 ⇒ 说"已经把缺的重新加入下载"（并且说清是哪些：缺的那些）
-        let added = recheck_note(2);
+        let added = recheck_note(2, Lang::Zh);
         assert!(added.contains("重新加入下载"), "加进去了就要说加进去了：{added}");
         assert!(!added.contains("没有新加"), "加进去了就别否认：{added}");
+        // 英文那一支也要走到（它的两支不能互相冒充）
+        let en = recheck_note(2, Lang::En);
+        assert!(en.contains("queued again"), "{en}");
+        assert!(
+            !en.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            "英文复核提示里混进了中文：{en}"
+        );
         // ② 一个都没加（缺的本来就在队列里/在跑）⇒ **不许**宣称加了
-        let nothing = recheck_note(0);
+        let nothing = recheck_note(0, Lang::Zh);
         assert!(
             !nothing.contains("重新加入下载"),
             "一个都没加进去，却把没发生的事说成发生了：{nothing}"
@@ -1542,12 +1673,14 @@ mod tests {
     /// 函数的返回值，没有第二处措辞可写。
     #[test]
     fn rejected_files_are_a_failure_and_nothing_else_is() {
-        assert_eq!(report_rejections(&[]), None, "没人被拒 ⇒ 不表态");
-        assert_eq!(
-            report_rejections(&[json!({"path": "a.txt", "reason": "x"})]),
-            Some(ExitCode::Incomplete),
-            "有文件没能进队列 ⇒ 判失败（静默少交是底线）"
-        );
+        for lang in [Lang::Zh, Lang::En] {
+            assert_eq!(report_rejections(&[], lang), None, "没人被拒 ⇒ 不表态");
+            assert_eq!(
+                report_rejections(&[json!({"path": "a.txt", "reason": "x"})], lang),
+                Some(ExitCode::Incomplete),
+                "有文件没能进队列 ⇒ 判失败（静默少交是底线）"
+            );
+        }
     }
 
     /// **修复轮 2 的 R-2**：校验失败要**连续两拍**才算数。
@@ -1586,11 +1719,19 @@ mod tests {
             json!({"path": "c.txt", "reason": "aria2 拒绝：连接超时"}),
             json!({"path": "d.txt"}), // 内核没给 reason ⇒ 至少要有路径
         ];
-        let lines = rejection_lines(&rejected);
+        let lines = rejection_lines(&rejected, Lang::Zh);
         assert_eq!(lines.len(), 3, "一条都不许丢");
         assert_eq!(lines[0], "a/b.txt —— 路径不安全（越界/控制字符/空段）");
         assert!(lines[2].contains("d.txt"));
-        assert!(rejection_lines(&[]).is_empty());
+        assert!(rejection_lines(&[], Lang::Zh).is_empty());
+        // 英文：内核原文（中文）逐字保留，而**壳自己补的那一格**是英文
+        let en = rejection_lines(
+            &[json!({"path": "d.txt"})],
+            Lang::En,
+        );
+        assert_eq!(en, vec!["d.txt".to_string()], "没给 reason ⇒ 只有路径");
+        let en_missing_path = rejection_lines(&[json!({"reason": "x"})], Lang::En);
+        assert_eq!(en_missing_path, vec!["(the kernel gave no path) —— x"]);
     }
 
     // -----------------------------------------------------------------------
@@ -1722,18 +1863,27 @@ mod tests {
             json!({"state": "complete", "path": "a.txt"}),
             json!({"state": "removed", "path": "b.txt"}),
         ];
-        let fallback = counts_text(&VerifyCounts {
-            ok: 120,
-            bad: 0,
-            missing: 0,
-            size_mismatch: 0,
-            unverifiable: 3,
-            unreadable: 0,
-        });
-        assert_eq!(stalled_lines(&all_done, &fallback), vec![fallback.clone()]);
-        assert!(stalled_lines(&[], &fallback)[0].contains("通过 120"));
+        let fallback = counts_text(
+            &VerifyCounts {
+                ok: 120,
+                bad: 0,
+                missing: 0,
+                size_mismatch: 0,
+                unverifiable: 3,
+                unreadable: 0,
+            },
+            Lang::Zh,
+        );
+        assert_eq!(
+            stalled_lines(&all_done, &fallback, Lang::Zh),
+            vec![fallback.clone()]
+        );
+        assert!(stalled_lines(&[], &fallback, Lang::Zh)[0].contains("通过 120"));
         // 连空 fallback 也不返回空列表（调用方给错也不该让客户看到一个空标题）
-        assert_eq!(stalled_lines(&[], ""), vec![String::new()]);
+        assert_eq!(
+            stalled_lines(&[], "", Lang::Zh),
+            vec![String::new()]
+        );
 
         // 有没结束的任务时：逐条说清（路径 + 内核原文），**不用** fallback
         let stuck = vec![
@@ -1742,8 +1892,14 @@ mod tests {
             json!({"state": "complete", "path": "c.txt"}),
         ];
         assert_eq!(
-            stalled_lines(&stuck, "不该出现"),
+            stalled_lines(&stuck, "不该出现", Lang::Zh),
             vec!["a.txt".to_string(), "b.txt —— 连接超时".to_string()]
+        );
+        // 内核没给路径时的占位也要跟着语言走（内核原文不翻译）
+        let no_path = vec![json!({"state": "error"})];
+        assert_eq!(
+            stalled_lines(&no_path, "x", Lang::En),
+            vec!["(the kernel gave no path)".to_string()]
         );
     }
 
@@ -1769,7 +1925,12 @@ mod tests {
         };
         // 校验阶段的真实形态：所有任务都 complete
         let all_done = vec![json!({"state": "complete", "path": "a.txt"})];
-        let lines = verify_stall_lines(&all_done, &counts, Duration::from_secs(12 * 60));
+        let lines = verify_stall_lines(
+            &all_done,
+            &counts,
+            Duration::from_secs(12 * 60),
+            Lang::Zh,
+        );
         let text = lines.join("\n");
 
         assert!(text.contains("12 分钟"), "要有「已经多久没变了」：{text}");
@@ -1790,21 +1951,72 @@ mod tests {
             lines.len() >= 3,
             "标题 + 计数 + 指引，至少三行：{lines:?}"
         );
+
+        // 英文那一份同样要三样俱全、且无汉字（它是新写的）
+        let en: Vec<String> = verify_stall_lines(
+            &all_done,
+            &counts,
+            Duration::from_secs(12 * 60),
+            Lang::En,
+        );
+        let en_text = en.join("\n");
+        assert!(en_text.contains("12 minute"), "{en_text}");
+        assert!(en_text.contains("verification"), "{en_text}");
+        assert!(
+            en_text.contains("passed 120") && en_text.contains("unverifiable 3"),
+            "{en_text}"
+        );
+        assert!(en_text.contains("Ctrl-C"), "{en_text}");
+        assert!(
+            !en_text
+                .chars()
+                .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            "英文停滞汇报里混进了中文：{en_text}"
+        );
     }
 
     /// `counts_text` 的六个数字都在（它是停滞汇报**唯一**的内容来源）。
     #[test]
     fn counts_text_carries_all_six_numbers() {
-        let s = counts_text(&VerifyCounts {
+        let counts = VerifyCounts {
             ok: 1,
             bad: 2,
             missing: 3,
             size_mismatch: 4,
             unverifiable: 5,
             unreadable: 6,
-        });
+        };
+        let s = counts_text(&counts, Lang::Zh);
         for want in ["通过 1", "不符 2", "缺失 3", "大小不符 4", "读不了 6", "无法校验 5"] {
             assert!(s.contains(want), "{want:?} 不在 {s:?} 里");
         }
+        // 英文：六个数字同样一个不少，且无汉字
+        let en = counts_text(&counts, Lang::En);
+        for want in [
+            "passed 1",
+            "mismatched 2",
+            "missing 3",
+            "size mismatch 4",
+            "unreadable 6",
+            "unverifiable 5",
+        ] {
+            assert!(en.contains(want), "{want:?} 不在 {en:?} 里");
+        }
+        assert!(
+            !en.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            "{en}"
+        );
+    }
+
+    /// 判据：`--lang` 非法 ⇒ `run` 走**退出码 1**（用法错误），而且不打任何下载相关的话。
+    #[test]
+    fn the_bad_lang_exits_with_the_usage_code() {
+        let code = run(vec![
+            "ABCdef1234567890abcd".to_string(),
+            "--lang".to_string(),
+            "klingon".to_string(),
+        ]);
+        assert_eq!(code, ExitCode::Usage);
+        assert_eq!(code.code(), 1);
     }
 }

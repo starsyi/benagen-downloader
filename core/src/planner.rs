@@ -1070,14 +1070,17 @@ mod tests {
             );
         }
         // 404 的专用文案（任务 2 裁定 C 点 1）：交付码打错是最常见的失败，
-        // 值得一句能照做的提示。这段文案在别处没有任何守护。
+        // 值得一句能照做的提示。⚠️ 0.3.0 起**句子不在传输层**（它拿不到语言），
+        // 由 `fetch` 按客户语言拼 ⇒ 这句改在 `fetch` 上守。这里同时确认
+        // 传输层仍带得出状态码（`http_status` 的判据靠它）。
         let srv_404 = StubHttp::start(vec![RawResponse::new(404)]);
-        let err_404 = t
-            .get(&format!(
-                "{}/AbCdEfGhIjKlMnOpQrSt/manifest.json",
-                srv_404.base()
-            ))
-            .expect_err("404 必须报错");
+        let err_404 = crate::delivery::fetch(
+            &t,
+            &srv_404.base(),
+            "AbCdEfGhIjKlMnOpQrSt",
+            crate::i18n::Lang::Zh,
+        )
+        .expect_err("404 必须报错");
         assert!(
             err_404.contains("清单不存在"),
             "404 应当给一句能照做的提示: {err_404:?}"

@@ -261,15 +261,19 @@ impl RowStateStyle {
     };
 
     /// 呈现用的标签。**任何一支都不许是空白**（约束 4）。
-    pub fn label(&self) -> &'static str {
-        match self {
-            RowStateStyle::Pending => "待下载",
-            RowStateStyle::Downloading => "下载中",
-            RowStateStyle::Complete => "已完成",
-            RowStateStyle::Failed => "失败",
+    pub fn label(&self, lang: crate::i18n::Lang) -> &'static str {
+        match (self, lang) {
+            (RowStateStyle::Pending, crate::i18n::Lang::Zh) => "待下载",
+            (RowStateStyle::Pending, _) => "Not yet",
+            (RowStateStyle::Downloading, crate::i18n::Lang::Zh) => "下载中",
+            (RowStateStyle::Downloading, _) => "Downloading",
+            (RowStateStyle::Complete, crate::i18n::Lang::Zh) => "已完成",
+            (RowStateStyle::Complete, _) => "Finished",
+            (RowStateStyle::Failed, crate::i18n::Lang::Zh) => "失败",
+            (RowStateStyle::Failed, _) => "Failed",
             // 占位字形与 `format.rs` 的 `SpeedFormat`/`PercentFormat` 同一个（`—`）：
             // 空串在界面上就是"什么都没说"，而"这一格没有值"本身也是一件要说出来的事。
-            RowStateStyle::None => "—",
+            (RowStateStyle::None, _) => "—",
         }
     }
 
@@ -1085,7 +1089,7 @@ mod tests {
             .iter()
             .map(|s| RowStateStyle::of(Some(*s)))
             .collect();
-        let labels: Vec<&str> = styles.iter().map(|s| s.label()).collect();
+        let labels: Vec<&str> = styles.iter().map(|s| s.label(crate::i18n::Lang::Zh)).collect();
         let colors: Vec<RowColor> = styles.iter().map(|s| s.color()).collect();
 
         assert_eq!(
@@ -1135,15 +1139,15 @@ mod tests {
             "四态 + 「没有状态」（目录行）—— 一共五格，顺序即声明序"
         );
         for s in RowStateStyle::ALL {
-            assert!(!s.label().trim().is_empty(), "{s:?} 的标签是空白");
-            assert_ne!(s.label(), "nil", "不得把 `nil` 这种字面量漏到界面上");
+            assert!(!s.label(crate::i18n::Lang::Zh).trim().is_empty(), "{s:?} 的标签是空白");
+            assert_ne!(s.label(crate::i18n::Lang::Zh), "nil", "不得把 `nil` 这种字面量漏到界面上");
             // ⚠️ **形态偏离（W-6）**：上游那句守的是 Swift 的 `nil`；Rust 侧对应的
             //    漏字面量是 `None``（字符串化的 `Option`），同一处防线一并钉住。
-            assert_ne!(s.label(), "None", "不得把 `None` 这种字面量漏到界面上");
+            assert_ne!(s.label(crate::i18n::Lang::Zh), "None", "不得把 `None` 这种字面量漏到界面上");
         }
         assert_eq!(RowStateStyle::of(None), RowStateStyle::None);
         assert_eq!(
-            RowStateStyle::of(None).label(),
+            RowStateStyle::of(None).label(crate::i18n::Lang::Zh),
             "—",
             "占位字形与 `format.rs` 的 SpeedFormat 同一个"
         );

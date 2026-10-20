@@ -124,6 +124,32 @@ pub struct Kernel {
     last_code_path: PathBuf,
 
     settings: Settings,
+    /// **已解析**的界面语言（永远是 `Zh`/`En`，不会是 `System`）。
+    ///
+    /// 来源依次是：`hello.language` > `settings.language` > 系统 locale。
+    /// 所有客户可见文案（错误、提示、进度）都查这一格，不各自去读环境变量。
+    pub language: crate::i18n::Lang,
+    /// 「客户/壳有没有明确选过界面语言」（规格 W1 的首启判据）。
+    ///
+    /// 判据是设置文件里**有没有 `language` 这个键**（见 `settings::load_from_with_flag`），
+    /// 不是"值是不是 system"：主动选了「跟随系统」也算选过。
+    pub language_chosen: bool,
+    /// 双域名竞速的进程内缓存（规格 W4.2）：`code → 上次命中的那一侧`。
+    pub race: crate::delivery_race::Cache,
+    /// 最近一次解析交付码的过程（四句人话，逐条追加，规格 W4.3）。
+    pub resolve_lines: Vec<String>,
+    /// 解析状态：`idle` / `resolving` / `hit_domestic` / `hit_international` / `failed`。
+    pub resolve_state: &'static str,
+    /// 命中的那一侧（没有就是 `None`）。
+    pub resolve_origin: Option<crate::delivery_race::Origin>,
+
+    /// 自动重启账本（规格 W3）：第 2/3 层。探活失败的计数、退避、预算都在里面。
+    pub restart: crate::engine::restart::Gate,
+
+    /// 最近 30 秒内见过的客户可见错误（同类只记一次，规格 W2）。
+    /// 壳通过 `error_recent` 读它——界面画的是"这一类又发生了 N 次"，
+    /// 而不是被上千条同样的失败刷屏。
+    pub errors: crate::errors::Recent,
     /// `None` = 还没有批次（或已被换码作废）。
     manifest: Option<Manifest>,
     /// 上次用过的交付码。**单独一个小文件**（简报第 6 条），不进 `settings`。
@@ -176,6 +202,16 @@ pub struct Kernel {
     daemon: Option<Arc<Daemon>>,
     /// 引擎是否已被判定断开（设计规格 §9）。判定之后每次读都会试一次重连。
     engine_disconnected: bool,
+    /// 引擎进程**自己**在动吗（写盘 / 烧 CPU，见 [`crate::procstat::is_busy`]）。
+    ///
+    /// 🔴 **这一格是"RPC 不回话"与"引擎死了"之间唯一的判别证据**：自愈线程每拍采一次
+    ///    写在这里，`settle_rpc_failure` 在判定断开之前读它。没有它的时候，引擎一边
+    ///    一秒写几十 MB、一边被判死，于是档 2 暂停全部、档 3 换引擎 + 重新入队，
+    ///    75 分钟里反复 3 次直到放弃（现场 `diag-kernel.log`，0.2.7）。
+    ///
+    /// ⚠️ 非 Windows 平台上 `procstat::read` 恒失败 ⇒ 这一格恒为 `false` ⇒ 行为与
+    ///    引入它之前**逐字相同**（保守的那一边：按"没在动"处理）。
+    engine_busy: bool,
     /// §6 的量化证据。挂在 Kernel 上而不是线程局部：它跨换引擎存活（换的只是 `daemon` 字段），
     /// 而 RPC 的耗时是在协议循环里量的，够不到线程局部。用原子量，不占内核锁。
     counters: Arc<crate::diag_counters::Counters>,
@@ -227,7 +263,7 @@ struct EngineStart {
 ///
 /// 引擎就绪留一行**诊断**到 stderr（绝不进协议通道）：引擎出问题时，这行给出的 RPC
 /// 端点就是 `curl` 的入口。secret 不打印。
-fn start_engine_off_lock(start: EngineStart) -> Result<Arc<Daemon>, ErrorBody> {
+fn start_engine_off_lock(lang: crate::i18n::Lang, start: EngineStart) -> Result<Arc<Daemon>, ErrorBody> {
     let opts = DaemonOptions {
         download_dir: start.download_dir,
         global_opts: start.global.clone(),
@@ -237,7 +273,16 @@ fn start_engine_off_lock(start: EngineStart) -> Result<Arc<Daemon>, ErrorBody> {
         counters: Some(start.counters),
     };
     let d = Daemon::start(opts)
-        .map_err(|e| ErrorBody::new(kcodes::ENGINE_START_FAILED, format!("启动下载引擎失败：{e}")))?;
+        .map_err(|e| {
+        ErrorBody::new(
+            kcodes::ENGINE_START_FAILED,
+            crate::i18n::text::tf(
+                lang,
+                crate::i18n::text::MsgKey::EngineStartFailed,
+                &[("err", &e.to_string())],
+            ),
+        )
+    })?;
     d.apply_global(&start.global).map_err(|e| {
         ErrorBody::new(
             kcodes::ENGINE_START_FAILED,
@@ -254,7 +299,9 @@ impl Kernel {
             Some(p) if !p.as_os_str().is_empty() => p.join("last_code"),
             _ => PathBuf::from("last_code"),
         };
-        let settings = settings::load_from(&settings_path);
+        let (settings, language_chosen) = settings::load_from_with_flag(&settings_path);
+        // 语言在构造时就解析一次：自愈线程/命令行工具不经过握手也要说对话。
+        let language = settings.language.resolve(&crate::i18n::system_locale());
         let last_code = std::fs::read_to_string(&last_code_path)
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
@@ -274,6 +321,8 @@ impl Kernel {
             settings_path,
             last_code_path,
             settings,
+            language,
+            language_chosen,
             manifest: None,
             last_code,
             update_path,
@@ -290,6 +339,13 @@ impl Kernel {
             retried: BTreeSet::new(),
             daemon: None,
             engine_disconnected: false,
+            engine_busy: false,
+            race: crate::delivery_race::Cache::new(),
+            resolve_lines: Vec::new(),
+            resolve_state: "idle",
+            resolve_origin: None,
+            restart: crate::engine::restart::Gate::new(),
+            errors: crate::errors::Recent::new(),
             counters: Arc::new(crate::diag_counters::Counters::default()),
             intent,
             stall_prev: None,
@@ -346,21 +402,24 @@ impl Kernel {
             let ping = d.ping();
             let ok = ping.is_ok();
             let cause = ping.err().unwrap_or_default();
-            let (disconnected, outcome) = reconnect_outcome(ok, &cause);
+            let verdict = reconnect_outcome(ok, self.engine_busy);
             // `why` 传**这条探活路径的成败短语**，不是探活的错误串：探活成功时那个串是空串，
             // 而"true → false"这一格**只**在探活成功时发生，传它会让日志以 `why=` 结尾。
             // （进到这一格 ⇔ 标志本来就是 `true`，所以失败那一支的值没变、
             // `set_engine_disconnected` 不落日志；失败本身由 `ping_failed` 记。）
-            let why = if disconnected {
-                "ensure_engine_probe_failed"
-            } else {
-                "ensure_engine_probe_ok"
+            let why = match verdict {
+                EngineVerdict::Alive => "ensure_engine_probe_ok",
+                EngineVerdict::Busy => "ensure_engine_probe_busy",
+                EngineVerdict::Dead => "ensure_engine_probe_failed",
             };
-            self.set_engine_disconnected(disconnected, why);
-            outcome?;
+            self.set_engine_disconnected(verdict.is_dead(), why);
+            // 忙 ⇒ 回"慢"而不是"断开"：调用方按瞬时故障处理，壳不点亮"重启内核"。
+            if let Some(e) = verdict.error(self.language, "ping", &cause) {
+                return Err(e);
+            }
             return Ok(d);
         }
-        let d = start_engine_off_lock(self.engine_start())?;
+        let d = start_engine_off_lock(self.language, self.engine_start())?;
         self.daemon = Some(Arc::clone(&d));
         // 新引擎起来了 ⇒ 一定不是断开态。走同一个口子（而不是直接赋值）是为了让
         // "`engine_disconnected` 只在 `set_engine_disconnected` 里被写"这条不变式
@@ -377,7 +436,7 @@ impl Kernel {
             Some(_) => self.ensure_engine(),
             None => Err(ErrorBody::new(
                 kcodes::ENGINE_NOT_STARTED,
-                "下载引擎尚未启动（先 enqueue 才会起引擎）",
+                crate::i18n::text::t(self.language, crate::i18n::text::MsgKey::EngineNotStarted),
             )),
         }
     }
@@ -398,17 +457,19 @@ impl Kernel {
 
     /// [`Kernel::on_rpc_failure`] 的判定段。探活结果由调用方给，好让探活本身可以在锁外做。
     fn settle_rpc_failure(&mut self, ping_ok: bool, op: &str, err: String) -> ErrorBody {
-        let (disconnected, outcome) = reconnect_outcome(ping_ok, &err);
+        let verdict = reconnect_outcome(ping_ok, self.engine_busy);
         // `why` 带上**出错的调用名**：那是客户在壳里唯一能看到的定位信息，
         // 只记 `err` 的话日志里会有一堆看不出发生在哪一步的失败。
         // （探活自己的错误已经由 `ping()` 以 `ping_failed` 单独记过一条，不在这里重复。）
-        self.set_engine_disconnected(disconnected, &format!("{op}: {err}"));
-        match outcome {
-            // ping 不通 → 判定断开
-            Err(b) => b,
-            // ping 通了 → 只是**这一次**调用失败（瞬时故障），不判断开，让壳可以重试
-            Ok(()) => engine_rpc_failed_error(op, &err),
+        self.set_engine_disconnected(verdict.is_dead(), &format!("{op}: {err}"));
+        if verdict == EngineVerdict::Busy {
+            // 现场取证用：这条与 `ping_failed` 一起才能还原"是慢不是死"。
+            crate::diagnostics::log("engine_rpc_slow_but_writing", &[("op", op.to_string())]);
         }
+        // ping 通了（`Alive`）⇒ 只是**这一次**调用失败（瞬时故障），不判断开，让壳可以重试。
+        verdict
+            .error(self.language, op, &err)
+            .unwrap_or_else(|| engine_rpc_failed_error(self.language, op, &err))
     }
 
     fn require_manifest(&self) -> Result<Manifest, ErrorBody> {
@@ -453,10 +514,30 @@ impl Kernel {
 /// ⇔ `ping.err()` 是 `None`——**`cause` 恒为空串**，客户看到的消息会以 `（探活：）`
 /// 结尾。`engine_rpc_failed_message_carries_the_operation` 把"必须带调用名"
 /// 钉住（换回那个空括号就会红）。
-fn engine_rpc_failed_error(op: &str, err: &str) -> ErrorBody {
+fn engine_rpc_failed_error(lang: crate::i18n::Lang, op: &str, err: &str) -> ErrorBody {
     ErrorBody::new(
         kcodes::ENGINE_RPC_FAILED,
-        format!("下载引擎调用失败（重连探活正常，可重试）：{op}：{err}"),
+        crate::i18n::text::tf(
+            lang,
+            crate::i18n::text::MsgKey::EngineRpcFailed,
+            &[("op", op), ("err", err)],
+        ),
+    )
+}
+
+/// 「引擎在写盘、但回不上话」那条消息的**唯一构造点**。
+///
+/// 与 [`engine_rpc_failed_error`] 的区别是**探活结果**：这条对应"探活不通，但进程在动"。
+/// 措辞上**不许**出现"已断开"：文件在盘上、任务没有丢，壳里那颗"重启内核"的按钮
+/// 不该被它点亮（现场 0.2.7 的误报正是从这里开始的）。
+fn engine_rpc_slow_error(lang: crate::i18n::Lang, op: &str, err: &str) -> ErrorBody {
+    ErrorBody::new(
+        kcodes::ENGINE_RPC_FAILED,
+        crate::i18n::text::tf(
+            lang,
+            crate::i18n::text::MsgKey::EngineRpcSlow,
+            &[("op", op), ("err", err)],
+        ),
     )
 }
 
@@ -472,20 +553,58 @@ fn engine_rpc_failed_error(op: &str, err: &str) -> ErrorBody {
 /// `d.ping()` 那个真实调用在 e2e 里造不出"进程死了又活过来"的场景（内嵌 aria2c 是
 /// 内核自己起的，端口与 secret 都在进程里），所以"把 `d.ping()` 换成恒定 `Err`"
 /// 这个变异体**仍然存活**。这一点在 task-13 报告里显式记账——**不要以为这条测试守住了它**。
-fn reconnect_outcome(ping_ok: bool, cause: &str) -> (bool, Result<(), ErrorBody>) {
+fn reconnect_outcome(ping_ok: bool, engine_busy: bool) -> EngineVerdict {
     if ping_ok {
-        (false, Ok(()))
+        EngineVerdict::Alive
+    } else if engine_busy {
+        EngineVerdict::Busy
     } else {
-        (
-            true,
-            Err(ErrorBody::new(
-                kcodes::ENGINE_DISCONNECTED,
-                format!(
-                    "下载引擎已断开：{cause}；已下载的文件保留在目标目录，可直接重试"
-                ),
-            )),
-        )
+        EngineVerdict::Dead
     }
+}
+
+/// 一次 RPC 失败之后对引擎的三档判读（[`reconnect_outcome`] 的结果）。
+///
+/// ⚠️ **"忙"必须与"死"分开**：两者的 RPC 表现一模一样（都不回话），但健康状态相反。
+///    混成一档的后果在 0.2.7 的现场日志里是完整的：判死 ⇒ 阶梯暂停全部 ⇒ 换引擎 ⇒
+///    重新入队 234 个任务，而被关掉的那个引擎当时正在往盘上写 GB 级数据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineVerdict {
+    /// 探活通了：引擎活着，只是这一次调用失败（瞬时故障，壳可重试）。
+    Alive,
+    /// 探活不通，但进程还在写盘 / 烧 CPU ⇒ **它在干活，只是回不上话**。
+    Busy,
+    /// 探活不通，进程也没动 ⇒ 真的死了。
+    Dead,
+}
+
+impl EngineVerdict {
+    /// 只有"真的死了"才置「已断开」——「忙」不许点亮壳里那颗"重启内核"的按钮。
+    fn is_dead(self) -> bool {
+        matches!(self, Self::Dead)
+    }
+
+    /// 这个判读该怎么回错误（`Alive` 以外都要回）。
+    ///
+    /// ⚠️ **错误文案的唯一出口**：三处判定（读/写方法失败、`ensure_engine` 的重连、
+    ///    动作路径）都走这里，免得同一个判读在三处写出三种措辞。
+    fn error(self, lang: crate::i18n::Lang, op: &str, err: &str) -> Option<ErrorBody> {
+        match self {
+            Self::Alive => None,
+            Self::Busy => Some(engine_rpc_slow_error(lang, op, err)),
+            Self::Dead => Some(engine_disconnected_error(lang, err)),
+        }
+    }
+}
+
+/// 「真的断开」那条消息的唯一构造点（消息里点明"已落盘的文件保留"，设计规格 §9）。
+///
+/// 文案在 `i18n::text`（规格 W1）：`lang` 由内核当前语言给，**不在这里判语言**。
+fn engine_disconnected_error(lang: crate::i18n::Lang, cause: &str) -> ErrorBody {
+    ErrorBody::new(
+        kcodes::ENGINE_DISCONNECTED,
+        crate::i18n::text::tf(lang, crate::i18n::text::MsgKey::EngineDisconnected, &[("cause", cause)]),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -798,6 +917,10 @@ pub fn spawn_recovery(kernel: Arc<Mutex<Kernel>>) {
             let mut last_counters = std::time::Instant::now();
             let mut last_task_sample = std::time::Instant::now();
             let mut recorded_stalls: BTreeSet<String> = BTreeSet::new();
+            // 进程读数的上一拍（只为"忙/死"判别服务，与 `stall_prev` 是两份基线，互不干扰）。
+            let mut busy_prev: Option<crate::procstat::Counters> = None;
+            // 一段"没应答但仍在写"只记一条日志，别把 75 分钟的静默刷成几千行。
+            let mut busy_logged = false;
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 let (d, counters, disconnected, mut owed, dir) = {
@@ -878,14 +1001,86 @@ pub fn spawn_recovery(kernel: Arc<Mutex<Kernel>>) {
                 }
 
                 let engine_moving = progress.stalled_for(now) < ladder.thresholds().stall;
-                let rung = ladder.next(now, &liveness, stalled_tasks, engine_moving);
+                // 引擎进程**自己**的读数：RPC 不回话时，只有它能分出"忙"与"死"。
+                // 非 Windows 上 `procstat::read` 恒失败 ⇒ `None` ⇒ `false` ⇒ 与旧口径相同。
+                let engine_busy = crate::procstat::busy(d.pid(), &mut busy_prev).unwrap_or(false);
+                lock(&kernel).engine_busy = engine_busy;
+                if answered {
+                    busy_logged = false;
+                } else if engine_busy && !busy_logged {
+                    busy_logged = true;
+                    crate::diagnostics::log(
+                        "engine_slow_but_writing",
+                        &[("pid", d.pid().unwrap_or(0).to_string())],
+                    );
+                }
+                let rung = ladder.next(now, &liveness, stalled_tasks, engine_moving, engine_busy);
+
+                // ── 第 2/3 层（规格 W3）：自动重启只由账本决定 ──────────────────
+                // 阶梯的 `ReplaceEngine` 不再是执行者：它只是"看起来没救了"的一个旁证。
+                // 真正动手要过三关——探活连败 3 次、进程确实没动（第 1 层取证）、预算未用尽。
+                let ms = now_ms();
+                let verdict = {
+                    let mut k = lock(&kernel);
+                    k.restart.on_probe(ms, answered, engine_busy, engine_moving)
+                };
+                match verdict {
+                    crate::engine::restart::Action::Restart { attempt } => {
+                        crate::procstat::log_sample(d.pid(), &mut stall_prev, "before_restart");
+                        crate::diagnostics::log(
+                            "engine_restart",
+                            &[
+                                ("attempt", attempt.to_string()),
+                                ("exited", d.process_exited().to_string()),
+                                ("by", "auto".to_string()),
+                            ],
+                        );
+                        let lang = lock(&kernel).language;
+                        match replace_engine(lang, &kernel) {
+                            Ok(_) => {
+                                // 欠账的 gid 属于旧引擎，换过去之后补发只会永远报"找不到"。
+                                owed.clear();
+                                persist_pending(&kernel, &owed);
+                                counters.record_engine_restart();
+                                lock(&kernel).restart.restart_done(ms);
+                                crate::diagnostics::log(
+                                    "engine_restarted",
+                                    &[("attempt", attempt.to_string())],
+                                );
+                            }
+                            Err(e) => {
+                                lock(&kernel).restart.restart_done(ms);
+                                crate::diagnostics::log(
+                                    "engine_restart_failed",
+                                    &[("attempt", attempt.to_string()), ("err", e.message)],
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    crate::engine::restart::Action::Recovered { attempt } => {
+                        let mut k = lock(&kernel);
+                        k.set_engine_disconnected(false, "auto_restart_recovered");
+                        crate::diagnostics::log(
+                            "engine_auto_recovered",
+                            &[("attempt", attempt.to_string())],
+                        );
+                    }
+                    crate::engine::restart::Action::Exhausted => {
+                        let mut k = lock(&kernel);
+                        if !k.engine_disconnected {
+                            note_auto_restart_gave_up(&mut k);
+                        }
+                    }
+                    crate::engine::restart::Action::None => {}
+                }
+
                 if restart_budget_is_refilled(
                     ladder.healthy_for(now),
                     progress.stalled_for(now),
                     &ladder.thresholds(),
                 ) {
-                    restarts = 0;
-                    gave_up = false;
+                    lock(&kernel).restart.reset();
                 }
                 match rung {
                     Rung::Observe => {}
@@ -913,7 +1108,10 @@ pub fn spawn_recovery(kernel: Arc<Mutex<Kernel>>) {
                         persist_pending(&kernel, &owed);
                     }
                     Rung::ReplaceEngine => {
-                        if restarts >= RECOVERY_MAX_RESTARTS {
+                        // 执行权已经交给上面的 `restart` 账本（规格 W3）：这里**不做**任何事。
+                        // 保留这个分支是为了让"阶梯看到了什么"仍有日志可循。
+                        crate::diagnostics::log("ladder_replace_wanted", &[("by", "ladder".to_string())]);
+                        if false {
                             if !gave_up {
                                 gave_up = true;
                                 crate::diagnostics::log(
@@ -934,7 +1132,8 @@ pub fn spawn_recovery(kernel: Arc<Mutex<Kernel>>) {
                                 ("exited", d.process_exited().to_string()),
                             ],
                         );
-                        match replace_engine(&kernel) {
+                        let lang = lock(&kernel).language;
+                        match replace_engine(lang, &kernel) {
                             Ok(_) => {
                                 // 欠账的 gid 属于旧引擎，换过去之后补发只会永远报"找不到"。
                                 owed.clear();
@@ -1356,6 +1555,14 @@ fn origin_of(uri: &str) -> Option<String> {
 }
 
 /// 现在（unix 秒）。时钟回拨由 `update::should_check` 那一支兜住。
+/// 毫秒时钟（`errors::Recent` 的窗口用它）。单调性不重要：只用差值。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1379,7 +1586,7 @@ fn now_secs() -> i64 {
 ///
 /// ⚠️ **先收旧的、再起新的**（不是反过来）。反过来的话两个 aria2 会同时活着，
 ///   而旧的只是"不应答"、不一定"没在下载"——同时写同一批文件是数据损坏级的风险。
-pub fn replace_engine(kernel: &Arc<Mutex<Kernel>>) -> Result<Arc<Daemon>, ErrorBody> {
+pub fn replace_engine(lang: crate::i18n::Lang, kernel: &Arc<Mutex<Kernel>>) -> Result<Arc<Daemon>, ErrorBody> {
     let (start, old) = {
         let mut k = lock(kernel);
         let start = k.engine_start();
@@ -1390,7 +1597,7 @@ pub fn replace_engine(kernel: &Arc<Mutex<Kernel>>) -> Result<Arc<Daemon>, ErrorB
         // 关不掉也往下走：它本来就不应答复，`close` 内部的兜底会 kill 掉它。
         let _ = o.close();
     }
-    match start_engine_off_lock(start) {
+    match start_engine_off_lock(lang, start) {
         Ok(fresh) => {
             let mut k = lock(kernel);
             k.daemon = Some(Arc::clone(&fresh));
@@ -1906,18 +2113,99 @@ fn recheck_complete_on_disk(k: &mut Kernel) {
     planner::recheck_complete(&k.download_dir, Some(&k.state), m, &mut k.complete);
 }
 
+/// 握手：版本协商 + 语言落定（规格 §2.1）。
+///
+/// 语言优先级：`hello.language`（壳说的）> 内核里存的设置（客户上次选的）
+/// > 系统 locale。解析结果既写回内核，也随响应回给壳——**两端不各算一次**。
+fn op_hello(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, ErrorBody> {
+    let mut hello = protocol::hello(params)?;
+    let requested = protocol::requested_lang(params);
+    let locale = crate::i18n::system_locale();
+    with_kernel(kernel, |k| {
+        let lang = requested.unwrap_or(k.settings.language).resolve(&locale);
+        k.language = lang;
+        hello.language = lang;
+        hello.language_chosen = k.language_chosen;
+        to_value(&hello)
+    })
+}
+
 fn to_value<T: serde::Serialize>(v: &T) -> Result<Value, ErrorBody> {
     serde_json::to_value(v).map_err(|e| ErrorBody::new(codes::INTERNAL, format!("序列化失败: {e}")))
 }
 
 /// 分派一条请求。返回 `(响应, 是否结束)`。
+/// 自动重启的预算用尽：**此刻**才允许说"下载引擎没有响应"（规格 W3.3）。
+///
+/// 三件事一起做：置断开标志（界面横幅）、把这**一类**错误记进账本（`error_recent` 会带
+/// 三句话给壳）、落一行 `engine_restart_gave_up`（现场按这一行数"第几次才放弃"）。
+fn note_auto_restart_gave_up(k: &mut Kernel) {
+    let attempt = k.restart.progress().attempt;
+    // 先置旗（横幅），再补一句人话（cause 换成完整消息）
+
+    k.errors.observe(
+        crate::errors::Class::EngineUnresponsive,
+        now_ms(),
+    );
+    let lang = k.language;
+    crate::diagnostics::log(
+        "engine_restart_gave_up",
+        &[
+            ("restarts", attempt.to_string()),
+            ("by", "auto".to_string()),
+        ],
+    );
+    // 让壳读到的是**同一句人话**（与 RPC 失败那条走同一个 `text::tf`）。
+    let msg = crate::i18n::text::tf(
+        lang,
+        crate::i18n::text::MsgKey::EngineDisconnected,
+        &[(
+            "cause",
+            crate::errors::Class::EngineUnresponsive.explain(lang),
+        )],
+    );
+    k.set_engine_disconnected(true, &msg);
+}
+
+/// 给一条错误填上客户可见的类，并落一行 `error_class=` 日志（规格 §2.3）。
+///
+/// **分型只在这一处发生**：客户看到的每一类错误，都能从线上 `error.class` 读到，
+/// 也能从日志按 `error_class=` 聚合。内部错误（`class_of` 返回 `None`）保持 `class`
+/// 为空——界面会显示"意料之外的错误 + 复制诊断信息"，**不猜**是哪一步坏的。
+fn classify_error(k: &mut Kernel, e: &mut ErrorBody, op: &str, now_ms: u64) -> Option<u32> {
+    let class = crate::errors::class_of(&e.code, None);
+    let mut count = None;
+    if let Some(c) = class {
+        e.class = Some(c.wire().to_string());
+        match k.errors.observe(c, now_ms) {
+            crate::errors::Seen::New => {}
+            crate::errors::Seen::Repeat { count: n } => count = Some(n),
+        }
+    }
+    crate::diagnostics::log(
+        "error_class",
+        &[
+            (
+                "class",
+                class.map(|c| c.wire()).unwrap_or("internal").to_string(),
+            ),
+            ("code", e.code.clone()),
+            ("op", op.to_string()),
+            ("count", count.unwrap_or(1).to_string()),
+        ],
+    );
+    count
+}
+
 pub fn dispatch(kernel: &Arc<Mutex<Kernel>>, req: &Request) -> (Response, bool) {
     let id = req.id;
     if req.method == "shutdown" {
         return (Response::ok(id, json!({})), true);
     }
     let r: Result<Value, ErrorBody> = match req.method.as_str() {
-        "hello" => protocol::hello(&req.params).and_then(|h| to_value(&h)),
+        // 握手要多做一件事：把语言解析结果**记进内核**（后续所有客户可见文案都查它），
+        // 并把实际语言回给壳。故它不能像原来那样一句 `protocol::hello` 了事。
+        "hello" => op_hello(kernel, &req.params),
         // ⚠️ 下面五个方法**刻意不用 `with_kernel` 包起来**：它们最贵的部分都是网络 I/O
         // （`fetch` 最坏 91.5 秒、`plan` 最坏 30 秒 × N、换码清理最坏约 40 秒），
         // 持着内核锁跑会让校验线程与落地监听器一起停摆分钟级（契约 §5.2）。
@@ -1945,6 +2233,9 @@ pub fn dispatch(kernel: &Arc<Mutex<Kernel>>, req: &Request) -> (Response, bool) 
         "get_download_dir" => with_kernel(kernel, op_get_download_dir),
         "enqueue_status" => with_kernel(kernel, op_enqueue_status),
         "update_status" => with_kernel(kernel, op_update_status),
+        "error_recent" => with_kernel(kernel, op_error_recent),
+        "restart_progress" => with_kernel(kernel, op_restart_progress),
+        "delivery_progress" => with_kernel(kernel, op_delivery_progress),
         "update_set_enabled" => with_kernel(kernel, |k| op_update_set_enabled(k, &req.params)),
         // ⚠️ 这一条**刻意不裹 `with_kernel`**（与上面那五个同源）：它最贵的部分是
         //    网络 I/O（最坏 5 秒），持锁跑会让校验线程与 `transfer_list` 一起停摆。
@@ -1957,7 +2248,14 @@ pub fn dispatch(kernel: &Arc<Mutex<Kernel>>, req: &Request) -> (Response, bool) 
     };
     match r {
         Ok(v) => (Response::ok(id, v), false),
-        Err(e) => (Response::err(id, &e.code, &e.message), false),
+        Err(mut e) => {
+            let now = now_ms();
+            {
+                let mut k = lock(kernel);
+                classify_error(&mut k, &mut e, &req.method, now);
+            }
+            (Response::err_with(id, e), false)
+        }
     }
 }
 
@@ -2055,6 +2353,108 @@ fn clear_engine_batch(d: &Daemon) {
 ///
 /// 于是拆成"锁外取数 / 锁内安装"两个阶段，锁内只剩短写入。
 /// 读循环是**同步**的，所以不存在两次 `load_delivery` 交错的语义问题。
+/// 拉清单：**显式基址**照旧单域名；没给就两个 CDN 一起查（规格 W4）。
+///
+/// 缓存命中先直连那一侧，失败再回退竞速——缓存过期或换了网络都不会卡住客户。
+fn load_with_race(
+    kernel: &Arc<Mutex<Kernel>>,
+    code: &str,
+    lang: crate::i18n::Lang,
+    explicit_base: Option<&str>,
+) -> Result<delivery::Manifest, (String, crate::errors::Cause)> {
+    // 显式基址：客户/壳指定了就不要自作聪明
+    if let Some(base) = explicit_base {
+        let t = UreqTransport::new();
+        let r = delivery::fetch(&t, base, code, lang).map_err(|e| {
+            let cause = crate::delivery_race::cause_of(&e);
+            (e, cause)
+        });
+        if let Ok(m) = &r {
+            let lines = vec![format!("{}（{}）", crate::delivery_race::Stage::Hit(
+                crate::delivery_race::Origin::from_base(base).unwrap_or(crate::delivery_race::Origin::Domestic),
+            ).text(lang), base)];
+            remember_resolution(kernel, None, "hit_domestic", lines);
+            let _ = m;
+        }
+        return r;
+    }
+
+    let cached = lock(kernel).race.lookup(code, now_ms());
+    if let Some(origin) = cached {
+        let t = UreqTransport::new();
+        remember_resolution(
+            kernel,
+            Some(origin),
+            "resolving",
+            vec![crate::delivery_race::Stage::Start.text(lang).to_string()],
+        );
+        match delivery::fetch(&t, origin.base(), code, lang) {
+            Ok(m) => {
+                remember_resolution(
+                    kernel,
+                    Some(origin),
+                    if origin == crate::delivery_race::Origin::Domestic {
+                        "hit_domestic"
+                    } else {
+                        "hit_international"
+                    },
+                    vec![crate::delivery_race::Stage::CachedHit(origin).text(lang).to_string()],
+                );
+                return Ok(m);
+            }
+            // 缓存不许成为新的单点：失败就回退竞速
+            Err(_) => {}
+        }
+    }
+
+    remember_resolution(
+        kernel,
+        None,
+        "resolving",
+        vec![crate::delivery_race::Stage::Start.text(lang).to_string()],
+    );
+    let code_owned = code.to_string();
+    let raced = crate::delivery_race::race(
+        move |origin| {
+            let t = UreqTransport::new();
+            delivery::fetch(&t, origin.base(), &code_owned, lang)
+        },
+        lang,
+        crate::delivery_race::RACE_TIMEOUT,
+    )?;
+    lock(kernel).race.remember(code, raced.origin, now_ms());
+    let state = if raced.origin == crate::delivery_race::Origin::Domestic {
+        "hit_domestic"
+    } else {
+        "hit_international"
+    };
+    remember_resolution(kernel, Some(raced.origin), state, raced.lines);
+    let mut m = raced.manifest;
+    // 清单里的基址就是**命中那一侧**：下载 URL 与交付页链接都跟着它（规格 W4.1）。
+    m.base_url = raced.origin.base().to_string();
+    Ok(m)
+}
+
+/// 把"解析到哪一步了"落进内核（界面读 `delivery_progress`）。
+fn remember_resolution(
+    kernel: &Arc<Mutex<Kernel>>,
+    origin: Option<crate::delivery_race::Origin>,
+    state: &'static str,
+    lines: Vec<String>,
+) {
+    let mut k = lock(kernel);
+    k.resolve_state = state;
+    k.resolve_origin = origin;
+    for line in lines {
+        crate::delivery_race::push_line(&mut k.resolve_lines, &line);
+    }
+    if state != "resolving" {
+        // 一次解析结束：把开头那句换新的（下一批不该还挂着上一批的过程）
+        let keep = k.resolve_lines.len().min(8);
+        k.resolve_lines.truncate(keep);
+    }
+}
+
 pub fn op_load_delivery(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, ErrorBody> {
     // ── 锁外 ①：参数解析（纯计算，连锁都不用取）──────────────────────────
     let raw = params
@@ -2069,10 +2469,21 @@ pub fn op_load_delivery(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<V
         .filter(|s| !s.is_empty())
         .unwrap_or(delivery::DEFAULT_BASE_URL);
 
+    // 语言：只为"给客户的那句话"取一格，取完立刻放锁（下面全是 I/O）
+    let lang = lock(kernel).language;
+
     // ── 锁外 ②：拉清单（最坏 91.5 秒）────────────────────────────────
-    let transport = UreqTransport::new();
-    let m = delivery::fetch(&transport, base, &code)
-        .map_err(|e| ErrorBody::new(kcodes::DELIVERY_FETCH_FAILED, e))?;
+    let explicit = params
+        .get("base_url")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    let m = load_with_race(kernel, &code, lang, if explicit { Some(base) } else { None })
+        .map_err(|(e, cause)| {
+            let class = crate::errors::class_of("", Some(cause));
+            let mut body = ErrorBody::new(kcodes::DELIVERY_FETCH_FAILED, e);
+            body.class = class.map(|c| c.wire().to_string());
+            body
+        })?;
 
     // ── 锁内 ①（短）：判"码变了没有"，并取旧引擎的句柄 ──────────────────
     let (code_changed, old_daemon) = {
@@ -2081,6 +2492,8 @@ pub fn op_load_delivery(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<V
         // 只在**码真的变了**的时候清：同一个码重复 load（壳刷新树）不该把正在下的任务删掉。
         let changed = k.manifest.as_ref().is_some_and(|old| old.code != m.code);
         if changed {
+            // 规格 W3.3：换了新交付码 = 换了一件事做，把自动重启的预算还回去。
+            k.restart.reset();
             // 在清引擎**之前**就作废后台队列与在飞的一批：清引擎要几十秒，期间飞着的
             // addUri 若不被代数挡住，就会把旧批次的文件落进引擎。
             k.discard_feed_queue();
@@ -2488,20 +2901,36 @@ fn resolve_targets(m: &Manifest, paths: &[String]) -> Result<Vec<delivery::File>
 ///
 /// 这条在 Go 版是界面层做的；现在引擎归内核，检查也归内核——否则壳要为了这件事
 /// 重复实现一遍目录与磁盘逻辑，两边还会漂移。失败即返回结构化错误、**不启动引擎**。
-fn preflight(dir: &Path, need_bytes: i64) -> Result<(), ErrorBody> {
+fn preflight(lang: crate::i18n::Lang, dir: &Path, need_bytes: i64) -> Result<(), ErrorBody> {
+    use crate::i18n::text::{tf, MsgKey};
     let bad = |m: String| ErrorBody::new(kcodes::PREFLIGHT_FAILED, m);
-    std::fs::create_dir_all(dir).map_err(|e| bad(format!("目标目录不可用（{}）：{e}", dir.display())))?;
+    let yes = |key: MsgKey, args: &[(&str, &str)]| bad(tf(lang, key, args));
+    std::fs::create_dir_all(dir).map_err(|e| {
+        yes(
+            MsgKey::PreflightDirUnusable,
+            &[("dir", &dir.display().to_string()), ("err", &e.to_string())],
+        )
+    })?;
     let probe = dir.join(".benagen-write-probe");
-    std::fs::write(&probe, b"").map_err(|e| bad(format!("目标目录不可写（{}）：{e}", dir.display())))?;
+    std::fs::write(&probe, b"").map_err(|e| {
+        yes(
+            MsgKey::PreflightNotWritable,
+            &[("dir", &dir.display().to_string()), ("err", &e.to_string())],
+        )
+    })?;
     let _ = std::fs::remove_file(&probe);
 
     let free = free_bytes(dir).map_err(bad)?;
     let need = need_bytes.max(0) as u64;
     if free < need {
-        return Err(bad(format!(
-            "磁盘剩余空间不足：本次需要 {need} 字节，{} 只剩 {free} 字节",
-            dir.display()
-        )));
+        return Err(yes(
+            MsgKey::PreflightNoSpace,
+            &[
+                ("need", &need.to_string()),
+                ("dir", &dir.display().to_string()),
+                ("free", &free.to_string()),
+            ],
+        ));
     }
     Ok(())
 }
@@ -2695,7 +3124,7 @@ pub fn op_enqueue(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, 
         //    ⚠️ 只在 `verbose` 档写（`log_verbose`）：普通档多这几行是噪声。
         let need: i64 = targets.iter().map(|f| f.size).sum();
         let t0 = std::time::Instant::now();
-        preflight(&k.download_dir, need)?;
+        preflight(k.language, &k.download_dir, need)?;
         crate::diagnostics::log_verbose(
             "enqueue_stage",
             &[
@@ -3347,8 +3776,9 @@ fn restore_batch(
     d: &Arc<Daemon>,
     check_space: bool,
 ) -> Result<Option<RestoreBatch>, ErrorBody> {
-    let (m, epoch, dir, wanted, queued) = {
+    let (m, epoch, dir, wanted, queued, lang) = {
         let k = lock(kernel);
+        let lang = k.language;
         let Some(m) = k.manifest.clone() else {
             return Ok(None);
         };
@@ -3357,7 +3787,7 @@ fn restore_batch(
             return Ok(None);
         }
         let queued: BTreeSet<String> = k.feed_queue.iter().map(|f| f.path.clone()).collect();
-        (m, k.batch_epoch, k.download_dir.clone(), wanted, queued)
+        (m, k.batch_epoch, k.download_dir.clone(), wanted, queued, lang)
     };
     let present: BTreeSet<String> = match d.snapshot() {
         Ok(s) => s.path_map.into_values().collect(),
@@ -3375,7 +3805,7 @@ fn restore_batch(
         return Ok(None);
     }
     if check_space {
-        preflight(&dir, remaining_bytes(&dir, &targets))?;
+        preflight(lang, &dir, remaining_bytes(&dir, &targets))?;
     }
     Ok(Some(RestoreBatch { m, epoch, targets }))
 }
@@ -3476,12 +3906,14 @@ impl Kernel {
         let ping = d.ping();
         let ok = ping.is_ok();
         let cause = ping.err().unwrap_or_default();
-        let (disconnected, outcome) = reconnect_outcome(ok, &cause);
+        let verdict = reconnect_outcome(ok, self.engine_busy);
         // 与 `on_rpc_failure` 同一条口子：这里是**动作**路径上的断开判定
         // （`on_rpc_failure` 管的是读/写方法），漏了它就等于"从动作路径闩死的断开"
         // 在日志里没有对应的一行。
-        self.set_engine_disconnected(disconnected, &format!("action: {cause}"));
-        outcome?;
+        self.set_engine_disconnected(verdict.is_dead(), &format!("action: {cause}"));
+        if let Some(e) = verdict.error(self.language, "ping", &cause) {
+            return Err(e);
+        }
         Ok(d)
     }
 
@@ -3605,6 +4037,60 @@ pub fn op_get_settings(k: &mut Kernel) -> Result<Value, ErrorBody> {
     }))
 }
 
+/// `delivery_progress`：**只读**，壳在"解析交付码"那一步逐条显示这个数组。
+///
+/// 返回 `{state, origin, lines}`；`state` 是 `idle`/`resolving`/`hit_domestic`/
+/// `hit_international`/`failed`。解析完成后壳把整块折叠成一行（规格 W4.3）。
+pub fn op_delivery_progress(k: &mut Kernel) -> Result<Value, ErrorBody> {
+    Ok(json!({
+        "state": k.resolve_state,
+        "origin": k.resolve_origin.map(|o| o.wire()),
+        "lines": k.resolve_lines,
+    }))
+}
+
+/// `restart_progress`：**只读**，给界面画"正在重启下载引擎（第 1/3 次）…"。
+///
+/// 返回 `{attempt, budget, state, sinceMs, fails}`；`state` 是四个词：
+/// `idle` / `waiting`（等退避）/ `verifying`（等进度证明）/ `exhausted`（预算用尽）。
+pub fn op_restart_progress(k: &mut Kernel) -> Result<Value, ErrorBody> {
+    let p = k.restart.progress();
+    Ok(json!({
+        "attempt": p.attempt,
+        "budget": p.budget,
+        "state": p.state,
+        "sinceMs": p.since_ms,
+        "fails": p.fails,
+    }))
+}
+
+/// `error_recent`：**只读**，壳轮询它来画"持续出错的横幅"。
+///
+/// 返回最近 30 秒内见过的客户可见错误（同类只算一条，带次数），按严重度降序，
+/// **三句话也一起给**——文案在 Rust（规格 I-1），壳不做翻译、不自己拼句子。
+pub fn op_error_recent(k: &mut Kernel) -> Result<Value, ErrorBody> {
+    let lang = k.language;
+    let now = now_ms();
+    let entries: Vec<Value> = k
+        .errors
+        .snapshot(now)
+        .into_iter()
+        .map(|e| {
+            let c = e.class;
+            json!({
+                "class": c.wire(),
+                "severity": c.severity(),
+                "count": e.count,
+                "repeats": e.repeats(),
+                "title": c.title(lang),
+                "explain": c.explain(lang),
+                "action": c.action(lang),
+            })
+        })
+        .collect();
+    Ok(json!({ "entries": entries }))
+}
+
 /// `update_status`：**只读**。壳轮询它，与 `transfer_list` 同一条路子。
 ///
 /// ⚠️ **任何取不到的情形都回成功**（`has_newer:false`），不是错误 ——
@@ -3688,8 +4174,11 @@ pub fn op_set_settings(k: &mut Kernel, params: &Value) -> Result<Value, ErrorBod
     s.save_to(&k.settings_path)
         .map_err(|e| ErrorBody::new(codes::INTERNAL, format!("保存设置失败：{e}")))?;
     k.settings = s.clone();
+    // ④ 语言也要跟着换：客户在设置里点「英文」应当立刻生效，而不是等下次启动
+    //    （规格 §2.2）。这里是"设置页改语言"的唯一落点。
+    k.language = s.language.resolve(&crate::i18n::system_locale());
 
-    // ④ 引擎在跑就即时生效（改参数不重启引擎）
+    // ⑤ 引擎在跑就即时生效（改参数不重启引擎）
     if let Some(d) = k.daemon.clone() {
         d.set_per_task(s.per_task_options());
         if let Err(e) = d.apply_global(&s.global_options()) {
@@ -3963,31 +4452,51 @@ mod tests {
     /// 这是本任务一处**显式记账的零守护**，不要以为这条测试把它守住了。
     #[test]
     fn reconnect_outcome_table() {
-        let (flag, outcome) = reconnect_outcome(true, "");
-        assert!(!flag, "ping 通了必须清掉「已断开」，否则引擎还活着壳却永远收到断开");
-        assert!(outcome.is_ok(), "ping 通了调用方应当继续用这个引擎");
-
-        let (flag, outcome) = reconnect_outcome(false, "connection refused");
-        assert!(flag, "ping 不通必须置上「已断开」");
-        let e = outcome.expect_err("ping 不通必须回错误，不能静默继续");
         assert_eq!(
-            e.code,
-            kcodes::ENGINE_DISCONNECTED,
-            "壳按这个码分支（设计规格 §9）: {e:?}"
+            reconnect_outcome(true, false),
+            EngineVerdict::Alive,
+            "ping 通了：引擎还活着，只是这一次调用失败"
         );
-        assert!(
-            e.message.contains("保留"),
-            "消息必须告诉客户文件还在、可以直接重试: {}",
-            e.message
+        assert_eq!(
+            reconnect_outcome(true, true),
+            EngineVerdict::Alive,
+            "ping 通了就是活着——忙不忙不改变这一档"
         );
-        // 失败原因要带出来，否则壳只能显示一句"已断开"、无从排查
+        assert_eq!(
+            reconnect_outcome(false, true),
+            EngineVerdict::Busy,
+            "ping 不通但进程在写盘：是忙，不是死"
+        );
+        assert_eq!(
+            reconnect_outcome(false, false),
+            EngineVerdict::Dead,
+            "ping 不通、进程也没动：这才叫断开"
+        );
+
+        // 三档各自回什么错误（文案的唯一出口）。
+        assert!(EngineVerdict::Alive.error(crate::i18n::Lang::Zh, "快照", "x").is_none());
+        let busy = EngineVerdict::Busy
+            .error(crate::i18n::Lang::Zh, "快照", "timed out")
+            .expect("忙也要回错误：调用方不能拿一份空快照继续");
+        assert_eq!(busy.code, kcodes::ENGINE_RPC_FAILED, "忙不许回「已断开」: {busy:?}");
         assert!(
-            e.message.contains("connection refused"),
+            !busy.message.contains("已断开"),
+            "「忙」的消息里出现「已断开」就是 0.2.7 那个误报: {}",
+            busy.message
+        );
+        assert!(busy.message.contains("写盘"), "要说清楚它在干活: {}", busy.message);
+
+        let dead = EngineVerdict::Dead
+            .error(crate::i18n::Lang::Zh, "快照", "connection refused")
+            .expect("死了必须回错误");
+        assert_eq!(dead.code, kcodes::ENGINE_DISCONNECTED, "壳按这个码分支（设计规格 §9）");
+        assert!(dead.message.contains("保留"), "消息必须告诉客户文件还在: {}", dead.message);
+        assert!(
+            dead.message.contains("connection refused"),
             "断开原因必须出现在消息里: {}",
-            e.message
+            dead.message
         );
     }
-
 
     /// 一次很慢的往返只让阶梯要求档 2，不要求换引擎，也不是"断了"。
     ///
@@ -4001,7 +4510,7 @@ mod tests {
         a.record_ok(Duration::from_secs(31));
         let mut l = Ladder::default();
         let now = Instant::now();
-        assert_eq!(l.next(now, &a, 0, true), Rung::PauseAllThenResumeAll);
+        assert_eq!(l.next(now, &a, 0, true, false), Rung::PauseAllThenResumeAll);
     }
 
     fn mk_task(gid: &str, state: TaskState, completed: i64) -> Task {
@@ -4620,7 +5129,7 @@ mod tests {
         assert_eq!(tp.stalled_count(t1, &t), 1);
         assert_eq!(tp.most_stalled(t1, &t), Some("stuck".to_string()));
         let mut l = Ladder::default();
-        assert_eq!(l.next(t1, &Liveness::default(), tp.stalled_count(t1, &t), true), Rung::ReconnectOne);
+        assert_eq!(l.next(t1, &Liveness::default(), tp.stalled_count(t1, &t), true, false), Rung::ReconnectOne);
     }
 
     /// **换上的是另一个引擎、且断开标志被清掉**（"自愈真的能自愈"的那一层）。
@@ -4628,6 +5137,275 @@ mod tests {
     /// 为什么需要它：阈值与判据的单元测试都是纯函数，绿不代表**真的有一个新进程起来并把句柄换过去**——那是 `replace_engine`
     /// 的活，只有起真引擎才验得到。这条用例真起两个 aria2。
     ///
+    /// 判据（规格 W1 的"闭集"）：预检那三句也在表里——空间不够是最常见的
+    /// 开工失败，英文客户不该看到一句中文。同一个条件、两种语言、同一个码。
+    #[test]
+    fn the_preflight_sentence_follows_the_kernels_language() {
+        let dir = TempDir::new();
+        let huge = i64::MAX; // 任何盘都装不下 ⇒ 必走"空间不足"那一支
+        let zh = preflight(crate::i18n::Lang::Zh, dir.path(), huge).expect_err("应当判空间不足");
+        let en = preflight(crate::i18n::Lang::En, dir.path(), huge).expect_err("应当判空间不足");
+        assert_eq!(zh.code, kcodes::PREFLIGHT_FAILED);
+        assert_eq!(en.code, zh.code, "码不跟语言变");
+        assert!(zh.message.contains("磁盘剩余空间不足"), "{}", zh.message);
+        assert!(
+            !en.message.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            "英文界面里蹦出了中文: {}",
+            en.message
+        );
+        assert!(en.message.contains("Not enough free space"), "{}", en.message);
+        // 两个数字都要落在句子里（客户据此判断换哪个盘）
+        assert!(en.message.contains(&huge.to_string()), "{}", en.message);
+    }
+
+    /// 判据（规格 W4.3）：解析过程**逐条追加**给壳，且完成后不会无限增长。
+    #[test]
+    fn the_resolution_lines_are_appended_and_bounded() {
+        let dir = TempDir::new();
+        let k = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), dir.join("s.json"))));
+        {
+            let mut kk = lock(&k);
+            assert_eq!(op_delivery_progress(&mut kk).unwrap()["state"], json!("idle"));
+        }
+        remember_resolution(
+            &k,
+            Some(crate::delivery_race::Origin::International),
+            "hit_international",
+            vec![
+                "正在解析交付码…（同时查国内与国际 CDN）".to_string(),
+                "已从国际 CDN 找到".to_string(),
+            ],
+        );
+        let v = op_delivery_progress(&mut lock(&k)).unwrap();
+        assert_eq!(v["state"], json!("hit_international"));
+        assert_eq!(v["origin"], json!("international"));
+        assert_eq!(v["lines"].as_array().unwrap().len(), 2);
+        // 连同一个域名命中两次，界面不该出现两行一样的句子
+        remember_resolution(
+            &k,
+            Some(crate::delivery_race::Origin::International),
+            "hit_international",
+            vec!["已从国际 CDN 找到".to_string()],
+        );
+        let v = op_delivery_progress(&mut lock(&k)).unwrap();
+        assert_eq!(v["lines"].as_array().unwrap().len(), 2, "连续重复不追加: {v}");
+    }
+
+    /// 判据（规格 W3.3）：预算用尽时**只在那时**说话——置断开、记这一类的错误、
+    /// 并且第二次用尽只加计数（界面不会重复弹卡片）。
+    #[test]
+    fn giving_up_speaks_once_and_that_class_reaches_the_page() {
+        let dir = TempDir::new();
+        let mut k = Kernel::new(dir.join("dl"), dir.join("s.json"));
+        k.language = crate::i18n::Lang::Zh;
+
+        note_auto_restart_gave_up(&mut k);
+        assert!(k.engine_disconnected, "用尽之后界面要能说“没有响应”");
+        let v = op_error_recent(&mut k).unwrap();
+        let e = &v["entries"][0];
+        assert_eq!(e["class"], json!("engine_unresponsive"));
+        assert!(e["explain"].as_str().unwrap().contains("自动重启"));
+
+        note_auto_restart_gave_up(&mut k);
+        let v = op_error_recent(&mut k).unwrap();
+        assert_eq!(v["entries"].as_array().unwrap().len(), 1, "同类只占一条: {v}");
+        assert_eq!(v["entries"][0]["count"], json!(2));
+
+        let p = op_restart_progress(&mut k).unwrap();
+        assert_eq!(p["budget"], json!(3));
+        assert_eq!(p["state"], json!("idle"), "没在重启时不该说正在重启: {p}");
+    }
+
+    /// 判据（规格 W2 / I-1）：`error_recent` 给的是**内核语言的**三句话 + 次数，
+    /// 而且同类只占一条（不会因为连错两次就出现两张卡片）。
+    #[test]
+    fn error_recent_counts_repeats_and_speaks_the_kernels_language() {
+        let dir = TempDir::new();
+        let mut k = Kernel::new(dir.join("dl"), dir.join("s.json"));
+        k.language = crate::i18n::Lang::Zh;
+        // 用**真实时钟**：`error_recent` 自己取 `now_ms()`，假的 1_000 会立刻过期
+        let now = now_ms();
+        for _ in 0..2 {
+            let mut e = ErrorBody::new(kcodes::PREFLIGHT_FAILED, "磁盘剩余空间不足");
+            classify_error(&mut k, &mut e, "enqueue", now);
+            assert_eq!(e.class.as_deref(), Some("disk_full"));
+        }
+        let v = op_error_recent(&mut k).unwrap();
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "同类只占一条: {v}");
+        assert_eq!(entries[0]["count"], json!(2));
+        assert_eq!(entries[0]["repeats"], json!(1));
+        assert_eq!(entries[0]["title"], json!("目标磁盘空间不足或不可写"));
+        assert!(entries[0]["action"].as_str().unwrap().contains("换目录"));
+
+        // 内部错误不进这张表（不面向客户）
+        let mut e = ErrorBody::new(kcodes::UNKNOWN_METHOD, "内核不认识方法");
+        classify_error(&mut k, &mut e, "nope", now);
+        let v = op_error_recent(&mut k).unwrap();
+        assert_eq!(v["entries"].as_array().unwrap().len(), 1, "内部错误不该出现: {v}");
+    }
+
+    /// 判据（规格 §2.3）：分类的**唯一入口**。有类的填线上字符串，
+    /// 内部错误保持空 `class`——客户界面据此决定"给一句人话"还是"意料之外"。
+    #[test]
+    fn the_funnel_fills_the_class_and_leaves_internal_codes_empty() {
+        let dir = TempDir::new();
+        let mut k = Kernel::new(dir.join("dl"), dir.join("s.json"));
+
+        let mut e = ErrorBody::new(kcodes::PREFLIGHT_FAILED, "磁盘剩余空间不足");
+        classify_error(&mut k, &mut e, "enqueue", 1_000);
+        assert_eq!(e.class.as_deref(), Some("disk_full"), "预检不过 = 盘的问题");
+
+        let mut e = ErrorBody::new(kcodes::ENGINE_DISCONNECTED, "下载引擎已断开");
+        classify_error(&mut k, &mut e, "transfer_list", 2_000);
+        assert_eq!(e.class.as_deref(), Some("engine_unresponsive"));
+
+        let mut e = ErrorBody::new(kcodes::UNKNOWN_METHOD, "内核不认识方法");
+        classify_error(&mut k, &mut e, "nope", 3_000);
+        assert_eq!(e.class, None, "内部错误不许被塞进某一类");
+    }
+
+    /// 判据（规格 W1）：同一件事的两种说法——中文界面不该看到英文，英文界面
+    /// **一个字都不能是中文**。两条文案共用同一个 `code`，只有话不一样。
+    #[test]
+    fn engine_errors_speak_the_language_the_kernel_is_set_to() {
+        let zh = engine_disconnected_error(crate::i18n::Lang::Zh, "RPC 超时");
+        let en = engine_disconnected_error(crate::i18n::Lang::En, "RPC timed out");
+        assert_eq!(zh.code, en.code, "码是判据、话是呈现，码不许跟着语言变");
+        assert!(zh.message.contains("已断开") && zh.message.contains("RPC 超时"), "{}", zh.message);
+        assert!(
+            !en.message.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            "英文界面里蹦出了中文: {}",
+            en.message
+        );
+        assert!(en.message.contains("RPC timed out"), "{}", en.message);
+        assert!(en.message.to_lowercase().contains("retry"), "要给客户一条出路: {}", en.message);
+
+        // 「慢」那条同样：英文文案里不许出现"已断开"这种判死的话术
+        let slow = engine_rpc_slow_error(crate::i18n::Lang::En, "tellActive", "timeout");
+        assert!(!slow.message.to_lowercase().contains("disconnected"), "{}", slow.message);
+    }
+
+    /// 判据（规格 §2.2）：设置页改语言**立刻**生效——落盘、换内核里的语言、下一次
+    /// 报错就换一种说法，不用重启客户端。
+    #[test]
+    fn changing_the_language_in_settings_takes_effect_at_once() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let path = dir.join("s.json");
+        let mut k = Kernel::new(dir.join("dl"), path.clone());
+        assert_eq!(k.language, crate::i18n::Lang::En, "默认跟随系统；空 locale 落在英文");
+
+        let params = serde_json::json!({"settings": {
+            "parallel": 5, "connections": 8, "splits": 8,
+            "min_split_size": "20M", "limit_mbps": 0,
+            "max_tries": 1, "retry_wait": 1,
+            "language": "zh"
+        }});
+        op_set_settings(&mut k, &params).expect("保存设置失败");
+        assert_eq!(k.language, crate::i18n::Lang::Zh, "内存里要立刻换");
+        assert_eq!(
+            settings::load_from(&path).language,
+            crate::i18n::Lang::Zh,
+            "落盘也要是新的（下次启动还认这个选择）"
+        );
+    }
+
+    /// 判据（规格 §2.1）：握手把语言**落进内核**并**回给壳**，两端不各算一次。
+    ///
+    /// 三行各钉一件事：壳说了算 > 存过的设置 > 系统 locale；且 `"system"` 永远
+    /// 不会被当结果回出去（壳拿它去查文案会落空）。
+    #[test]
+
+    /// 判据（规格 W1 首启）：`language_chosen` 只认**设置文件里有没有那一格**，
+    /// 不认"值是不是 system"——主动选了「跟随系统」也算选过，不该再弹一次。
+    #[test]
+    fn the_first_run_flag_follows_the_file_not_the_value() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let settings_path = dir.join("s.json");
+        let hello_flag = |kernel: &Arc<Mutex<Kernel>>| {
+            let req = protocol::Request {
+                id: 1,
+                method: "hello".to_string(),
+                params: serde_json::json!({"protocol": protocol::PROTOCOL_VERSION}),
+            };
+            let (resp, _) = dispatch(kernel, &req);
+            let v = serde_json::to_value(&resp).unwrap();
+            v["result"]["language_chosen"].as_bool().unwrap_or(false)
+        };
+
+        // ① 没有设置文件 = 首次运行
+        let kernel = Arc::new(Mutex::new(Kernel::new(
+            dir.join("dl"),
+            settings_path.clone(),
+        )));
+        assert!(!hello_flag(&kernel), "首次运行必须说「还没选过」");
+
+        // ② 客户选了「跟随系统」——**键在文件里**，就算选过了
+        let mut saved = settings::default_settings();
+        saved.language = crate::i18n::Lang::System;
+        saved.save_to(&settings_path).expect("写设置失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(
+            dir.join("dl"),
+            settings_path.clone(),
+        )));
+        assert!(hello_flag(&kernel), "选了跟随系统也是选过了");
+
+        // ③ 手写的文件里没有这一格 ⇒ 还是"没选过"（旧版本留下的设置）
+        std::fs::write(
+            &settings_path,
+            br#"{"parallel":5,"connections":8,"splits":8,"min_split_size":"20M","limit_mbps":0,"max_tries":1,"retry_wait":1}"#,
+        )
+        .expect("写设置失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), settings_path)));
+        assert!(!hello_flag(&kernel), "缺这一格 ⇒ 还要问一次");
+    }
+
+    fn hello_settles_the_language_once_for_both_ends() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let settings_path = dir.join("s.json");
+        // 客户上次选的是英文
+        let mut saved = settings::default_settings();
+        saved.language = crate::i18n::Lang::En;
+        saved.save_to(&settings_path).expect("写设置失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), settings_path)));
+
+        let hello_with = |lang: Option<&str>| {
+            let mut params = serde_json::json!({"protocol": protocol::PROTOCOL_VERSION});
+            if let Some(l) = lang {
+                params["language"] = serde_json::json!(l);
+            }
+            let req = protocol::Request {
+                id: 1,
+                method: "hello".to_string(),
+                params,
+            };
+            let (resp, _) = dispatch(&kernel, &req);
+            let v = serde_json::to_value(&resp).unwrap();
+            (
+                v["result"]["language"].as_str().map(str::to_string),
+                lock(&kernel).language,
+            )
+        };
+
+        // ① 壳没说话 ⇒ 用存过的设置（英文）
+        let (echoed, stored) = hello_with(None);
+        assert_eq!(echoed.as_deref(), Some("en"));
+        assert_eq!(stored, crate::i18n::Lang::En);
+
+        // ② 壳说中文 ⇒ 压过设置，且内核里也换了（后续报错才跟着说中文）
+        let (echoed, stored) = hello_with(Some("zh"));
+        assert_eq!(echoed.as_deref(), Some("zh"));
+        assert_eq!(stored, crate::i18n::Lang::Zh);
+
+        // ③ `system` 是输入值，不是产出值
+        let (echoed, stored) = hello_with(Some("system"));
+        assert_ne!(echoed.as_deref(), Some("system"), "回给壳的必须是解析后的语言");
+        assert_ne!(stored, crate::i18n::Lang::System);
+    }
+
     /// 三个断言各自钉一件事：
     ///   · 新引擎 `ping` 得通 ⇒ 换上来的是**活的**，不是又一份死句柄；
     ///   · `rpc_url` 与旧的不同 ⇒ 确实是**另一个**进程，不是把旧句柄原地还回来；
@@ -4651,7 +5429,7 @@ mod tests {
             k.set_engine_disconnected(true, "test");
         }
 
-        let fresh = replace_engine(&kernel).expect("换引擎失败");
+        let fresh = replace_engine(crate::i18n::Lang::Zh, &kernel).expect("换引擎失败");
         let ping_ok = fresh.ping().is_ok();
         let new_url = fresh.rpc_url().to_string();
         let (installed, disconnected) = {
@@ -4745,7 +5523,7 @@ mod tests {
         op_enqueue(&kernel, &json!({"paths": ["t/a.bin", "t/b.bin"]})).expect("入队");
         assert_eq!(engine_paths(&kernel), paths(&["t/a.bin", "t/b.bin"]));
 
-        replace_engine(&kernel).expect("换引擎");
+        replace_engine(crate::i18n::Lang::Zh, &kernel).expect("换引擎");
         let after = engine_paths(&kernel);
         close_engine(&kernel);
 
@@ -4773,7 +5551,7 @@ mod tests {
         })
         .expect("移除");
 
-        replace_engine(&kernel).expect("换引擎");
+        replace_engine(crate::i18n::Lang::Zh, &kernel).expect("换引擎");
         let after = engine_paths(&kernel);
         close_engine(&kernel);
 
@@ -6051,7 +6829,7 @@ mod tests {
     /// 那是瞬时竞态，构造不出来。所以它只有这一层守护——**这一层是真的**。）
     #[test]
     fn engine_rpc_failed_message_carries_the_operation() {
-        let e = engine_rpc_failed_error("aria2.addUri", "GID x is not found");
+        let e = engine_rpc_failed_error(crate::i18n::Lang::Zh, "aria2.addUri", "GID x is not found");
         assert_eq!(e.code, kcodes::ENGINE_RPC_FAILED, "{e:?}");
         assert!(
             e.message.contains("aria2.addUri"),

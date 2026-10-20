@@ -64,6 +64,37 @@ export function noticesFromState(state) {
       retry: false,
     });
   }
+  // ③ 目标盘写得比下载慢（`DiskNotice`）。判据（多慢算慢）与句子**都在 Rust**：
+  //    这里只把发过来的那句摆上去 —— 不按数字判、也不拼文案（规格约束 10）。
+  //    为什么要说：现场 1.7 MB/s 的锅是移动硬盘的写速度，不是 CDN（2026-10-20）。
+  if (state && state.disk && typeof state.disk.text === "string" && state.disk.text.length > 0) {
+    out.push({
+      kind: "warning",
+      icon: "exclamationmark.circle",
+      text: state.disk.text,
+      hint: null,
+      // 不是错误、重试没有意义（换盘才是解）：不给「重试」。
+      retry: false,
+    });
+  }
+  // ④ 错误卡片（规格 W2 的八类病灶）：**句子全在 Rust**（`presentation::error_card`），
+  //    这里只按发过来的顺序摆（第一条最要紧：`CardBook` 已按严重度排好）。
+  //    `count > 1` 时把次数说出来 —— 30 秒窗口里同类合并成一条，否则客户会以为"只错了一次"。
+  if (state && Array.isArray(state.error_cards)) {
+    for (const card of state.error_cards) {
+      if (!card || typeof card.title !== "string") continue;
+      // ⚠️ **次数已经拼进 `title` 了**（Rust 拼的，`ErrorCard::of`）：这里不拼字符串。
+      out.push({
+        kind: "error",
+        icon: "exclamationmark.triangle.fill",
+        text: card.title,
+        hint: `${card.explain} ${card.action}`,
+        // 动作**不在这里执行**（"换内置盘""重新下载"不是一次重试能代替的）：
+        // 卡片只说明 + 给下一步，按钮仍然是引擎横幅那一颗。
+        retry: false,
+      });
+    }
+  }
   return out;
 }
 

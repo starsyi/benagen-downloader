@@ -140,7 +140,8 @@ fn run_handover(session: &Arc<Session>, old_dir: Option<&str>) {
         running: true,
         ..Default::default()
     }));
-    if let Err(why) = kernel::migrate_start(&client, old_dir) {
+    let lang = session.lang();
+    if let Err(why) = kernel::migrate_start(lang, &client, old_dir) {
         refuse(why.text());
         return;
     }
@@ -153,9 +154,10 @@ fn run_handover(session: &Arc<Session>, old_dir: Option<&str>) {
 /// 只有内核管道结束（`KernelGone`）才走「内核没了」那条路；连续取不到进度到了上限、或者内核说它既不在跑也没完成，
 /// 都判定这次搬运已经丢了。
 fn follow_migrate(session: &Arc<Session>, client: &CoreClient, poll: Duration, give_up_after: u32) {
+    let lang = session.lang();
     let mut misses = 0;
     loop {
-        match kernel::migrate_status(client) {
+        match kernel::migrate_status(lang, client) {
             Ok(st) => {
                 misses = 0;
                 if !st.running && !st.finished {

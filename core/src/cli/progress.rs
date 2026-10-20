@@ -19,6 +19,8 @@
 //! ⚠️ **一条也不要用 locale 相关的格式化**：`format!("{:.1}")` 的小数点固定是 `.`，
 //! 不随机器语言环境变（与 Swift 那份刻意绕开 `ByteCountFormatter` 是同一条理由）。
 
+use crate::i18n::{text, Lang};
+
 /// 未知/不适用时打的那个字。**破折号，不是 `0`**（见 [`speed`] / [`percent_text`]）。
 pub const DASH: &str = "—";
 
@@ -132,21 +134,34 @@ pub fn percent_text(done: i64, total: i64) -> String {
 ///（[`should_emit`]）——行里带上百分比，那条规则才自洽：每次打一行，行里告诉你现在几成。
 /// 它的值走 [`percent_text`]，所以 `total_bytes <= 0` 时那一格自然是 `—`，不是 `0%`。
 ///
-/// `failed > 0` 时在末尾补 ` · 失败 N`。
-pub fn line(v: &View) -> String {
-    let mut s = format!(
-        "已下 {}/{} · {} / {} · {} · {}",
-        v.done_files,
-        v.total_files,
-        bytes(v.done_bytes),
-        bytes(v.total_bytes),
-        percent_text(v.done_bytes, v.total_bytes),
-        speed(v.speed),
-    );
+/// `failed > 0` 时在末尾补失败项（中文是 ` · 失败 N`，英文是 ` · N failed`）。
+///
+/// ⚠️ **句子在 `i18n::text` 里成句**，这里只负责把六个数（有失败时七个数）填进占位符：
+/// 中文原句逐字是 `已下 {done_files}/{total_files} · …`，拆成两半拼接就会在
+/// 别的语言里语序错位。
+pub fn line(v: &View, lang: Lang) -> String {
+    let done_files = v.done_files.to_string();
+    let total_files = v.total_files.to_string();
+    let done_bytes = bytes(v.done_bytes);
+    let total_bytes = bytes(v.total_bytes);
+    let percent = percent_text(v.done_bytes, v.total_bytes);
+    let speed = speed(v.speed);
+    let base = [
+        ("done_files", done_files.as_str()),
+        ("total_files", total_files.as_str()),
+        ("done_bytes", done_bytes.as_str()),
+        ("total_bytes", total_bytes.as_str()),
+        ("percent", percent.as_str()),
+        ("speed", speed.as_str()),
+    ];
     if v.failed > 0 {
-        s.push_str(&format!(" · 失败 {}", v.failed));
+        let failed = v.failed.to_string();
+        let mut args = base.to_vec();
+        args.push(("failed", failed.as_str()));
+        text::tf(lang, text::MsgKey::CliProgressLineFailed, &args)
+    } else {
+        text::tf(lang, text::MsgKey::CliProgressLine, &base)
     }
-    s
 }
 
 /// 这一拍要不要真的发出去。
@@ -185,7 +200,7 @@ mod tests {
             speed: 8_598_323,
             failed: 0,
         };
-        let s = line(&v);
+        let s = line(&v, Lang::Zh);
         assert!(s.contains("12/48"), "{s}");
         assert!(s.contains("3.4 GB"), "{s}");
         assert!(s.contains("12.1 GB"), "{s}");
@@ -210,7 +225,11 @@ mod tests {
             speed: 8_598_323,
             failed: 0,
         };
-        assert!(line(&v).contains("28%"), "{}", line(&v));
+        assert!(
+            line(&v, Lang::Zh).contains("28%"),
+            "{}",
+            line(&v, Lang::Zh)
+        );
     }
 
     /// 总量还没加载时，行里那一格出 `—` 而**不是 `0%`**——R17 的那条规则要真的
@@ -226,7 +245,7 @@ mod tests {
             speed: 0,
             failed: 0,
         };
-        let s = line(&v);
+        let s = line(&v, Lang::Zh);
         // 百分比那一格与速度那一格都是 `—`，所以两个破折号挨着
         assert!(s.contains("— · —"), "{s}");
         assert!(!s.contains("0%"), "清单还没加载 ⇒ 不是 0%：{s}");
@@ -245,10 +264,45 @@ mod tests {
             speed: 0,
             failed: 2,
         };
-        assert!(line(&v).contains("失败 2"), "{}", line(&v));
+        assert!(
+            line(&v, Lang::Zh).contains("失败 2"),
+            "{}",
+            line(&v, Lang::Zh)
+        );
 
         let clean = View { failed: 0, ..v };
-        assert!(!line(&clean).contains("失败"), "{}", line(&clean));
+        assert!(
+            !line(&clean, Lang::Zh).contains("失败"),
+            "{}",
+            line(&clean, Lang::Zh)
+        );
+    }
+
+    /// 判据：英文进度行**没有汉字**，而且那几样事实一个不少。
+    ///
+    /// 这一条与中文那条**不是重复**：中文行原先就在，英文行是本轮新写的；
+    /// 新写的那一行最容易"翻译时漏掉一格"（比如忘了把 `失败 N` 那一格带过去）。
+    #[test]
+    fn the_english_line_has_no_cjk_and_keeps_every_piece() {
+        let v = View {
+            done_files: 12,
+            total_files: 48,
+            done_bytes: 3_650_722_201,
+            total_bytes: 12_994_918_400,
+            speed: 8_598_323,
+            failed: 2,
+        };
+        let s = line(&v, Lang::En);
+        assert!(
+            !s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            "英文进度行里混进了中文：{s}"
+        );
+        for want in ["12/48", "3.4 GB", "12.1 GB", "28%", "8.2 MB/s", "2 failed"] {
+            assert!(s.contains(want), "{want:?} 不在英文进度行里：{s}");
+        }
+        // 没有失败项时不许出现 "0 failed"
+        let clean = View { failed: 0, ..v };
+        assert!(!line(&clean, Lang::En).contains("failed"), "{}", line(&clean, Lang::En));
     }
 
     #[test]

@@ -184,6 +184,10 @@ export const CMD = Object.freeze({
   //    那四条命令的头注（尤其 `open_update_url`：它是一条**窄语义**的命令，
   //    只放行官方发布页那一个前缀）。
   updateStatus: "update_status",
+  // 自动重启的进度（规格 W3）：只读轮询，句子在 Rust（`presentation::restart_notice`）。
+  restartProgress: "restart_progress",
+  // 双域名竞速的解析过程（规格 W4）：句子由内核拼好，前端只逐行摆。
+  deliveryProgress: "delivery_progress",
   updateSetEnabled: "update_set_enabled",
   // ⚠️ **这一条规格 §2 有、而壳一直到 2026-10-15 都没有**：设置里那颗「立即检测」
   //    （不受 24 小时节流）。内核早就备好了 `op_check_update_now`，缺的只是这条命令

@@ -151,7 +151,7 @@ build_one() {  # $1 = arm64 / x86_64
     *) die "不认识的架构 '$arch'（只支持 arm64 / x86_64）" 2 ;;
   esac
   aria2c_name="aria2c-macos-$arch"
-  dist_name="benagen-dl-${VERSION:-0.2.8}-macos-$arch"
+  dist_name="benagen-dl-${VERSION:-0.3.0}-macos-$arch"
   local aria2c_src="$ROOT/assets/$aria2c_name"
 
   # 入库资产的存在性检查放在**编译之前**：缺件的正确处置是"立刻说清楚"，
@@ -224,13 +224,17 @@ build_one() {  # $1 = arm64 / x86_64
   ok "内嵌资产 $aria2c_name 的 sha256 前 ${HASH_PREFIX_LEN} 位 = ${want}（两条工具一致）"
 
   local ver
-  ver="$("$out" --version)" || die "产物跑不起来：$out --version 退出码非 0" 1
+  # 语言**必须钉住**：0.3.0 起 `--version` 会跟随系统语言，英文机器上那一行是
+  # `benagen-dl 0.3.0 (bundled aria2c …)` —— 判据按中文形态抠，不钉语言就会误判成"格式变了"。
+  ver="$("$out" --version --lang zh)" || die "产物跑不起来：$out --version 退出码非 0" 1
   printf '      $ %s --version\n      %s\n' "$dist_name" "$ver"
   # `--version` 的一行形如 `benagen-dl 0.1.0（内嵌 aria2c e167cf7d1234）`。
   # 判据是**逐字**：把括号里那串抠出来与资产摘要比。抠不出来（格式变了）= 判死，
   # 因为"格式变了"会让这条判据静默失效 —— 而它正是本任务 @6 要的那一条。
   local got_hash
   got_hash="$(printf '%s' "$ver" | sed -n 's/.*内嵌 aria2c \([0-9a-f]\{12\}\).*/\1/p')"
+  # 兜底：万一以后中文形态又改字，英文那半也能抠出来（两种形态只差括号里的那半句）。
+  [ -n "$got_hash" ] || got_hash="$(printf '%s' "$ver" | sed -n 's/.*bundled aria2c \([0-9a-f]\{12\}\).*/\1/p')"
   [ -n "$got_hash" ] \
     || die "--version 的输出里抠不出内嵌 aria2c 的 ${HASH_PREFIX_LEN} 位摘要（输出：${ver}）——判据失效，按失败处理" 1
   [ "$got_hash" = "$want" ] \
@@ -239,7 +243,8 @@ build_one() {  # $1 = arm64 / x86_64
 
   # ---- 自验 4：--help 出得来、是中文用法说明 ------------------------------
   local help_out
-  help_out="$("$out" --help)" || die "产物跑不起来：$out --help 退出码非 0" 1
+  # 同上：钉语言（不钉就会在英文机器上印英文用法，这条判据按中文形态比）。
+  help_out="$("$out" --help --lang zh)" || die "产物跑不起来：$out --help 退出码非 0" 1
   printf '%s' "$help_out" | grep -q '^用法：' \
     || die "--help 的输出里没有「用法：」—— 用法说明没印出来" 1
   printf '%s' "$help_out" | grep -q '退出码：' \

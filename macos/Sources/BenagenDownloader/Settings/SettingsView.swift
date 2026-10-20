@@ -115,7 +115,7 @@ struct SettingsView: View {
                 .foregroundStyle(.tertiary)
             Text("内核还没有交出参数面板")
                 .font(.callout)
-            Text(EngineStatusPresentation.text(for: model.engine))
+            Text(EngineStatusPresentation.text(for: model.engine, lang: model.language))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

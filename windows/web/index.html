@@ -227,6 +227,9 @@
             自己已经装着的版本。判据落在 `render.js:updateNoticeFromStatus`。
          ⚠️ 那颗「收起」的图形由 JS 补（`dom.js:ICONS` 是图形的家），这里只留按钮
             与它的无障碍名字 —— 一颗只有 × 的按钮对读屏来说是空的。 -->
+    <div class="update-bar" id="restart-bar" hidden>
+      <span class="update-bar__text selectable" id="restart-bar-text"></span>
+    </div>
     <div class="update-bar" id="update-bar" hidden>
       <span class="update-bar__text selectable">有新版本 <span id="update-bar-latest"></span>（当前 <span id="update-bar-current"></span>）</span>
       <button class="notice__action" id="update-bar-go" type="button">去下载</button>
@@ -333,6 +336,9 @@
     <div class="empty__status" id="empty-status">
       <div class="empty__busy" id="empty-busy" hidden>
         <span class="empty__spinner" aria-hidden="true"></span>
+        <!-- 双域名竞速的解析过程（规格 W4）：**每一行都是内核给的句子**，
+             前端只 append —— 一个字都不拼（§3.2）。空列表 = 什么也不摆。 -->
+        <ul class="empty__resolve" id="empty-resolve"></ul>
       </div>
       <div class="empty__failure" id="empty-failure" hidden>
         <span class="empty__failure-icon" id="empty-failure-icon"></span>
@@ -881,6 +887,21 @@
      才画得出来，而"改下载目录"恰恰是**内核起不来时**最可能要去改的一件事
      （内核的状态文件就在下载目录里）。两者写在一起，内核一挂它就跟着消失了。
      --------------------------------------------------------------------------- -->
+<!-- 首启语言询问（规格 W1）：客户还没选过语言时弹一次。
+     标题、说明、三个选项名**全部来自 Rust**（`settings_get` 的 `language` 那一格），
+     所以这个模板里一个中文字都没有；判据是 `state().language_chosen === false`。 -->
+<template id="tpl-window-language">
+  <div class="win" id="lang-root">
+    <div class="win__head">
+      <h2 class="win__title" id="lang-title"></h2>
+    </div>
+    <div class="win__body">
+      <p class="set__note" id="lang-note"></p>
+      <div class="set__langs" id="lang-row" role="radiogroup"></div>
+    </div>
+  </div>
+</template>
+
 <template id="tpl-window-settings">
   <div class="win win--settings" id="set-root">
     <div class="win__head">
@@ -999,6 +1020,13 @@
           <span class="set__spacer"></span>
           <span class="set__dismiss" id="set-update-receipt-dismiss"></span>
         </div>
+      </section>
+
+      <!-- 界面语言（规格 W1）：**标题、选项名、当前值全部来自 Rust**（`api/settings.rs`
+           的 `language` 那一格），所以这里一个中文字都没有 —— 前端只摆位置。 -->
+      <section class="set__section" id="set-language-section" hidden>
+        <h3 class="set__title" id="set-language-title"></h3>
+        <div class="set__langs" id="set-language-row" role="radiogroup"></div>
       </section>
 
       <section class="set__section">

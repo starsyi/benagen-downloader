@@ -8,7 +8,7 @@ import Foundation
 //
 // 抓取方式（真内核，`core/target/release/benagen-core`）：
 //
-//   printf '%s\n' '{"id":1,"method":"hello","params":{"protocol":1}}' \
+//   printf '%s\n' '{"id":1,"method":"hello","params":{"protocol":2}}' \
 //     | ./core/target/release/benagen-core
 //
 // ⚠️ 下面第一条里的 `min_split_size_choices` 是**截短过的**：真内核回的是
@@ -16,7 +16,7 @@ import Foundation
 //    **其余字段逐字来自真实抓取**（`protocol` 是 `1`，它是 result 里排序后的最后一个键）。
 //    100 项那条的形状由 `helloChoiceListIsTheWholeContractRange` 单独钉住。
 
-private let HELLO_OK = #"{"id":1,"ok":true,"result":{"min_split_size_choices":["1M","2M","3M"],"protocol":1}}"#
+private let HELLO_OK = #"{"id":1,"ok":true,"result":{"min_split_size_choices":["1M","2M","3M"],"protocol":2}}"#
 
 // 真实抓取：`{"id":2,"method":"get_settings","params":{}}`（逐字，未截断）
 private let SETTINGS_OK = #"{"id":2,"ok":true,"result":{"last_code":"","settings":{"connections":16,"limit_mbps":0,"max_tries":3,"min_split_size":"20M","parallel":8,"retry_wait":1,"splits":16}}}"#
@@ -69,7 +69,7 @@ private let GET_STATE_OK = #"{"id":7,"ok":true,"result":{"code":"R.pnhIQhki1xxKW
     #expect(env.id == 1)
     #expect(env.ok == true)
     let hello = try env.unwrap(HelloResult.self)
-    #expect(hello.protocolVersion == 1)          // JSON 键是 "protocol"，见 CodingKeys
+    #expect(hello.protocolVersion == UInt32(kProtocolVersion))          // JSON 键是 "protocol"，见 CodingKeys
     #expect(hello.minSplitSizeChoices == ["1M", "2M", "3M"])
 }
 
@@ -132,11 +132,11 @@ private let GET_STATE_OK = #"{"id":7,"ok":true,"result":{"code":"R.pnhIQhki1xxKW
     #expect(v.unverifiable.isEmpty)
     #expect(v.allGood == true)
 
-    // ④ `{"protocol": 1}` 配 `case protocolVersion = "protocol"`：
+    // ④ `{"protocol":2}` 配 `case protocolVersion = "protocol"`：
     //    这里比对的是**转换后的键名**（`protocol` 无下划线，转换后仍是 `protocol`）
     //    与 CodingKey 的 `stringValue`。`decodesHelloResult` 那条走的就是它。
-    let hello = try CoreJSON.decoder.decode(HelloResult.self, from: Data(#"{"protocol":1,"min_split_size_choices":["1M"]}"#.utf8))
-    #expect(hello.protocolVersion == 1)
+    let hello = try CoreJSON.decoder.decode(HelloResult.self, from: Data(#"{"protocol":2,"min_split_size_choices":["1M"]}"#.utf8))
+    #expect(hello.protocolVersion == UInt32(kProtocolVersion))
     #expect(hello.minSplitSizeChoices == ["1M"])
 }
 
@@ -251,8 +251,8 @@ private let GET_STATE_OK = #"{"id":7,"ok":true,"result":{"code":"R.pnhIQhki1xxKW
 
 @Test func requestsEncodeToOneLineOfJSON() throws {
     let line = try RequestLine.encode(id: 1, method: "hello",
-                                      params: .object(["protocol": .number(1)]))
-    #expect(line == #"{"id":1,"method":"hello","params":{"protocol":1}}"#)
+                                      params: .object(["protocol": .number(Double(kProtocolVersion))]))
+    #expect(line == #"{"id":1,"method":"hello","params":{"protocol":2}}"#)
     #expect(!line.contains("\n"))
 
     // params 里的键是**调用方给的线上键名**，逐字带出去——嵌套一层也一样。
@@ -417,13 +417,13 @@ private let GET_STATE_OK = #"{"id":7,"ok":true,"result":{"code":"R.pnhIQhki1xxKW
     // 真内核回的 `min_split_size_choices` 是 1M–100M 整整 100 项（协议 §2.3 的枚举面）。
     // 壳的 `-k` 控件就是照它建的，所以条数与两端必须钉住。
     // 下面这行**是真实抓取**（`hello` 响应的原文，未截断）。
-    let line = #"{"id":1,"ok":true,"result":{"min_split_size_choices":["1M","2M","3M","4M","5M","6M","7M","8M","9M","10M","11M","12M","13M","14M","15M","16M","17M","18M","19M","20M","21M","22M","23M","24M","25M","26M","27M","28M","29M","30M","31M","32M","33M","34M","35M","36M","37M","38M","39M","40M","41M","42M","43M","44M","45M","46M","47M","48M","49M","50M","51M","52M","53M","54M","55M","56M","57M","58M","59M","60M","61M","62M","63M","64M","65M","66M","67M","68M","69M","70M","71M","72M","73M","74M","75M","76M","77M","78M","79M","80M","81M","82M","83M","84M","85M","86M","87M","88M","89M","90M","91M","92M","93M","94M","95M","96M","97M","98M","99M","100M"],"protocol":1}}"#
+    let line = #"{"id":1,"ok":true,"result":{"min_split_size_choices":["1M","2M","3M","4M","5M","6M","7M","8M","9M","10M","11M","12M","13M","14M","15M","16M","17M","18M","19M","20M","21M","22M","23M","24M","25M","26M","27M","28M","29M","30M","31M","32M","33M","34M","35M","36M","37M","38M","39M","40M","41M","42M","43M","44M","45M","46M","47M","48M","49M","50M","51M","52M","53M","54M","55M","56M","57M","58M","59M","60M","61M","62M","63M","64M","65M","66M","67M","68M","69M","70M","71M","72M","73M","74M","75M","76M","77M","78M","79M","80M","81M","82M","83M","84M","85M","86M","87M","88M","89M","90M","91M","92M","93M","94M","95M","96M","97M","98M","99M","100M"],"protocol":2}}"#
     let env = try CoreJSON.decoder.decode(RawEnvelope.self, from: Data(line.utf8))
     let r = try env.unwrap(HelloResult.self)
     #expect(r.minSplitSizeChoices.count == 100)
     #expect(r.minSplitSizeChoices.first == "1M")
     #expect(r.minSplitSizeChoices.last == "100M")
-    #expect(r.protocolVersion == 1)
+    #expect(r.protocolVersion == UInt32(kProtocolVersion))
 }
 
 @Test func pausedAndWaitingDifferOnlyByRawStatus() throws {

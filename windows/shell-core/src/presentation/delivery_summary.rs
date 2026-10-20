@@ -45,29 +45,44 @@ impl DeliverySummary {
     const NO_VALUE: &'static str = "—";
 
     /// 内核清单 → 摘要。
-    pub fn of(info: &DeliveryInfo) -> DeliverySummary {
+    pub fn of(lang: crate::i18n::Lang, info: &DeliveryInfo) -> DeliverySummary {
         DeliverySummary {
             code: if info.code.is_empty() {
                 Self::NO_VALUE.to_string()
             } else {
                 info.code.clone()
             },
-            files_text: format!("{} 个文件", info.total_files),
+            files_text: match lang {
+                crate::i18n::Lang::Zh => format!("{} 个文件", info.total_files),
+                _ => {
+                    if info.total_files == 1 {
+                        "1 file".to_string()
+                    } else {
+                        format!("{} files", info.total_files)
+                    }
+                }
+            },
             size_text: ByteFormat::text(info.total_bytes),
             // ⚠️ 空串直接给占位符，**不进** [`TimestampPresentation`]：那里对空串的行为是
             //    "原样返回"，两者结果相同，但这一层的语义是"这个字段根本没有值"。
-            validity_text: format!(
-                "有效期至 {}",
-                if info.expires_at.is_empty() {
+            validity_text: {
+                let at = if info.expires_at.is_empty() {
                     Self::NO_VALUE.to_string()
                 } else {
                     TimestampPresentation::text(&info.expires_at)
+                };
+                match lang {
+                    crate::i18n::Lang::Zh => format!("有效期至 {at}"),
+                    _ => format!("Valid until {at}"),
                 }
-            ),
+            },
             // 过期与否**只看内核给的 `expired`**：那是内核按同一份 `expires_at` 算出来的，
             // 壳再自己比一次时间就是重实现内核逻辑（约束 1），两边还会因为时钟差打架。
             expired_badge_text: if info.expired {
-                Some("已过期".to_string())
+                Some(match lang {
+                    crate::i18n::Lang::Zh => "已过期".to_string(),
+                    _ => "Expired".to_string(),
+                })
             } else {
                 None
             },
@@ -88,10 +103,10 @@ impl DeliverySummary {
     /// ⚠️ [`LoadState::Failed`] 也是 `None`：刷新失败时内核清单还留着
     ///    （`loadDeliveryFailureKeepsTheOldManifest`），但呈现层已经退回"没有生效的批次"
     ///    那一支，此时再挂一个批次号，就是在说"这批还在"而主区正说着"没有生效的批次"。
-    pub fn of_load_state(state: &LoadState) -> Option<DeliverySummary> {
+    pub fn of_load_state(lang: crate::i18n::Lang, state: &LoadState) -> Option<DeliverySummary> {
         match state {
             LoadState::Idle | LoadState::Loading | LoadState::Failed(_) => None,
-            LoadState::Loaded(info) => Some(Self::of(info)),
+            LoadState::Loaded(info) => Some(Self::of(lang, info)),
         }
     }
 }
@@ -185,12 +200,18 @@ impl DeliveryCodeEntry {
     ///    在静态初始化时就插好了。Rust 的 `concat!` 只吃字面量、拼不进另一个常量，
     ///    所以这里写成函数、用 `format!` 从唯一的 [`Self::MAXIMUM_TEXT`] 派生 ——
     ///    **保住的正是上游那句"改一处不会打架"**（两个数只有一份）。
-    ///    任务 11 的简报把这两条写成 `too_long_hint()`，与这里的形态一致。
-    pub fn base_url_too_long_hint() -> String {
-        format!(
-            "自定义下载地址过长（超过 {}），请确认粘贴的内容确实是交付页的地址。",
-            Self::MAXIMUM_TEXT
-        )
+    ///    任务 11 的简报把这两条写成 `too_long_hint(crate::i18n::Lang::Zh)`，与这里的形态一致。
+    pub fn base_url_too_long_hint(lang: crate::i18n::Lang) -> String {
+        match lang {
+            crate::i18n::Lang::Zh => format!(
+                "自定义下载地址过长（超过 {}），请确认粘贴的内容确实是交付页的地址。",
+                Self::MAXIMUM_TEXT
+            ),
+            _ => format!(
+                "The custom download address is too long (over {}). Check that you pasted the delivery page address.",
+                Self::MAXIMUM_TEXT
+            ),
+        }
     }
 
     /// 手输的那一串过长时，要说的话。
@@ -204,11 +225,17 @@ impl DeliveryCodeEntry {
     ///    （会一直等下去），是给"绕过呈现层的调用点"兜底的；这里是 `typed` 旁边的一句
     ///    **即时提示**，在用户还没点之前就该出现。两句都从 [`Self::MAXIMUM_TEXT`]
     ///    派生（上界本身只有 [`Self::MAXIMUM_BYTES`] 一份），改一处不会打架。
-    pub fn too_long_hint() -> String {
-        format!(
-            "交付码过长（超过 {}），请只粘贴交付码本身或交付页链接。",
-            Self::MAXIMUM_TEXT
-        )
+    pub fn too_long_hint(lang: crate::i18n::Lang) -> String {
+        match lang {
+            crate::i18n::Lang::Zh => format!(
+                "交付码过长（超过 {}），请只粘贴交付码本身或交付页链接。",
+                Self::MAXIMUM_TEXT
+            ),
+            _ => format!(
+                "The delivery code is too long (over {}). Paste only the code itself or the delivery page link.",
+                Self::MAXIMUM_TEXT
+            ),
+        }
     }
 }
 
@@ -378,7 +405,7 @@ mod tests {
     /// 上游 `summaryShowsBatchNumberFilesAndTotalSize`。
     #[test]
     fn summary_shows_batch_number_files_and_total_size() {
-        let s = DeliverySummary::of(&delivery_info());
+        let s = DeliverySummary::of(crate::i18n::Lang::Zh, &delivery_info());
 
         assert_eq!(s.code, "C24-8_×_25WS024", "批次号（交付码）原文照登");
         assert_eq!(s.files_text, "7 个文件");
@@ -390,7 +417,7 @@ mod tests {
     /// 上游 `summaryMarksExpiredBatches`。
     #[test]
     fn summary_marks_expired_batches() {
-        let expired = DeliverySummary::of(&DeliveryFixture {
+        let expired = DeliverySummary::of(crate::i18n::Lang::Zh, &DeliveryFixture {
             expired: true,
             ..DeliveryFixture::kernel_defaults()
         }
@@ -404,7 +431,7 @@ mod tests {
 
         // ⚠️ 反向的一半也断言：否则"恒返回已过期"的变异体也能活下来。
         assert_eq!(
-            DeliverySummary::of(&delivery_info()).expired_badge_text,
+            DeliverySummary::of(crate::i18n::Lang::Zh, &delivery_info()).expired_badge_text,
             None
         );
     }
@@ -415,7 +442,7 @@ mod tests {
         // `created_at` / `expires_at` 是内核**原样透传**的字符串，可能为空串、也可能不是
         // RFC3339。格式化失败必须**回落到原文** —— 绝不显示 "Invalid Date"（简报明文）。
         assert_eq!(
-            DeliverySummary::of(
+            DeliverySummary::of(crate::i18n::Lang::Zh, 
                 &DeliveryFixture {
                     expires_at: String::new(),
                     ..DeliveryFixture::kernel_defaults()
@@ -427,7 +454,7 @@ mod tests {
             "空串给占位符，不给 'nil'、不给空白"
         );
         assert_eq!(
-            DeliverySummary::of(
+            DeliverySummary::of(crate::i18n::Lang::Zh, 
                 &DeliveryFixture {
                     expires_at: "待定".to_string(),
                     ..DeliveryFixture::kernel_defaults()
@@ -439,7 +466,7 @@ mod tests {
             "不是时间戳就原样显示"
         );
         assert_eq!(
-            DeliverySummary::of(
+            DeliverySummary::of(crate::i18n::Lang::Zh, 
                 &DeliveryFixture {
                     expires_at: "2026-10-14T16:13:34".to_string(),
                     ..DeliveryFixture::kernel_defaults()
@@ -455,7 +482,7 @@ mod tests {
     /// 上游 `summaryDoesNotInventTextForEmptyFields`。
     #[test]
     fn summary_does_not_invent_text_for_empty_fields() {
-        let s = DeliverySummary::of(
+        let s = DeliverySummary::of(crate::i18n::Lang::Zh, 
             &DeliveryFixture {
                 code: String::new(),
                 created_at: String::new(),
@@ -490,21 +517,21 @@ mod tests {
         let info = delivery_info();
 
         // 没加载（含加载中、失败）时摘要为 None —— 那一格显示占位，**不显示上一批的批次号**。
-        assert!(DeliverySummary::of_load_state(&LoadState::Idle).is_none());
-        assert!(DeliverySummary::of_load_state(&LoadState::Loading).is_none());
-        assert!(DeliverySummary::of_load_state(&LoadState::Failed(
+        assert!(DeliverySummary::of_load_state(crate::i18n::Lang::Zh, &LoadState::Idle).is_none());
+        assert!(DeliverySummary::of_load_state(crate::i18n::Lang::Zh, &LoadState::Loading).is_none());
+        assert!(DeliverySummary::of_load_state(crate::i18n::Lang::Zh, &LoadState::Failed(
             "拉取交付清单失败：HTTP 404".to_string()
         ))
         .is_none());
 
         assert_eq!(
-            DeliverySummary::of_load_state(&LoadState::Loaded(info.clone()))
+            DeliverySummary::of_load_state(crate::i18n::Lang::Zh, &LoadState::Loaded(info.clone()))
                 .map(|s| s.code)
                 .as_deref(),
             Some("C24-8_×_25WS024")
         );
         assert_eq!(
-            DeliverySummary::of_load_state(&LoadState::Loaded(info))
+            DeliverySummary::of_load_state(crate::i18n::Lang::Zh, &LoadState::Loaded(info))
                 .map(|s| s.size_text)
                 .as_deref(),
             Some("3.0 GB")
@@ -556,7 +583,7 @@ mod tests {
         //    本阶段最想要的那条性质：**同一件事不出现第二份来源**。
         //    形态与上游逐字同形（源的 `static let` 也是插值、`#expect` 也是自指），
         //    按裁决 T"不得意译"，这里**不**改写成写死的字面量。
-        let hint = DeliveryCodeEntry::too_long_hint();
+        let hint = DeliveryCodeEntry::too_long_hint(crate::i18n::Lang::Zh);
         assert!(
             hint.contains(DeliveryCodeEntry::MAXIMUM_TEXT),
             "提示里说的数必须与判据用的数一致：{hint}"
@@ -569,7 +596,7 @@ mod tests {
         // 所以共用同一个上界与同一套要求 —— 下面两条钉住"那一半也没有被落下"。
         // 同上（裁决 LL）：这一条钉的是"两个字段说的数是同一个"，
         // 而 `base_url` 那一句同样从 [`DeliveryCodeEntry::MAXIMUM_TEXT`] 派生。
-        let url_hint = DeliveryCodeEntry::base_url_too_long_hint();
+        let url_hint = DeliveryCodeEntry::base_url_too_long_hint(crate::i18n::Lang::Zh);
         assert!(
             url_hint.contains(DeliveryCodeEntry::MAXIMUM_TEXT),
             "两个字段说的数必须是同一个：{url_hint}"

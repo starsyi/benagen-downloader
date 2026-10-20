@@ -57,17 +57,20 @@ public enum EngineStatusPresentation {
     ///    不再套「引擎不可用：」的前缀 —— 它本身就是一句完整的话，而工具栏只有一行、
     ///    还要留给「内核无响应（等待超过 5 秒）」这个长度（约束 4：失败要**出现在界面上**，
     ///    不能只活在悬停浮层里；任务 4 正是栽在徽标文字整个掉进 tooltip 上）。
-    public static func text(for engine: AppModel.EngineState) -> String {
+    ///
+    /// ⚠️ `lang` **默认中文**：既有调用点与既有测试（`EngineStatusPresentationTests`）
+    ///    读的都是中文原句；新代码显式传 `model.language`。
+    public static func text(for engine: AppModel.EngineState, lang: Lang = .zh) -> String {
         switch engine {
         case .unknown:
-            return "正在连接内核…"
+            return lang.t(.engineConnecting)
         case .notStarted:
-            return "引擎未启动"
+            return lang.t(.engineNotStarted)
         case .running:
-            return "运行中"
+            return lang.t(.engineRunning)
         case .unavailable(let reason):
-            if isHandshakeTimeout(reason) { return AppModel.handshakeTimeoutMessage }
-            return "引擎不可用：\(singleLine(reason))"
+            if isHandshakeTimeout(reason) { return lang.t(.engineHandshakeTimeout) }
+            return lang.tf(.engineUnavailablePrefix, ["reason": singleLine(reason)])
         }
     }
 
@@ -88,16 +91,16 @@ public enum EngineStatusPresentation {
     ///
     /// ⚠️ 唯一的例外仍是握手超时：内核一个字都没回，那句"原文"不存在 ——
     ///    浮层给的是壳写的[`handshakeTimeoutTooltip`]（"可能卡在授权框上，去点「允许」再回来重试"）。
-    public static func tooltip(for engine: AppModel.EngineState) -> String {
+    public static func tooltip(for engine: AppModel.EngineState, lang: Lang = .zh) -> String {
         switch engine {
         case .unknown:
-            return "内核尚未握手（壳正在启动它）"
+            return lang.t(.engineConnectingTooltip)
         case .notStarted:
-            return "下载引擎尚未启动 —— 添加下载任务后内核会启动它"
+            return lang.t(.engineNotStartedTooltip)
         case .running:
-            return "下载引擎正在运行"
+            return lang.t(.engineRunningTooltip)
         case .unavailable(let reason):
-            if isHandshakeTimeout(reason) { return handshakeTimeoutTooltip }
+            if isHandshakeTimeout(reason) { return lang.t(.engineHandshakeTooltip) }
             return reason
         }
     }

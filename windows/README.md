@@ -1054,3 +1054,98 @@ sha256： 55620981b098badfbed947928374fc0f11d3b85f1c5bd695c8c4835d73c91d4d
 ```
 
 真机验收认 sha256、不认文件名（`dist/` 里可能还躺着更早的同名/异名包）。
+
+### 0.2.9 候选修复（2026-10-20）：慢盘提示 + 「下载引擎已断开」误判
+
+现场（0.2.7，Windows，客户机 `[hetao@localhost]` 那台旁边的 Windows 机器）：下载目录在
+**移动硬盘**上，速度停在 1.7 MB/s，界面反复报
+「下载引擎已断开：RPC 请求失败：http://127.0.0.1:65435/jsonrpc … os error 10060」。
+
+诊断依据是客户导出的 `诊断日志/`（内核日志 709 KB / 1792413982 → 1792487496，约 20 小时）：
+
+* 引擎进程**一直在写盘**：相邻两拍 `io_write` 增量从几十 MB 到 18 GB，`cpu_ms` 也在涨；
+* 同期 RPC 探活不回话，`rpc_worst_ms = 30016`，`rpc_calls == rpc_failures == rpc_gt10s`；
+* 自愈阶梯把它读成"死了"：**12 段静默**（最长 75 分钟）里做了 7 次"暂停全部 → 换引擎"，
+  `queue_restore wanted=234 added=100`，第 3 次之后 `engine_restart_gave_up` 放弃，
+  界面从此停在那句"已断开"。
+
+两处改动：
+
+1. **判读分三档**（`core/src/kernel.rs` 的 `EngineVerdict` + `core/src/procstat.rs::is_busy`）：
+   探活不通时再看引擎进程**自己**的读数——**写盘或烧 CPU 都算活着**：
+   * 探活通 ⇒ 瞬时错误（`engine_rpc_failed`，壳可重试）；
+   * **探活不通、进程在动 ⇒ 「下载引擎响应很慢（仍在写盘，任务没有停，稍后会自动恢复）」**，
+     不置「已断开」、不点亮"重启内核"、不触发换引擎；
+   * 探活不通、进程也没动 ⇒ 才判断开。
+   阶梯（`core/src/engine/supervisor.rs`）同步拿到这一格：**忙 ⇒ 一步都不做**
+   （既不暂停全部，也不换引擎）。非 Windows 平台 `procstat::read` 恒失败 ⇒ 行为与改前逐字相同。
+   新增日志项：`engine_slow_but_writing`（自愈线程）、`engine_rpc_slow_but_writing`（判定点）。
+2. **慢盘提醒**（`windows/shell-core/src/presentation/disk_notice.rs` +
+   `windows/shell-win/src/diskspeed.rs`）：**开始下载**与**换下载目录**时，往目标目录真写
+   8 MiB（≤2 秒、写完即删、`sync_all` 之后才计时）量落盘速度；低于 **20 MB/s** 就在常驻提示里说
+   「目标磁盘写入约 N MB/s，比下载速度慢……换到内置盘，或把「并行文件数」调到 1–2」。
+   判据与句子都在 Rust（前端 `render.js` 只画第三条），量不出来 ⇒ 一个字都不说。
+
+读数（本工作树）：
+
+```
+core                    540 lib + 4 cli_e2e + 36 e2e + 2 legs_e2e = 582 passed
+windows/scripts/test.sh 退出码 0；699 例（shell-core 569+8、shell-win 117+2 ignored、面板夹具 ok=158）
+字体子集                 重生成 211,560 B / sha256 e997f85e…（新字形 忙/旋/稍），四处登记已同步
+```
+
+真机待验：换成移动硬盘 ⇒ 常驻提示里应出现那句；同一台机器下大文件 ⇒ 静默期**不再**出现
+`engine_restart` / `engine_restart_gave_up`，改出现 `engine_slow_but_writing`。
+
+### 0.3.0（2026-10-21）：中英双语 / 八类错误 / 自动重启 / 双域名
+
+计划与规格：`docs/superpowers/plans/2026-10-20-v0.3.0-i18n-errors-engines-domains.md`、
+`docs/superpowers/specs/2026-10-20-v0.3.0-i18n-errors-engines-domains-design.md`。
+
+四项需求（客户 2026-10-20 提出）：
+
+1. 「下载引擎已断开」要**能自愈**——RPC 一段时间不回包时自动重启内核，多次不成功后**才**报错；
+2. **错误分型**：八类病灶、每类一句人话 + 一个动作；
+3. **中英双语**，首次打开选语言（Windows / macOS / CLI 全端）；
+4. **双域名**：`download.benagen.com`（国内）与 `downloadint.benagen.com`（国际）同时解析，
+   同一个交付码只在一侧，自动命中并**显示解析过程**。
+
+落地方式（一句话版）：
+
+* **判据在 Rust、句子在表里、前端只画**（规格 I-1）。日志不翻译（I-2）。
+* 语言：设置里 `language: "system"|"zh"|"en"`；**首次弹窗的判据是「设置文件里没有这一格」**
+  （`core/src/settings.rs::load_from_with_flag`），不是「值等于 system」；切换立刻生效
+  （内核 `op_set_settings` 重新解析）。
+* 八类：`network_unreachable / dns_failed / server_refused / disk_slow / disk_full /
+  engine_unresponsive / engine_crashed / verify_mismatch`；分类只在一个漏斗里发生
+  （`core/src/kernel.rs::classify_error`），每类在 `core/src/errors/class.rs` 有三句；
+  壳侧 30 s 内同类只累加次数、按严重度置顶（`windows/shell-core/src/presentation/error_card.rs`）。
+* 自动重启：`RESTART_AFTER_PROBES=3` 探活、预算 3 次、退避 **5/15/45 s**、
+  成功判据是「探活通**且** 60 s 内有进度」；**引擎在写盘时永不重启**
+  （0.2.9 的 `EngineVerdict::Busy` 闸门仍在前面）。
+* 双域名：`core/src/delivery_race.rs` 两路并行（各 8 s），命中后 `base_url`/页面链接跟着命中域名，
+  进程内按交付码缓存 24 h；失败回退到竞速；四阶段行由内核拼好经 `delivery_progress` 下发。
+
+界面新增两处**壳级**提示（任何分区都看得见，与 0.2.8 的更新条同法）：
+
+* `#restart-bar` —— 自动重启的三档句子（等待 / 验证 / 放弃），
+  句子在 `windows/shell-core/src/presentation/restart_notice.rs`，节拍 3 s、只读、拿不到就收起；
+* 空屏加载期间的**解析四阶段**（`#empty-resolve`），行由内核给、前端只 append，不在加载就清空。
+
+协议：**`PROTOCOL_VERSION = 2`**（三端同批升，不降级协商）。0.3.0 的壳连 0.2.x 内核（以及反过来）
+都会在 `hello` 上收到 `protocol_mismatch` —— 这是有意的：`hello` 新增了 `language`/`language_chosen`，
+`ErrorBody` 新增了 `class`，混用会得到"字段缺失但不报错"的半截行为。
+
+读数（2026-10-21 收口）：
+
+```
+core                     594 lib + 4 cli_e2e + 37 e2e + 2 legs_e2e 全绿
+windows/scripts/test.sh  EXIT=0；726 例（面板夹具 ok=168 fail=0）
+macos/scripts/test.sh    624 passed（--disable-sandbox）
+字体子集                 212,972 B / sha256 84b76d08…（新字形随文案表增长）
+```
+
+真机待验（T12 清单见
+`docs/superpowers/specs/2026-10-20-v0.3.0-i18n-errors-engines-domains-design.md` 的「真机验收」一节）：
+首次弹窗只弹一次、断网后的错误卡说人话、拔盘出慢盘提醒、挂起内核进程看自动重启三档、
+国际域名那台机器能解析出交付码。

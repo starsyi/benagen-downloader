@@ -8,6 +8,7 @@
 //! 把"下完了"当成成功，比报失败糟得多——客户拿到一份"成功"的回执、数据其实是坏的，
 //! 等发现时可能已经删了源。
 
+use crate::i18n::{text, Lang};
 use crate::kcodes;
 use crate::protocol::codes;
 use crate::protocol::ErrorBody;
@@ -89,21 +90,24 @@ impl ExitCode {
         }
     }
 
-    /// 最后一行给人看的中文说明。**都在说"接下来该干什么"**，不是复述错误。
+    /// 最后一行给人看的说明（按语言取表）。**都在说"接下来该干什么"**，不是复述错误。
     ///
     /// 内核给的原文（`ErrorBody.message`）由壳逐字打印在**前一行**（全局约束 8），
     /// 这一句只负责把"这是哪一步坏的、接下来怎么办"收口。
-    pub const fn message(self) -> &'static str {
-        match self {
-            ExitCode::Ok => "全部完成，校验通过",
-            ExitCode::Usage => "命令行用法不对——照上面的说明改一下再跑",
-            ExitCode::Manifest => "清单没拉到——先确认交付码与网络，再跑一次",
-            ExitCode::Preflight => "这个目录用不了——换一个可写、空间够的目录（-o）再跑",
-            ExitCode::Engine => "下载引擎没起来——这是本机环境的问题，把上面的报错发给我们",
-            ExitCode::Incomplete => "下载没有完成——再跑一次会接着下",
-            ExitCode::VerifyFailed => "文件都下完了，但校验没通过与下一行一起看是哪几类",
-            ExitCode::Interrupted => "被中断（再跑一次会接着下）",
-        }
+    ///
+    /// 中文八句逐字搬进 `i18n::text`（`CliExitOk` …）；英文是 T8 新增。
+    pub fn message(self, lang: Lang) -> &'static str {
+        let key = match self {
+            ExitCode::Ok => text::MsgKey::CliExitOk,
+            ExitCode::Usage => text::MsgKey::CliExitUsage,
+            ExitCode::Manifest => text::MsgKey::CliExitManifest,
+            ExitCode::Preflight => text::MsgKey::CliExitPreflight,
+            ExitCode::Engine => text::MsgKey::CliExitEngine,
+            ExitCode::Incomplete => text::MsgKey::CliExitIncomplete,
+            ExitCode::VerifyFailed => text::MsgKey::CliExitVerifyFailed,
+            ExitCode::Interrupted => text::MsgKey::CliExitInterrupted,
+        };
+        text::t(lang, key)
     }
 }
 
@@ -228,26 +232,45 @@ mod tests {
         assert_eq!(of_error(&ErrorBody::new("internal", "x")), ExitCode::Engine);
     }
 
-    /// 每个变体都要有一句**自己的**话，且非空。
+    /// 每个变体都要有一句**自己的**话，且非空；**两种语言各自满足**。
     ///
     /// 两条不同的失败给出同一句话，等于其中一条**永远不会以正确的样子**出现在界面上——
     /// 与 Swift 侧 `RowStateStyle` 钉"四个状态两两不同"是同一条理由。
     /// 这里**不逐字钉文案**（那是措辞，不是契约；脚本读的是数字），只钉这个性质。
+    ///
+    /// ⚠️ 英文那一半是本轮新增的，**必须逐条验**：漏翻一条会退化成"整句等于中文"
+    /// （那一条会被 `seen` 抓到与另一条重了，或者被下面的无 CJK 抓到）。
     #[test]
     fn every_exit_code_has_its_own_non_empty_message() {
-        let mut seen = std::collections::HashSet::new();
-        for code in ExitCode::ALL {
-            let message = code.message();
-            assert!(!message.trim().is_empty(), "{code:?} 的那句话是空的");
-            assert!(
-                seen.insert(message),
-                "{code:?} 的那句话与别的变体重了：{message:?}"
+        for lang in [Lang::Zh, Lang::En] {
+            let mut seen = std::collections::HashSet::new();
+            for code in ExitCode::ALL {
+                let message = code.message(lang);
+                assert!(!message.trim().is_empty(), "{code:?}/{lang:?} 的那句话是空的");
+                assert!(
+                    seen.insert(message),
+                    "{code:?}/{lang:?} 的那句话与别的变体重了：{message:?}"
+                );
+            }
+            assert_eq!(
+                seen.len(),
+                ExitCode::ALL.len(),
+                "{lang:?}：不同文案的条数必须等于变体数"
             );
         }
-        assert_eq!(
-            seen.len(),
-            ExitCode::ALL.len(),
-            "不同文案的条数必须等于变体数"
-        );
+    }
+
+    /// 判据：英文那八句里**一个汉字都没有**。
+    #[test]
+    fn the_english_exit_messages_have_no_cjk() {
+        for code in ExitCode::ALL {
+            let message = code.message(Lang::En);
+            assert!(
+                !message
+                    .chars()
+                    .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "{code:?} 的英文里混进了中文：{message}"
+            );
+        }
     }
 }

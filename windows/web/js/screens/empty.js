@@ -34,6 +34,7 @@ export function mount(el, ctx) {
   const failureEl = byIdIn(el, "empty-failure");
   const failureTextEl = byIdIn(el, "empty-failure-text");
   const failureIconEl = byIdIn(el, "empty-failure-icon");
+  const resolveEl = byIdIn(el, "empty-resolve");
 
   // 失败图标（造型照 `exclamationmark.triangle.fill`，颜色由 `.empty__failure` 的
   // 红色 currentColor 带下去）。**在挂载时建一次**，不在每次渲染时重建。
@@ -159,6 +160,12 @@ export function mount(el, ctx) {
     //    `@State showAdvanced`，加载中也不会自己合上）。这里顺手把它收起来，
     //    等于"我替你做了一个你没做的动作"，而那个动作**不会有任何东西变红**。
     busyEl.hidden = !busy;
+    // 不在加载 ⇒ 逐行记录也一起清掉（否则下一次加载会先闪上一批的旧行）。
+    resolveBusy = busy;
+    if (!busy) {
+      resolveEl.dataset.key = "";
+      clear(resolveEl);
+    }
 
     if (kind === "failed") {
       // ⚠️ 正文是**内核原文逐字**（约束 3）：不 trim、不折行、不加前缀、
@@ -170,6 +177,39 @@ export function mount(el, ctx) {
     }
     syncSubmitEnabled();
   }
+
+  /**
+   * 解析过程那一拍（`delivery_progress`，800 ms）。
+   *
+   * 🔴 为什么要它：0.3.0 的解析会**先在国内 CDN、再在国际 CDN** 各试一次（规格 W4），
+   *    最快也要一秒多；这段时间里只有一颗转圈，客户会以为卡住了。内核把四阶段
+   *    逐行拼好（句子在 Rust），这里**只 append** —— 不拼、不翻译、不排序。
+   *
+   * ⚠️ 只在 `busy`（`state.load.kind === "loading"`）时去问：不在加载就一个请求都不发。
+   */
+  let resolveBusy = false;
+  async function tickResolve() {
+    if (!resolveBusy) return;
+    let payload;
+    try {
+      payload = await ctx.call(ctx.CMD.deliveryProgress);
+    } catch (error) {
+      return;
+    }
+    const lines = payload && Array.isArray(payload.lines) ? payload.lines : [];
+    const key = JSON.stringify(lines);
+    if (key === resolveEl.dataset.key) return;
+    resolveEl.dataset.key = key;
+    clear(resolveEl);
+    for (const line of lines) {
+      if (typeof line !== "string" || line.length === 0) continue;
+      const item = document.createElement("li");
+      item.className = "empty__resolve-line selectable";
+      item.textContent = line;
+      resolveEl.append(item);
+    }
+  }
+  ctx.poller.start("empty:resolve", 800, tickResolve);
 
   // 首帧按 `idle` 画（= 表单）。⚠️ 与 `render.js:routeOfState` 的默认值**必须一致** ——
   // 不一致的话，"还没拿到第一拍"的那几帧会先画成 A、再跳成 B，

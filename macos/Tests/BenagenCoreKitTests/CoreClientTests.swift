@@ -730,7 +730,7 @@ private func fieldOf(_ line: (String, [(String, String)]), _ key: String) -> Str
 @Test func everyKernelCallIsLoggedWithTheShellsOwnWordsOnFailure() throws {
     let ch = FakeChannel()
     ch.toSend = [
-        #"{"id":1,"ok":true,"result":{"protocol":1}}"#,
+        #"{"id":1,"ok":true,"result":{"protocol":2}}"#,
         #"{"id":2,"ok":true,"result":{}}"#,
         #"{"id":3,"ok":true,"result":{}}"#,
         #"{"id":4,"ok":false,"error":{"code":"no_delivery","message":"这一批不存在或已过期"}}"#,

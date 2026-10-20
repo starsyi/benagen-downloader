@@ -49,17 +49,8 @@ use crate::protocol::EngineState;
 ///    原话，当时是真的）。**那句话现在已经不成立**：任务 17 给握手加上了上界。
 ///    订正它的是任务 17（裁定 FF 里"顺带复核本注释"那一条）—— 别再照旧文改回去。
 pub const HANDSHAKE_TIMEOUT_MESSAGE: &str = "内核无响应（等待超过 5 秒）";
-
-/// 补充提示里那句"该干什么"（**两条**：是什么 + 怎么办；只有"是什么"的话，客户能做的
-/// 就只剩"再等等"）。这句提示**只有客户去问才看得到**，所以它只补充。
-///
-/// ⚠️ 上游是 `EngineStatusPresentation.handshakeTimeoutTooltip` 这个 `static let`；
-///    这里写成模块私有常量再经 [`EngineStatusPresentation::handshake_timeout_tooltip`] 导出
-///    ——命名空间用法与上游一致（空 `enum` + 固有 `impl`，见 `presentation/mod.rs` 头部）。
-const HANDSHAKE_TIMEOUT_TOOLTIP: &str = concat!(
-    "内核可能正卡在系统授权对话框上（例如\"想访问下载文件夹\"）。",
-    "请查看屏幕上是否有该对话框并点「允许」，然后点「重试」。"
-);
+/// 英文那一句（判据与 [`HANDSHAKE_TIMEOUT_MESSAGE`] 一样逐字：改一个就得改另一个的判别式）。
+pub const HANDSHAKE_TIMEOUT_MESSAGE_EN: &str = "The core is not responding (waited more than 5 seconds)";
 
 /// Swift `Character.isNewline` 的**逐字对位**：U+000A–U+000D、U+0085、U+2028、U+2029。
 ///
@@ -85,8 +76,13 @@ impl EngineStatusPresentation {
     /// ⚠️ 这一处的文案是**壳自己写的**（不是"唯一一处"——上游 `AppModel` 的
     ///    `.protocolMismatch` 分支、`onKernelDeath`、`restartKernel` 里也有壳写的话；
     ///    其余一律"内核原文照登"，约束 3）。理由见 [`HANDSHAKE_TIMEOUT_MESSAGE`]。
-    pub fn handshake_timeout_tooltip() -> &'static str {
-        HANDSHAKE_TIMEOUT_TOOLTIP
+    pub fn handshake_timeout_tooltip(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::EngineHandshakeTooltip)
+    }
+
+    /// 握手超时那句正文（**按语言**）。壳在"起内核失败"那条路上用它落 `last_error`。
+    pub fn handshake_timeout_message(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::EngineHandshakeTimeout)
     }
 
     /// 这一条 `reason` 是不是"握手超时"（而不是内核给的失败原因）？
@@ -99,7 +95,7 @@ impl EngineStatusPresentation {
     /// 而超时与"内核说它自己不可用"要给出完全不同的两句话 —— 前者是壳写的、可操作的；
     /// 后者是内核原文、一个字不改。判别式就是这两者的分水岭。
     pub fn is_handshake_timeout(reason: &str) -> bool {
-        reason == HANDSHAKE_TIMEOUT_MESSAGE
+        reason == HANDSHAKE_TIMEOUT_MESSAGE || reason == HANDSHAKE_TIMEOUT_MESSAGE_EN
     }
 
     /// 状态正文。
@@ -111,16 +107,21 @@ impl EngineStatusPresentation {
     ///    不再套「引擎不可用：」的前缀 —— 它本身就是一句完整的话，而正文只有一行、
     ///    还要留给「内核无响应（等待超过 5 秒）」这个长度（约束 4：失败要**出现在正文里**，
     ///    不能只活在补充提示里）。
-    pub fn text(engine: &EngineState) -> String {
+    pub fn text(lang: crate::i18n::Lang, engine: &EngineState) -> String {
+        use crate::i18n::{t, Key};
         match engine {
-            EngineState::Connecting => "正在连接内核…".to_string(),
-            EngineState::NotStarted => "引擎未启动".to_string(),
-            EngineState::Running => "运行中".to_string(),
+            EngineState::Connecting => t(lang, Key::EngineConnecting).to_string(),
+            EngineState::NotStarted => t(lang, Key::EngineNotStarted).to_string(),
+            EngineState::Running => t(lang, Key::EngineRunning).to_string(),
             EngineState::Unavailable(reason) => {
                 if Self::is_handshake_timeout(reason) {
-                    return HANDSHAKE_TIMEOUT_MESSAGE.to_string();
+                    return Self::handshake_timeout_message(lang).to_string();
                 }
-                format!("引擎不可用：{}", Self::single_line(reason))
+                crate::i18n::tf(
+                    lang,
+                    Key::EngineUnavailablePrefix,
+                    &[("reason", &Self::single_line(reason))],
+                )
             }
         }
     }
@@ -153,16 +154,15 @@ impl EngineStatusPresentation {
     ///
     /// ⚠️ 唯一的例外仍是握手超时：内核一个字都没回，那句"原文"不存在 ——
     ///    这里给的是壳写的 [`Self::handshake_timeout_tooltip`]。
-    pub fn tooltip(engine: &EngineState) -> String {
+    pub fn tooltip(lang: crate::i18n::Lang, engine: &EngineState) -> String {
+        use crate::i18n::{t, Key};
         match engine {
-            EngineState::Connecting => "内核尚未握手（壳正在启动它）".to_string(),
-            EngineState::NotStarted => {
-                "下载引擎尚未启动 —— 添加下载任务后内核会启动它".to_string()
-            }
-            EngineState::Running => "下载引擎正在运行".to_string(),
+            EngineState::Connecting => t(lang, Key::EngineConnectingTooltip).to_string(),
+            EngineState::NotStarted => t(lang, Key::EngineNotStartedTooltip).to_string(),
+            EngineState::Running => t(lang, Key::EngineRunningTooltip).to_string(),
             EngineState::Unavailable(reason) => {
                 if Self::is_handshake_timeout(reason) {
-                    return Self::handshake_timeout_tooltip().to_string();
+                    return Self::handshake_timeout_tooltip(lang).to_string();
                 }
                 reason.clone()
             }
@@ -208,16 +208,16 @@ mod tests {
     #[test]
     fn engine_status_text_pins_every_case() {
         assert_eq!(
-            EngineStatusPresentation::text(&EngineState::Connecting),
+            EngineStatusPresentation::text(crate::i18n::Lang::Zh, &EngineState::Connecting),
             "正在连接内核…"
         );
         assert_eq!(
-            EngineStatusPresentation::text(&EngineState::NotStarted),
+            EngineStatusPresentation::text(crate::i18n::Lang::Zh, &EngineState::NotStarted),
             "引擎未启动"
         );
-        assert_eq!(EngineStatusPresentation::text(&EngineState::Running), "运行中");
+        assert_eq!(EngineStatusPresentation::text(crate::i18n::Lang::Zh, &EngineState::Running), "运行中");
         assert_eq!(
-            EngineStatusPresentation::text(&EngineState::Unavailable("内核崩了".to_string())),
+            EngineStatusPresentation::text(crate::i18n::Lang::Zh, &EngineState::Unavailable("内核崩了".to_string())),
             "引擎不可用：内核崩了"
         );
     }
@@ -225,10 +225,10 @@ mod tests {
     #[test]
     fn engine_status_text_distinguishes_all_four_cases() {
         let all: BTreeSet<String> = [
-            EngineStatusPresentation::text(&EngineState::Connecting),
-            EngineStatusPresentation::text(&EngineState::NotStarted),
-            EngineStatusPresentation::text(&EngineState::Running),
-            EngineStatusPresentation::text(&EngineState::Unavailable("x".to_string())),
+            EngineStatusPresentation::text(crate::i18n::Lang::Zh, &EngineState::Connecting),
+            EngineStatusPresentation::text(crate::i18n::Lang::Zh, &EngineState::NotStarted),
+            EngineStatusPresentation::text(crate::i18n::Lang::Zh, &EngineState::Running),
+            EngineStatusPresentation::text(crate::i18n::Lang::Zh, &EngineState::Unavailable("x".to_string())),
         ]
         .into_iter()
         .collect();
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn engine_status_text_folds_newlines_but_keeps_the_reason_verbatim() {
         let reason = "找不到内核可执行文件 benagen-core（找过：\n/a\n/b\n/c）";
-        let text = EngineStatusPresentation::text(&EngineState::Unavailable(reason.to_string()));
+        let text = EngineStatusPresentation::text(crate::i18n::Lang::Zh, &EngineState::Unavailable(reason.to_string()));
 
         assert_eq!(
             text,
@@ -256,18 +256,18 @@ mod tests {
 
         assert_eq!(HANDSHAKE_TIMEOUT_MESSAGE, "内核无响应（等待超过 5 秒）");
         assert_eq!(
-            EngineStatusPresentation::text(&engine),
+            EngineStatusPresentation::text(crate::i18n::Lang::Zh, &engine),
             "内核无响应（等待超过 5 秒）"
         );
         assert_eq!(
-            EngineStatusPresentation::tooltip(&engine),
+            EngineStatusPresentation::tooltip(crate::i18n::Lang::Zh, &engine),
             concat!(
                 "内核可能正卡在系统授权对话框上（例如\"想访问下载文件夹\"）。",
                 "请查看屏幕上是否有该对话框并点「允许」，然后点「重试」。"
             )
         );
         assert_eq!(
-            EngineStatusPresentation::handshake_timeout_tooltip(),
+            EngineStatusPresentation::handshake_timeout_tooltip(crate::i18n::Lang::Zh),
             concat!(
                 "内核可能正卡在系统授权对话框上（例如\"想访问下载文件夹\"）。",
                 "请查看屏幕上是否有该对话框并点「允许」，然后点「重试」。"
@@ -283,11 +283,11 @@ mod tests {
     fn engine_status_timeout_discriminator_is_exact_not_fuzzy() {
         let near_miss = format!("{HANDSHAKE_TIMEOUT_MESSAGE}。");
         assert_eq!(
-            EngineStatusPresentation::text(&EngineState::Unavailable(near_miss.clone())),
+            EngineStatusPresentation::text(crate::i18n::Lang::Zh, &EngineState::Unavailable(near_miss.clone())),
             format!("引擎不可用：{near_miss}")
         );
         assert_eq!(
-            EngineStatusPresentation::tooltip(&EngineState::Unavailable(near_miss.clone())),
+            EngineStatusPresentation::tooltip(crate::i18n::Lang::Zh, &EngineState::Unavailable(near_miss.clone())),
             near_miss
         );
         assert!(!EngineStatusPresentation::is_handshake_timeout(&near_miss));
@@ -336,15 +336,15 @@ mod tests {
     #[test]
     fn engine_status_tooltip_pins_every_case() {
         assert_eq!(
-            EngineStatusPresentation::tooltip(&EngineState::Connecting),
+            EngineStatusPresentation::tooltip(crate::i18n::Lang::Zh, &EngineState::Connecting),
             "内核尚未握手（壳正在启动它）"
         );
         assert_eq!(
-            EngineStatusPresentation::tooltip(&EngineState::NotStarted),
+            EngineStatusPresentation::tooltip(crate::i18n::Lang::Zh, &EngineState::NotStarted),
             "下载引擎尚未启动 —— 添加下载任务后内核会启动它"
         );
         assert_eq!(
-            EngineStatusPresentation::tooltip(&EngineState::Running),
+            EngineStatusPresentation::tooltip(crate::i18n::Lang::Zh, &EngineState::Running),
             "下载引擎正在运行"
         );
     }
@@ -353,17 +353,19 @@ mod tests {
     fn engine_status_tooltip_keeps_reason_untouched_while_text_folds_it() {
         let reason = "找不到内核可执行文件（找过：\n/a\n/b）";
         assert_eq!(
-            EngineStatusPresentation::tooltip(&EngineState::Unavailable(reason.to_string())),
+            EngineStatusPresentation::tooltip(crate::i18n::Lang::Zh, &EngineState::Unavailable(reason.to_string())),
             reason
         );
         assert_ne!(
-            EngineStatusPresentation::tooltip(&EngineState::Unavailable(reason.to_string())),
-            EngineStatusPresentation::text(&EngineState::Unavailable(reason.to_string()))
+            EngineStatusPresentation::tooltip(crate::i18n::Lang::Zh, &EngineState::Unavailable(reason.to_string())),
+            EngineStatusPresentation::text(crate::i18n::Lang::Zh, &EngineState::Unavailable(reason.to_string()))
         );
         assert!(!has_newline(&EngineStatusPresentation::text(
+            crate::i18n::Lang::Zh,
             &EngineState::Unavailable(reason.to_string())
         )));
         assert!(has_newline(&EngineStatusPresentation::tooltip(
+            crate::i18n::Lang::Zh,
             &EngineState::Unavailable(reason.to_string())
         )));
     }

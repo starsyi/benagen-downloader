@@ -24,7 +24,6 @@ use serde::Serialize;
 use crate::client::ClientError;
 use crate::platform::Platform;
 use crate::presentation::engine_status::EngineStatusPresentation;
-use crate::presentation::error_text::error_text;
 use crate::presentation::format::{ByteFormat, PercentFormat, SpeedFormat};
 use crate::presentation::RowColor;
 use crate::protocol::{EngineState, GlobalStat, TaskAction, TaskState, TransferItem};
@@ -113,7 +112,7 @@ impl TransferRow {
     ///
     /// ⚠️ **W-6（命名）**：上游是 `init(_ item:)`，这里按简报的 API 块写成 `new(item)` ——
     ///    Rust 没有"与类型同名的构造器"那个惯例位置，`new` 是这个语言里的对位写法。
-    pub fn new(item: &TransferItem) -> Self {
+    pub fn new(lang: crate::i18n::Lang, item: &TransferItem) -> Self {
         let path = TransferReveal::manifest_path(item.path.as_deref());
         let is_paused = Self::is_paused(item);
         Self {
@@ -128,7 +127,7 @@ impl TransferRow {
             percent_text: PercentFormat::text(item.completed, item.total),
             progress_fraction: Self::fraction(item.completed, item.total),
             speed_text: SpeedFormat::text(item.speed),
-            state_label: Self::label(item.state).to_string(),
+            state_label: Self::label(item.state, lang).to_string(),
             state_color: Self::color(item.state),
             state_icon_name: Self::icon_name(item.state).to_string(),
             shows_paused_badge: is_paused,
@@ -207,13 +206,18 @@ impl TransferRow {
     }
 
     /// `TaskState` 五档 → 呈现标签。**任何一档都不许是空白**（约束 4）。
-    fn label(state: TaskState) -> &'static str {
-        match state {
-            TaskState::Waiting => "等待中",
-            TaskState::Active => "下载中",
-            TaskState::Complete => "已完成",
-            TaskState::Error => "失败",
-            TaskState::Removed => "已移除",
+    fn label(state: TaskState, lang: crate::i18n::Lang) -> &'static str {
+        match (state, lang) {
+            (TaskState::Waiting, crate::i18n::Lang::Zh) => "等待中",
+            (TaskState::Waiting, _) => "Waiting",
+            (TaskState::Active, crate::i18n::Lang::Zh) => "下载中",
+            (TaskState::Active, _) => "Downloading",
+            (TaskState::Complete, crate::i18n::Lang::Zh) => "已完成",
+            (TaskState::Complete, _) => "Finished",
+            (TaskState::Error, crate::i18n::Lang::Zh) => "失败",
+            (TaskState::Error, _) => "Failed",
+            (TaskState::Removed, crate::i18n::Lang::Zh) => "已移除",
+            (TaskState::Removed, _) => "Removed",
         }
     }
 
@@ -304,13 +308,19 @@ pub struct TransferGlobalSummary {
 impl TransferGlobalSummary {
     /// ⚠️ 三个数**一个都不能省**（约束 4）：只显示"活动"的话，一个"排队等着的"
     /// 和一个"已经失败的"在客户面前就分不出来了。
-    pub fn of(global: &GlobalStat) -> Self {
+    pub fn of(lang: crate::i18n::Lang, global: &GlobalStat) -> Self {
         Self {
             speed_text: SpeedFormat::text(global.download_speed),
-            activity_text: format!(
-                "活动 {} · 等待 {} · 已停止 {}",
-                global.num_active, global.num_waiting, global.num_stopped
-            ),
+            activity_text: match lang {
+                crate::i18n::Lang::Zh => format!(
+                    "活动 {} · 等待 {} · 已停止 {}",
+                    global.num_active, global.num_waiting, global.num_stopped
+                ),
+                _ => format!(
+                    "{} active · {} waiting · {} stopped",
+                    global.num_active, global.num_waiting, global.num_stopped
+                ),
+            },
             // 没有已结束的任务时**禁用**那一项：点了之后毫无变化的话，
             // 用户分不清"清完了"还是"没生效"（约束 4）。
             can_clear_finished: global.num_stopped > 0,
@@ -340,8 +350,8 @@ pub enum TransferActionFailure {}
 
 impl TransferActionFailure {
     /// 一条失败 → 一句话。**逐字**交出去，不加工、不加前缀。
-    pub fn message_of(error: &ClientError) -> String {
-        error_text(error)
+    pub fn message_of(lang: crate::i18n::Lang, error: &ClientError) -> String {
+        crate::presentation::error_text::error_text_in(lang, error)
     }
 }
 
@@ -391,7 +401,7 @@ pub struct EngineBanner {
 
 impl EngineBanner {
     /// `engine` 与 `last_error` → 横幅；两处都没话说时 `None`。
-    pub fn of(engine: &EngineState, last_error: Option<&str>) -> Option<Self> {
+    pub fn of(lang: crate::i18n::Lang, engine: &EngineState, last_error: Option<&str>) -> Option<Self> {
         if let EngineState::Unavailable(why) = engine {
             // ⚠️ 覆盖 `Unavailable` 的**每一个**理由，不只是 `engine_disconnected` /
             //    `engine_start_failed`：任务 4b 的握手超时与重启失败都落在这里，
@@ -402,7 +412,7 @@ impl EngineBanner {
                 // 超时是**壳探测到的**状况（内核一个字都没回，没有原文可登），
                 // 所以只有这一支补一句"该去点什么"；内核自己给的失败原因不套壳的话。
                 hint: if EngineStatusPresentation::is_handshake_timeout(why) {
-                    Some(EngineStatusPresentation::handshake_timeout_tooltip().to_string())
+                    Some(EngineStatusPresentation::handshake_timeout_tooltip(lang).to_string())
                 } else {
                     None
                 },
@@ -444,11 +454,17 @@ impl TransferListEmpty {
     ///
     /// ⚠️ **W-6（返回类型）**：上游是 `String?`，这里给 `Option<&'static str>` ——
     ///    两支都是常量，借用出去比每次造一个 `String` 更贴近"它就是那句话本身"。
-    pub fn of(engine: &EngineState) -> Option<&'static str> {
-        match engine {
-            EngineState::NotStarted => Some(Self::ENGINE_NOT_STARTED),
-            EngineState::Running | EngineState::Connecting => Some(Self::NOTHING_IN_FLIGHT),
-            EngineState::Unavailable(_) => None,
+    pub fn of(lang: crate::i18n::Lang, engine: &EngineState) -> Option<&'static str> {
+        match (engine, lang) {
+            (EngineState::NotStarted, crate::i18n::Lang::Zh) => Some(Self::ENGINE_NOT_STARTED),
+            (EngineState::NotStarted, _) => Some("The download engine has not started yet (no tasks added)."),
+            (EngineState::Running | EngineState::Connecting, crate::i18n::Lang::Zh) => {
+                Some(Self::NOTHING_IN_FLIGHT)
+            }
+            (EngineState::Running | EngineState::Connecting, _) => {
+                Some("Nothing is being transferred.")
+            }
+            (EngineState::Unavailable(_), _) => None,
         }
     }
 }
@@ -712,6 +728,7 @@ impl TransferReveal {
 
 #[cfg(test)]
 mod tests {
+
     //! 上游：`macos/Tests/BenagenCoreKitTests/TransferRowTests.swift`（39 条，逐条对位）。
 
     use super::*;
@@ -720,6 +737,46 @@ mod tests {
     //    `AppModel.handshakeTimeoutMessage`，本波次不移植 `AppModel`，它的家在
     //    `presentation::engine_status`（`engine_status.rs` 的头注记了这一次裁决）。
     use crate::presentation::engine_status::HANDSHAKE_TIMEOUT_MESSAGE;
+
+    /// 判据（规格 W1）：**同一份数据、两种语言**，五档标签、汇总行、空态三处都换话，
+    /// 英文里一个汉字都没有。判别力：把任一 `label` 臂写死回中文 ⇒ 红。
+    #[test]
+    fn the_transfer_screen_speaks_english_when_asked() {
+        let item = Fixture {
+            state: TaskState::Waiting,
+            ..Default::default()
+        }
+        .build();
+        assert_eq!(
+            TransferRow::new(crate::i18n::Lang::En, &item).state_label,
+            "Waiting"
+        );
+        assert_eq!(
+            TransferRow::new(crate::i18n::Lang::Zh, &item).state_label,
+            "等待中"
+        );
+
+        let g = GlobalStat {
+            num_active: 2,
+            num_waiting: 3,
+            num_stopped: 4,
+            download_speed: 0,
+        };
+        assert_eq!(
+            TransferGlobalSummary::of(crate::i18n::Lang::En, &g).activity_text,
+            "2 active · 3 waiting · 4 stopped"
+        );
+        assert_eq!(
+            TransferGlobalSummary::of(crate::i18n::Lang::Zh, &g).activity_text,
+            "活动 2 · 等待 3 · 已停止 4"
+        );
+        assert_eq!(
+            TransferListEmpty::of(crate::i18n::Lang::En, &EngineState::NotStarted),
+            Some("The download engine has not started yet (no tasks added).")
+        );
+        let has_cjk = |s: &str| s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+        assert!(!has_cjk(&TransferGlobalSummary::of(crate::i18n::Lang::En, &g).activity_text));
+    }
 
     /// 上游 `TaskState.allCases`（Swift 的 `CaseIterable`）。
     ///
@@ -794,7 +851,7 @@ mod tests {
     }
 
     fn row(f: Fixture) -> TransferRow {
-        TransferRow::new(&f.build())
+        TransferRow::new(crate::i18n::Lang::Zh, &f.build())
     }
 
     fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -1249,17 +1306,18 @@ mod tests {
         let rpc = ClientError::Kernel {
             code: "invalid_params".to_string(),
             message: "GID g1 没有路径映射（可能已被移除）".to_string(),
+            class: None,
         };
         assert_eq!(
-            TransferActionFailure::message_of(&rpc),
+            TransferActionFailure::message_of(crate::i18n::Lang::Zh, &rpc),
             "GID g1 没有路径映射（可能已被移除）"
         );
         assert_eq!(
-            TransferActionFailure::message_of(&ClientError::KernelGone),
-            "内核进程已退出（管道结束）"
+            TransferActionFailure::message_of(crate::i18n::Lang::Zh, &ClientError::KernelGone),
+            "下载引擎进程已退出。请点「重试」重新启动它。"
         );
         // 结构化 `code` **不进文案**（契约 §5.1：壳按 code 分支，给客户看的是 message）。
-        assert!(!TransferActionFailure::message_of(&rpc).contains("invalid_params"));
+        assert!(!TransferActionFailure::message_of(crate::i18n::Lang::Zh, &rpc).contains("invalid_params"));
     }
 
     // -----------------------------------------------------------------------
@@ -1277,7 +1335,7 @@ mod tests {
             num_waiting: 3,
             num_stopped: 4,
         };
-        let s = TransferGlobalSummary::of(&g);
+        let s = TransferGlobalSummary::of(crate::i18n::Lang::Zh, &g);
         assert_eq!(s.speed_text, "900 B/s");
         assert!(
             s.activity_text.contains('2')
@@ -1292,7 +1350,7 @@ mod tests {
     fn a_zero_speed_is_a_placeholder_not_zero_bytes_per_second() {
         // 口径同 `SpeedFormat`：速度为 0 时是"不知道/已停"，不是"每秒零字节"。
         assert_eq!(
-            TransferGlobalSummary::of(&GlobalStat {
+            TransferGlobalSummary::of(crate::i18n::Lang::Zh, &GlobalStat {
                 download_speed: 0,
                 num_active: 0,
                 num_waiting: 0,
@@ -1309,7 +1367,7 @@ mod tests {
         // 没有已结束的任务时那一处**禁用** —— 否则用户点了之后毫无变化，
         // 分不清"清完了"还是"没生效"（约束 4）。
         assert_eq!(
-            TransferGlobalSummary::of(&GlobalStat {
+            TransferGlobalSummary::of(crate::i18n::Lang::Zh, &GlobalStat {
                 download_speed: 0,
                 num_active: 1,
                 num_waiting: 0,
@@ -1319,7 +1377,7 @@ mod tests {
             false
         );
         assert_eq!(
-            TransferGlobalSummary::of(&GlobalStat {
+            TransferGlobalSummary::of(crate::i18n::Lang::Zh, &GlobalStat {
                 download_speed: 0,
                 num_active: 1,
                 num_waiting: 0,
@@ -1347,7 +1405,7 @@ mod tests {
             // ⚠️ 裁决 EE：这个常量**是 `use` 进来的**，不是在本文件里又写了一遍字面量。
             HANDSHAKE_TIMEOUT_MESSAGE,
         ] {
-            let banner = EngineBanner::of(&EngineState::Unavailable(why.to_string()), None);
+            let banner = EngineBanner::of(crate::i18n::Lang::Zh, &EngineState::Unavailable(why.to_string()), None);
             assert_eq!(
                 banner.as_ref().map(|b| b.text.as_str()),
                 Some(why),
@@ -1367,6 +1425,7 @@ mod tests {
         // 超时那句提示里写着"…然后点「重试」"—— 本任务就是那一处的落点。
         // 横幅上除了原文（是什么），还要有那句"该怎么办"（壳写的）。
         let banner = EngineBanner::of(
+            crate::i18n::Lang::Zh,
             &EngineState::Unavailable(HANDSHAKE_TIMEOUT_MESSAGE.to_string()),
             None,
         )
@@ -1374,7 +1433,7 @@ mod tests {
         assert_eq!(banner.text, HANDSHAKE_TIMEOUT_MESSAGE);
         assert_eq!(
             banner.hint.as_deref(),
-            Some(EngineStatusPresentation::handshake_timeout_tooltip())
+            Some(EngineStatusPresentation::handshake_timeout_tooltip(crate::i18n::Lang::Zh))
         );
     }
 
@@ -1384,6 +1443,7 @@ mod tests {
         // 内核自己给的失败原因**不套壳的指导语**：那句话是给"内核一个字都没回"的现场写的，
         // 挂在一条内核已经说清楚原因的失败上就是壳在替内核解释（约束 3）。
         let banner = EngineBanner::of(
+            crate::i18n::Lang::Zh,
             &EngineState::Unavailable("引擎启动失败：aria2c 没有在 30 秒内就绪".to_string()),
             None,
         );
@@ -1396,6 +1456,7 @@ mod tests {
         // 瞬时错误（`engine_rpc_failed` / 一行垃圾）**不该**给「重试」：那一处的语义是
         // "重启内核"，拿它去处理一次可自愈的抖动等于杀掉一个健康的引擎（约束 1）。
         let transient = EngineBanner::of(
+            crate::i18n::Lang::Zh,
             &EngineState::Running,
             Some("下载引擎 RPC 失败：connection reset"),
         )
@@ -1409,9 +1470,9 @@ mod tests {
     #[test]
     fn a_usable_engine_without_an_error_has_no_banner() {
         // 没有要说的就不挂一条横幅（空横幅会把"一切正常"也变成一条要读的东西）。
-        assert_eq!(EngineBanner::of(&EngineState::Running, None), None);
-        assert_eq!(EngineBanner::of(&EngineState::NotStarted, None), None);
-        assert_eq!(EngineBanner::of(&EngineState::Connecting, None), None);
+        assert_eq!(EngineBanner::of(crate::i18n::Lang::Zh, &EngineState::Running, None), None);
+        assert_eq!(EngineBanner::of(crate::i18n::Lang::Zh, &EngineState::NotStarted, None), None);
+        assert_eq!(EngineBanner::of(crate::i18n::Lang::Zh, &EngineState::Connecting, None), None);
     }
 
     /// 上游 `theEngineReasonWinsOverAStaleTransientError`。
@@ -1420,6 +1481,7 @@ mod tests {
         // 两个来源同时有话说时，**以 `engine` 为准**：它是当前连接的事实，
         // 而 `last_error` 是"上一拍"的残留（非粘滞出口，下一次成功就清）。
         let banner = EngineBanner::of(
+            crate::i18n::Lang::Zh,
             &EngineState::Unavailable("下载引擎已断开：内核进程已退出（管道结束）".to_string()),
             Some("上一拍的瞬时错误"),
         )
@@ -1436,7 +1498,7 @@ mod tests {
     #[test]
     fn engine_not_started_is_presented_as_an_empty_state_not_an_error() {
         // `engine_not_started` → 「下载引擎尚未启动（还没有添加过任务）」，不显示为错误。
-        let text = TransferListEmpty::of(&EngineState::NotStarted);
+        let text = TransferListEmpty::of(crate::i18n::Lang::Zh, &EngineState::NotStarted);
         assert_eq!(text, Some("下载引擎尚未启动（还没有添加过任务）"));
     }
 
@@ -1445,7 +1507,7 @@ mod tests {
     fn an_empty_running_list_says_nothing_is_in_flight() {
         // 引擎在跑、列表为空 ⇒ 是"没有任务"，不是"引擎没起来"。
         assert_eq!(
-            TransferListEmpty::of(&EngineState::Running),
+            TransferListEmpty::of(crate::i18n::Lang::Zh, &EngineState::Running),
             Some("没有正在传输的任务")
         );
     }
@@ -1456,7 +1518,7 @@ mod tests {
         // 引擎不可用时**不在这里再说一遍**：顶部横幅（常驻、带「重试」）已经说了同一句话，
         // 两处重复同一句原文只会让真正要看的那条变淡。
         assert_eq!(
-            TransferListEmpty::of(&EngineState::Unavailable(
+            TransferListEmpty::of(crate::i18n::Lang::Zh, &EngineState::Unavailable(
                 "下载引擎已断开：内核进程已退出（管道结束）".to_string()
             )),
             None

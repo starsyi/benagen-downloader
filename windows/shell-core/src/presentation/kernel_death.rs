@@ -53,7 +53,6 @@
 //!    `error_text.rs` 同一条）。
 
 use crate::client::ClientError;
-use crate::presentation::error_text::error_text;
 use crate::protocol::codes;
 
 /// 「内核没了」的判定与它那句原文。
@@ -71,10 +70,10 @@ impl KernelDeath {
     ///
     /// ⚠️ **判据一律看结构化 `code`**（契约 §5.1：不看 `message` 的措辞）——
     ///    内核那支认的是 [`codes::ENGINE_DISCONNECTED`] 这个**码**，不是那句话长什么样。
-    pub fn reason_of(error: &ClientError) -> Option<String> {
+    pub fn reason_of(lang: crate::i18n::Lang, error: &ClientError) -> Option<String> {
         match error {
             // ① 传输层：管道结束 ⇒ 内核进程没了（`client.rs`：这是"内核已死"的唯一可靠信号）。
-            ClientError::KernelGone => Some(format!("{}{}", Self::PREFIX, error_text(error))),
+            ClientError::KernelGone => Some(format!("{}{}", Self::PREFIX, crate::presentation::error_text::error_text_in(lang, error))),
             // ①′ 传输层：**壳自己等超时了**（A5）—— 看门狗已经把这条通道关掉、子进程也收了
             //     ⇒ 规格 §3 A5 的原话是「把这条通道**判死**（**等同于 `KernelGone`**），
             //     走既有的「内核没了」路径（横幅 + 「重试」）」。
@@ -87,7 +86,7 @@ impl KernelDeath {
             //       `client.rs` 那一侧记着两件事的**不同**（内核可能还活着，所以不许报成
             //       `KernelGone`）；这里取的是两者的**相同**之处。
             ClientError::CallTimedOut { .. } => {
-                Some(format!("{}{}", Self::PREFIX, error_text(error)))
+                Some(format!("{}{}", Self::PREFIX, crate::presentation::error_text::error_text_in(lang, error)))
             }
             // ② 内核**自己**报的那两个码（上游 `case .engineDisconnected?, .engineStartFailed?`）：
             //    "引擎已被判定断开、这次重连也没成功"（设计规格 §9）与"引擎起不来"
@@ -96,7 +95,7 @@ impl KernelDeath {
             ClientError::Kernel { code, .. }
                 if code == codes::ENGINE_DISCONNECTED || code == codes::ENGINE_START_FAILED =>
             {
-                Some(error_text(error))
+                Some(crate::presentation::error_text::error_text_in(lang, error))
             }
             _ => None,
         }
@@ -157,6 +156,17 @@ pub enum CallFailure {
     /// ⚠️ 载荷是**内核原文**（`error_text`，约束 3：逐字、不加工）—— 一个字符都没变
     ///    （与 `Text` 的唯一区别是**调用方拿它做什么**）。
     NoDelivery(String),
+    /// **内核亲口说了分型**（规格 W2 的八类，`class` 是线上词）。
+    ///
+    /// ⚠️ 它与 `Text` 的唯一区别是**多带一格**：界面要按类给一句人话 + 一个动作
+    ///    （`presentation::error_card`），而"这一类是什么"只有内核说得准（壳不许靠
+    ///    措辞猜，契约 §5.1）。文字仍然是内核原文，一个字符都没动。
+    Classified {
+        /// 内核原文（[`error_text`] 的产物）。
+        text: String,
+        /// `network_unreachable` / `dns_failed` / … 之一。
+        class: String,
+    },
     /// **内核亲口说：下载引擎还没起来**（结构化码 `engine_not_started`，
     /// 见 [`is_engine_not_started`]）。
     ///
@@ -180,20 +190,29 @@ impl CallFailure {
     /// ⚠️ **判据的次序**：先问"内核是不是死了"（那一档要翻引擎），再问"内核是不是说
     ///    这一批没了"（那一档要作废当前批次），其余才是普通失败。
     ///    两条判断**不会同时成立**（一个是 transport / 引擎家族的码，一个是 `no_delivery`）。
-    pub fn of(error: &ClientError) -> Self {
-        if let Some(reason) = KernelDeath::reason_of(error) {
+    pub fn of(lang: crate::i18n::Lang, error: &ClientError) -> Self {
+        if let Some(reason) = KernelDeath::reason_of(crate::i18n::Lang::Zh, error) {
             return CallFailure::KernelGone {
                 reason,
-                text: error_text(error),
+                text: crate::presentation::error_text::error_text_in(lang, error),
             };
         }
         if is_engine_not_started(error) {
-            return CallFailure::EngineNotStarted(error_text(error));
+            return CallFailure::EngineNotStarted(crate::presentation::error_text::error_text_in(lang, error));
         }
         if is_no_delivery(error) {
-            return CallFailure::NoDelivery(error_text(error));
+            return CallFailure::NoDelivery(crate::presentation::error_text::error_text_in(lang, error));
         }
-        CallFailure::Text(error_text(error))
+        if let ClientError::Kernel {
+            class: Some(class), ..
+        } = error
+        {
+            return CallFailure::Classified {
+                text: crate::presentation::error_text::error_text_in(lang, error),
+                class: class.clone(),
+            };
+        }
+        CallFailure::Text(crate::presentation::error_text::error_text_in(lang, error))
     }
 
     /// 壳自己写的一句话（没有内核原文可登的那些：解不动回执、后台线程炸了…）。
@@ -212,6 +231,15 @@ impl CallFailure {
             CallFailure::EngineNotStarted(t) => t,
             CallFailure::NoDelivery(t) => t,
             CallFailure::Text(t) => t,
+            CallFailure::Classified { text, .. } => text,
+        }
+    }
+
+    /// 内核给的分型（没有就是 `None`：那些错误界面按"意料之外的错误"处置）。
+    pub fn class(&self) -> Option<&str> {
+        match self {
+            CallFailure::Classified { class, .. } => Some(class),
+            _ => None,
         }
     }
 }
@@ -270,9 +298,10 @@ mod tests {
             method: "get_state".to_string(),
             waited: Duration::from_secs(150),
         };
-        let reason = KernelDeath::reason_of(&error).expect("超时判死就是「内核没了」那一档");
+        let reason = KernelDeath::reason_of(crate::i18n::Lang::Zh, &error).expect("超时判死就是「内核没了」那一档");
         assert_eq!(
-            reason, "下载引擎已断开：内核在 150s 内没有回应 get_state——这条通道已判死，请点「重试」",
+            reason,
+            "下载引擎已断开：下载引擎在 150s 内没有回应 get_state——这条通道已判死，请点「重试」。",
             "与 `KernelGone` 同一列（壳加前缀）；正文是 `client.rs` 那句人话，一字不改"
         );
         assert!(
@@ -282,7 +311,7 @@ mod tests {
 
         // 完整的落点：调用方拿到的必须是 `KernelGone` 那一格（翻引擎 + 就地显示两句话），
         // 不是 `Text`（那一格**不翻引擎** ⇒ 横幅与「重试」都不会出现）。
-        match CallFailure::of(&error) {
+        match CallFailure::of(crate::i18n::Lang::Zh, &error) {
             CallFailure::KernelGone { reason: r, text } => {
                 assert_eq!(r, reason, "翻引擎那句与 `reason_of` 是同一句");
                 assert!(
@@ -297,13 +326,16 @@ mod tests {
 
     /// 传输层那一支：**壳加前缀**，而且前缀是逐字的那一个。
     ///
-    /// 判别力：把 `format!` 换成 `error_text(error)`（丢前缀），这一条立刻红 ——
+    /// 判别力：把 `format!` 换成 `crate::presentation::error_text::error_text_in(lang, error)`（丢前缀），这一条立刻红 ——
     /// 而那句前缀正是客户在界面上认出"这是内核没了，不是这一屏的事"的那半句话。
     #[test]
     fn a_transport_death_gets_the_shells_prefix_in_front_of_the_clients_text() {
-        let reason = KernelDeath::reason_of(&ClientError::KernelGone)
+        let reason = KernelDeath::reason_of(crate::i18n::Lang::Zh, &ClientError::KernelGone)
             .expect("管道结束就是内核已死（`client.rs` 的记账）");
-        assert_eq!(reason, "下载引擎已断开：内核进程已退出（管道结束）");
+        assert_eq!(
+            reason,
+            "下载引擎已断开：下载引擎进程已退出。请点「重试」重新启动它。"
+        );
         assert!(
             reason.starts_with(KernelDeath::PREFIX),
             "传输层那一支必须带上壳写的前缀：{reason}"
@@ -320,8 +352,9 @@ mod tests {
         let error = ClientError::Kernel {
             code: "engine_disconnected".to_string(),
             message: message.to_string(),
+            class: None,
         };
-        let reason = KernelDeath::reason_of(&error).expect("这个码就是引擎断开");
+        let reason = KernelDeath::reason_of(crate::i18n::Lang::Zh, &error).expect("这个码就是引擎断开");
         assert_eq!(
             reason, message,
             "内核自己说的那句要**原样**进引擎那一格（约束 3：壳不加工内核的话）"
@@ -349,13 +382,14 @@ mod tests {
         let error = ClientError::Kernel {
             code: "engine_start_failed".to_string(),
             message: message.to_string(),
+            class: None,
         };
         // ⚠️ 断言是**相等**（不是"包含"）：它同时钉住两件事 ——
         //    ① 这个码被认出来了（`Some(…)` 而不是 `None`）；
         //    ② 与"断开"那一支同样**不加**前缀（约束 3：内核原文字面照登）。
         //    只钉 ① 的话，"两支都套前缀"那种改法不会红。
         assert_eq!(
-            KernelDeath::reason_of(&error).as_deref(),
+            KernelDeath::reason_of(crate::i18n::Lang::Zh, &error).as_deref(),
             Some(message),
             "这个码必须把引擎那一格改掉（上游与 `engine_disconnected` 并列），而且原文照登"
         );
@@ -363,7 +397,7 @@ mod tests {
 
     /// **别的一律不是**：这不是"凡是错误都翻引擎"。
     ///
-    /// 判别力：把 `_ => None` 改成"任何错误都算"（例如把兜底写成 `Some(error_text(error))`），
+    /// 判别力：把 `_ => None` 改成"任何错误都算"（例如把兜底写成 `Some(crate::presentation::error_text::error_text_in(lang, error))`），
     /// 这一条立刻红 —— 而那个改动会把一次**可自愈的** RPC 抖动（`engine_rpc_failed` 是
     /// 上游明确**不**吸收的一类）翻成一条要求客户点「重试」的引擎横幅：拿它去处理一次抖动
     /// 等于杀掉一个健康的引擎。
@@ -373,14 +407,17 @@ mod tests {
             ClientError::Kernel {
                 code: "engine_rpc_failed".to_string(),
                 message: "connection reset".to_string(),
+                class: None,
             },
             ClientError::Kernel {
                 code: "engine_not_started".to_string(),
                 message: "下载引擎尚未启动".to_string(),
+                class: None,
             },
             ClientError::Kernel {
                 code: "path_not_found".to_string(),
                 message: "清单里没有目录".to_string(),
+                class: None,
             },
             // 内核还在，只是发来的东西壳解不动（上游 `.malformedResponse` → `.verbatim`）。
             ClientError::LineNotUtf8,
@@ -390,7 +427,7 @@ mod tests {
         ];
         for error in &not_death {
             assert_eq!(
-                KernelDeath::reason_of(error),
+                KernelDeath::reason_of(crate::i18n::Lang::Zh, error),
                 None,
                 "这一条不是「内核没了」，不许动引擎那一格：{error:?}"
             );
@@ -401,7 +438,7 @@ mod tests {
     /// （翻引擎用 `reason`、就地显示用 `text` —— 见那个类型自己的文档）。
     ///
     /// 判别力（两个方向都实测过）：
-    ///   * 把 `of` 写成常量 `CallFailure::Text(error_text(error))`（即"忘了分派"）⇒ 红，
+    ///   * 把 `of` 写成常量 `CallFailure::Text(crate::presentation::error_text::error_text_in(lang, error))`（即"忘了分派"）⇒ 红，
     ///     而那个改动会让三页继续各自把内核死亡当成一条瞬时错误（横幅没有「重试」、闸门不关、
     ///     轮询继续拍一个死内核）；
     ///   * 把 `text` 那一半丢掉（`KernelGone` 只留 `reason`）⇒ 红 —— 而那个改动是
@@ -409,15 +446,15 @@ mod tests {
     ///     **一点反应都没有**（引擎横幅早就挂在那里了，它不是"你刚才那一下没成"的回答）。
     #[test]
     fn a_call_failure_keeps_the_two_contracts_and_both_messages_apart() {
-        let death = CallFailure::of(&ClientError::KernelGone);
+        let death = CallFailure::of(crate::i18n::Lang::Zh, &ClientError::KernelGone);
         match death {
             CallFailure::KernelGone { reason, text } => {
                 assert_eq!(
-                    reason, "下载引擎已断开：内核进程已退出（管道结束）",
+                    reason, "下载引擎已断开：下载引擎进程已退出。请点「重试」重新启动它。",
                     "`reason` 是写进引擎那一格的那句话（带壳写的前缀）"
                 );
                 assert_eq!(
-                    text, "内核进程已退出（管道结束）",
+                    text, "下载引擎进程已退出。请点「重试」重新启动它。",
                     "`text` 是给这一屏就地显示的内核原文 —— **不带**那半句前缀（免得与横幅逐字重复）"
                 );
                 assert_ne!(reason, text, "两句话是两件事，不许退化成同一句");
@@ -429,11 +466,15 @@ mod tests {
             CallFailure::EngineNotStarted(text) => {
                 panic!("内核没了却被判成「引擎没起来」：{text}")
             }
+            CallFailure::Classified { text, .. } => {
+                panic!("内核没了却带着分型：{text}")
+            }
         }
 
-        let other = CallFailure::of(&ClientError::Kernel {
+        let other = CallFailure::of(crate::i18n::Lang::Zh, &ClientError::Kernel {
             code: "engine_rpc_failed".to_string(),
             message: "connection reset".to_string(),
+            class: None,
         });
         match other {
             CallFailure::Text(text) => assert_eq!(text, "connection reset"),
@@ -446,6 +487,9 @@ mod tests {
             CallFailure::EngineNotStarted(text) => {
                 panic!("一次 RPC 报错不是「引擎没起来」（那会把引擎那一格翻成未启动）：{text}")
             }
+            CallFailure::Classified { text, class } => {
+                panic!("`class: None` 的内核错误不该带分型：{class} / {text}")
+            }
         }
         // 壳自己写的那一支（没有内核原文可登）。
         match CallFailure::shell("后台线程炸了".to_string()) {
@@ -453,6 +497,7 @@ mod tests {
             CallFailure::KernelGone { .. } => panic!("壳自己写的诊断不是内核没了"),
             CallFailure::NoDelivery(_) => panic!("壳自己写的诊断不是「这一批没了」"),
             CallFailure::EngineNotStarted(_) => panic!("壳自己写的诊断不是「引擎没起来」"),
+            CallFailure::Classified { .. } => panic!("壳自己写的诊断没有内核分型"),
         }
     }
 
@@ -469,9 +514,10 @@ mod tests {
         let not_started = ClientError::Kernel {
             code: "engine_not_started".to_string(),
             message: "下载引擎尚未启动（先 enqueue 才会起引擎）".to_string(),
+            class: None,
         };
         assert!(is_engine_not_started(&not_started), "这个码就是「引擎没起来」");
-        match CallFailure::of(&not_started) {
+        match CallFailure::of(crate::i18n::Lang::Zh, &not_started) {
             CallFailure::EngineNotStarted(text) => assert_eq!(
                 text, "下载引擎尚未启动（先 enqueue 才会起引擎）",
                 "内核原文逐字（约束 3）"
@@ -483,11 +529,12 @@ mod tests {
         let expired = ClientError::Kernel {
             code: "no_delivery".to_string(),
             message: "这一批不存在或已过期".to_string(),
+            class: None,
         };
         assert!(!is_engine_not_started(&expired), "`no_delivery` 不是「引擎没起来」");
         assert!(!is_no_delivery(&not_started), "`engine_not_started` 不是「这一批没了」");
         assert!(matches!(
-            CallFailure::of(&expired),
+            CallFailure::of(crate::i18n::Lang::Zh, &expired),
             CallFailure::NoDelivery(_)
         ));
 
@@ -508,9 +555,10 @@ mod tests {
         let expired = ClientError::Kernel {
             code: "no_delivery".to_string(),
             message: "这一批不存在或已过期".to_string(),
+            class: None,
         };
         assert!(is_no_delivery(&expired), "这个码就是「这一批没了」");
-        match CallFailure::of(&expired) {
+        match CallFailure::of(crate::i18n::Lang::Zh, &expired) {
             CallFailure::NoDelivery(text) => {
                 assert_eq!(text, "这一批不存在或已过期", "内核原文逐字（约束 3）")
             }
@@ -525,10 +573,11 @@ mod tests {
             let error = ClientError::Kernel {
                 code: code.to_string(),
                 message: "另外一件事".to_string(),
+                class: None,
             };
             assert!(!is_no_delivery(&error), "{code} 不是「这一批没了」");
             assert!(
-                matches!(CallFailure::of(&error), CallFailure::Text(_)),
+                matches!(CallFailure::of(crate::i18n::Lang::Zh, &error), CallFailure::Text(_)),
                 "{code} 该走「别的失败」那一格"
             );
         }
@@ -536,7 +585,7 @@ mod tests {
         // 内核没了那一档也**不许**被这一格抢走（那要翻引擎，不是作废批次）。
         assert!(!is_no_delivery(&ClientError::KernelGone));
         assert!(matches!(
-            CallFailure::of(&ClientError::KernelGone),
+            CallFailure::of(crate::i18n::Lang::Zh, &ClientError::KernelGone),
             CallFailure::KernelGone { .. }
         ));
     }

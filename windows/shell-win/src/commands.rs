@@ -56,6 +56,8 @@ use shell_core::presentation::app_preferences::{
     DownloadDirChange, DownloadDirectory, VerboseLoggingChange,
 };
 use shell_core::presentation::breadcrumb::Breadcrumb;
+use crate::diskspeed;
+use shell_core::presentation::disk_notice::DiskNotice;
 use shell_core::presentation::browser_row::{BrowserRow, BrowserSelection, SelectionSummary};
 use shell_core::presentation::delivery_summary::DeliveryCodeEntry;
 use shell_core::api::tree::DownloadAction;
@@ -116,6 +118,10 @@ pub fn invoke_handler<R: tauri::Runtime>(
     tauri::generate_handler![
         // 七个既有端点（任务 7，对齐第二代那七条路由）
         state,
+        // 自动重启的进度（规格 W3）：前端轮询它来画「正在重启下载引擎（第 n/3 次）…」。
+        restart_progress,
+        // 双域名竞速的解析过程（规格 W4）：加载清单期间把四阶段逐行摆出来。
+        delivery_progress,
         load,
         retry,
         tree,
@@ -186,17 +192,19 @@ pub fn state(app: tauri::State<'_, Shell>) -> Value {
 #[tauri::command(async)]
 pub fn load(app: tauri::State<'_, Shell>, code: String, base_url: Option<String>) -> Value {
     app.session.reset_auto_restart();
+    // 这两句"太长"的提示要按界面语言成句（规格 W1）。
+    let lang = app.session.lang();
     // ⚠️ 前端不传 `base_url` 时它是 `None`（"高级：自定义下载地址"那一格没填）⇒ 空串，
     //    与第二代 `body.get("base_url").and_then(as_str).unwrap_or("")` 逐字同义。
     let base_url = base_url.unwrap_or_default();
     if !DeliveryCodeEntry::is_sendable(&code) {
         app.session
-            .set_load(LoadState::Failed(DeliveryCodeEntry::too_long_hint()));
+            .set_load(LoadState::Failed(DeliveryCodeEntry::too_long_hint(lang)));
         return api::envelope::ok(serde_json::json!({ "status": "rejected" }));
     }
     if !base_url.is_empty() && !DeliveryCodeEntry::is_sendable(&base_url) {
         app.session
-            .set_load(LoadState::Failed(DeliveryCodeEntry::base_url_too_long_hint()));
+            .set_load(LoadState::Failed(DeliveryCodeEntry::base_url_too_long_hint(lang)));
         return api::envelope::ok(serde_json::json!({ "status": "rejected" }));
     }
     // ⚠️ 锁的纪律：`client()` 克隆出来就放锁，`spawn_load` 起后台线程跑那条长调用。
@@ -255,13 +263,15 @@ pub fn tree(
     let Some(client) = app.session.client() else {
         return api::envelope::err(api::NO_KERNEL);
     };
+    // 状态列那几个词要按界面语言成句（规格 W1）。
+    let lang = app.session.lang();
     match path {
-        Some(path) => match kernel::list_dir(&client, &path) {
+        Some(path) => match kernel::list_dir(lang, &client, &path) {
             Ok(result) => {
                 app.session.set_last_error(None);
                 // ⚠️ 面包屑由壳拼（`list_dir` 的目录项没有 `path` 键），而且这里传的
                 //    `path` 就是请求里那一条**清单原文**（约束 3：不 trim、不加工）。
-                api::tree::level(
+                api::tree::level(lang,
                     &Breadcrumb::new(&path),
                     &BrowserRow::rows(&result.entries, &path),
                 )
@@ -270,7 +280,7 @@ pub fn tree(
             //    判据在 `api::tree::level_failure` 的文档里。面包屑跟着**退到的那一层**走。
             Err(why) => api::tree::level_failure(&Breadcrumb::new(&why.path), &why),
         },
-        None => match kernel::get_tree(&client) {
+        None => match kernel::get_tree(lang, &client) {
             Ok(result) => {
                 app.session.set_last_error(None);
                 // ⚠️ 那一层 `path` 的分支**不看** `selection`（"这一层有哪些行"与勾选面无关）。
@@ -316,6 +326,7 @@ fn whole_tree(
     selection: Option<&[String]>,
 ) -> Value {
     let view = session.view();
+    let lang = view.lang;
     // ⚠️ `tree_code == code` 在这里**是事实不是捷径**：这一棵树就是为"当前已加载的那一批"
     //    刚拉下来的，两个码本来就是同一个值。那道闸实际拦住的是 `code == None`
     //    （还没有生效批次 ⇒ 不显示进度），也就是它的本意：不把上一批的进度摆在这一批底下。
@@ -341,9 +352,9 @@ fn whole_tree(
     //    它的出处是 macOS 侧 `SelectionBar.swift:33` 的 `hint: selection.isEmpty ? … : nil`
     //    （那是视图里的一步取值，不是一条能被单测钉住的判据）。
     let action = DownloadAction {
-        button_title: DownloadTargets::button_title(&selected),
+        button_title: DownloadTargets::button_title(lang, &selected),
         empty_selection_hint: if selected.is_empty() {
-            Some(DownloadTargets::empty_selection_hint().to_string())
+            Some(DownloadTargets::empty_selection_hint(lang).to_string())
         } else {
             None
         },
@@ -420,6 +431,8 @@ pub fn enqueue(app: tauri::State<'_, Shell>, paths: Vec<String>) -> Value {
 /// 三步（规格 §5.3）：取数据（**会话快照**里那一批的全部文件）→ 判据（`kernel_paths`
 /// 里那一次 `DownloadTargets::paths`）→ 交给内核。
 fn enqueue_with(session: &Arc<Session>, paths: Vec<String>) -> Value {
+    // 失败文案要按界面语言成句（规格 W1）。
+    let lang = session.lang();
     let Some(client) = session.client() else {
         return api::envelope::err(api::NO_KERNEL);
     };
@@ -449,7 +462,7 @@ fn enqueue_with(session: &Arc<Session>, paths: Vec<String>) -> Value {
         DownloadTargets::chunks(&paths)
     };
     for (i, chunk) in chunks.iter().enumerate() {
-        match kernel::enqueue(&client, chunk) {
+        match kernel::enqueue(lang, &client, chunk) {
             Ok(mut r) => {
                 merged.added.append(&mut r.added);
                 merged.rejected.append(&mut r.rejected);
@@ -486,6 +499,11 @@ fn enqueue_with(session: &Arc<Session>, paths: Vec<String>) -> Value {
     //    不许被这行覆盖。
     //    ⚠️ 少了这一行，入队之后徽标停在「引擎未启动」而列表已在下载（2026-10-14 现场）。
     session.set_engine(EngineState::Running);
+    // 目标盘可能比网慢（现场 1.7 MB/s 是移动硬盘写的锅，不是 CDN）：量一次、粘滞进会话。
+    // 量不出来就不提示 —— 提示是"额外的好意"，不许让它变成一次失败。
+    if let Ok(preferences) = load_preferences() {
+        note_disk_speed(session, Some(&preferences.download_dir), false);
+    }
     api::enqueue::enqueue(&EnqueueFeedback::of(&merged))
 }
 
@@ -562,9 +580,11 @@ fn transfers_with(session: &Arc<Session>) -> Value {
     };
     // ⚠️ 空列表那句话要用到引擎态 ⇒ 先取一份快照（锁只在这一行里）。
     let engine = session.view().engine;
+    // 空态文案要按界面语言成句（规格 W1）：取一次，两处空快照共用。
+    let lang = session.lang();
     // ⚠️ 两个翻格判据**先算出来再 `match`**：`Snapshot` 臂按值拿走了 `result` 之后
     //    `poll` 就动不了了。判据本身住在 `TransferPoll`（四档各有一条用例钉着）。
-    let poll = kernel::transfer_list(&client);
+    let poll = kernel::transfer_list(lang, &client);
     let promote_running = poll.promotes_engine_to_running();
     let flip_not_started = poll.flips_engine_to_not_started();
     match poll {
@@ -576,11 +596,11 @@ fn transfers_with(session: &Arc<Session>) -> Value {
             if promote_running {
                 session.set_engine(EngineState::Running);
             }
-            let rows: Vec<TransferRow> = result.items.iter().map(TransferRow::new).collect();
+            let rows: Vec<TransferRow> = result.items.iter().map(|i| TransferRow::new(lang, i)).collect();
             api::transfers::transfers(
                 &rows,
-                Some(&TransferGlobalSummary::of(&result.global)),
-                TransferListEmpty::of(&engine),
+                Some(&TransferGlobalSummary::of(lang, &result.global)),
+                TransferListEmpty::of(lang, &engine),
                 &batch_control(&rows),
             )
         }
@@ -599,7 +619,7 @@ fn transfers_with(session: &Arc<Session>) -> Value {
             if flip_not_started {
                 session.note_engine_not_started();
             }
-            api::transfers::transfers(&[], None, TransferListEmpty::of(&engine), &batch_control(&[]))
+            api::transfers::transfers(&[], None, TransferListEmpty::of(lang, &engine), &batch_control(&[]))
         }
         // 🔴 **内核亲口说"这一批没了"**（`no_delivery`）：除了发空快照，还要**作废当前批次**
         //    （清掉 `load_request` —— 对齐 macOS 的 `resetToEmptyState()`）。
@@ -610,7 +630,7 @@ fn transfers_with(session: &Arc<Session>) -> Value {
         //    （正常态、不显示那句话），我们照办 —— 界面上的表现就是**空态**，不是红横幅。
         TransferPoll::NoDelivery => {
             session.reset_to_empty_state();
-            api::transfers::transfers(&[], None, TransferListEmpty::of(&engine), &batch_control(&[]))
+            api::transfers::transfers(&[], None, TransferListEmpty::of(lang, &engine), &batch_control(&[]))
         }
         TransferPoll::Failed(why) => {
             note_failure(session, &why);
@@ -624,10 +644,11 @@ fn transfers_with(session: &Arc<Session>) -> Value {
 /// ⚠️ 前端**只在校验页可见时**按 1 s 轮询它（规格 §3.5），否则一发都不发。
 #[tauri::command(async)]
 pub fn verify(app: tauri::State<'_, Shell>) -> Value {
+    let lang = app.session.lang();
     let Some(client) = app.session.client() else {
         return api::envelope::err(api::NO_KERNEL);
     };
-    match kernel::verify_status(&client) {
+    match kernel::verify_status(lang, &client) {
         Ok(status) => {
             app.session.set_last_error(None);
             // ⚠️ `VerifySummary::of` 收 `Option`，而"还没取过"（`None`）那一档**在这里
@@ -636,7 +657,7 @@ pub fn verify(app: tauri::State<'_, Shell>) -> Value {
             //    按纪律（规格 §3.2 在 Rust 侧的同一形态）归 `shell-core::api`。
             //    它今天的不可达性、以及**为什么宁可留一句也不许 panic** 都写在
             //    `api::verify::NO_VERIFY_SUMMARY` 的文档里 —— 别把它搬回这里。
-            match VerifySummary::of(Some(&status)) {
+            match VerifySummary::of(app.session.lang(), Some(&status)) {
                 Some(summary) => api::verify::verify(&summary),
                 None => api::envelope::err(api::verify::NO_VERIFY_SUMMARY),
             }
@@ -669,10 +690,11 @@ pub fn verify(app: tauri::State<'_, Shell>) -> Value {
 ///    这一条**只把原文交给那次调用的回执**（前端对它的失败**只记控制台、不上屏**）。
 #[tauri::command(async)]
 pub fn update_status(app: tauri::State<'_, Shell>) -> Value {
+    let lang = app.session.lang();
     let Some(client) = app.session.client() else {
         return api::envelope::err(api::NO_KERNEL);
     };
-    match kernel::update_status(&client) {
+    match kernel::update_status(lang, &client) {
         Ok(kernel_value) => {
             // 成功 ⇒ 清掉上一次失败（那一条更新检查恢复了），与其余命令同一条非粘滞口径。
             app.session.set_last_error(None);
@@ -694,10 +716,11 @@ pub fn update_status(app: tauri::State<'_, Shell>) -> Value {
 ///    `verbose_logging_set` 那种"改了要重启"的开关**不是一回事**。
 #[tauri::command(async)]
 pub fn update_set_enabled(app: tauri::State<'_, Shell>, enabled: bool) -> Value {
+    let lang = app.session.lang();
     let Some(client) = app.session.client() else {
         return api::envelope::err(api::NO_KERNEL);
     };
-    match kernel::update_set_enabled(&client, enabled) {
+    match kernel::update_set_enabled(lang, &client, enabled) {
         Ok(kernel_value) => {
             app.session.set_last_error(None);
             api::update::update_status(&kernel_value)
@@ -729,12 +752,57 @@ pub fn update_set_enabled(app: tauri::State<'_, Shell>, enabled: bool) -> Value 
 ///    这一条是用户点出来的 ⇒ 没有内核 / 传输断了必须让用户知道自己那一下没成
 ///    （同 [`update_set_enabled`] 那一档）。而内核**自己的**失败不进这里：
 ///    它落进 `last_check_ok:false`、由那句回执说（那是"没查成"，不是"命令没发出去"）。
+/// 自动重启的进度（规格 W3）：**轮询**它来画「正在重启下载引擎（第 n/3 次）…」。
+///
+/// ⚠️ 取不到 ⇒ 回 `{"text": null}`（不是错误）：这是一条**装饰**命令，
+///    拿不到就什么都不说，不把一次读失败升级成红条。
+/// 双域名竞速的解析过程（规格 W4）：加载清单期间轮询它，把四阶段逐行摆出来。
+///
+/// ⚠️ 取不到 ⇒ 回 `{"lines": []}`（不是错误，同 `restart_progress` 那条）。
+#[tauri::command(async)]
+pub fn delivery_progress(app: tauri::State<'_, Shell>) -> Value {
+    let lang = app.session.lang();
+    let Some(client) = app.session.client() else {
+        return api::envelope::ok(serde_json::json!({"lines": []}));
+    };
+    match kernel::delivery_progress(lang, &client) {
+        Ok(v) => api::envelope::ok(serde_json::json!({
+            "lines": v.get("lines").cloned().unwrap_or_else(|| serde_json::json!([])),
+        })),
+        Err(_) => api::envelope::ok(serde_json::json!({"lines": []})),
+    }
+}
+
+#[tauri::command(async)]
+pub fn restart_progress(app: tauri::State<'_, Shell>) -> Value {
+    let lang = app.session.lang();
+    let Some(client) = app.session.client() else {
+        return api::envelope::ok(serde_json::json!({"text": null}));
+    };
+    match kernel::restart_progress(lang, &client) {
+        Ok(v) => {
+            let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("idle");
+            let attempt = v.get("attempt").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+            let budget = v.get("budget").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+            let notice = shell_core::presentation::restart_notice::RestartNotice::of(
+                lang, state, attempt, budget,
+            );
+            api::envelope::ok(match notice {
+                Some(n) => serde_json::json!({"text": n.text}),
+                None => serde_json::json!({"text": null}),
+            })
+        }
+        Err(_) => api::envelope::ok(serde_json::json!({"text": null})),
+    }
+}
+
 #[tauri::command(async)]
 pub fn update_check_now(app: tauri::State<'_, Shell>) -> Value {
+    let lang = app.session.lang();
     let Some(client) = app.session.client() else {
         return api::envelope::err(api::NO_KERNEL);
     };
-    match kernel::update_check_now(&client) {
+    match kernel::update_check_now(lang, &client) {
         Ok(kernel_value) => {
             app.session.set_last_error(None);
             let check = UpdateCheck::of(&kernel_value);
@@ -814,10 +882,11 @@ pub fn task_action(
     action: TaskAction,
     gid: Option<String>,
 ) -> Value {
+    let lang = app.session.lang();
     let Some(client) = app.session.client() else {
         return api::envelope::err(api::NO_KERNEL);
     };
-    match kernel::task_action(&client, action, gid) {
+    match kernel::task_action(lang, &client, action, gid) {
         Ok(()) => {
             // 一键开始成功 ⇒ 「刚换过目录、队列还没补回来」这件事办完了；搬运的结果话也不用再留。
             if action == TaskAction::ResumeAll {
@@ -893,16 +962,17 @@ pub fn reveal(path: Option<String>) -> Value {
 ///    由 `api::settings::payload` 从 `SessionView.handshake_reply` 那一格解析。
 #[tauri::command(async)]
 pub fn settings_get(app: tauri::State<'_, Shell>) -> Value {
+    let lang = app.session.lang();
     let Some(client) = app.session.client() else {
         return api::envelope::err(api::NO_KERNEL);
     };
     // ⚠️ 锁的纪律：`view()` 与 `client()` 都是"读一次就放锁"（`-k` 的候选集合要从
     //    这一格里取，而它是一份 `String` 的克隆 —— 与内核无关）。
     let handshake = app.session.view().handshake_reply;
-    match kernel::get_settings(&client) {
+    match kernel::get_settings(lang, &client) {
         Ok(current) => {
             app.session.set_last_error(None);
-            api::settings::payload(&current, handshake.as_deref())
+            api::settings::payload_for(&current, handshake.as_deref(), app.session.lang())
         }
         Err(why) => {
             note_failure(&app.session, &why);
@@ -917,7 +987,7 @@ pub fn settings_get(app: tauri::State<'_, Shell>) -> Value {
 ///
 /// ⚠️ **它不重启内核**：七个字段里没有一项走 argv —— 内核的 `set_settings` 把
 ///    `-j` 与限速**即时**下发给正在跑的引擎，其余各项在**添加新任务**时生效
-///    （`SettingsForm::APPLY_NOTE` 说的就是这件事）。改**下载目录**是另一条命令
+///    （`SettingsForm::apply_note(crate::i18n::Lang::Zh)` 说的就是这件事）。改**下载目录**是另一条命令
 ///    （`preferences_set`）—— 那一个**必须**重启内核，因为目录只在 argv 上。
 ///
 /// ⚠️ **回执发的是"写完之后"那一份**（内核的 `set_settings` 回的是归一化之后的值，
@@ -926,14 +996,17 @@ pub fn settings_get(app: tauri::State<'_, Shell>) -> Value {
 ///    内核这条响应本身就是"现在生效的那一份"。
 #[tauri::command(async)]
 pub fn settings_set(app: tauri::State<'_, Shell>, settings: Settings) -> Value {
+    let lang = app.session.lang();
     let Some(client) = app.session.client() else {
         return api::envelope::err(api::NO_KERNEL);
     };
     let handshake = app.session.view().handshake_reply;
-    match kernel::set_settings(&client, &settings) {
+    match kernel::set_settings(lang, &client, &settings) {
         Ok(echoed) => {
             app.session.set_last_error(None);
-            api::settings::payload(&echoed, handshake.as_deref())
+            // 客户这次明确选过语言了（首启询问从此不再出现）。
+            app.session.note_language_chosen(&echoed.settings.language);
+            api::settings::payload_for(&echoed, handshake.as_deref(), app.session.lang())
         }
         Err(why) => {
             note_failure(&app.session, &why);
@@ -946,9 +1019,10 @@ pub fn settings_set(app: tauri::State<'_, Shell>, settings: Settings) -> Value {
 ///
 /// **对齐 macOS**：`AppModel.downloadDir` + `SettingsView` 的下载目录段。
 #[tauri::command]
-pub fn preferences_get() -> Value {
+pub fn preferences_get(app: tauri::State<'_, Shell>) -> Value {
+    let lang = app.session.lang();
     match load_preferences() {
-        Ok(preferences) => api::preferences::current(&preferences),
+        Ok(preferences) => api::preferences::current(lang, &preferences),
         // 存放根取不到（`%APPDATA%` 缺失）⇒ **大声失败**：那句话点名了缺的是哪个变量、
         // 并给出补救（W-2）。**不许**悄悄当成"未配置"（那会让用户以为设置丢了）。
         Err(why) => api::envelope::err(&why),
@@ -1167,6 +1241,7 @@ fn owner_hwnd<R: tauri::Runtime>(_window: &tauri::WebviewWindow<R>) -> *mut std:
 ///      那是用户的选择，下次启动仍然按它起内核（与 macOS 同一条）。
 #[tauri::command(async)]
 pub fn preferences_set(app: tauri::State<'_, Shell>, dir: String) -> Value {
+    let lang = app.session.lang();
     let path = match preferences_path() {
         Ok(path) => path,
         Err(why) => return api::envelope::err(&why),
@@ -1177,7 +1252,7 @@ pub fn preferences_set(app: tauri::State<'_, Shell>, dir: String) -> Value {
     let updated = current.setting_download_dir(&dir);
 
     if updated.download_dir == current.download_dir {
-        return api::preferences::change(&DownloadDirChange::Unchanged {
+        return api::preferences::change(lang, &DownloadDirChange::Unchanged {
             dir: updated.download_dir,
         });
     }
@@ -1188,14 +1263,14 @@ pub fn preferences_set(app: tauri::State<'_, Shell>, dir: String) -> Value {
     //    · 旧目录：偏好里「未配置」时落盘根是内核的默认值，只有内核知道它是哪儿。
     let (paused, old_dir) = match app.session.client() {
         Some(client) => {
-            let paused = match kernel::task_action(&client, TaskAction::PauseAll, None) {
+            let paused = match kernel::task_action(lang, &client, TaskAction::PauseAll, None) {
                 Ok(()) => true,
                 Err(why) => {
                     note_failure(&app.session, &why);
                     false
                 }
             };
-            (paused, kernel::download_dir(&client).ok())
+            (paused, kernel::download_dir(lang, &client).ok())
         }
         None => (false, None),
     };
@@ -1206,7 +1281,7 @@ pub fn preferences_set(app: tauri::State<'_, Shell>, dir: String) -> Value {
         } else {
             api::preferences::save_failed(&cause)
         };
-        return api::preferences::change(&DownloadDirChange::Failed { message });
+        return api::preferences::change(lang, &DownloadDirChange::Failed { message });
     }
     // 待搬的旧目录先记下：批次加载好、内核在线的那一刻交接（见 `Session::take_handover`）。
     // 这一次重启失败的话，它留给之后的重试。
@@ -1215,12 +1290,16 @@ pub fn preferences_set(app: tauri::State<'_, Shell>, dir: String) -> Value {
     //    否则"自动重启已经用掉预算"会让改目录变成一件按下去没有回音的事。
     app.session.reset_auto_restart();
     match restart_kernel(&app.session, ChangedSetting::DownloadDir.restart_timeout_message()) {
-        Ok(()) => api::preferences::change(&DownloadDirChange::Changed {
-            dir: updated.download_dir,
-        }),
+        Ok(()) => {
+            // 新盘要重新量一次（旧盘那句不许粘在新盘上）。
+            note_disk_speed(&app.session, Some(&updated.download_dir), true);
+            api::preferences::change(lang, &DownloadDirChange::Changed {
+                dir: updated.download_dir,
+            })
+        }
         // 内核起不来的**原因原文**照登（可能是"没找到内核…"，也可能是握手超时那句，
         // 也可能是"没在期限内落地"）—— 三种都是**完整的一句话**，壳不再加工。
-        Err(why) => api::preferences::change(&DownloadDirChange::Failed { message: why }),
+        Err(why) => api::preferences::change(lang, &DownloadDirChange::Failed { message: why }),
     }
 }
 
@@ -1262,10 +1341,10 @@ pub fn verbose_logging_set(app: tauri::State<'_, Shell>, on: bool) -> Value {
     let updated = current.setting_verbose_logging(on);
 
     if updated.verbose_logging == current.verbose_logging {
-        return api::preferences::verbose_change(&VerboseLoggingChange::Unchanged { on });
+        return api::preferences::verbose_change(app.session.lang(), &VerboseLoggingChange::Unchanged { on });
     }
     if let Err(cause) = updated.save(&path) {
-        return api::preferences::verbose_change(&VerboseLoggingChange::Failed {
+        return api::preferences::verbose_change(app.session.lang(), &VerboseLoggingChange::Failed {
             message: api::preferences::verbose_save_failed(&cause.to_string()),
         });
     }
@@ -1280,9 +1359,9 @@ pub fn verbose_logging_set(app: tauri::State<'_, Shell>, on: bool) -> Value {
         &app.session,
         ChangedSetting::VerboseLogging.restart_timeout_message(),
     ) {
-        Ok(()) => api::preferences::verbose_change(&VerboseLoggingChange::Changed { on }),
+        Ok(()) => api::preferences::verbose_change(app.session.lang(), &VerboseLoggingChange::Changed { on }),
         // 内核起不来的**原因原文**照登（与 `preferences_set` 同一条）。
-        Err(why) => api::preferences::verbose_change(&VerboseLoggingChange::Failed { message: why }),
+        Err(why) => api::preferences::verbose_change(app.session.lang(), &VerboseLoggingChange::Failed { message: why }),
     }
 }
 
@@ -1532,6 +1611,28 @@ pub fn load_preferences() -> Result<Preferences, String> {
     Ok(Preferences::load(&preferences_path()?))
 }
 
+/// 量一次目标盘的写入速度，把"盘比网慢"那句摆进会话。
+///
+/// 判据（多慢算慢、那句话怎么说）**全在 `shell_core::presentation::disk_notice`**；
+/// 这里只负责"什么时候量、量哪个目录"：
+///   * **真的开始下载时**（`enqueue` 成功）—— 客户此刻正盯着速度，提示才有地方落；
+///   * **换下载目录之后**（`fresh = true`）—— 新盘要重新量，旧结论不许粘在新盘上。
+///
+/// ⚠️ `cached` ⇒ 同一个目录一次运行只写一次盘（探针 8 MiB，写完即删）。
+/// ⚠️ 量不出来（目录还没建 / 盘被拔掉 / 只读）⇒ **不提示**：宁可不说，也不许编数字。
+fn note_disk_speed(session: &Arc<Session>, dir: Option<&str>, fresh: bool) {
+    let Some(dir) = dir.map(str::trim).filter(|d| !d.is_empty()) else {
+        return;
+    };
+    let path = std::path::Path::new(dir);
+    let mbps = if fresh {
+        diskspeed::fresh(path)
+    } else {
+        diskspeed::cached(path)
+    };
+    session.set_disk(DiskNotice::of(mbps));
+}
+
 /// **把偏好里那一格落到壳自己这个进程的日志档位上**（规格 §2.3 / §2.4）。
 ///
 /// 🔴 **两处调用点共用这一份**（它们时机不同，缺一个就是一个方向不工作）：
@@ -1718,6 +1819,12 @@ fn note_failure(session: &Arc<Session>, why: &CallFailure) {
         CallFailure::EngineNotStarted(_) => session.note_engine_not_started(),
         // ⚠️ 这一格是**非粘滞**的（下一个成功请求就清）：这里只写，不清。
         CallFailure::Text(message) => session.set_last_error(Some(message.clone())),
+        // 内核给了分型（规格 W2）：文字照旧进 `last_error`，**另外**记一张卡片
+        // （同类 30 秒内只加计数、按严重度置顶，句子由 `error_card` 按语言成句）。
+        CallFailure::Classified { text, class } => {
+            session.set_last_error(Some(text.clone()));
+            session.note_error_class(class);
+        }
     }
 }
 
@@ -1811,7 +1918,7 @@ mod tests {
         let session = Arc::new(Session::new());
         session.install_client(
             Arc::new(CoreClient::new(Box::new(channel.clone()))),
-            r#"{"protocol":1}"#.to_string(),
+            r#"{"protocol":2}"#.to_string(),
         );
         session.set_load(load);
         (session, channel)
@@ -2183,7 +2290,7 @@ mod tests {
         let session = Arc::new(Session::new());
         session.install_client(
             Arc::new(CoreClient::new(Box::new(channel.clone()))),
-            r#"{"protocol":1}"#.to_string(),
+            r#"{"protocol":2}"#.to_string(),
         );
         session.set_load(LoadState::Loaded(a_batch_of(huge)));
         (session, channel)
@@ -2409,10 +2516,12 @@ mod tests {
         //   收 IPC 的那条线程上 —— 它不许阻塞，也不该为它开一条线程池线程）。
         //   2026-10-15 +1：`update_check_now`（问内核、且内核那一条里要发网络请求
         //   ⇒ `(async)`，理由见它自己的文档）。
+        //   2026-10-21 +1：`restart_progress`（问内核、只读 ⇒ `(async)`；
+        //   它是**轮询**用的装饰命令，拿不到就回 `text: null`，不升级成红条）。
         assert_eq!(
             decls.len(),
-            25,
-            "命令数变了（期望 25）：{decls:?} —— 新增命令时请一并想清楚它该不该开在主线程上"
+            27,
+            "命令数变了（期望 26）：{decls:?} —— 新增命令时请一并想清楚它该不该开在主线程上"
         );
 
         let mut offenders = Vec::new();
@@ -2525,7 +2634,7 @@ mod tests {
         let session = Arc::new(Session::new());
         session.install_client(
             Arc::new(CoreClient::new(Box::new(ch))),
-            r#"{"protocol":1}"#.to_string(),
+            r#"{"protocol":2}"#.to_string(),
         );
         session.set_engine(EngineState::NotStarted);
 

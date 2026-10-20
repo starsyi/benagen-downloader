@@ -394,6 +394,39 @@
   gap: var(--sp-6);
 }
 
+/* 界面语言那一行（规格 W1）：三个按钮，选中的那一颗描边 —— 无新文案，标签来自 Rust。 */
+.set__title {
+  margin: 0;
+  font-size: var(--text-body);
+  font-weight: 600;
+}
+
+.set__langs {
+  display: flex;
+  gap: var(--sp-6);
+}
+
+.set__lang {
+  padding: 5px 12px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--text-body);
+  cursor: pointer;
+}
+
+.set__lang[aria-checked="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.set__lang:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .set__label {
   flex: none;
   width: 130px;

@@ -122,6 +122,7 @@ mod tests {
         let e = ClientError::Kernel {
             code: "delivery_fetch_failed".to_string(),
             message: "拉取交付清单失败：HTTP 404".to_string(),
+                class: None,
         };
         // ⚠️ **判别力有多大，如实说**（修复轮 2 / 复审）：它**不是**恒真，但只比原来
         //    强一点点 —— 夹具的载荷与期望串是**同一句**，所以它只能杀掉"identity 被破坏"
@@ -132,7 +133,7 @@ mod tests {
         //    （上游那条同形；本波次没有把它删掉，是因为"上屏逐字"确实是这一支的判据。）
         assert_eq!(
             DeliverySwitch::Failed {
-                message: error_text(&e)
+                message: error_text(&e),
             }
             .notice_text(),
             "拉取交付清单失败：HTTP 404"

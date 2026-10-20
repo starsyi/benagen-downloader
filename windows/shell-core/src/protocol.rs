@@ -37,8 +37,8 @@ use std::collections::BTreeMap;
 /// 协议版本。握手时协商（`hello`）。
 ///
 /// 出处：`core/src/protocol.rs`。版本**相符**才握手成功，**不做降级协商**——
-/// 目前只有版本 1，降级协商会掩盖"壳与内核不是一套"。
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 0.3.0 起是版本 2（旧版壳与新内核、新版壳与旧内核都**握手失败**，不降级）。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 解析失败时使用的保留 `id`（`core/src/protocol.rs`）。
 ///
@@ -115,7 +115,7 @@ pub mod codes {
 /// 所以壳对无参方法发 `"params":null` 是安全的，不必特判。
 ///
 /// ⚠️ **`hello` 不是无参方法**：设计规格 §5.1 的原文是
-/// `{"id":1,"method":"hello","params":{"protocol":1}}`，`params` 必须是对象且带 `protocol`
+/// `{"id":1,"method":"hello","params":{"protocol":2}}`，`params` 必须是对象且带 `protocol`
 /// （缺了内核回 `invalid_params`）。别照"无参方法"那半句去发一个不带 `params` 的 `hello`
 /// ——那握不上手，而且要到端到端才暴露。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,6 +132,12 @@ pub struct Request {
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+    /// 错误分型（规格 W2 的八类，`core/src/errors/class.rs` 给的线上词）。
+    ///
+    /// ⚠️ 可选：开发期协议仍是 v1，0.2.x 的内核不带这一格 ⇒ `None`（界面按
+    /// "意料之外的错误"处置，不猜）。
+    #[serde(default)]
+    pub class: Option<String>,
 }
 
 /// 一条响应（`core/src/protocol.rs` 的 `Response`）。
@@ -148,7 +154,7 @@ pub struct Response {
     pub error: Option<ErrorBody>,
 }
 
-/// `hello` 的入参（`core/src/protocol.rs` 的 `HelloParams`）：`{"protocol":1}`。
+/// `hello` 的入参（`core/src/protocol.rs` 的 `HelloParams`）：`{"protocol":2}`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HelloParams {
     pub protocol: u32,
@@ -165,6 +171,19 @@ pub struct HelloResult {
     /// 章程见 `lib.rs` 头部），这里只陈述它**是什么**：**内核认可的最小分片大小取值集合**。
     /// 抄第二遍就是漂移的开始（改内核不改壳，客户会选到内核拒收的值）。
     pub min_split_size_choices: Vec<String>,
+    /// 内核**实际**用的语言（`zh` / `en`，永远不是 `system`）。
+    ///
+    /// ⚠️ 可选：开发期协议仍是 v1（老内核不发这一格）。缺字段 ⇒
+    /// [壳按中文画](crate::i18n::Lang::from_hello) —— 宁可语言不对，也不让握手失败。
+    #[serde(default)]
+    pub language: Option<String>,
+    /// 「客户有没有明确选过界面语言」（规格 W1 的首启判据）。
+    ///
+    /// ⚠️ 可选：开发期协议仍是 v1，0.2.x 的内核回执里没有这一格（T11 升 2 之后变成
+    ///    必发）。缺字段按 `false` = "还没选过" —— 首启弹窗会多问一次，而**不会**
+    ///    把一个已经选过英文的客户拦住：那一格的来源是设置文件，不是这里。
+    #[serde(default)]
+    pub language_chosen: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +531,18 @@ pub struct Settings {
     pub max_tries: i32,
     /// 0–60 秒。
     pub retry_wait: i32,
+    /// 界面语言：`system` / `zh` / `en`（规格 W1）。
+    ///
+    /// ⚠️ **壳必须原样回传**（哪怕设置页只改了并行数）：内核的 `set_settings` 是
+    ///    整份替换，漏掉这一格就等于"顺手把语言重置成跟随系统"——客户选了英文，
+    ///    改一次并行数就变回中文，而没有任何东西会报错。
+    #[serde(default = "default_language")]
+    pub language: String,
+}
+
+/// `language` 的缺省：老版本的壳发来的七键载荷（没有这一格）按"跟随系统"。
+fn default_language() -> String {
+    "system".to_string()
 }
 
 /// `transfer_list` 的 `global`（`core/src/engine/rpc.rs` 的 `GlobalStat`）。
@@ -937,7 +968,7 @@ mod tests {
     /// `#[serde(deny_unknown_fields)]`，这一条立刻红。
     #[test]
     fn unknown_fields_are_tolerated_so_the_kernel_can_add_fields() {
-        let line = r#"{"id":1,"ok":true,"trace_id":"t-1","result":{"protocol":1,"min_split_size_choices":["1M"],"future_field":123}}"#;
+        let line = r#"{"id":1,"ok":true,"trace_id":"t-1","result":{"protocol":2,"min_split_size_choices":["1M"],"future_field":123}}"#;
         let r: Response = serde_json::from_str(line).expect("信封上多一个键不该让整条响应解不动");
         assert_eq!(r.id, 1);
         let h: HelloResult = serde_json::from_value(r.result.expect("带 result")).expect("多余键不该致命");
@@ -996,7 +1027,7 @@ mod tests {
     /// 钉它的是 `request_params_is_optional`）。所以壳不必为无参方法特判。
     #[test]
     fn shell_emits_the_requests_in_the_documented_shape() {
-        assert_eq!(PROTOCOL_VERSION, 1, "协议版本是跨进程约定，不是内部常量");
+        assert_eq!(PROTOCOL_VERSION, 2, "协议版本是跨进程约定，不是内部常量");
         assert_eq!(UNCORRELATED_ID, 0, "保留 id 必须是 0（壳从 1 起分配）");
 
         let line = serde_json::to_string(&Request {
@@ -1006,7 +1037,7 @@ mod tests {
         })
         .expect("序列化不该失败");
         assert_eq!(
-            line, r#"{"id":1,"method":"hello","params":{"protocol":1}}"#,
+            line, r#"{"id":1,"method":"hello","params":{"protocol":2}}"#,
             "壳发出去的握手请求必须就是设计规格 §5.1 的那一行"
         );
         assert!(!line.contains('\n'), "JSON Lines：一行一条，实际 {line:?}");
@@ -1196,7 +1227,7 @@ mod tests {
     #[test]
     fn hello_result_carries_the_choices_from_the_kernel() {
         let h: HelloResult = serde_json::from_str(
-            r#"{"protocol":1,"min_split_size_choices":["1M","2M","100M"]}"#,
+            r#"{"protocol":2,"min_split_size_choices":["1M","2M","100M"]}"#,
         )
         .expect("握手回执必须能解");
         assert_eq!(h.protocol, PROTOCOL_VERSION);
@@ -1205,7 +1236,7 @@ mod tests {
             vec!["1M".to_string(), "2M".to_string(), "100M".to_string()]
         );
 
-        let p: HelloParams = serde_json::from_str(r#"{"protocol":1}"#).expect("握手参数必须能解");
+        let p: HelloParams = serde_json::from_str(r#"{"protocol":2}"#).expect("握手参数必须能解");
         assert_eq!(p.protocol, PROTOCOL_VERSION);
     }
 
@@ -1358,7 +1389,7 @@ mod tests {
     /// 且 `min_split_size` 是**字符串**（`"20M"`，不是数字）——它是 `-k`，
     /// 写错会让 aria2 直接启动失败（契约 §2.3）。
     #[test]
-    fn settings_mirrors_the_seven_adjustable_fields() {
+    fn settings_mirrors_the_eight_fields() {
         let s: Settings = serde_json::from_str(
             r#"{"parallel":8,"connections":16,"splits":16,"min_split_size":"20M",
                 "limit_mbps":0,"max_tries":3,"retry_wait":1}"#,
@@ -1371,6 +1402,8 @@ mod tests {
         assert_eq!(s.limit_mbps, 0);
         assert_eq!(s.max_tries, 3);
         assert_eq!(s.retry_wait, 1);
+        // 载荷里没这一格 ⇒ 按"跟随系统"（老版本的壳就是这么发的）。
+        assert_eq!(s.language, "system");
 
         // ⚠️ `Settings` 是**双向**的：`set_settings` 要把壳改过的值发回内核。
         // 发出去的键名必须与收进来的逐字相同——否则改设置会静默无效。
@@ -1378,7 +1411,7 @@ mod tests {
         assert_eq!(
             back,
             json!({"parallel":8,"connections":16,"splits":16,"min_split_size":"20M",
-                   "limit_mbps":0,"max_tries":3,"retry_wait":1})
+                   "limit_mbps":0,"max_tries":3,"retry_wait":1,"language":"system"})
         );
     }
 

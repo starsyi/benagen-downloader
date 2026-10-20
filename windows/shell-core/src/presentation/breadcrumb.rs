@@ -13,7 +13,7 @@
 
 use serde::Serialize;
 use crate::client::ClientError;
-use crate::presentation::error_text::error_text;
+
 
 // ---------------------------------------------------------------------------
 // 当前目录的层级链
@@ -168,8 +168,8 @@ impl DirLoadFailure {
     /// 退回上一层时那句提示。
     const FALLBACK_NOTICE: &'static str = "已返回上一层";
 
-    pub fn of(error: &ClientError, current_path: &str) -> Self {
-        let message = error_text(error);
+    pub fn of(lang: crate::i18n::Lang, error: &ClientError, current_path: &str) -> Self {
+        let message = crate::presentation::error_text::error_text_in(lang, error);
 
         // 只认**结构化错误码** `path_not_found`，不看 `message` 的措辞（契约 §5.1）。
         if let ClientError::Kernel { code, .. } = error {
@@ -182,7 +182,10 @@ impl DirLoadFailure {
                     return Self {
                         message,
                         path: parent,
-                        notice: Some(Self::FALLBACK_NOTICE.to_string()),
+                        notice: Some(match lang {
+                            crate::i18n::Lang::Zh => Self::FALLBACK_NOTICE.to_string(),
+                            _ => "Back to the parent folder".to_string(),
+                        }),
                     };
                 }
             }
@@ -209,7 +212,7 @@ mod tests {
 
     use super::{Breadcrumb, DirLoadFailure};
     use crate::client::ClientError;
-    use crate::presentation::error_text::error_text;
+    
 
     /// 上游 `splitsPathIntoSegmentsForTheCrumbs`。
     #[test]
@@ -320,8 +323,9 @@ mod tests {
         let e = ClientError::Kernel {
             code: "path_not_found".to_string(),
             message: "清单里没有目录 \"a/b/c\"".to_string(),
+                class: None,
         };
-        let f = DirLoadFailure::of(&e, "a/b/c");
+        let f = DirLoadFailure::of(crate::i18n::Lang::Zh, &e, "a/b/c");
 
         assert_eq!(f.path, "a/b", "退回上一层");
         assert_eq!(f.message, "清单里没有目录 \"a/b/c\"", "内核原文逐字照登（约束 3）");
@@ -338,10 +342,11 @@ mod tests {
     fn path_not_found_at_the_root_stays_at_the_root() {
         // 根上无路可退：必须停在根，不得拼出一个前导 "/" 的假路径（那会让下一次
         // `list_dir` 换一个新错误回来，用户看到的是错误在变、位置不变）。
-        let f = DirLoadFailure::of(
+        let f = DirLoadFailure::of(crate::i18n::Lang::Zh, 
             &ClientError::Kernel {
                 code: "path_not_found".to_string(),
                 message: "清单里没有目录 \"\"".to_string(),
+                class: None,
             },
             "",
         );
@@ -365,10 +370,12 @@ mod tests {
             ClientError::Kernel {
                 code: "engine_disconnected".to_string(),
                 message: "下载引擎已断开".to_string(),
+                class: None,
             },
             ClientError::Kernel {
                 code: "invalid_params".to_string(),
                 message: "参数不合法".to_string(),
+                class: None,
             },
             ClientError::KernelGone,
             ClientError::MalformedResponse {
@@ -377,7 +384,7 @@ mod tests {
             },
         ];
         for e in &cases {
-            let f = DirLoadFailure::of(e, "a/b");
+            let f = DirLoadFailure::of(crate::i18n::Lang::Zh, e, "a/b");
             assert_eq!(f.path, "a/b", "{e} 不该把用户弹走");
             assert_eq!(f.notice, None);
             assert!(!f.did_fall_back());
@@ -387,7 +394,11 @@ mod tests {
             //    "同一句话出现第二份来源"。
             //    形态与上游逐字同形（源写的是 `f.message == AppModel.message(of: e)`），
             //    按裁决 T"不得意译"，这里**不**改写成一个写死的字面量。
-            assert_eq!(f.message, error_text(e), "原文逐字（约束 3）");
+            assert_eq!(
+                f.message,
+                crate::presentation::error_text::error_text_in(crate::i18n::Lang::Zh, e),
+                "原文逐字（约束 3；按界面语言成句 = 规格 W1）"
+            );
         }
     }
 }

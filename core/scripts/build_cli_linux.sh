@@ -366,16 +366,20 @@ WANT_OPENSSL="$(openssl dgst -sha256 "$ARIA2C_SRC" | awk '{print $NF}')"
 WANT="${WANT_SHASUM:0:$HASH_PREFIX_LEN}"
 ok "内嵌资产 ${ARIA2C_ASSET} 的 sha256 前 ${HASH_PREFIX_LEN} 位 = ${WANT}（两条工具一致）"
 
-VER="$("$BIN" --version)" || die "产物跑不起来：$BIN --version 退出码非 0" 1
+# 语言钉住：0.3.0 起 `--version` 跟随系统语言（英文机器上那一行是
+# `benagen-dl 0.3.0 (bundled aria2c …)`）；判据按中文形态抠，不钉语言就会误判成"格式变了"。
+VER="$("$BIN" --version --lang zh)" || die "产物跑不起来：$BIN --version 退出码非 0" 1
 printf '    $ %s --version\n    %s\n' "$BIN_NAME" "$VER"
 GOT_HASH="$(printf '%s' "$VER" | sed -n 's/.*内嵌 aria2c \([0-9a-f]\{12\}\).*/\1/p')"
+# 兜底：中文形态以后若再改字，英文那半（`(bundled aria2c …)`）也能抠出来。
+[ -n "$GOT_HASH" ] || GOT_HASH="$(printf '%s' "$VER" | sed -n 's/.*bundled aria2c \([0-9a-f]\{12\}\).*/\1/p')"
 [ -n "$GOT_HASH" ] \
   || die "--version 的输出里抠不出内嵌 aria2c 的 ${HASH_PREFIX_LEN} 位摘要（输出：${VER}）——判据失效，按失败处理" 1
 [ "$GOT_HASH" = "$WANT" ] \
   || die "编进去的 aria2c 与 core/assets/$ARIA2C_ASSET 不是同一份：--version 说 ${GOT_HASH}，资产是 ${WANT}" 1
 ok "--version 的摘要与资产逐字一致（${GOT_HASH}）"
 
-HELP="$("$BIN" --help)" || die "产物跑不起来：$BIN --help 退出码非 0" 1
+HELP="$("$BIN" --help --lang zh)" || die "产物跑不起来：$BIN --help 退出码非 0" 1
 printf '%s' "$HELP" | grep -q '^用法：' || die "--help 的输出里没有「用法：」" 1
 printf '%s' "$HELP" | grep -q '退出码：' \
   || die "--help 的输出里没有「退出码：」—— 退出码表是给客户的对外契约" 1
@@ -389,9 +393,9 @@ ok "--help 可读（$(printf '%s\n' "$HELP" | head -1)）"
 #    不该跟着消失 —— 否则人得自己去 `target/` 里翻。落位本身不是任何"已通过"的断言，
 #    退出码仍然由下面那道测试决定，红了照样非 0，什么都没被静默放过。
 log "4/5 产物落位"
-cp -f "$BIN" "$OUT/$BIN_NAME-${VERSION:-0.2.8}-linux-x86_64"
+cp -f "$BIN" "$OUT/$BIN_NAME-${VERSION:-0.3.0}-linux-x86_64"
 chmod +x "$OUT/$BIN_NAME-linux-x86_64"
-DST="$OUT/$BIN_NAME-${VERSION:-0.2.8}-linux-x86_64"
+DST="$OUT/$BIN_NAME-${VERSION:-0.3.0}-linux-x86_64"
 printf '    路径   ：%s\n    字节数 ：%s\n    sha256 ：%s\n' \
   "$DST" "$(stat -c '%s' "$DST")" "$(sha256sum "$DST" | awk '{print $1}')"
 
@@ -471,7 +475,7 @@ rm -f "$TEST_LOG"
 log "完成"
 printf '    产物已落位：%s\n' "$DST"
 printf '\n    取回（在 Mac 上）：\n'
-printf "      scp root@%s:%s dist_cli/benagen-dl-${VERSION:-0.2.8}-linux-x86_64\n" "$(hostname)" "$DST"
+printf "      scp root@%s:%s dist_cli/benagen-dl-${VERSION:-0.3.0}-linux-x86_64\n" "$(hostname)" "$DST"
 printf '\n    还剩一件本脚本**不做**的事（见文件头）：拿真交付码真下载一次 ——\n'
 printf '      cd %s && ./out/%s-linux-x86_64 <真交付码> -o %s/dl; echo "退出码=$?"\n' \
   "$BUILD_ROOT" "$BIN_NAME" "$BUILD_ROOT"

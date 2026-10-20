@@ -248,6 +248,7 @@ fn settings_result() -> SettingsResult {
             limit_mbps: 0,
             max_tries: 3,
             retry_wait: 1,
+            language: "system".to_string(),
         },
         last_code: CODE.to_string(),
     }
@@ -486,6 +487,7 @@ fn settings_match_cases() -> serde_json::Value {
                 limit_mbps: 100,
                 max_tries: 100,
                 retry_wait: 60,
+            language: "system".to_string(),
             },
         ),
         (
@@ -500,6 +502,7 @@ fn settings_match_cases() -> serde_json::Value {
                 limit_mbps: 250,
                 max_tries: 7,
                 retry_wait: 30,
+            language: "system".to_string(),
             },
             Settings {
                 parallel: 16,
@@ -509,6 +512,7 @@ fn settings_match_cases() -> serde_json::Value {
                 limit_mbps: 250,
                 max_tries: 7,
                 retry_wait: 30,
+            language: "system".to_string(),
             },
         ),
     ];
@@ -531,7 +535,7 @@ fn settings_match_cases() -> serde_json::Value {
 
     json!({
         // ⚠️ 面板上七格与七个字段的**对应顺序**（前端那一侧要按它去填格子）。
-        //    来源：`SettingsForm::PARAMETER_LABELS` 的顺序 = `Parameters` 的顺序
+        //    来源：`SettingsForm::parameter_labels(shell_core::i18n::Lang::Zh)` 的顺序 = `Parameters` 的顺序
         //    = `protocol::Settings` 的字段声明顺序（三处今天一致）。
         //    ⚠️ 这份对照**判不到**"顺序被重排了"（重排之后多数用例的判决仍然相同）——
         //       `check_mirror_cases` 的自检与前端那几条标签断言只钉得住"标签逐字来自载荷"。
@@ -549,7 +553,7 @@ fn settings_match_cases() -> serde_json::Value {
 ///    这条**性质**（顺序照内核给的、不排序），不是那 100 项本身。
 ///    ⚠️ 故意**不含 `21M`**：上面那份 `settings` 的当前值就在集合外。
 const HELLO_WIRE: &str =
-    r#"{"protocol":1,"min_split_size_choices":["1M","2M","5M","10M","20M","50M","100M"]}"#;
+    r#"{"protocol":2,"min_split_size_choices":["1M","2M","5M","10M","20M","50M","100M"]}"#;
 
 // ---------------------------------------------------------------------------
 // 手动检测更新（设置里那颗「立即检测」，规格 §2）的夹具
@@ -639,7 +643,29 @@ fn a_view() -> SessionView {
         }),
         last_error: None,
         fallback_notice: None,
+        // ⚠️ 保持 `None`：夹具是**最多见的那一屏**（盘不慢 ⇒ 没有那句话）。
+        //    慢盘那一格由 `api/state.rs` 的用例与面板夹具单独钉（⑥½）。
+        disk: None,
         handshake_reply: None,
+        lang: shell_core::i18n::Lang::Zh,
+        language_chosen: true,
+        error_cards: vec![shell_core::presentation::error_card::ErrorCard::of(
+            shell_core::presentation::error_card::ClassKind::DiskSlow,
+            shell_core::i18n::Lang::Zh,
+            2,
+        )],
+    }
+}
+
+/// `state()` 的载荷：**英文界面那一份**（规格 W1：语言在握手时定，界面跟着它走）。
+///
+/// ⚠️ 它存在的理由：**同一份状态两种语言**要说两套话。这一份与 `a_view` 只差
+///    `lang` 与 `language_chosen` 两格，其余逐字相同的字段 —— 差异全在句子，
+///    而这正是"判据在 Rust、句子在表里"那条纪律要验的那一半。
+fn a_english_view() -> SessionView {
+    SessionView {
+        lang: shell_core::i18n::Lang::En,
+        ..a_view()
     }
 }
 
@@ -689,6 +715,18 @@ fn a_timeout_view() -> SessionView {
     }
 }
 
+/// `RestartNotice::of` 的线上形状（`null` 也照原样给 —— 那正是"什么都不说"）。
+fn restart_notice(
+    lang: shell_core::i18n::Lang,
+    state: &str,
+    attempt: u32,
+) -> serde_json::Value {
+    match shell_core::presentation::restart_notice::RestartNotice::of(lang, state, attempt, 3) {
+        Some(n) => json!({ "text": n.text }),
+        None => json!({ "text": null }),
+    }
+}
+
 fn main() {
     // 输出路径：命令行第一个参数；不给就打到 stdout。
     let out_path = std::env::args().nth(1);
@@ -706,9 +744,9 @@ fn main() {
     let selected: BTreeSet<String> = tree.default_selected.iter().cloned().collect();
     let sizes = SelectionSummary::size_index(&tree.flat);
     let action = api::tree::DownloadAction {
-        button_title: DownloadTargets::button_title(&selected),
+        button_title: DownloadTargets::button_title(shell_core::i18n::Lang::Zh, &selected),
         empty_selection_hint: if selected.is_empty() {
-            Some(DownloadTargets::empty_selection_hint().to_string())
+            Some(DownloadTargets::empty_selection_hint(shell_core::i18n::Lang::Zh).to_string())
         } else {
             None
         },
@@ -719,30 +757,31 @@ fn main() {
 
     // ---- 读不到某一层 --------------------------------------------------------
     // `DirLoadFailure::of` 只认**结构化错误码**，所以这里从一个真的 `ClientError` 造。
-    let failure = shell_core::presentation::breadcrumb::DirLoadFailure::of(
+    let failure = shell_core::presentation::breadcrumb::DirLoadFailure::of(shell_core::i18n::Lang::Zh, 
         &shell_core::client::ClientError::Kernel {
             code: shell_core::protocol::codes::PATH_NOT_FOUND.to_string(),
             message: PATH_NOT_FOUND_MESSAGE.to_string(),
+                class: None,
         },
         "01.RawData",
     );
 
     // ---- 传输列表（任务 11）--------------------------------------------------
     // ⚠️ 这几份的组装**照 `commands.rs:transfers` 的三行**（同上面 `whole_tree` 那条记账）：
-    //    `TransferRow::new` 逐条过 → `TransferGlobalSummary::of(&global)` →
-    //    `TransferListEmpty::of(&engine)`。
+    //    `TransferRow::new` 逐条过 → `TransferGlobalSummary::of(shell_core::i18n::Lang::Zh, &global)` →
+    //    `TransferListEmpty::of(shell_core::i18n::Lang::Zh, &engine)`。
     let transfer_items = transfer_items(TRANSFER_ITEMS_WIRE);
-    let transfer_rows: Vec<TransferRow> = transfer_items.iter().map(TransferRow::new).collect();
+    let transfer_rows: Vec<TransferRow> = transfer_items.iter().map(|i| TransferRow::new(shell_core::i18n::Lang::Zh, i)).collect();
     let transfer_rows_next: Vec<TransferRow> = transfer_items_next(&transfer_items)
         .iter()
-        .map(TransferRow::new)
+        .map(|i| TransferRow::new(shell_core::i18n::Lang::Zh, i))
         .collect();
     // 「移除了一行之后的下一拍」：**结构真的变了一次** —— 给那条用例的**对照组**
     //（"行容器的 childList 变更 = 0" 必须能被证伪）。
     let transfer_rows_after: Vec<TransferRow> = transfer_items
         .iter()
         .filter(|it| it.gid != "g-done")
-        .map(TransferRow::new)
+        .map(|i| TransferRow::new(shell_core::i18n::Lang::Zh, i))
         .collect();
     // 「暂停全部 / 一键开始」那两颗按钮：判据在 `BatchControl::of`，夹具从它倒出来。
     let batch_rows = BatchControl::of(&transfer_rows, false, None);
@@ -772,13 +811,13 @@ fn main() {
     };
     let batch_migrating = BatchControl::of(&transfer_rows, true, Some(&migrating));
     let batch_migrated_errors = BatchControl::of(&[], true, Some(&migrated_with_errors));
-    let transfer_global = TransferGlobalSummary::of(&TRANSFER_GLOBAL);
-    let transfer_global_next = TransferGlobalSummary::of(&TRANSFER_GLOBAL_NEXT);
+    let transfer_global = TransferGlobalSummary::of(shell_core::i18n::Lang::Zh, &TRANSFER_GLOBAL);
+    let transfer_global_next = TransferGlobalSummary::of(shell_core::i18n::Lang::Zh, &TRANSFER_GLOBAL_NEXT);
     // 空态那句话由 `TransferListEmpty::of` 给：引擎在跑 ⇒ 「没有正在传输的任务」；
     // 引擎不可用 ⇒ **`None`**（"这一屏不说话"，横幅已在说同一句）。
-    let empty_running = TransferListEmpty::of(&EngineState::Running);
+    let empty_running = TransferListEmpty::of(shell_core::i18n::Lang::Zh, &EngineState::Running);
     let empty_engine_down =
-        TransferListEmpty::of(&EngineState::Unavailable("引擎不可用".to_string()));
+        TransferListEmpty::of(shell_core::i18n::Lang::Zh, &EngineState::Unavailable("引擎不可用".to_string()));
 
     let fixtures = json!({
         // `state()`：引擎在跑、一批已加载（`load.summary.code` 就是面包屑根那一格的字）。
@@ -790,6 +829,27 @@ fn main() {
         // `state()`：**引擎正在连接内核**，而当前那一批仍然生效 —— 改下载目录
         // 重启内核那一小段就是它（"重放当前批次"在界面上的全部表现）。
         "stateConnecting": api::state::state(&a_connecting_view(), None),
+        // `state()`：**英文界面**（同一份状态，两套句子）。前端那条判据据此确认
+        // "它会跟着载荷换语言"，而不是把中文写死在模板里。
+        "stateEnglish": api::state::state(&a_english_view(), None),
+        // `restart_progress`：四档都倒出来（`idle` 什么都不说；另三档各一句）。
+        // ⚠️ 句子由 `presentation::restart_notice` 算，这里不手写。
+        "restartProgress": json!({
+            "idle": restart_notice(shell_core::i18n::Lang::Zh, "idle", 0),
+            "waiting": restart_notice(shell_core::i18n::Lang::Zh, "waiting", 2),
+            "verifying": restart_notice(shell_core::i18n::Lang::Zh, "verifying", 2),
+            "exhausted": restart_notice(shell_core::i18n::Lang::Zh, "exhausted", 3),
+            "waitingEn": restart_notice(shell_core::i18n::Lang::En, "waiting", 2),
+        }),
+        // `delivery_progress`：加载期间那四行（**由内核拼好**，壳只逐行摆）。
+        "deliveryProgress": json!({
+            "lines": [
+                "正在向国内服务器索取清单…",
+                "国内没有应答，正在试国际服务器…",
+                "国际服务器已应答，正在校验清单…",
+                "清单已拿到。"
+            ],
+        }),
         // `tree()` 无 path：进度 + 勾选摘要 + **内核给的默认勾选面** + 底栏那个动作。
         "treeWhole": api::tree::whole(
             &Breadcrumb::new(""),
@@ -799,9 +859,9 @@ fn main() {
             &action,
         ),
         // `tree("")`：根那一层。
-        "treeLevelRoot": api::tree::level(&root_bc, &root_rows),
+        "treeLevelRoot": api::tree::level(shell_core::i18n::Lang::Zh, &root_bc, &root_rows),
         // `tree("01.RawData")`：子目录那一层。
-        "treeLevelSub": api::tree::level(&sub_bc, &sub_rows),
+        "treeLevelSub": api::tree::level(shell_core::i18n::Lang::Zh, &sub_bc, &sub_rows),
         // `tree("01.RawData")` 的失败支：面包屑跟着**退到的那一层**走。
         "treeLevelFailure": api::tree::level_failure(&Breadcrumb::new(&failure.path), &failure),
         // `enqueue`：部分成功（`added` 与 `rejected` 两边都有落点）。
@@ -862,7 +922,7 @@ fn main() {
         // `settings_get`：七项 + `-k` 的候选集合（`hello`）+ 两句说明 + 两种横幅 + 三份 help。
         "settingsGet": api::settings::payload(&settings_result(), Some(HELLO_WIRE)),
         // `preferences_get`：已配置 / 未配置（后者那一行是 Rust 给的"默认（…）"，不是空行）。
-        "preferencesGet": api::preferences::current(&preferences()),
+        "preferencesGet": api::preferences::current(shell_core::i18n::Lang::Zh, &preferences()),
         // 🔴 **同一条链路的 Windows 形状那一份**（修复轮 2）：真机是 Windows ⇒ 路径里
         //    **一个 `/` 都没有**，而"下载到哪儿了"那一行与改目录的回执都要按**最后一个
         //    分隔符**切（尾段是那个名字，一个字都不许少）。只认 `/` 的实现在这里会把
@@ -870,11 +930,11 @@ fn main() {
         //    是 `flex: none`）⇒ **用户最需要看的那一格恰好看不见**。
         //    ⚠️ 它是**独立的一份载荷**，不是把上面那一组改成 Windows：上面那一组仍在
         //    验 POSIX 分支（两种形状各有一条判据，谁也替不了谁）。
-        "preferencesGetWindows": api::preferences::current(&Preferences::new(r"D:\交付\Benagen")),
-        "preferencesSetWindowsChanged": api::preferences::change(&DownloadDirChange::Changed {
+        "preferencesGetWindows": api::preferences::current(shell_core::i18n::Lang::Zh, &Preferences::new(r"D:\交付\Benagen")),
+        "preferencesSetWindowsChanged": api::preferences::change(shell_core::i18n::Lang::Zh, &DownloadDirChange::Changed {
             dir: r"D:\交付\交付_新盘".to_string(),
         }),
-        "preferencesGetDefault": api::preferences::current(&Preferences::empty()),
+        "preferencesGetDefault": api::preferences::current(shell_core::i18n::Lang::Zh, &Preferences::empty()),
         // `preferences_check`：**能用的**那一档（`check` 为 null = 可以用 ⇒ 前端弹确认）。
         // ⚠️ 确认文案取**真的那一段**（三条后果全在里面，`DownloadDirectory::confirmation`）。
         "preferencesCheckOk": api::preferences::plan(
@@ -895,22 +955,24 @@ fn main() {
         // ⚠️ 失败那一句用 `api::preferences::restart_timed_out()`（**壳自己的那一句**，
         //    不是在这里编的）：编一句到夹具里 = 夹具与真载荷各说各话，
         //    而夹具正是前端那套验收的**唯一**期望值来源。
-        "preferencesSetChanged": api::preferences::change(&DownloadDirChange::Changed {
+        "preferencesSetChanged": api::preferences::change(shell_core::i18n::Lang::Zh, &DownloadDirChange::Changed {
             dir: "/Volumes/Data/交付_新盘".to_string(),
         }),
-        "preferencesSetUnchanged": api::preferences::change(&DownloadDirChange::Unchanged {
+        "preferencesSetUnchanged": api::preferences::change(shell_core::i18n::Lang::Zh, &DownloadDirChange::Unchanged {
             dir: preferences().download_dir,
         }),
-        "preferencesSetFailed": api::preferences::change(&DownloadDirChange::Failed {
+        "preferencesSetFailed": api::preferences::change(shell_core::i18n::Lang::Zh, &DownloadDirChange::Failed {
             message: api::preferences::restart_timed_out().to_string(),
         }),
         // `verbose_logging_set` 的两支回执（任务 3）：**形状与 `preferences_set` 逐格相同**，
         // 但话不一样（那三句把主词写死成了"下载目录"）—— 见 `VerboseLoggingChange` 的文档。
         // ⚠️ 这一句同样取自 Rust（不在夹具里编），理由与上面那条一字不差。
         "verboseLoggingSetChanged": api::preferences::verbose_change(
+            shell_core::i18n::Lang::Zh,
             &VerboseLoggingChange::Changed { on: true },
         ),
         "verboseLoggingSetFailed": api::preferences::verbose_change(
+            shell_core::i18n::Lang::Zh,
             &VerboseLoggingChange::Failed {
                 message: api::preferences::verbose_restart_timed_out().to_string(),
             },
@@ -1269,9 +1331,9 @@ fn main() {
         "对位用例里必须有一条是**没改动**：{settings_meta}"
     );
     // 🔴 面板上七格与七个字段的顺序：**第 4 项是枚举**（前端按这份顺序填格子，
-    //    而它成立的前提是 `PARAMETER_LABELS` 的顺序 = `Settings` 的字段顺序）。
+    //    而它成立的前提是 `parameter_labels(shell_core::i18n::Lang::Zh)` 的顺序 = `Settings` 的字段顺序）。
     assert!(
-        SettingsForm::parameters()[3].min.is_none(),
+        SettingsForm::parameters(shell_core::i18n::Lang::Zh)[3].min.is_none(),
         "第 4 项应当是没有数值区间的枚举（`-k`）——`fieldOrder` 那份顺序就建立在它上面：{}",
         settings_meta["fieldOrder"]
     );

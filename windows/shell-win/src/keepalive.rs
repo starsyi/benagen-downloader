@@ -41,9 +41,10 @@ pub fn spawn(session: Arc<Session>, on_count: Arc<dyn Fn(usize) + Send + Sync>) 
         let mut tracker = lifecycle::AwakeTracker::default();
         loop {
             std::thread::sleep(lifecycle::watch_interval(WINDOW_VISIBLE.load(Ordering::Relaxed)));
+            let lang = session.lang();
             let reading = match session.client() {
                 None => lifecycle::Reading::Miss,
-                Some(client) => match kernel::transfer_list(&client) {
+                Some(client) => match kernel::transfer_list(lang, &client) {
                     TransferPoll::Snapshot(result) => lifecycle::Reading::Count(
                         result
                             .items

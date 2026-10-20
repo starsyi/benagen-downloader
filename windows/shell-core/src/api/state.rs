@@ -32,18 +32,27 @@ use crate::session_view::SessionView;
 ///    一个值只从一个地方取，免得两个来源将来各说各话。
 pub fn state(view: &SessionView, handshake: Option<&str>) -> Value {
     envelope::ok(serde_json::json!({
-        "engine": engine_wire(&view.engine),
-        "load": load_wire(&view.load),
+        "engine": engine_wire(view.lang, &view.engine),
+        "load": load_wire(view.lang, &view.load),
         "last_error": &view.last_error,
         "fallback_notice": &view.fallback_notice,
+        // ⚠️ 目标盘写入太慢时的一句话（`DiskNotice`，成句在 Rust）。`None` 就是 JS 那句
+        //    "什么也别画"—— 前端**不许**自己按数字判断慢不慢（那是判据，在本 crate 里）。
+        "disk": view.disk.as_ref().map(|d| serde_json::json!({"text": crate::presentation::disk_notice::DiskNotice::text(view.lang, d.mbps)})),
         "handshake_reply": handshake,
         // ⚠️ 顶部横幅是**成句** —— "哪个来源优先、要不要给「重试」、握手超时那句补充
         //    说明"三条都是判据（`EngineBanner::of` 里写着）。前端零业务逻辑
         //    （规格约束 10）⇒ 那句话只能在这一侧成形。`None` = 此刻没话说。
-        "banner": to_wire(&EngineBanner::of(&view.engine, view.last_error.as_deref())),
+        "banner": to_wire(&EngineBanner::of(view.lang, &view.engine, view.last_error.as_deref())),
         // ⚠️ 同上：传输列表那 200 ms 轮询的闸（规格 §6.3"引擎不可用一拍都不发"）
         //    走的是 `EngineGate` —— 让 JS 自己判就等于把那道判据抄进前端。
         "allows_requests": EngineGate::allows_requests(&view.engine),
+        // 首启语言询问（规格 W1）：判据是**设置文件里有没有那一格**（内核握手说的），
+        // 前端不许自己按"语言等不等于 system"去猜。
+        "language_chosen": view.language_chosen,
+        // 错误卡片（规格 W2）：三句人话 + 严重度 + 计数，**全部在 Rust 成句**。
+        // 前端只按顺序摆（多条并存时第一条就是最要紧的那条）。
+        "error_cards": to_wire(&view.error_cards),
     }))
 }
 
@@ -88,7 +97,7 @@ pub fn state(view: &SessionView, handshake: Option<&str>) -> Value {
 ///    那条补充（"内核可能正卡在系统授权对话框上…"）。分档靠
 ///    `EngineStatusPresentation::is_handshake_timeout`（**逐字相等**，不是包含），
 ///    本函数不重写那份判断。
-fn engine_wire(engine: &EngineState) -> Value {
+fn engine_wire(lang: crate::i18n::Lang, engine: &EngineState) -> Value {
     use crate::protocol::EngineState::*;
     // ⚠️ `kind` 是本函数手写的那一半（线上契约）；`reason` **只在 `Unavailable` 那一档
     //    才有这个键**（另外三档的线上形状里根本没有它 —— 多一个 `"reason": null`
@@ -111,7 +120,7 @@ fn engine_wire(engine: &EngineState) -> Value {
     // ---- 呈现值那一半：**全部来自 `presentation/engine_status.rs`** -------------
     wire.insert(
         "text".to_string(),
-        serde_json::json!(EngineStatusPresentation::text(engine)),
+        serde_json::json!(EngineStatusPresentation::text(lang, engine)),
     );
     wire.insert(
         "icon".to_string(),
@@ -119,7 +128,7 @@ fn engine_wire(engine: &EngineState) -> Value {
     );
     wire.insert(
         "tooltip".to_string(),
-        serde_json::json!(EngineStatusPresentation::tooltip(engine)),
+        serde_json::json!(EngineStatusPresentation::tooltip(lang, engine)),
     );
     Value::Object(wire)
 }
@@ -129,13 +138,13 @@ fn engine_wire(engine: &EngineState) -> Value {
 /// ⚠️ `Loaded` 那一格发的是 `DeliverySummary`（**界面值**），不是内核的 `DeliveryInfo`
 ///    —— 第六版裁定（见 `api/mod.rs` 文件头）。`DeliverySummary` 里有 `code` / `files_text` /
 ///    `size_text` / `validity_text` / `expired_badge_text` 五格，已经是"给客户看的样子"。
-fn load_wire(load: &LoadState) -> Value {
+fn load_wire(lang: crate::i18n::Lang, load: &LoadState) -> Value {
     match load {
         LoadState::Idle => serde_json::json!({ "kind": "idle" }),
         LoadState::Loading => serde_json::json!({ "kind": "loading" }),
         LoadState::Loaded(info) => serde_json::json!({
             "kind": "loaded",
-            "summary": to_wire(&DeliverySummary::of(info)),
+            "summary": to_wire(&DeliverySummary::of(lang, info)),
         }),
         LoadState::Failed(message) => serde_json::json!({ "kind": "failed", "message": message }),
     }
@@ -152,8 +161,66 @@ mod tests {
             load: LoadState::Idle,
             last_error: None,
             fallback_notice: None,
+            disk: None,
             handshake_reply: None,
+            lang: crate::i18n::Lang::Zh,
+            language_chosen: false,
+            error_cards: Vec::new(),
         }
+    }
+
+
+    /// 判据（规格 W1/I-2）：语言由握手落定，**同一个引擎状态按语言给出两份文案**。
+    /// 前端一个字的业务逻辑都不加（I-1）—— 这里不给，界面就只能是中文。
+    #[test]
+    fn the_same_engine_state_speaks_english_when_the_handshake_says_so() {
+        let mut view = a_view();
+        view.engine = EngineState::Unavailable("内核进程已退出".to_string());
+        let zh = state(&view, None);
+        view.lang = crate::i18n::Lang::En;
+        let en = state(&view, None);
+        assert_eq!(zh["data"]["engine"]["text"], serde_json::json!("引擎不可用：内核进程已退出"));
+        assert_eq!(
+            en["data"]["engine"]["text"],
+            serde_json::json!("Engine unavailable: 内核进程已退出"),
+            "内核原文照登（约束 3），只有壳那半句翻"
+        );
+        assert_eq!(zh["data"]["engine"]["icon"], en["data"]["engine"]["icon"], "图标名是语义标签，不随语言");
+        assert_eq!(zh["data"]["banner"]["kind"], en["data"]["banner"]["kind"]);
+    }
+
+
+
+    /// 判据（规格 W2）：卡片**逐字**过线（三句人话 + 严重度 + 计数），前端只摆位置。
+    #[test]
+    fn error_cards_reach_the_page_verbatim() {
+        use crate::presentation::error_card::{ClassKind, ErrorCard};
+        let mut view = a_view();
+        view.error_cards = vec![
+            ErrorCard::of(ClassKind::NetworkUnreachable, crate::i18n::Lang::En, 2),
+            ErrorCard::of(ClassKind::DiskSlow, crate::i18n::Lang::En, 1),
+        ];
+        let v = state(&view, None);
+        let cards = v["data"]["error_cards"].as_array().expect("两张");
+        assert_eq!(cards.len(), 2);
+        // 次数 > 1 ⇒ 标题里带着次数（Rust 拼的，不是前端拼的）。
+        assert_eq!(cards[0]["title"], serde_json::json!("Cannot reach the server (x2)"));
+        assert_eq!(cards[0]["count"], serde_json::json!(2));
+        assert_eq!(cards[0]["severity"], serde_json::json!(60));
+        assert_eq!(
+            cards[1]["action"],
+            serde_json::json!("Use the internal disk, or set parallel files to 1-2.")
+        );
+    }
+
+    /// 判据（规格 W1 首启）：`language_chosen` 逐字过线，前端靠它决定要不要弹一次询问。
+    #[test]
+    fn the_first_run_flag_reaches_the_page() {
+        let mut view = a_view();
+        view.language_chosen = false;
+        assert_eq!(state(&view, None)["data"]["language_chosen"], serde_json::json!(false));
+        view.language_chosen = true;
+        assert_eq!(state(&view, None)["data"]["language_chosen"], serde_json::json!(true));
     }
 
     fn an_info(code: &str) -> DeliveryInfo {
@@ -347,6 +414,26 @@ mod tests {
         let v = state(&view, None);
         assert_eq!(v["data"]["last_error"], serde_json::json!("旧的瞬时错误"));
         assert_eq!(v["data"]["fallback_notice"], serde_json::json!("退回了同目录那份内核"));
+    }
+
+    /// 目标盘那句提示**原样过线**（句子与判据都在 Rust，前端只画）。
+    ///
+    /// 判别力：把 `"disk": to_wire(&view.disk)` 删掉 ⇒ 第一个断言拿到 `null` ⇒ 红。
+    #[test]
+    fn a_slow_disk_notice_reaches_the_page_verbatim() {
+        let mut view = a_view();
+        view.disk = crate::presentation::disk_notice::DiskNotice::of(Some(6));
+        let v = state(&view, None);
+        assert_eq!(
+            v["data"]["disk"]["text"],
+            serde_json::json!(crate::presentation::disk_notice::DiskNotice::text(crate::i18n::Lang::Zh, 6)),
+            "成句必须逐字过线（前端不拼文案）"
+        );
+
+        // 够快 / 没量过 ⇒ 那一格是 `null`（前端靠它决定"不画"）。
+        view.disk = crate::presentation::disk_notice::DiskNotice::of(Some(200));
+        let v = state(&view, None);
+        assert!(v["data"]["disk"].is_null(), "够快的盘不许发一句话出来");
     }
 
     /// ⚠️ **`handshake_reply` 取的是参数那一份**（见函数文档）：它是诊断区唯一保留的自报项，

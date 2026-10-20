@@ -5,6 +5,7 @@
 
 pub mod daemon;
 pub mod legs;
+pub mod restart;
 pub mod rpc;
 pub mod status;
 pub mod supervisor;

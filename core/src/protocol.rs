@@ -23,7 +23,7 @@ use crate::engine::status::{Task, TaskState};
 use crate::settings::parse_size_mb;
 
 /// 协议版本。握手时协商。
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 结构化错误码。**壳不得靠字符串匹配判断错误类型**（设计规格 §5.1）——
 /// 它匹配的是这里的 `code` 常量值，不是 `message` 的措辞（措辞会变，码不会）。
@@ -51,7 +51,7 @@ pub mod codes {
 /// 的方法就该只写 `{"id":1,"method":"shutdown"}`。
 ///
 /// ⚠️ **`hello` 不是无参方法**：设计规格 §5.1 的原文是
-/// `{"id":1,"method":"hello","params":{"protocol":1}}`，[`hello`] 也要求 `params`
+/// `{"id":1,"method":"hello","params":{"protocol":2}}`，[`hello`] 也要求 `params`
 /// 是对象、里面带 `protocol`（缺了回 `invalid_params`）。别照前半句去发一个
 /// 不带 `params` 的 `hello`——那握不上手，而且要到端到端才暴露。
 ///
@@ -71,6 +71,10 @@ pub struct ErrorBody {
     /// 结构化错误码。**壳不得靠字符串匹配判断错误类型。**
     pub code: String,
     pub message: String,
+    /// 错误分类（规格 §3 的八类之一）。**可缺省**：没分类的错误里这一格不出现，
+    /// 老壳与老测试看到的载荷形状逐字不变（`skip_serializing_if` 就是为它写的）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
 }
 
 impl ErrorBody {
@@ -78,7 +82,14 @@ impl ErrorBody {
         ErrorBody {
             code: code.to_string(),
             message: message.into(),
+            class: None,
         }
+    }
+
+    /// 打上分类标签（分类表见 `core/src/errors.rs`，T2 落地）。
+    pub fn with_class(mut self, class: &str) -> Self {
+        self.class = Some(class.to_string());
+        self
     }
 
     /// 参数不在允许的取值集合内。
@@ -128,11 +139,19 @@ impl Response {
     /// 一律回 0 的后果是**壳那条 `id = 5` 的请求永远等不到配对响应**（挂起或超时）。
     /// 接线点见 `main.rs` 的读循环。
     pub fn err(id: u64, code: &str, message: &str) -> Self {
+        Response::err_with(id, ErrorBody::new(code, message))
+    }
+
+    /// 失败响应，**保留调用方已经填好的 `ErrorBody`**（含 `class`）。
+    ///
+    /// ⚠️ 别把它实现成"再 `ErrorBody::new(code, message)` 一次"：那样
+    ///    分类（`ErrorBody.class`）会在最后一刻被丢掉，壳永远拿不到它。
+    pub fn err_with(id: u64, body: ErrorBody) -> Self {
         Response {
             id,
             ok: false,
             result: None,
-            error: Some(ErrorBody::new(code, message)),
+            error: Some(body),
         }
     }
 }
@@ -252,10 +271,14 @@ pub fn write_response(r: &Response) -> Result<String, ErrorBody> {
 // 握手
 // ---------------------------------------------------------------------------
 
-/// `hello` 的入参：`{"protocol":1}`。
+/// `hello` 的入参：`{"protocol":2}`。
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct HelloParams {
     pub protocol: u32,
+    /// 壳希望用的语言：`"zh"` / `"en"` / `"system"`。**可选**——没有这一格
+    /// 就按系统 locale 解析（老壳、测试、以及 CLI 不传时都是这条路）。
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// `hello` 的结果。
@@ -268,6 +291,15 @@ pub struct HelloResult {
     /// 另一个阶段的产物，它拿不到本 crate 的常量。把集合交给壳，
     /// 壳才建得出那个"让客户不可能输错"的枚举控件（§2.3 的原话）。
     pub min_split_size_choices: Vec<String>,
+    /// 内核**实际**用的语言（`"zh"` / `"en"`，永远不是 `"system"`）。
+    /// 壳拿它渲染自己的文案，而不是自己再算一遍——两端各算一次必然有一天不对。
+    pub language: crate::i18n::Lang,
+    /// 「客户有没有明确选过界面语言」（规格 W1 的首启判据）。
+    ///
+    /// ⚠️ 与 `language` **不是一回事**：`language` 是"此刻解析成什么"（没选过也会解析出
+    ///    跟随系统的结果），这一格是"选过没有"。首启弹窗只认这一格。
+    #[serde(default)]
+    pub language_chosen: bool,
 }
 
 /// 握手：版本协商（设计规格 §5.1）。
@@ -301,7 +333,23 @@ pub fn hello(params: &Value) -> Result<HelloResult, ErrorBody> {
     Ok(HelloResult {
         protocol: PROTOCOL_VERSION,
         min_split_size_choices: min_split_size_choices(),
+        // 占位：语言要拿内核里存的设置一起解析，而本函数是纯函数。
+        // 真正填它的是 `kernel::op_hello`（它会把解析结果回写给壳）。
+        language: crate::i18n::Lang::System,
+        // 同上：这一格只有内核看得见设置文件，`op_hello` 填。
+        language_chosen: false,
     })
+}
+
+/// 读 `hello` 里壳声明的语言。
+///
+/// 认 `"zh"`/`"en"`/`"system"` 与 `zh-CN` 这类写法，**不认识就当没传**
+/// （规格 §2.1：语言不值得让握手失败——真失败了客户连界面都看不到）。
+pub fn requested_lang(params: &Value) -> Option<crate::i18n::Lang> {
+    params
+        .get("language")
+        .and_then(Value::as_str)
+        .and_then(crate::i18n::Lang::parse)
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +447,43 @@ impl TransferItem {
             raw_status: raw_status.to_string(),
             error_message: task.err.clone(),
             path,
+        }
+    }
+}
+
+#[cfg(test)]
+mod lang_tests {
+    use super::*;
+
+    /// 判据：没分类的错误**不出现** `class` 这一格（老载荷形状逐字不变）。
+    #[test]
+    fn an_unclassified_error_carries_no_class_field() {
+        let e = ErrorBody::new(codes::INVALID_PARAMS, "x");
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("class").is_none(), "{v}");
+    }
+
+    /// 判据：分了类的错误才出现，且只多这一格。
+    #[test]
+    fn a_classified_error_carries_the_class_and_nothing_else() {
+        let e = ErrorBody::new(codes::INVALID_PARAMS, "x").with_class("server_refused");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["class"], "server_refused");
+        assert_eq!(v["code"], codes::INVALID_PARAMS);
+    }
+
+    /// 判据：`hello` 认 `language`，不认识的值当没传（不让握手失败）。
+    #[test]
+    fn hello_reads_a_known_language_and_ignores_an_unknown_one() {
+        let with = serde_json::json!({"protocol": PROTOCOL_VERSION, "language": "en"});
+        assert_eq!(requested_lang(&with), Some(crate::i18n::Lang::En));
+        let unknown = serde_json::json!({"protocol": PROTOCOL_VERSION, "language": "fr"});
+        assert_eq!(requested_lang(&unknown), None);
+        let absent = serde_json::json!({"protocol": PROTOCOL_VERSION});
+        assert_eq!(requested_lang(&absent), None);
+        // 三种都能握手成功（形状不变）
+        for p in [with, unknown, absent] {
+            assert!(hello(&p).is_ok(), "{p}");
         }
     }
 }

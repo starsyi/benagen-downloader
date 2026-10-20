@@ -17,6 +17,7 @@ import { Poller, INTERVALS_MS } from "./js/poll.js";
 import { screenFor } from "./js/screens/registry.js";
 import { openSwitchcode } from "./js/switchcode.js";
 import { openSettings } from "./js/settings.js";
+import { openModal } from "./js/dialogs.js";
 import {
   noticesFromState,
   engineBadgeFromState,
@@ -26,6 +27,72 @@ import {
   gateFromState,
   updateNoticeFromStatus,
 } from "./js/render.js";
+
+
+// ---------------------------------------------------------------------------
+// 首启语言询问（规格 W1）
+// ---------------------------------------------------------------------------
+//
+// ⚠️ 判据**不在前端**：`state().language_chosen` 是内核看设置文件说的
+//    （"客户/壳有没有明确选过这一格"）——前端若自己按"语言是不是 system"去猜，
+//    主动选了「跟随系统」的客户每次启动都会被再问一次。
+// ⚠️ 文案**全部来自 Rust**（`settings_get` 的 `language` 那一格）：标题、说明、
+//    三个选项名。前端只摆位置（§3.2）。
+let languageAsked = false;
+
+async function maybeAskLanguage(state) {
+  if (languageAsked) return;
+  if (!state || state.language_chosen !== false) return;
+  languageAsked = true;
+  let payload;
+  try {
+    payload = await call(CMD.settingsGet);
+  } catch {
+    // 问不到就**不打扰**：语言这一格晚一点再选也不影响下载（首启弹窗不是阻塞路径）。
+    return;
+  }
+  const spec = payload && payload.language ? payload.language : null;
+  if (!spec || !Array.isArray(spec.choices) || spec.choices.length === 0) return;
+
+  const modal = openModal("tpl-window-language");
+  const title = modal.root.querySelector("#lang-title");
+  const note = modal.root.querySelector("#lang-note");
+  const row = modal.root.querySelector("#lang-row");
+  if (title) title.textContent = spec.title;
+  if (note) note.textContent = spec.note;
+  if (!row) return;
+  let busy = false;
+  for (const choice of spec.choices) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "set__lang";
+    button.setAttribute("role", "radio");
+    button.setAttribute(
+      "aria-checked",
+      String(choice.value) === String(spec.value) ? "true" : "false"
+    );
+    button.textContent = choice.label;
+    button.addEventListener("click", async () => {
+      if (busy) return;
+      busy = true;
+      for (const b of row.querySelectorAll("button")) b.disabled = true;
+      try {
+        // 整份设置回传（内核是整份替换），只改语言那一格。
+        await call(CMD.settingsSet, {
+          settings: { ...payload.settings, language: choice.value },
+        });
+        modal.close();
+        // 立刻重取一拍：`language_chosen` 变成 true，界面文案跟着内核那一档换。
+        await tickState();
+      } catch (error) {
+        busy = false;
+        for (const b of row.querySelectorAll("button")) b.disabled = false;
+        showTransientFailure(failureText(error));
+      }
+    });
+    row.append(button);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 装配
@@ -490,6 +557,9 @@ async function tickState() {
   // `last_error` —— 那一格由 Rust 决定什么时候消失（`SessionView` 的语义）。
   localFailure = null;
   lastState = state;
+  // 首启语言询问（规格 W1）：判据是 `language_chosen === false`（**设置文件里有没有
+  // 那一格**，由内核在握手时说的）。只问一次；问过之后由壳自己记住本次会话不再问。
+  void maybeAskLanguage(state);
 
   poller.setGate(gateFromState(state));
 
@@ -595,6 +665,27 @@ poller.start(CMD.state, INTERVALS_MS.state, tickState, true);
 //    ⚠️ **受闸门管**（不传 `ungated`）：引擎不可用的时候不去打内核 ——
 //       与它原先挂在文件页上时的口径一致（`poll.js:_fire` 第二条）。
 poller.start(CMD.updateStatus, INTERVALS_MS.update_status, tickUpdate);
+
+// ⑥ 自动重启那一拍（规格 W3）：**壳自己的**，与上一条同理由（任何分区都看得见）。
+//    它是只读的装饰命令：拿不到（没有内核 / 老内核不认这个方法）⇒ 什么都不说，
+//    绝不把一次读失败摆成红条 —— 那时 `state()` 那条节拍本来就在说更准的话。
+poller.start(CMD.restartProgress, INTERVALS_MS.restart_progress, tickRestart);
+
+/**
+ * 自动重启那一拍（`restart_progress`，3 s）。
+ *
+ * 句子在 Rust（`presentation::restart_notice`），这里只把拿到的 `text` 摆上壳级条。
+ * `text` 为 `null`（内核说 `idle`）⇒ 收起那条 —— "没有在重启"就不该有横幅。
+ */
+async function tickRestart() {
+  let payload;
+  try {
+    payload = await call(CMD.restartProgress);
+  } catch (error) {
+    return;
+  }
+  shell.setRestartNotice(payload && typeof payload.text === "string" ? payload : null);
+}
 
 // 关窗/刷新时停掉全部节拍。⚠️ 这一步**不是**为了省电：Tauri 里 webview 一销毁，
 // 在飞的 `invoke` 会以一次拒绝收场，而那一次拒绝会走 `showTransientFailure` ⇒

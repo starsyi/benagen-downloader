@@ -186,9 +186,9 @@ impl DownloadTargets {
     /// 也不报数字：这道闸是壳的**安全预算**（[`Self::REQUEST_BUDGET_BYTES`]），
     /// 把它当"内核的上限"说出去，对着日志排障的人会得出错误的结论
     /// （上游为同一件事记过一笔账：`macos/Sources/BenagenCoreKit/AppModel.swift:1370-1375`）。
-    pub fn blocked_reason(paths: &[String]) -> Option<&'static str> {
+    pub fn blocked_reason(lang: crate::i18n::Lang, paths: &[String]) -> Option<&'static str> {
         if Self::exceeds_request_budget(paths) {
-            Some(Self::over_budget_hint())
+            Some(Self::over_budget_hint(lang))
         } else {
             // 没有理由 = 可以按。**空数组走的就是这一支**（见本函数文档的 ②）。
             None
@@ -197,13 +197,13 @@ impl DownloadTargets {
 
     /// 超预算时那句话。**私有**：调用方只该问 [`Self::blocked_reason`] ——
     /// "什么时候说"与"说什么"分家，就会有人只挑走一半（判据留在 `blocked_reason` 里）。
-    fn over_budget_hint() -> &'static str {
-        "选中的项太多，超过一次能发出的上限：请少选一些"
+    fn over_budget_hint(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::OverBudgetHint)
     }
 
     /// 一项都没勾时要说的那句话（**明说**会发生什么，不让用户猜）。
-    pub fn empty_selection_hint() -> &'static str {
-        "未勾选任何项，将下载全部待下载文件"
+    pub fn empty_selection_hint(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::EmptySelectionHint)
     }
 
     /// 这个动作的文案。**未选中任何项时是「全部下载」**（上游 `:81-83`）。
@@ -217,18 +217,19 @@ impl DownloadTargets {
     ///
     /// ⚠️ 数值上只说"有 / 没有勾选"这一件事，**不拼项数**：项数已经由另一处
     ///    （`SelectionSummary` 的「已选 N 项」）说过了，两处各说一遍迟早会不一致。
-    pub fn button_title(selection: &BTreeSet<String>) -> String {
-        if selection.is_empty() {
-            "全部下载".to_string()
+    pub fn button_title(lang: crate::i18n::Lang, selection: &BTreeSet<String>) -> String {
+        let key = if selection.is_empty() {
+            crate::i18n::Key::DownloadAll
         } else {
-            "下载选中".to_string()
-        }
+            crate::i18n::Key::DownloadSelected
+        };
+        crate::i18n::t(lang, key).to_string()
     }
 
     /// 这个动作的提示文案。**两处入口共用这一份** ——
     /// 两个入口各写一句文案，改一处就会出现"同一件事两个说法"。
-    pub fn help_text() -> &'static str {
-        "把选中的文件加入下载队列（未选中时 = 全部待下载文件）"
+    pub fn help_text(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::DownloadHelp)
     }
 }
 
@@ -748,7 +749,7 @@ mod tests {
     #[test]
     fn an_over_budget_request_is_blocked_with_a_sentence_the_ui_can_act_on() {
         let why =
-            DownloadTargets::blocked_reason(&an_over_budget_set()).expect("超预算必须有理由（它会挡住这一发）");
+            DownloadTargets::blocked_reason(crate::i18n::Lang::Zh, &an_over_budget_set()).expect("超预算必须有理由（它会挡住这一发）");
         assert_eq!(
             why, "选中的项太多，超过一次能发出的上限：请少选一些",
             "这句话是**壳自己写的**（内核在这件事上一个字都没说），逐字钉住"
@@ -782,14 +783,14 @@ mod tests {
             !DownloadTargets::exceeds_request_budget(&[]),
             "空数组是整批全选那条出路，它必须永远在预算之内"
         );
-        assert!(DownloadTargets::blocked_reason(&[]).is_none());
+        assert!(DownloadTargets::blocked_reason(crate::i18n::Lang::Zh, &[]).is_none());
         // ② 正常规模不许误伤（否则用户连三个文件都下不了）。
-        assert!(DownloadTargets::blocked_reason(&v(&["a.txt", "dir/b.bin"])).is_none());
+        assert!(DownloadTargets::blocked_reason(crate::i18n::Lang::Zh, &v(&["a.txt", "dir/b.bin"])).is_none());
         // ③ 与 `exceeds_request_budget` **是同一个判据**（不是各算各的）：边界两侧都对得上。
         let envelope = DownloadTargets::request_bytes(&v(&[""]));
         let exact = DownloadTargets::REQUEST_BUDGET_BYTES - envelope;
-        assert!(DownloadTargets::blocked_reason(&v(&[&"x".repeat(exact)])).is_none(), "恰好等于预算不算超");
-        assert!(DownloadTargets::blocked_reason(&v(&[&"x".repeat(exact + 1)])).is_some(), "多一个字节就该挡");
+        assert!(DownloadTargets::blocked_reason(crate::i18n::Lang::Zh, &v(&[&"x".repeat(exact)])).is_none(), "恰好等于预算不算超");
+        assert!(DownloadTargets::blocked_reason(crate::i18n::Lang::Zh, &v(&[&"x".repeat(exact + 1)])).is_some(), "多一个字节就该挡");
     }
 
     /// **被挡下的那一发要有一句说得出话的回执**（不能"点了没反应"）。
@@ -798,7 +799,7 @@ mod tests {
     /// 而真机上那是约束 4 明禁的静默失效：用户点了下载，界面一个字都不说。
     #[test]
     fn a_blocked_enqueue_says_why_and_does_not_switch_views() {
-        let why = DownloadTargets::blocked_reason(&an_over_budget_set()).expect("夹具必须超预算");
+        let why = DownloadTargets::blocked_reason(crate::i18n::Lang::Zh, &an_over_budget_set()).expect("夹具必须超预算");
         let f = EnqueueFeedback::blocked(why);
 
         assert_eq!(f.summary, why, "回执顶上那句就是判据说出的那句话（一个字都不加）");
@@ -813,7 +814,7 @@ mod tests {
         // 一项都没勾时发的是 `paths: []` = 全部待下载 —— 那句提示必须**明说**这件事
         // （"按下去会下全部"，不是"按下去什么都没发生"）。空白文案 = 静默（约束 4）。
         assert_eq!(
-            DownloadTargets::empty_selection_hint(),
+            DownloadTargets::empty_selection_hint(crate::i18n::Lang::Zh),
             "未勾选任何项，将下载全部待下载文件"
         );
     }
@@ -823,21 +824,21 @@ mod tests {
     fn the_button_says_download_all_when_nothing_is_selected() {
         // 未选中任何项时文案变成「全部下载」，发出去的是 `paths: []`。
         // 所以这个动作**不是禁用**，是换一句话说（"按下去什么都不会发生"才该禁用）。
-        assert_eq!(DownloadTargets::button_title(&set(&[])), "全部下载");
-        assert_eq!(DownloadTargets::button_title(&set(&["a.bin"])), "下载选中");
+        assert_eq!(DownloadTargets::button_title(crate::i18n::Lang::Zh, &set(&[])), "全部下载");
+        assert_eq!(DownloadTargets::button_title(crate::i18n::Lang::Zh, &set(&["a.bin"])), "下载选中");
         assert_eq!(
-            DownloadTargets::button_title(&set(&["a.bin", "b/c"])),
+            DownloadTargets::button_title(crate::i18n::Lang::Zh, &set(&["a.bin", "b/c"])),
             "下载选中",
             "选中几项都是同一句话：文案只说「有 / 没有勾选」这一件事"
         );
         // 两个文案必须**不同** —— 相同的话，"有没有勾选"就看不出来，
         // 而这两个状态发出去的请求是两件完全不同的事（`[路径]` vs 全部待下载）。
         assert_ne!(
-            DownloadTargets::button_title(&set(&[])),
-            DownloadTargets::button_title(&set(&["a.bin"]))
+            DownloadTargets::button_title(crate::i18n::Lang::Zh, &set(&[])),
+            DownloadTargets::button_title(crate::i18n::Lang::Zh, &set(&["a.bin"]))
         );
         assert!(
-            !DownloadTargets::help_text().trim().is_empty(),
+            !DownloadTargets::help_text(crate::i18n::Lang::Zh).trim().is_empty(),
             "提示文案不得空白（约束 4），且两处入口共用这一份"
         );
     }
@@ -937,6 +938,7 @@ mod tests {
         let f = EnqueueFeedback::failure(&ClientError::Kernel {
             code: "invalid_params".to_string(),
             message: ALL_REJECTED_ERROR.to_string(),
+            class: None,
         });
 
         assert_eq!(f.summary, ALL_REJECTED_ERROR, "内核原文逐字（约束 3），不做任何加工");
@@ -956,6 +958,7 @@ mod tests {
         let f = EnqueueFeedback::failure(&ClientError::Kernel {
             code: "engine_start_failed".to_string(),
             message: "启动下载引擎失败：端口 6800 被占用".to_string(),
+            class: None,
         });
 
         assert_eq!(f.summary, "启动下载引擎失败：端口 6800 被占用", "内核原文逐字（约束 3）");
@@ -1000,6 +1003,7 @@ mod tests {
             &ClientError::Kernel {
                 code: "preflight_failed".to_string(),
                 message: "磁盘空间不足：需要 10 GB，可用 2 GB".to_string(),
+                class: None,
             },
             Some("AAA-1"),
         );

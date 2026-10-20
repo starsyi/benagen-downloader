@@ -151,6 +151,10 @@ const invocations = [];
 /** `state()` 那一格的载荷。⚠️ **可变**：几条断言要它换一个批次/换一种加载态。 */
 // ⚠️ 这两格的初值是**占位**（`FIX` 要等 `loadFixtures()`，见文件上那一段）——
 //    `loadFixtures()` 落地的第一步就把它们接上，而那时第一拍还没开始。
+/** `restart_progress` 的回执：默认 `null`（= 没在重启，那条横幅不该出现）。 */
+let restartPayload = { ok: true, data: { text: null } };
+/** `delivery_progress` 的回执：默认空（= 没说过的阶段不摆）。 */
+let resolvePayload = { ok: true, data: { lines: [] } };
 let statePayload = null;
 /** 让某一条命令回一个**失败信封**（`invoke.js` 会把它抛成原文）。 */
 let failures = {};
@@ -187,6 +191,10 @@ async function invoke(cmd, args) {
   invocations.push({ cmd, args: args || {} });
   if (failures[cmd]) return { ok: false, error: { message: failures[cmd] } };
   if (cmd === "state") return statePayload;
+  // 自动重启的进度（规格 W3）：句子在 Rust，夹具只回它给的那一句（或 `null`）。
+  if (cmd === "restart_progress") return restartPayload;
+  // 双域名竞速的解析过程（规格 W4）：行由内核拼好，夹具只回它给的那几行。
+  if (cmd === "delivery_progress") return resolvePayload;
   if (cmd === "tree") {
     const path = args && typeof args.path === "string" ? args.path : null;
     if (path === null) return FIX.treeWhole;
@@ -904,6 +912,12 @@ async function runAll() {
       return control.getAttribute("min") === String(parameters[i].min)
         && control.getAttribute("max") === String(parameters[i].max);
     }));
+  function langButtons2Check() {
+    const now = [...doc().querySelectorAll("#set-language-row .set__lang")];
+    return now[2] && now[2].getAttribute("aria-checked") === "true"
+      && now[0].getAttribute("aria-checked") === "false";
+  }
+  const EN_AFTER_CLICK = "en";
   const select = q("#set-params-rows select");
   check("③h `-k` 那一项是**枚举**控件（不是数字框）", !!select);
   const options = [...select.options].map((o) => o.value);
@@ -919,6 +933,18 @@ async function runAll() {
       && txt("#set-params-notes").includes(FIX.settingsGet.data.notes.apply));
   check("③m 横幅初始 = 「与内核当前参数一致」那一句（挑选，不是造句）",
     txt("#set-banner") === FIX.settingsGet.data.banner.clean, txt("#set-banner"));
+  // ---- 界面语言那一行（规格 W1）：标题与三个选项名**全部来自 Rust** --------------
+  const langButtons = [...doc().querySelectorAll("#set-language-row .set__lang")];
+  check("③n0 语言那一行：标题 + 三个按钮，文字逐字来自载荷",
+    txt("#set-language-title") === FIX.settingsGet.data.language.title
+      && langButtons.length === 3
+      && langButtons.map((b) => b.textContent).join("|")
+        === FIX.settingsGet.data.language.choices.map((c) => c.label).join("|"),
+    langButtons.map((b) => b.textContent).join("|"));
+  check("③n1 当前语言那一颗是选中态（aria-checked）",
+    langButtons.filter((b) => b.getAttribute("aria-checked") === "true").length === 1
+      && langButtons[0].getAttribute("aria-checked") === "true");
+
   check("③n 没有改动 ⇒ 「保存」禁用且 help 是「一致」那一句",
     q("#set-save").disabled
       && q("#set-save").getAttribute("title") === FIX.settingsGet.data.save_help.clean,
@@ -933,15 +959,24 @@ async function runAll() {
   check("③p 有改动 ⇒ 「保存」可按，help 换成「下发」那一句",
     !q("#set-save").disabled
       && q("#set-save").getAttribute("title") === FIX.settingsGet.data.save_help.unsaved);
+  // 点「English」⇒ 变成待保存的改动；保存时必须原样带上（漏了 = 改并行数就把语言重置）
+  langButtons[2].click();
+  await sleep(200);
+  check("③q0 点英文 ⇒ 横幅变「有未保存的改动」，且英文那颗是选中态",
+    txt("#set-banner") === FIX.settingsGet.data.banner.unsaved
+      && langButtons2Check(),
+    txt("#set-banner"));
+
   click(q("#set-save"));
   await sleep(600);
   const saved = calls("settings_set").pop();
   const body = saved && saved.args.settings;
-  check("③q 保存发的是**七个键**（键名 = 线上契约），值取自表里那一份",
-    !!body && Object.keys(body).length === 7
+  check("③q 保存发的是**八个键**（键名 = 线上契约），值取自表里那一份，语言原样回传",
+    !!body && Object.keys(body).length === 8
       && body.parallel === 4
       && body.min_split_size === "21M"
-      && "retry_wait" in body && "limit_mbps" in body,
+      && "retry_wait" in body && "limit_mbps" in body
+      && body.language === EN_AFTER_CLICK,
     JSON.stringify(body));
   await sleep(300);
   check("③r 保存成功 ⇒ 用**回执那一份**重播种（横幅回到「一致」）",
@@ -1277,6 +1312,90 @@ async function runAll() {
   failures = {};
   esc();
   await sleep(200);
+
+  // =========================================================================
+  // ⑥½ 目标盘慢的那句提示（`state.disk`）：**发什么就画什么，不发就不画**
+  // =========================================================================
+  // 为什么要有：2026-10-20 现场，客户把下载目录放在移动硬盘上，下载 1.7 MB/s
+  // 被当成网络问题查了两天。判据（多慢算慢、句子怎么写）在 Rust
+  // （`presentation/disk_notice.rs`，那边有单测）—— 这一组只判前端那一半：
+  // 载荷里有那句话⇒它逐字上屏；载荷里没有⇒它真的消失（不是画上去就不管了）。
+  const DISK_TEXT = "目标磁盘写入约 7 MB/s，比下载速度慢（夹具）";
+  statePayload = stateWith((data) => { data.disk = { text: DISK_TEXT }; });
+  await sleep(1600);
+  check("⑥½a 慢盘那句提示**上了屏**，且逐字",
+    txt("#notices").includes(DISK_TEXT), `「${txt("#notices")}」`);
+
+  // 负控制：这一格为 `null` ⇒ 那句话必须消失。
+  // ⚠️ 少了它，一个"看到 disk 就画、画完再也不清"的实现也能全绿。
+  statePayload = stateWith((data) => { data.disk = null; });
+  await sleep(1600);
+  check("⑥½b 不发 ⇒ 那句话**真的没了**（负控制）",
+    !txt("#notices").includes(DISK_TEXT), `「${txt("#notices")}」`);
+
+  // =========================================================================
+  // ⑥⅕ 双域名解析的四阶段（`delivery_progress`）：加载期间逐行摆，加载结束就清空
+  // =========================================================================
+  // 为什么要有：规格 W4 要求"显示解析过程"（国内 / 国际两个 CDN 各试一次，最慢要一秒多）。
+  // 句子由内核逐行拼好；这里只判前端那一半：**给几行就摆几行、一行不多**，
+  // 且加载结束（`load.kind` 不再是 loading）⇒ 那些行**真的清掉**（不留在屏上）。
+  const RESOLVE_LINES = ["正在向国内服务器索取清单……（夹具）", "国内没问到，正在试国际服务器……（夹具）"];
+  resolvePayload = { ok: true, data: { lines: RESOLVE_LINES } };
+  statePayload = stateWith((data) => { data.load = { kind: "loading" }; });
+  await sleep(2000);
+  const resolveShown = txt("#empty-resolve");
+  check("⑥⅕a 解析的每一行都摆出来了（顺序与载荷一致）",
+    RESOLVE_LINES.every((line) => resolveShown.includes(line)), `「${resolveShown}」`);
+
+  statePayload = stateWith((data) => { data.load = { kind: "idle" }; });
+  await sleep(2000);
+  check("⑥⅕b 不在加载 ⇒ 那些行**真的清掉**（负控制）",
+    !txt("#empty-resolve").includes(RESOLVE_LINES[0]), `「${txt("#empty-resolve")}」`);
+
+  // =========================================================================
+  // ⑥⅔ 自动重启的进度条（`restart_progress`）：有那一句就上屏，`null` 就收起
+  // =========================================================================
+  // 为什么要有：规格 W3 要求"重启期间显示「正在重启下载引擎（第 n/3 次）…」"。
+  // 句子在 Rust（`presentation::restart_notice`，四种状态逐个钉过）；这里只判前端
+  // 那一半：**载荷给什么就显示什么，不给就收起**（不是画上去就不管）。
+  const RESTART_TEXT = "正在重启下载引擎（第 2/3 次）…（夹具）";
+  restartPayload = { ok: true, data: { text: RESTART_TEXT } };
+  await sleep(3200);
+  check("⑥⅔a 重启进度那句**上了壳级条**（任何分区都看得见）",
+    txt("#restart-bar").includes(RESTART_TEXT), `「${txt("#restart-bar")}」`);
+
+  restartPayload = { ok: true, data: { text: null } };
+  await sleep(3200);
+  check("⑥⅔b 不重启 ⇒ 那条**真的收起**（负控制）",
+    !txt("#restart-bar").includes(RESTART_TEXT), `「${txt("#restart-bar")}」`);
+
+  // =========================================================================
+  // ⑥¾ 八类错误卡片（`state.error_cards`）：三句话全在 Rust，前端只摆
+  // =========================================================================
+  // 为什么要有：规格 W2 的核心承诺是"不同病灶说不同的话 + 每类给一个动作"。
+  // 句子与次序在 Rust（`presentation::error_card`，那边对八类 × 两种语言逐个钉过）；
+  // 这一组只判前端那一半：**载荷里三句都要上屏**，且**同一张卡合并了次数**时
+  // 次数那一句（Rust 拼的）也逐字出现 —— 前端不许自己拼"(x2)"。
+  const CARD = {
+    class: "disk_full",
+    title: "目标磁盘空间不足或不可写（2 次）",
+    explain: "目标磁盘上没有足够的空间。",
+    action: "换一个磁盘或清理空间后重试。",
+    severity: 30,
+    count: 2,
+  };
+  statePayload = stateWith((data) => { data.error_cards = [CARD]; });
+  await sleep(1600);
+  const cardText = txt("#notices");
+  check("⑥¾a 错误卡的标题逐字上屏（次数是 Rust 拼的）",
+    cardText.includes(CARD.title), `「${cardText}」`);
+  check("⑥¾b 解释与动作两句**都要**上屏（缺一句客户就不知道下一步）",
+    cardText.includes(CARD.explain) && cardText.includes(CARD.action), `「${cardText}」`);
+
+  statePayload = stateWith((data) => { data.error_cards = []; });
+  await sleep(1600);
+  check("⑥¾c 没有卡片 ⇒ 那三句**真的没了**（负控制）",
+    !txt("#notices").includes(CARD.title), `「${txt("#notices")}」`);
 
   // =========================================================================
   // ⑦ 🔴 R-5 对位差分：**判据在 Rust、行为在 JS** 的那几条，两边结论必须一致

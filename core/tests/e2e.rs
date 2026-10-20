@@ -26,6 +26,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+
+/// 本 crate 没有 lib target（见文件头），协议版本只能在这里再写一份。
+///
+/// 它与 `core/src/protocol.rs:26` 是同一条跨进程约定；`hello_negotiates_the_protocol_version`
+/// 会拿内核 `hello` 的回执与它比对 —— 所以升协议时漏改这里，那条用例立刻红（这正是 0.3.0 升 2 时发生的事）。
+const PROTOCOL_VERSION: u32 = 2;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -739,15 +745,15 @@ fn hello_negotiates_the_protocol_version() {
     let dir = TempDir::new("hello");
     let mut core = Core::start(&dir.path().join("dl"), &dir.path().join("s.json"));
 
-    let r = core.ok("hello", json!({"protocol": 1}));
-    assert_eq!(r["protocol"], json!(1), "内核协议版本必须是 1");
+    let r = core.ok("hello", json!({"protocol":2}));
+    assert_eq!(r["protocol"], json!(2), "内核协议版本必须是 2");
     assert!(
         r["min_split_size_choices"].as_array().unwrap().len() == 100,
         "枚举面必须随握手交给壳（§2.3 的落点）：{r}"
     );
 
     // 版本不符 → protocol_mismatch，且**不做降级协商**
-    let e = core.err("hello", json!({"protocol": 2}));
+    let e = core.err("hello", json!({"protocol": 1}));
     assert_eq!(e["code"], json!("protocol_mismatch"), "{e}");
 
     // 参数形状不对 → invalid_params
@@ -1122,7 +1128,9 @@ fn enqueue_preflight_failure_does_not_start_the_engine() {
     let mut core = Core::start(&blocker, &dir.path().join("s.json"));
 
     // 前面的方法照常可用（只有开工前检查该拦）
-    core.ok("hello", json!({"protocol": 1}));
+    // ⚠️ 语言显式钉成中文：本用例断言的是**中文措辞**，而 0.3.0 起内核跟随系统
+    //    locale 选语言（本机是英文 locale）——不钉就会"在自己的机器上红"。
+    core.ok("hello", json!({"protocol":2, "language": "zh"}));
     // 清单从桩上取（`base_url` 显式指向桩，否则内核会去打生产 CDN——测试必须自洽）
     core.ok(
         "load_delivery",
@@ -1522,7 +1530,7 @@ fn stdout_carries_only_protocol_messages() {
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(b"{\"id\":1,\"method\":\"hello\",\"params\":{\"protocol\":1}}\n")
+        .write_all(b"{\"id\":1,\"method\":\"hello\",\"params\":{\"protocol\":2}}\n")
         .unwrap();
     drop(child.stdin.take()); // EOF → 内核应当自己收尾退出
     let out = child.wait_with_output().expect("等内核退出");
@@ -1562,8 +1570,8 @@ fn invalid_utf8_is_a_protocol_error_not_an_eof() {
     assert_eq!(v["error"]["code"], json!("bad_request"), "{line}");
 
     // 连接**还活着**：后续请求照常工作
-    let r = core.ok("hello", json!({"protocol": 1}));
-    assert_eq!(r["protocol"], json!(1), "解码失败不得把连接丢掉");
+    let r = core.ok("hello", json!({"protocol":2}));
+    assert_eq!(r["protocol"], json!(2), "解码失败不得把连接丢掉");
 }
 
 /// 简报第 13 条：**行长上限必须显式做出并记账。**
@@ -1582,7 +1590,7 @@ fn over_long_line_is_rejected_and_the_loop_resyncs() {
     core.send_raw(&junk);
 
     // 紧跟一条正常请求，然后读到**它**的响应为止。
-    let (v, bads) = core.call_collecting_errors("hello", json!({"protocol": 1}));
+    let (v, bads) = core.call_collecting_errors("hello", json!({"protocol":2}));
 
     // ⚠️ 判别力在这里：`bads >= 2` 才能把"有上限"与"没上限"分开。
     //   - **有** 8 MiB 上限：这 9 MiB 被切成 8 MiB（超限 → 报错）＋ 1 MiB（碎片 → JSON 非法 → 报错），
@@ -1597,7 +1605,11 @@ fn over_long_line_is_rejected_and_the_loop_resyncs() {
 
     // 循环必须**重新对齐**：后续请求照常工作
     assert_eq!(v["ok"], json!(true), "{v}");
-    assert_eq!(v["result"]["protocol"], json!(1), "超长行之后协议循环必须还能用");
+    assert_eq!(
+        v["result"]["protocol"],
+        json!(PROTOCOL_VERSION),
+        "超长行之后协议循环必须还能用"
+    );
 }
 
 /// 简报第 12 条：**能配对的就必须配上**——这条只能在 stdio 这一层测。
@@ -1632,7 +1644,7 @@ fn malformed_request_with_a_readable_id_keeps_its_id() {
     assert_eq!(v["id"], json!(0), "畸形 JSON 只能回保留值: {line}");
 
     // ③ 之后一切照常
-    core.ok("hello", json!({"protocol": 1}));
+    core.ok("hello", json!({"protocol":2}));
 }
 
 /// 简报第 9 条：自动重入队的集合**就是** `verify::CheckResult::failures()`。
@@ -1764,6 +1776,32 @@ fn mixed_batch_classifies_every_file_exactly_once() {
     }
 }
 
+/// 规格 W1 的端到端判别力：**同一个拒绝**，壳说英文时客户看到的是英文，
+/// 且**一个汉字都没有**——文本表接错线（比如句子没查表）会在这里露头。
+#[test]
+fn the_same_preflight_rejection_speaks_english_when_asked() {
+    const P: &str = "t/huge.bin";
+    let files: &[(&str, &[u8])] = &[(P, b"tiny")];
+    let mut env = Env::new(
+        "nospace-en",
+        files,
+        Faults {
+            size_override: &[(P, 1 << 50)],
+            ..Default::default()
+        },
+    );
+    env.core.ok("hello", json!({"protocol":2, "language": "en"}));
+    env.load();
+    let e = env.err("enqueue", json!({"paths": [P]}));
+    assert_eq!(e["code"], json!("preflight_failed"), "{e}");
+    let msg = e["message"].as_str().unwrap();
+    assert!(
+        !msg.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+        "选了英文却回中文: {msg}"
+    );
+    assert!(msg.contains("free space"), "要能看出是空间不够: {msg}");
+}
+
 /// 简报第 4 条的**另一半**：开工前检查里的「磁盘剩余空间」。
 ///
 /// 判别力：把 `free < need` 改成恒假（只查可写、不查空间）的实现会直接去起引擎，
@@ -1782,6 +1820,8 @@ fn preflight_rejects_when_the_disk_cannot_hold_the_batch() {
             ..Default::default()
         },
     );
+    // 中文措辞：0.3.0 起语言跟随系统/壳，测试里显式钉住（否则在英文 locale 的机器上红）
+    env.core.ok("hello", json!({"protocol":2, "language": "zh"}));
     env.load();
     let e = env.err("enqueue", json!({"paths": [P]}));
     assert_eq!(
@@ -1793,6 +1833,8 @@ fn preflight_rejects_when_the_disk_cannot_hold_the_batch() {
         e["message"].as_str().unwrap().contains("空间"),
         "消息要说清是空间不够（而不是别的开工前检查）: {e}"
     );
+    // 规格 §2.3：客户可见的每一类错误都带 class（壳按它选"一句人话 + 一个按钮"）
+    assert_eq!(e["class"], json!("disk_full"), "预检不过必须带上类: {e}");
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         aria2c_for(&env.dl()).is_empty(),
@@ -2194,6 +2236,8 @@ fn enqueue_rejects_unknown_paths() {
     let mut core = Core::start(&dir.path().join("dl"), &dir.path().join("s.json"));
     let e = core.err("enqueue", json!({"paths": ["t/a.txt"]}));
     assert_eq!(e["code"], json!("no_delivery"), "{e}");
+    // 内部错误：码保留，**没有** class（界面显示"意料之外"，不猜是哪一步坏的）
+    assert!(e.get("class").is_none(), "内部错误不许带类: {e}");
 }
 
 // ===========================================================================

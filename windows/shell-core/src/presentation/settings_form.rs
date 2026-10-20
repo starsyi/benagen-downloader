@@ -109,6 +109,8 @@ pub struct SettingsForm {
     pub retry_wait: i32,
     /// 内核 `hello` 给的 `-k` 取值集合（**壳不生成它**）。
     pub choices: Vec<String>,
+    /// 界面语言：`system` / `zh` / `en`（规格 W1）。**原样回传**，理由见 `protocol::Settings`。
+    pub language: String,
 }
 
 impl SettingsForm {
@@ -125,6 +127,7 @@ impl SettingsForm {
             max_tries: settings.max_tries,
             retry_wait: settings.retry_wait,
             choices,
+            language: settings.language.clone(),
         }
     }
 
@@ -143,7 +146,26 @@ impl SettingsForm {
             limit_mbps: self.limit_mbps,
             max_tries: self.max_tries,
             retry_wait: self.retry_wait,
+            language: self.language.clone(),
         }
+    }
+
+    // MARK: - 界面语言
+
+    /// 语言选项的**线上值**（顺序就是设置页那一行的顺序：跟随系统 → 中文 → English）。
+    ///
+    /// ⚠️ 与 `core/src/i18n::Lang::parse` 认的写法**逐字对齐**（`system`/`zh`/`en`）：
+    ///    这一格是**唯一**的来源，前端照着画，不自己拼字符串。
+    pub const LANGUAGE_VALUES: [&'static str; 3] = ["system", "zh", "en"];
+
+    /// 语言选项的显示名（按当前界面语言给；**选项自身的名字不翻译**——
+    /// 「中文」永远叫中文、`English` 永远叫 English，否则选错语言的人找不回来）。
+    pub fn language_labels(lang: crate::i18n::Lang) -> Vec<String> {
+        let system = match lang {
+            crate::i18n::Lang::Zh => "跟随系统",
+            crate::i18n::Lang::En => "Follow system",
+        };
+        vec![system.to_string(), "中文".to_string(), "English".to_string()]
     }
 
     // MARK: - `-k` 的枚举面
@@ -178,13 +200,14 @@ impl SettingsForm {
     ///    而一个手改进 `settings.json` 的 `999M` 会被内核回 `invalid_params`
     ///    —— 谁是合法值由内核判（壳不比内核更松、也不更严），这句话只负责
     ///    让客户知道"这个值不在内核给的清单里"。
-    pub fn min_split_size_note(&self) -> Option<String> {
+    pub fn min_split_size_note(&self, lang: crate::i18n::Lang) -> Option<String> {
         if self.choices.iter().any(|c| c == &self.min_split_size) {
             None
         } else {
-            Some(format!(
-                "当前值「{}」不在内核给出的取值集合里。保存会按这个原值下发，由内核校验。",
-                self.min_split_size
+            Some(crate::i18n::tf(
+                lang,
+                crate::i18n::Key::SettingsMinSplitNote,
+                &[("value", &self.min_split_size)],
             ))
         }
     }
@@ -337,22 +360,25 @@ impl SettingsForm {
     /// 🔴 这一份来自**视图层**（上游没有单测），本波次把它搬进来的理由见模块头。
     ///    ⚠️ 它与 [`Self::LIMITS`] 是**两份独立的事实**（一个是名字、一个是数），
     ///    下面的 [`Self::parameters`] 把它们配起来 —— 那一步是"配对"，不是抄数。
-    pub const PARAMETER_LABELS: [&'static str; 7] = [
-        "并行文件数（-j）",
-        "单文件连接数（-x）",
-        "分片数（-s）",
-        "最小分片大小（-k）",
-        "限速（MB/s）",
-        "重试次数",
-        "重试间隔（秒）",
-    ];
+    pub fn parameter_labels(lang: crate::i18n::Lang) -> [&'static str; 7] {
+        use crate::i18n::{t, Key};
+        [
+            t(lang, Key::SettingsParamParallel),
+            t(lang, Key::SettingsParamConnections),
+            t(lang, Key::SettingsParamSplits),
+            t(lang, Key::SettingsParamMinSplit),
+            t(lang, Key::SettingsParamLimit),
+            t(lang, Key::SettingsParamMaxTries),
+            t(lang, Key::SettingsParamRetryWait),
+        ]
+    }
 
     /// 七项 → **给前端用的**（标签 + 区间），顺序即面板上从上到下的顺序。
     ///
     /// 🔴 新增（上游的标签在视图层、区间在 `SettingsForm.limits`，没有任何一处把
     ///    它们配起来；而前端需要的就是这个配对）。判据一条都不多：
-    ///    标签来自 [`Self::PARAMETER_LABELS`]，区间来自 [`Self::LIMITS`]。
-    pub fn parameters() -> Vec<Parameter> {
+    ///    标签来自 [`Self::parameter_labels(crate::i18n::Lang::Zh)`]，区间来自 [`Self::LIMITS`]。
+    pub fn parameters(lang: crate::i18n::Lang) -> Vec<Parameter> {
         let limits = Self::LIMITS;
         let numeric = |range: &RangeInclusive<i64>| {
             (Some(*range.start()), Some(*range.end()))
@@ -367,7 +393,7 @@ impl SettingsForm {
             numeric(&(*limits.max_tries.start() as i64..=*limits.max_tries.end() as i64)),
             numeric(&(*limits.retry_wait.start() as i64..=*limits.retry_wait.end() as i64)),
         ];
-        Self::PARAMETER_LABELS
+        Self::parameter_labels(lang)
             .iter()
             .zip(bounds)
             .map(|(label, (min, max))| Parameter { label, min, max })
@@ -383,7 +409,9 @@ impl SettingsForm {
     /// ⚠️ 必须写出来：`0` 在这里是一个**有专门含义的取值**（不限速），而客户看到
     ///    "限速 0"很自然会读成"限速到 0 = 不让下载"，正好反了。内核侧同一个语义
     ///    （不限速时**显式下发 `"0"`**）也说明 `0` 不是"缺省/未设"。
-    pub const LIMIT_MBPS_NOTE: &'static str = "0 = 不限速（不限制总下载速度）";
+    pub fn limit_mbps_note(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::SettingsLimitNote)
+    }
 
     /// 参数面板底下那句"改动什么时候生效"。
     ///
@@ -393,9 +421,9 @@ impl SettingsForm {
     ///    `global_options`（并行数 `-j` 与限速）经 `changeGlobalOption` **立即**下发；
     ///    其余各项是逐任务选项，在**添加任务**时随 `addUri` 交出去。
     ///    不说清楚，客户改完 `-s` 会以为正在传的那些任务变了（它们没变）。
-    pub const APPLY_NOTE: &'static str =
-        "改动会写盘保存（重开应用仍是这一份）。并行数与限速对已启动的引擎即时生效；\
-其余各项在添加新任务时生效，已在传输的任务不受影响。";
+    pub fn apply_note(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::SettingsApplyNote)
+    }
 
     /// 保存条上那句横幅：有改动 / 与内核一致。
     ///
@@ -408,16 +436,20 @@ impl SettingsForm {
     ///    [`Self::dirty_banner`] 这个**挑选函数**（挑选现在活在前端）。它的落点由
     ///    [`Self::matches`] 那条差分覆盖：判决一致 ⇒ 挑出来的句子自然一致。
     ///    `check_presentation_mirrors.sh` 里那一格账把它记成"承接点是载荷"。
-    pub const UNSAVED_BANNER: &'static str = "有未保存的改动";
-    /// 与内核一致那一句。见 [`Self::UNSAVED_BANNER`]。
-    pub const CLEAN_BANNER: &'static str = "与内核当前参数一致";
+    pub fn unsaved_banner(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::SettingsUnsavedBanner)
+    }
+    /// 与内核一致那一句。见 [`Self::unsaved_banner(lang)`]。
+    pub fn clean_banner(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::SettingsCleanBanner)
+    }
 
     /// 横幅文字（`has_unsaved_changes` 由 [`Self::matches`] 算出来）。
-    pub fn dirty_banner(has_unsaved_changes: bool) -> &'static str {
+    pub fn dirty_banner(lang: crate::i18n::Lang, has_unsaved_changes: bool) -> &'static str {
         if has_unsaved_changes {
-            Self::UNSAVED_BANNER
+            Self::unsaved_banner(lang)
         } else {
-            Self::CLEAN_BANNER
+            Self::clean_banner(lang)
         }
     }
 
@@ -502,6 +534,7 @@ mod tests {
             limit_mbps,
             max_tries,
             retry_wait,
+            language: "system".to_string(),
         }
     }
 
@@ -549,7 +582,7 @@ mod tests {
             vec!["3M", "1M", "2M"],
             "顺序照内核给的，不排序、不去重"
         );
-        assert_eq!(f.min_split_size_note(), None, "在集合里就没什么可说的");
+        assert_eq!(f.min_split_size_note(crate::i18n::Lang::Zh), None, "在集合里就没什么可说的");
     }
 
     /// 上游 `anOffListValueIsAppendedExactlyOnceAndExplained`。
@@ -566,7 +599,7 @@ mod tests {
             vec!["1M", "20M", "21M"],
             "不在集合里就追加在末尾，只追加一次"
         );
-        let note = f.min_split_size_note();
+        let note = f.min_split_size_note(crate::i18n::Lang::Zh);
         assert!(
             note.as_deref().unwrap_or("").contains("21M"),
             "说明里要点名这个值：{}",
@@ -630,7 +663,7 @@ mod tests {
     ///    `minSplitSize`/`limitMbps`，内核把它们当成缺失键、回 invalid_params。
     ///    所以"个数 == 7"这条对"名字对不对"零判别力，这里逐个点名。
     #[test]
-    fn set_settings_always_sends_all_seven_keys() {
+    fn set_settings_always_sends_all_eight_keys() {
         let body = SettingsForm::request_body(&default_settings()).expect("Settings 必须编得出来");
         let obj = body.as_object().expect("request_body 必须是一个 JSON 对象");
         let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
@@ -644,10 +677,39 @@ mod tests {
                 "limit_mbps",
                 "max_tries",
                 "retry_wait",
+                "language",
             ]
             .into_iter()
             .collect::<std::collections::BTreeSet<&str>>()
         );
+    }
+
+
+    /// 判据（规格 W1）：**改别的参数不许把语言顺手重置**。
+    ///
+    /// 判别力：把 `settings()` 里的 `language` 改成 `"system".to_string()` ⇒ 这条红。
+    /// 现场代价：客户选了英文，改一次并行数就变回中文，而没有任何东西会报错。
+    #[test]
+    fn saving_other_parameters_keeps_the_language() {
+        let mut s = fixture(8, 16, 16, "20M", 0, 3, 1);
+        s.language = "en".to_string();
+        let mut form = SettingsForm::new(&s, vec![]);
+        form.parallel = 12;
+        assert_eq!(form.settings().language, "en", "语言不是这张表的可调项");
+    }
+
+    /// 判据（规格 W1）：语言选项**三档**，线上值与内核 `Lang::parse` 认的逐字对齐。
+    #[test]
+    fn the_language_choices_are_the_three_wire_words() {
+        assert_eq!(SettingsForm::LANGUAGE_VALUES, ["system", "zh", "en"]);
+        let labels = SettingsForm::language_labels(crate::i18n::Lang::Zh);
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels[0], "跟随系统");
+        assert_eq!(labels[1], "中文");
+        assert_eq!(labels[2], "English", "选项自身的名字不翻译");
+        let en = SettingsForm::language_labels(crate::i18n::Lang::En);
+        assert_eq!(en[0], "Follow system");
+        assert_eq!(en[1], "中文");
     }
 
     /// 上游 `setSettingsParamsWrapsTheBodyUnderTheSettingsKey`。
@@ -671,7 +733,7 @@ mod tests {
                 .expect("request_body 必须是对象"),
             "内层那一份就是 request_body 本身（不是各编一次的两份）"
         );
-        assert_eq!(inner.len(), 7);
+        assert_eq!(inner.len(), 8);
     }
 
     /// 🔴 **新增（R-38 复审）：编码失败回的是那句可读的话，不是一个 panic。**
@@ -758,6 +820,7 @@ mod tests {
                 "limit_mbps": 12_345,
                 "max_tries": 7,
                 "retry_wait": 3,
+                "language": "system",
             })
         );
     }
@@ -803,8 +866,8 @@ mod tests {
     fn zero_means_unlimited_and_the_screen_says_so() {
         // `0` = 不限速，**界面要写明这一条**（客户看到"限速 0"很自然会读成
         // "限速到 0 = 不让下载"，正好反了）。
-        assert!(SettingsForm::LIMIT_MBPS_NOTE.contains('0'));
-        assert!(SettingsForm::LIMIT_MBPS_NOTE.contains("不限速"));
+        assert!(SettingsForm::limit_mbps_note(crate::i18n::Lang::Zh).contains('0'));
+        assert!(SettingsForm::limit_mbps_note(crate::i18n::Lang::Zh).contains("不限速"));
     }
 
     /// 上游 `theScreenSaysWhenEachSettingApplies`。
@@ -813,9 +876,9 @@ mod tests {
         // 内核的两条生效路径不同：并行数与限速走 `changeGlobalOption`
         // **对已在跑的引擎即时生效**；其余各项是"添加任务时"下发的逐任务选项。
         // 不说清楚，客户改完 `-s` 会以为正在传的任务变了。
-        assert!(SettingsForm::APPLY_NOTE.contains("即时生效"));
-        assert!(SettingsForm::APPLY_NOTE.contains("新任务"));
-        assert!(!SettingsForm::APPLY_NOTE.is_empty());
+        assert!(SettingsForm::apply_note(crate::i18n::Lang::Zh).contains("即时生效"));
+        assert!(SettingsForm::apply_note(crate::i18n::Lang::Zh).contains("新任务"));
+        assert!(!SettingsForm::apply_note(crate::i18n::Lang::Zh).is_empty());
     }
 
     /// 上游 `aSaveFailureShowsTheKernelTextVerbatim`。
@@ -834,6 +897,7 @@ mod tests {
             error_text(&ClientError::Kernel {
                 code: "invalid_params".to_string(),
                 message: "并行文件数必须在 1–64 之间，当前 99".to_string(),
+                class: None,
             }),
             "并行文件数必须在 1–64 之间，当前 99"
         );
@@ -844,6 +908,7 @@ mod tests {
             error_text(&ClientError::Kernel {
                 code: "engine_rpc_failed".to_string(),
                 message: partial.to_string(),
+                class: None,
             }),
             partial
         );
@@ -879,7 +944,7 @@ mod tests {
     ///    （下面这张表）—— 本函数把它们**配**在一起，不是又抄一遍数。
     #[test]
     fn the_seven_parameters_have_their_labels_and_ranges() {
-        let parameters = SettingsForm::parameters();
+        let parameters = SettingsForm::parameters(crate::i18n::Lang::Zh);
         assert_eq!(parameters.len(), 7, "七项，一个不多一个不少");
 
         let labels: Vec<&str> = parameters.iter().map(|p| p.label).collect();
@@ -927,16 +992,16 @@ mod tests {
     /// 新增（上游在 `SettingsView.swift:425` 的视图层，没有单测）：保存条上那句横幅。
     #[test]
     fn the_dirty_banner_says_unsaved_when_it_differs() {
-        assert_eq!(SettingsForm::dirty_banner(true), "有未保存的改动");
+        assert_eq!(SettingsForm::dirty_banner(crate::i18n::Lang::Zh, true), "有未保存的改动");
         assert_ne!(
-            SettingsForm::dirty_banner(true),
-            SettingsForm::dirty_banner(false),
+            SettingsForm::dirty_banner(crate::i18n::Lang::Zh, true),
+            SettingsForm::dirty_banner(crate::i18n::Lang::Zh, false),
             "两种状态必须在界面上分得开（判据是 `matches`）"
         );
         // 判据的接线：表里的七项与内核那份不一致 ⇒ 就是"有未保存的改动"。
         let dirty = SettingsForm::new(&default_settings(), vec![]);
         assert_eq!(
-            SettingsForm::dirty_banner(!dirty.matches(Some(&fixture(8, 16, 16, "20M", 0, 3, 60)))),
+            SettingsForm::dirty_banner(crate::i18n::Lang::Zh, !dirty.matches(Some(&fixture(8, 16, 16, "20M", 0, 3, 60)))),
             "有未保存的改动"
         );
     }
@@ -944,10 +1009,10 @@ mod tests {
     /// 新增（上游在 `SettingsView.swift:425` 的视图层，没有单测）：与内核一致那一句。
     #[test]
     fn the_clean_banner_says_it_matches_the_kernel() {
-        assert_eq!(SettingsForm::dirty_banner(false), "与内核当前参数一致");
+        assert_eq!(SettingsForm::dirty_banner(crate::i18n::Lang::Zh, false), "与内核当前参数一致");
         let clean = SettingsForm::new(&default_settings(), vec![]);
         assert_eq!(
-            SettingsForm::dirty_banner(!clean.matches(Some(&default_settings()))),
+            SettingsForm::dirty_banner(crate::i18n::Lang::Zh, !clean.matches(Some(&default_settings()))),
             "与内核当前参数一致"
         );
     }

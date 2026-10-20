@@ -525,8 +525,8 @@ mod tests {
     #[test]
     fn the_protocol_version_comes_from_the_kernel_not_from_us() {
         assert_eq!(
-            protocol_version_from_handshake(Some(r#"{"protocol":1,"min_split_size_choices":[]}"#)),
-            Some(1)
+            protocol_version_from_handshake(Some(r#"{"protocol":2,"min_split_size_choices":[]}"#)),
+            Some(2)
         );
         assert_eq!(protocol_version_from_handshake(None), None, "没握上手 ⇒ 未连上");
         assert_eq!(

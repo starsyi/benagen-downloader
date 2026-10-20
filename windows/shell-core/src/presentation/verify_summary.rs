@@ -67,14 +67,15 @@ impl VerifyClass {
     ///   - `size_mismatch` = "大小不符"；
     ///   - `unverifiable` = "清单与 HEAD 都没给出 crc64"；
     ///   - `unreadable` = "能 stat 到但读不了（权限/IO 错误）"。
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::Key;
         match self {
-            VerifyClass::Passed => "校验通过",
-            VerifyClass::Mismatched => "内容不符",
-            VerifyClass::Missing => "文件缺失",
-            VerifyClass::SizeMismatch => "大小不符",
-            VerifyClass::Unverifiable => "无法校验",
-            VerifyClass::Unreadable => "无法读取",
+            VerifyClass::Passed => crate::i18n::t(lang, Key::VerifyPassed),
+            VerifyClass::Mismatched => crate::i18n::t(lang, Key::VerifyMismatched),
+            VerifyClass::Missing => crate::i18n::t(lang, Key::VerifyMissing),
+            VerifyClass::SizeMismatch => crate::i18n::t(lang, Key::VerifySizeMismatch),
+            VerifyClass::Unverifiable => crate::i18n::t(lang, Key::VerifyUnverifiable),
+            VerifyClass::Unreadable => crate::i18n::t(lang, Key::VerifyUnreadable),
         }
     }
 
@@ -124,9 +125,9 @@ impl VerifyClass {
     ///    没有一个"原文"可以把这件事讲给客户听。
     ///    **每一类都出这一行的结果**：这一行永远在（因为这一类永远在），
     ///    `VerifyClassRow` 里 `note` 非 `None` 就等于那一句会被给出来。
-    pub fn note(&self) -> Option<&'static str> {
+    pub fn note(&self, lang: crate::i18n::Lang) -> Option<&'static str> {
         match self {
-            VerifyClass::Unverifiable => Some("这些文件没有可比的校验值，不是失败"),
+            VerifyClass::Unverifiable => Some(crate::i18n::t(lang, crate::i18n::Key::VerifyUnverifiableNote)),
             VerifyClass::Passed
             | VerifyClass::Mismatched
             | VerifyClass::Missing
@@ -266,9 +267,13 @@ impl VerifyClassRow {
     ///
     /// ⚠️ 它存在的全部理由是约束 4 那一句"计数为 0 的类**显示 0，不得隐藏**"：
     ///    只靠"路径列表为空所以没东西可给"来表达 0，在客户眼里就是"这一类不见了"。
-    pub fn count_text(&self) -> String {
+    pub fn count_text(&self, lang: crate::i18n::Lang) -> String {
         // 上游是 `"\(count) 项"`；两处共用一个格式串，改一处就两处都改。
-        format!("{} 项", self.count())
+        crate::i18n::tf(
+            lang,
+            crate::i18n::Key::VerifyItemsSuffix,
+            &[("n", &self.count().to_string())],
+        )
     }
 
     /// 这一类算不算失败（口径在 [`VerifyClass::is_failure`]）。
@@ -318,13 +323,18 @@ pub enum VerifyVerdict {
 }
 
 impl VerifyVerdict {
-    pub fn text(&self) -> String {
+    pub fn text(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Key;
         match self {
-            VerifyVerdict::NotVerified => "尚未校验".to_string(),
-            VerifyVerdict::AllGood => "全部通过".to_string(),
-            VerifyVerdict::Failed(n) => format!("{n} 项未通过"),
+            VerifyVerdict::NotVerified => crate::i18n::t(lang, Key::VerifyNotVerified).to_string(),
+            VerifyVerdict::AllGood => crate::i18n::t(lang, Key::VerifyAllGood).to_string(),
+            VerifyVerdict::Failed(n) => crate::i18n::tf(
+                lang,
+                Key::VerifyFailedPrefix,
+                &[("n", &n.to_string())],
+            ),
             VerifyVerdict::KernelSaysNotAllGood => {
-                "内核判定未全部通过（六类里没有失败项）".to_string()
+                crate::i18n::t(lang, Key::VerifyUnaccounted).to_string()
             }
         }
     }
@@ -372,12 +382,18 @@ pub struct VerifySummary {
     pub classified_count: usize,
     /// 顶部那一行总结。
     pub verdict: VerifyVerdict,
+    /// 这份摘要是用哪种语言成句的（行标签与总结都在构造时定下来）。
+    ///
+    /// ⚠️ 存起来而不是每次现问：这些字**已经贴进 `rows`** 了，两处各拿一个语言
+    ///    就会出现"标签是中文、总结是英文"。换语言 ⇒ 重新构造一份（`of` 是纯函数）。
+    #[serde(skip)]
+    pub lang: crate::i18n::Lang,
 }
 
 impl VerifySummary {
     /// 顶部总结的正文。
     pub fn headline(&self) -> String {
-        self.verdict.text()
+        self.verdict.text(self.lang)
     }
 
     /// 顶部总结的颜色（枚举，由 `shell-win` 映射）。
@@ -391,8 +407,8 @@ impl VerifySummary {
     }
 
     /// 「已校验 N 项」—— 让"这份结果覆盖了多少"看得见（同 `ByteFormat` 的"缺值也要说出来"）。
-    pub fn classified_text(&self) -> String {
-        format!("已校验 {} 项", self.classified_count)
+    pub fn classified_text(&self, lang: crate::i18n::Lang) -> String {
+        crate::i18n::tf(lang, crate::i18n::Key::VerifyCheckedPrefix, &[("n", &self.classified_count.to_string())])
     }
 
     /// `verify_status` 的结果 → 呈现值；**`None`（还没取过）→ `None`**。
@@ -400,7 +416,7 @@ impl VerifySummary {
     /// ⚠️ `None` 不能变成"六类全 0 + 全部通过"：那是**替内核宣布一句它没说过的话**
     ///    （还没问过它）。`shell-win` 对 `None` 走的是"还没有校验结果，点刷新"那一支，
     ///    钉住它的是 `no_result_at_all_is_not_an_all_clear`。
-    pub fn of(status: Option<&VerifyStatus>) -> Option<VerifySummary> {
+    pub fn of(lang: crate::i18n::Lang, status: Option<&VerifyStatus>) -> Option<VerifySummary> {
         let status = status?;
 
         // 恒六条：遍历的是 `ALL_CLASSES`（不是"内核给了哪些桶"）—— 空的那几类也在里面，
@@ -409,12 +425,12 @@ impl VerifySummary {
             .iter()
             .map(|kind| VerifyClassRow {
                 kind: *kind,
-                label: kind.label().to_string(),
+                label: kind.label(lang).to_string(),
                 color: kind.color(),
                 icon_name: kind.icon_name().to_string(),
                 // 路径是**内核原文、逐字**（约束 3）：直接搬，不加工。
                 paths: status.paths(*kind).to_vec(),
-                note: kind.note().map(|n| n.to_string()),
+                note: kind.note(lang).map(|n| n.to_string()),
             })
             .collect();
 
@@ -445,6 +461,7 @@ impl VerifySummary {
             failed_count,
             classified_count,
             verdict,
+            lang,
         })
     }
 }
@@ -498,14 +515,14 @@ impl SidebarBadge {
     ///    `isFailure`，但求和写了两遍 —— 加一类失败、或改一次 `isFailure` 的口径，
     ///    两处就会分叉，而症状是"两处的失败计数对不上"）。
     ///    `None`（还没取过）→ 0：没有数据不等于"有一堆没通过"。
-    pub fn unpassed(status: Option<&VerifyStatus>) -> usize {
-        VerifySummary::of(status).map_or(0, |s| Self::unpassed_of_summary(&s))
+    pub fn unpassed(lang: crate::i18n::Lang, status: Option<&VerifyStatus>) -> usize {
+        VerifySummary::of(lang, status).map_or(0, |s| Self::unpassed_of_summary(&s))
     }
 
     /// 从**已经算好的摘要**里取未通过项数 —— [`SidebarBadge::unpassed`] 的第二种入口。
     ///
     /// ⚠️ **它不是第二份实现**：`unpassed` 的正文逐字就是
-    ///    `VerifySummary::of(status).map_or(0, |s| s.failed_count)`，也就是**这一格**。
+    ///    `VerifySummary::of(crate::i18n::Lang::Zh, status).map_or(0, |s| s.failed_count)`，也就是**这一格**。
     ///    两条路只差"手上拿到的是内核回执还是摘要"：`api::verify` 手上是摘要
     ///    （那一屏的载荷本来就是 `VerifySummary`），所以它走这一条。
     ///    分叉的症状是"侧栏徽标的数与校验屏顶上那句「N 项未通过」不一样"。
@@ -691,7 +708,11 @@ mod tests {
     }
 
     fn summary(fx: VerifyFx) -> VerifySummary {
-        VerifySummary::of(Some(&fx.build())).expect("有结果就一定有一份总结")
+        VerifySummary::of(crate::i18n::Lang::Zh, Some(&fx.build())).expect("有结果就一定有一份总结")
+    }
+
+    fn summary_lang(lang: crate::i18n::Lang, fx: VerifyFx) -> VerifySummary {
+        VerifySummary::of(lang, Some(&fx.build())).expect("有结果就一定有一份总结")
     }
 
     fn row_of(s: &VerifySummary, kind: VerifyClass) -> &VerifyClassRow {
@@ -788,7 +809,7 @@ mod tests {
         assert_eq!(
             s.rows
                 .iter()
-                .map(VerifyClassRow::count_text)
+                .map(|r| r.count_text(crate::i18n::Lang::Zh))
                 .collect::<Vec<String>>(),
             vec!["1 项", "0 项", "0 项", "0 项", "0 项", "0 项"]
         );
@@ -958,10 +979,50 @@ mod tests {
 
     /// 上游 `noResultAtAllIsNotAnAllClear`。
     #[test]
+
+    /// 判据（规格 W2）：**同一份回执、两种语言**，六类行与顶部总结都换话，
+    /// 而且英文里一个汉字都没有。
+    ///
+    /// 判别力：把 `of()` 里的 `kind.label(lang)` 写回 `“中文”` ⇒ 这条红。
+    #[test]
+    fn the_same_status_speaks_english_when_asked() {
+        let fx = || VerifyFx {
+            ok: v(&["a"]),
+            bad: v(&["b"]),
+            unverifiable: v(&["u"]),
+            ..Default::default()
+        };
+        let zh = summary_lang(crate::i18n::Lang::Zh, fx());
+        let en = summary_lang(crate::i18n::Lang::En, fx());
+        assert_eq!(zh.rows[1].kind, VerifyClass::Mismatched);
+        assert_eq!(zh.rows[1].label, "内容不符");
+        assert_eq!(en.rows[1].label, "Content differs");
+        assert_eq!(zh.headline(), "1 项未通过");
+        assert_eq!(en.headline(), "1 did not pass");
+        assert_eq!(en.classified_text(crate::i18n::Lang::En), "Checked 3");
+        for row in &en.rows {
+            assert!(
+                !row.label.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "英文行标签里有汉字：{}",
+                row.label
+            );
+        }
+        assert!(
+            en.rows[4]
+                .note
+                .as_deref()
+                .map(|n| !n.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)))
+                .unwrap_or(true),
+            "英文那一句说明里也不许有汉字"
+        );
+    }
+
+    /// 上游 `noResultAtAllIsNotAnAllClear`（属性被一次编辑吃掉过，已补回）。
+    #[test]
     fn no_result_at_all_is_not_an_all_clear() {
         // `verify == None`（还没取过）≠「六类全 0 + 全部通过」。
         // 变成后者就是在替内核宣布一句它根本没说过的话。
-        assert!(VerifySummary::of(None).is_none());
+        assert!(VerifySummary::of(crate::i18n::Lang::Zh, None).is_none());
     }
 
     /// 上游 `everyVerdictHasItsOwnWording`。
@@ -1005,16 +1066,16 @@ mod tests {
             ),
         ];
         for (verdict, text, color, icon) in &expected {
-            assert_eq!(verdict.text(), *text, "{} 的文案不对", verdict.text());
-            assert_eq!(verdict.color(), *color, "{} 的颜色不对", verdict.text());
-            assert_eq!(verdict.icon_name(), *icon, "{} 的图标不对", verdict.text());
+            assert_eq!(verdict.text(crate::i18n::Lang::Zh), *text, "{} 的文案不对", verdict.text(crate::i18n::Lang::Zh));
+            assert_eq!(verdict.color(), *color, "{} 的颜色不对", verdict.text(crate::i18n::Lang::Zh));
+            assert_eq!(verdict.icon_name(), *icon, "{} 的图标不对", verdict.text(crate::i18n::Lang::Zh));
         }
 
         let texts = [
-            VerifyVerdict::NotVerified.text(),
-            VerifyVerdict::AllGood.text(),
-            VerifyVerdict::Failed(1).text(),
-            VerifyVerdict::KernelSaysNotAllGood.text(),
+            VerifyVerdict::NotVerified.text(crate::i18n::Lang::Zh),
+            VerifyVerdict::AllGood.text(crate::i18n::Lang::Zh),
+            VerifyVerdict::Failed(1).text(crate::i18n::Lang::Zh),
+            VerifyVerdict::KernelSaysNotAllGood.text(crate::i18n::Lang::Zh),
         ];
         let distinct: std::collections::BTreeSet<&String> = texts.iter().collect();
         assert_eq!(distinct.len(), 4);
@@ -1115,7 +1176,7 @@ mod tests {
         );
         assert_eq!(s.classified_count, 6);
         assert_eq!(s.headline(), "4 项未通过");
-        assert_eq!(s.classified_text(), "已校验 6 项");
+        assert_eq!(s.classified_text(crate::i18n::Lang::Zh), "已校验 6 项");
     }
 
     // -----------------------------------------------------------------------
@@ -1146,7 +1207,7 @@ mod tests {
             ..Default::default()
         }
         .build();
-        assert_eq!(SidebarBadge::unpassed(Some(&status)), 4);
+        assert_eq!(SidebarBadge::unpassed(crate::i18n::Lang::Zh, Some(&status)), 4);
     }
 
     /// 上游 `theVerifyBadgeDoesNotCountUnverifiable`。
@@ -1160,7 +1221,7 @@ mod tests {
             ..Default::default()
         }
         .build();
-        assert_eq!(SidebarBadge::unpassed(Some(&only_unverifiable)), 0);
+        assert_eq!(SidebarBadge::unpassed(crate::i18n::Lang::Zh, Some(&only_unverifiable)), 0);
 
         let two_failures = VerifyFx {
             bad: v(&["b"]),
@@ -1168,8 +1229,8 @@ mod tests {
             ..Default::default()
         }
         .build();
-        assert_eq!(SidebarBadge::unpassed(Some(&two_failures)), 2);
-        assert_eq!(SidebarBadge::unpassed(None), 0);
+        assert_eq!(SidebarBadge::unpassed(crate::i18n::Lang::Zh, Some(&two_failures)), 2);
+        assert_eq!(SidebarBadge::unpassed(crate::i18n::Lang::Zh, None), 0);
     }
 
     /// 🔴 **两种入口必须数出同一个数**（`unfinished_of_rows` 对 `unfinished_transfers`）。
@@ -1191,7 +1252,7 @@ mod tests {
             item("r", TaskState::Removed, "removed"),
         ];
         let list = list(items.clone());
-        let rows: Vec<TransferRow> = items.iter().map(TransferRow::new).collect();
+        let rows: Vec<TransferRow> = items.iter().map(|i| TransferRow::new(crate::i18n::Lang::Zh, i)).collect();
 
         assert_eq!(SidebarBadge::unfinished_transfers(Some(&list)), 3);
         assert_eq!(SidebarBadge::unfinished_of_rows(&rows), 3);
@@ -1218,9 +1279,9 @@ mod tests {
             ..Default::default()
         }
         .build();
-        let s = VerifySummary::of(Some(&status)).expect("有回执就恒有摘要");
+        let s = VerifySummary::of(crate::i18n::Lang::Zh, Some(&status)).expect("有回执就恒有摘要");
         assert_eq!(SidebarBadge::unpassed_of_summary(&s), 1);
-        assert_eq!(SidebarBadge::unpassed(Some(&status)), 1);
+        assert_eq!(SidebarBadge::unpassed(crate::i18n::Lang::Zh, Some(&status)), 1);
         assert_eq!(
             SidebarBadge::unpassed_of_summary(&s),
             s.failed_count,
@@ -1305,6 +1366,7 @@ mod tests {
             VerifyRefreshFailure::message_of(&ClientError::Kernel {
                 code: "invalid_params".to_string(),
                 message: "内核原文".to_string(),
+                class: None,
             }),
             "内核原文"
         );

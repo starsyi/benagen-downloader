@@ -108,6 +108,16 @@ struct RootView: View {
                 if let banner = EngineBanner.of(engine: model.engine, lastError: model.lastError) {
                     engineBannerBar(banner)
                 }
+                // 自动重启进度（T7）：`restart_progress` 的四档句子之一。
+                // 只读装饰 —— 取不到就是没有这一行，真正的故障仍由上面的引擎横幅说。
+                if let restart = model.restartNotice, !restart.text.isEmpty {
+                    restartNoticeBar(restart)
+                }
+                // 八类错误卡（T7）：内核 `error_recent` 已按严重度降序、同类合并，
+                // `ErrorCards.from` 只换成壳的三句话。**顺序就是数组顺序**，视图不重排。
+                if !model.errorCards.isEmpty {
+                    errorCardsBar
+                }
                 // ⑥ 「有新版本」（规格 §4）—— 🔴 **与下载回执是两条独立元素**（不共用、不互相
                 //    覆盖）：回执是"这一次动作的结果"（几秒后消失），更新提示是"一直在，
                 //    直到客户处理或关掉"。判据全在 `UpdateNotice.of`（只有 `has_newer`、
@@ -183,7 +193,7 @@ struct RootView: View {
             }
             ToolbarItem {
                 // 约束 4 的落点：内核没起来时，工具栏上那句原因就是客户唯一的线索。
-                EngineStatusBadge(engine: model.engine)
+                EngineStatusBadge(engine: model.engine, lang: model.language)
             }
         }
         // -------------------------------------------------------------------
@@ -291,6 +301,17 @@ struct RootView: View {
             guard shouldPollUpdate else { return }
             await updateLoop()
         }
+        // -------------------------------------------------------------------
+        // 双语装饰那一拍（T7）：错误卡 + 重启进度。
+        //
+        // 闸门用 `EngineGate.allowsRequests`（与其余请求同源）：内核不可用 / 还没握手时
+        // 一拍都不发 —— 那种时候该说话的是引擎横幅，不是这三条只读装饰。
+        // `engine` 变化 ⇒ 这个 `.task(id:)` 自动取消/重挂，所以握手一完成就会拉第一次。
+        // -------------------------------------------------------------------
+        .task(id: shouldPollNotices) {
+            guard shouldPollNotices else { return }
+            await noticesLoop()
+        }
         // 规格 §14.2 的定稿。配合 App.swift 的 `.windowResizability(.contentMinSize)`，
         // 这个 frame 就是**窗口拖不小到的下界**：
         //   侧边栏 220–280 + 四列平铺列表（名称/大小/时间/状态）约需 820px + 内边距 20×2 + 工具栏。
@@ -362,6 +383,15 @@ struct RootView: View {
         section == .files
     }
 
+    /// 双语装饰（错误卡 / 重启进度）现在该跑吗。
+    ///
+    /// ⚠️ 条件只有 `EngineGate.allowsRequests(model.engine)` —— **不含**分区、**不含**
+    ///    `hasLoadedManifest`：这两样讲的是"下载引擎/内核现在整体是否可用"，
+    ///    空态页上握手失败也得能看见原因（那正是错误卡存在的理由）。
+    private var shouldPollNotices: Bool {
+        EngineGate.allowsRequests(model.engine)
+    }
+
     /// 60 秒一拍拉更新状态。**只在文件页可见时跑**——离开文件页时 `.task` 会取消它，
     /// 所以没有"永不取消的循环"（取消在下一次 `Task.sleep` 抛出时立刻生效，与 `pollLoop` 同款）。
     ///
@@ -377,6 +407,20 @@ struct RootView: View {
                     nanoseconds: UInt64(AppModel.updateCheckInterval * 1_000_000_000))
             } catch {
                 return      // 取消（离开文件页）⇒ 立刻停，不再拍
+            }
+        }
+    }
+
+    /// 3 秒一拍拉「重启进度 + 错误卡」这两条只读装饰（节拍常量在 `AppModel.noticePollInterval`）。
+    /// 取不到时模型自己回到空/保持上一帧，这里不显示任何错误（同 Windows 只读命令的语义）。
+    private func noticesLoop() async {
+        while !Task.isCancelled {
+            await model.pollNotices()
+            do {
+                try await Task.sleep(
+                    nanoseconds: UInt64(AppModel.noticePollInterval * 1_000_000_000))
+            } catch {
+                return      // 视图消失 / 引擎状态变化 ⇒ 取消
             }
         }
     }
@@ -433,7 +477,7 @@ struct RootView: View {
                 BoundedNoticeText(text: banner.text, font: .callout.weight(.semibold))
                 Spacer(minLength: 8)
                 if banner.showsRetry {
-                    Button("重试") {
+                    Button(model.language.t(.retry)) {
                         Task { await model.retryEngine() }
                     }
                     // 正在重启（`busyReason` 非 nil）时禁用：重启有防重入闸门，
@@ -450,6 +494,55 @@ struct RootView: View {
                 // 它是**壳自己写死的常量**（长度壳完全掌握），走散文那一档就够。
                 BoundedNoticeText(text: hint, font: .caption)
                     .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.4))
+    }
+
+    // MARK: - 双语装饰：重启进度 / 八类错误卡（T7）
+
+    /// 自动重启进度那一行（`RestartNotice.of` 的四档句子之一，中文逐字沿用既有文案）。
+    /// 只读装饰：`restart_progress` 取不到时模型给 `nil`，这里就什么都不画。
+    private func restartNoticeBar(_ notice: RestartNotice) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .foregroundStyle(Color.orange)
+            BoundedNoticeText(text: notice.text, font: .callout.weight(.semibold))
+            Spacer(minLength: 8)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.4))
+    }
+
+    /// 八类错误卡：每张一条「标题 + 解释 + 动作」。
+    ///
+    /// ⚠️ **顺序就是 `model.errorCards` 的顺序**（严重度降序、同类合并、最多 3 张，
+    ///    判据在 `ErrorCards.from`）—— 视图不排序、不合并、不再数次数。
+    /// 文案全是壳的定稿表（`ErrorCard`），长度有界；仍走 `BoundedNoticeText`
+    /// 是为了与其余常驻行同一套高度纪律（见本文件文件头）。
+    private var errorCardsBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(model.errorCards, id: \.errorClass.rawValue) { card in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: card.severity >= 50
+                          ? "exclamationmark.triangle.fill"
+                          : "exclamationmark.circle")
+                        .foregroundStyle(card.severity >= 50 ? Color.red : Color.orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        BoundedNoticeText(text: card.title, font: .callout.weight(.semibold))
+                        BoundedNoticeText(text: card.explain, font: .caption)
+                            .foregroundStyle(.secondary)
+                        BoundedNoticeText(text: card.action, font: .caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                }
+                .textSelection(.enabled)     // 客户要能把这三句话原样发出去（约束 3 / C-7）
             }
         }
         .padding(.horizontal, 20)

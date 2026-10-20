@@ -14,7 +14,7 @@ use crate::presentation::verify_summary::{SidebarBadge, VerifySummary};
 ///
 /// ## ⚠️ 先说清楚：**这条分支今天是不可达的**
 ///
-/// `VerifySummary::of(Some(_))` **恒 `Some`**（它唯一的 `None` 出口是 `let status = status?;`
+/// `VerifySummary::of(crate::i18n::Lang::Zh, Some(_))` **恒 `Some`**（它唯一的 `None` 出口是 `let status = status?;`
 /// 那一行，也就是"实参本身是 `None`"）。而命令层调它时手上**恒有一条**内核刚回的
 /// `status`（`commands.rs` 的 `verify()` 在 `Ok(status)` 那一支里才走到这里）⇒
 /// 按今天的签名，这句话**一个字都不会出现在屏幕上**。
@@ -58,7 +58,7 @@ pub const NO_VERIFY_SUMMARY: &str =
 /// **已移植**到 `presentation/verify_summary.rs`）。
 ///
 /// ⚠️ **为什么收 `&VerifySummary` 而不是 `Option`**：上游的调用点手上**恒有一条**
-///    内核刚回的 `status`（`VerifySummary::of(Some(&status))` 恒 `Some`）。
+///    内核刚回的 `status`（`VerifySummary::of(crate::i18n::Lang::Zh, Some(&status))` 恒 `Some`）。
 ///    "还没取过"（`None`）这一档在**命令层**就分掉了 —— 它根本不会调到本函数
 ///    （那时该发的是 `err`：这一次动作整个没成）。
 ///    ⚠️ 但那**不等于** `VerifySummary::of` 的 `None` 可以折成"六类全 0 + 全部通过"：
@@ -67,7 +67,7 @@ pub const NO_VERIFY_SUMMARY: &str =
 ///
 /// ## 🔴 那五格是**补上的**（它们曾经真的缺着）
 ///
-/// `VerifySummary` 的 `headline()` / `headline_color()` / `headline_icon()` /
+/// `VerifySummary` 的 `headline(crate::i18n::Lang::Zh)` / `headline_color()` / `headline_icon()` /
 /// `classified_text()` 与 `VerifyClassRow::count_text()` 是**方法**，不是字段 ——
 /// 派生的 `Serialize` 里**没有它们**。于是 `to_wire(summary)` 发出去的只有
 /// `rows`（六个键）/ `all_good` / `failed_count` / `classified_count` / `verdict`，
@@ -113,7 +113,7 @@ pub fn verify(summary: &VerifySummary) -> Value {
     if let Some(rows) = data.get_mut("rows").and_then(Value::as_array_mut) {
         for (wire_row, row) in rows.iter_mut().zip(summary.rows.iter()) {
             if let Some(map) = wire_row.as_object_mut() {
-                map.insert("count_text".to_string(), Value::String(row.count_text()));
+                map.insert("count_text".to_string(), Value::String(row.count_text(summary.lang)));
             }
         }
     }
@@ -141,7 +141,7 @@ pub fn verify(summary: &VerifySummary) -> Value {
         );
         map.insert(
             "classified_text".to_string(),
-            Value::String(summary.classified_text()),
+            Value::String(summary.classified_text(summary.lang)),
         );
         map.insert(
             "headline_color".to_string(),
@@ -206,7 +206,7 @@ mod tests {
     /// `data` **就是**那份摘要（不包一层 `summary` 键：形状多一层，前端多一条读法）。
     #[test]
     fn the_summary_is_the_data_itself() {
-        let summary = VerifySummary::of(Some(&a_status())).expect("有回执就恒有摘要");
+        let summary = VerifySummary::of(crate::i18n::Lang::Zh, Some(&a_status())).expect("有回执就恒有摘要");
         let v = verify(&summary);
         assert_eq!(v["ok"], serde_json::json!(true));
         assert!(v["data"].get("rows").is_some(), "data 该是那份摘要：{v}");
@@ -220,7 +220,7 @@ mod tests {
     ///    不手抄一遍字面量：抄了就是同一条判据的第二个实现。
     #[test]
     fn every_class_row_reaches_the_client() {
-        let summary = VerifySummary::of(Some(&a_status())).expect("有回执就恒有摘要");
+        let summary = VerifySummary::of(crate::i18n::Lang::Zh, Some(&a_status())).expect("有回执就恒有摘要");
         let v = verify(&summary);
         let rows = v["data"]["rows"].as_array().expect("rows 是个数组");
         assert_eq!(rows.len(), ALL_CLASSES.len(), "校验六类、一条不少：{v}");
@@ -247,7 +247,7 @@ mod tests {
     /// 形状与 `api/state.rs:engine_wire` 补那三格是同一条判据。
     #[test]
     fn the_presentation_cells_reach_the_client() {
-        let summary = VerifySummary::of(Some(&a_status())).expect("有回执就恒有摘要");
+        let summary = VerifySummary::of(crate::i18n::Lang::Zh, Some(&a_status())).expect("有回执就恒有摘要");
         let v = verify(&summary);
 
         // ---- ① 顶部那一行总结：正文 / 标记 / 颜色 / 「已校验 N 项」-------------
@@ -293,11 +293,11 @@ mod tests {
         );
         assert_eq!(
             v["data"]["classified_text"],
-            serde_json::json!(summary.classified_text()),
+            serde_json::json!(summary.classified_text(summary.lang)),
             "{v}"
         );
         for (row, src) in rows.iter().zip(summary.rows.iter()) {
-            assert_eq!(row["count_text"], serde_json::json!(src.count_text()), "{v}");
+            assert_eq!(row["count_text"], serde_json::json!(src.count_text(summary.lang)), "{v}");
         }
     }
 }

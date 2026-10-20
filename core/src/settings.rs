@@ -44,6 +44,12 @@ pub struct Settings {
     pub max_tries: i32,
     /// 0–60 秒
     pub retry_wait: i32,
+    /// 界面语言（规格 §2.1）。**排在最后**：`save_to` 的键顺序由字段顺序决定，
+    /// 追加在末尾才不动既有七项的相对次序。
+    ///
+    /// 缺省（老配置文件里没有这一格）= [`Lang::System`]。
+    #[serde(default)]
+    pub language: crate::i18n::Lang,
 }
 
 /// 默认值。
@@ -89,6 +95,7 @@ pub fn default_settings() -> Settings {
         limit_mbps: 0,
         max_tries: 1,
         retry_wait: 1,
+        language: crate::i18n::Lang::System,
     }
 }
 
@@ -99,33 +106,58 @@ impl Settings {
     /// 越界必须在**输入时**拦下——`-k` 这类值写错会让 aria2 直接启动失败，
     /// 那就成了「启动了才发现参数非法」。
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_in(crate::i18n::Lang::Zh)
+    }
+
+    /// 同上，但**按界面语言成句**（0.3.0：客户在英文界面看到越界提示时，那句也必须是英文）。
+    ///
+    /// ⚠️ 判据（哪个数越界、上下界是多少）与语言**无关**：这里两个入口共用同一串
+    ///    比较，只有最后那句 `format!` 换表 —— 抄一份英文判据是实现分叉的老路（R-5）。
+    pub fn validate_in(&self, lang: crate::i18n::Lang) -> Result<(), String> {
+        use crate::i18n::text::{tf, MsgKey};
+        let msg = |key: MsgKey, args: &[(&str, &str)]| tf(lang, key, args);
         if self.parallel < 1 || self.parallel > 64 {
-            return Err(format!("并行文件数必须在 1–64 之间，当前 {}", self.parallel));
+            return Err(msg(
+                MsgKey::SettingsParallelRange,
+                &[("value", &self.parallel.to_string())],
+            ));
         }
         if self.connections < 1 || self.connections > 16 {
-            return Err(format!(
-                "单文件连接数必须在 1–16 之间，当前 {}",
-                self.connections
+            return Err(msg(
+                MsgKey::SettingsConnectionsRange,
+                &[("value", &self.connections.to_string())],
             ));
         }
         if self.splits < 1 || self.splits > 16 {
-            return Err(format!("分片数必须在 1–16 之间，当前 {}", self.splits));
+            return Err(msg(
+                MsgKey::SettingsSplitsRange,
+                &[("value", &self.splits.to_string())],
+            ));
         }
-        parse_size_mb(&self.min_split_size)?;
+        parse_size_mb_in(lang, &self.min_split_size)?;
         // 上界 LIMIT_MBPS_MAX（100 GB/s）为防溢出而设，规格 §6 未规定限速上界：
         // 换算成字节/秒时会乘以 1024*1024，取值过大则乘法回绕——静默变成「不限速」（0）
         // 或回绕成负数被 aria2 拒绝、引擎启动失败。两者都是全局约束明令禁止的。
         if self.limit_mbps < 0 || self.limit_mbps > LIMIT_MBPS_MAX {
-            return Err(format!(
-                "限速必须在 0–{LIMIT_MBPS_MAX} MB/s 之间（上界为防溢出而设），当前 {}",
-                self.limit_mbps
+            return Err(msg(
+                MsgKey::SettingsLimitRange,
+                &[
+                    ("max", &LIMIT_MBPS_MAX.to_string()),
+                    ("value", &self.limit_mbps.to_string()),
+                ],
             ));
         }
         if self.max_tries < 1 || self.max_tries > 100 {
-            return Err(format!("重试次数必须在 1–100 之间，当前 {}", self.max_tries));
+            return Err(msg(
+                MsgKey::SettingsTriesRange,
+                &[("value", &self.max_tries.to_string())],
+            ));
         }
         if self.retry_wait < 0 || self.retry_wait > 60 {
-            return Err(format!("重试间隔必须在 0–60 秒之间，当前 {}", self.retry_wait));
+            return Err(msg(
+                MsgKey::SettingsWaitRange,
+                &[("value", &self.retry_wait.to_string())],
+            ));
         }
         Ok(())
     }
@@ -210,15 +242,22 @@ impl Settings {
 
 /// 解析 `20M` 这类字符串，返回 MB 数。范围 1M–100M。
 pub fn parse_size_mb(s: &str) -> Result<i64, String> {
+    parse_size_mb_in(crate::i18n::Lang::Zh, s)
+}
+
+/// 同上，按界面语言成句（0.3.0）。**边界只有这一份实现**：两个入口共用同一串比较，
+/// 只有最后那句 `format!` 换表 —— 抄一份英文边界就是漂移的开始（契约 §2.1）。
+pub fn parse_size_mb_in(lang: crate::i18n::Lang, s: &str) -> Result<i64, String> {
+    use crate::i18n::text::{tf, MsgKey};
     let trimmed = s.trim().to_uppercase();
     let Some(digits) = trimmed.strip_suffix('M') else {
-        return Err(format!("最小分片大小须以 M 结尾（如 20M），当前 {s:?}"));
+        return Err(tf(lang, MsgKey::SettingsSizeSuffix, &[("value", &format!("{s:?}"))]));
     };
     let Ok(n) = digits.parse::<i64>() else {
-        return Err(format!("最小分片大小无法解析: {s:?}"));
+        return Err(tf(lang, MsgKey::SettingsSizeUnparsable, &[("value", &format!("{s:?}"))]));
     };
     if !(1..=100).contains(&n) {
-        return Err(format!("最小分片大小必须在 1M–100M 之间，当前 {s:?}"));
+        return Err(tf(lang, MsgKey::SettingsSizeRange, &[("value", &format!("{s:?}"))]));
     }
     Ok(n)
 }
@@ -268,6 +307,10 @@ struct RawSettings {
     limit_mbps: Option<i64>,
     max_tries: Option<i64>,
     retry_wait: Option<i64>,
+    /// **收 `String` 而不是 `Lang`**：手改成 `"fr"` 这种不认识的值时，
+    /// `Lang` 的反序列化会失败 ⇒ 整份文档连坐回默认（七项合法设置一起丢）。
+    /// 收字符串再 [`crate::i18n::Lang::parse`]，坏值只丢这一格。
+    language: Option<String>,
 }
 
 /// 把 JSON 里读到的整数夹进 `i32` 值域；`None` → 0（Go 的零值）。
@@ -293,13 +336,23 @@ fn saturating_i32(v: Option<i64>) -> i32 {
 ///
 /// 越界项**逐项**回退到默认值，合法项保留——避免一个手改坏的数字把整份配置作废。
 pub fn load_from(path: &Path) -> Settings {
+    load_from_with_flag(path).0
+}
+
+/// 同 [`load_from`]，但**多回一格**：「客户/壳有没有明确选过界面语言」。
+///
+/// 判据是**文件里有没有 `language` 这个键**——不是"值等不等于 system"：
+/// 客户主动选了「跟随系统」也是选过了，不该再弹一次首启询问（规格 W1）。
+/// 文件缺失、读不出来、解析失败一律算"没选过"（那时正是首次运行）。
+pub fn load_from_with_flag(path: &Path) -> (Settings, bool) {
     let def = default_settings();
     let Ok(raw) = std::fs::read(path) else {
-        return def;
+        return (def, false);
     };
     let Ok(loaded) = serde_json::from_slice::<RawSettings>(&raw) else {
-        return def;
+        return (def, false);
     };
+    let language_chosen = loaded.language.is_some();
     let loaded = Settings {
         parallel: saturating_i32(loaded.parallel),
         connections: saturating_i32(loaded.connections),
@@ -308,8 +361,13 @@ pub fn load_from(path: &Path) -> Settings {
         limit_mbps: loaded.limit_mbps.unwrap_or(0),
         max_tries: saturating_i32(loaded.max_tries),
         retry_wait: saturating_i32(loaded.retry_wait),
+        language: loaded
+            .language
+            .as_deref()
+            .and_then(crate::i18n::Lang::parse)
+            .unwrap_or_default(),
     };
-    merge_with_defaults(&loaded, &def)
+    (merge_with_defaults(&loaded, &def), language_chosen)
 }
 
 /// 保留合法的字段，把越界的换成默认值。
@@ -415,6 +473,14 @@ mod tests {
             let mut s = default_settings();
             mut_(&mut s);
             assert!(s.validate().is_err(), "{name} 应当被拒绝");
+            // 0.3.0：同一份越界判定，换语言只说另一种话（判据不复制一份，只换表）。
+            let en = s
+                .validate_in(crate::i18n::Lang::En)
+                .expect_err("英文也应当拒绝");
+            assert!(
+                !en.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "{name} 的英文提示里混进了汉字：{en}"
+            );
         }
     }
 
@@ -530,6 +596,7 @@ mod tests {
                     limit_mbps: 0,
                     max_tries: 1,
                     retry_wait: 0,
+                    language: crate::i18n::Lang::System,
                 },
             ),
             (
@@ -543,6 +610,7 @@ mod tests {
                     limit_mbps: 0,
                     max_tries: 1,
                     retry_wait: 0,
+                    language: crate::i18n::Lang::System,
                 },
             ),
             (
@@ -558,6 +626,7 @@ mod tests {
                     limit_mbps: 7,
                     max_tries: 6,
                     retry_wait: 1,
+                    language: crate::i18n::Lang::System,
                 },
             ),
             (
@@ -573,6 +642,7 @@ mod tests {
                     limit_mbps: 7,
                     max_tries: 6,
                     retry_wait: 2,
+                    language: crate::i18n::Lang::System,
                 },
             ),
         ];
@@ -698,6 +768,7 @@ mod tests {
             limit_mbps: 7,
             max_tries: 6,
             retry_wait: 2,
+            language: crate::i18n::Lang::System,
         };
 
         let cases: Vec<(&str, &str, Settings)> = vec![
@@ -749,6 +820,30 @@ mod tests {
             let got = load_from(&path);
             assert_eq!(got, want, "{name}: 输入 {raw}");
         }
+    }
+
+    /// 判据：语言这一格写坏了**只丢语言**，七项技术参数照旧——与 `RawSettings`
+    /// 逐项回退的既有规矩一致（语言不是数字，故单独用字符串收再解析）。
+    #[test]
+    fn a_broken_language_does_not_take_the_other_seven_down_with_it() {
+        let dir = TempDir::new();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"parallel":32,"connections":6,"splits":6,"min_split_size":"30M","limit_mbps":7,"max_tries":6,"retry_wait":2,"language":"fr"}"#,
+        )
+        .unwrap();
+        let got = load_from(&path);
+        assert_eq!(got.parallel, 32, "七项必须原样保留");
+        assert_eq!(got.language, crate::i18n::Lang::System, "不认识的词回默认");
+
+        // 认识的词要能存回来、再读出来（`save_to` 的键序由字段顺序决定，末尾追加不扰前七项）
+        let mut s = got.clone();
+        s.language = crate::i18n::Lang::En;
+        s.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"language\": \"en\""), "落盘形状: {raw}");
+        assert_eq!(load_from(&path).language, crate::i18n::Lang::En);
     }
 
     /// 复制一份 `Settings` 再改一处，避免每个用例重复整段字面量（对应 Go 的 `mk`）。

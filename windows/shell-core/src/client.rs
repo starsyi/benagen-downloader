@@ -158,7 +158,12 @@ pub enum ClientError {
     /// 当成自己的（界面显示另一个请求的数据）比吵一句糟得多。
     Desync { expected: u64, got: u64 },
     /// 内核回的结构化错误（`ok:false`）。`code` 见 [`crate::protocol::codes`]。
-    Kernel { code: String, message: String },
+    Kernel {
+        code: String,
+        message: String,
+        /// 内核给的分型（可选，见 `protocol::ErrorBody::class`）。
+        class: Option<String>,
+    },
     /// `ok:true` 却没有 `result`（内核的 `skip_serializing_if` 保证了这两个键互斥）。
     MissingResult { id: u64 },
     /// 这条通道已经收场，不再收新请求。两种来源，**都是终局**：
@@ -224,7 +229,7 @@ impl std::fmt::Display for ClientError {
                 f,
                 "内核回的响应 id 是 {got}，而当前在等 {expected}（请求-响应失步）"
             ),
-            ClientError::Kernel { code, message } => {
+            ClientError::Kernel { code, message, .. } => {
                 write!(f, "内核报错 [{code}]：{message}")
             }
             ClientError::MissingResult { id } => {
@@ -1218,10 +1223,12 @@ impl CoreClient {
                 let e = resp.error.unwrap_or(ErrorBody {
                     code: String::new(),
                     message: String::new(),
+                    class: None,
                 });
                 return Err(ClientError::Kernel {
                     code: e.code,
                     message: e.message,
+                    class: e.class,
                 });
             }
             // ⚠️ "ok:false" 与"ok:true 却缺 result"两条守卫**只此一份**，不在这里复制到别处。
@@ -1523,21 +1530,21 @@ mod tests {
     #[test]
     fn requests_are_numbered_from_one_and_monotonic() {
         let stub = StubChannel::new(vec![
-            line(r#"{"id":1,"ok":true,"result":{"protocol":1}}"#),
+            line(r#"{"id":1,"ok":true,"result":{"protocol":2}}"#),
             line(r#"{"id":2,"ok":true,"result":{}}"#),
         ]);
         let client = CoreClient::new(Box::new(stub.clone()));
 
         let v = client
-            .call("hello", json!({"protocol": 1}))
+            .call("hello", json!({"protocol":2}))
             .expect("第一次握手必须成功");
-        assert_eq!(v["protocol"], json!(1));
+        assert_eq!(v["protocol"], json!(crate::protocol::PROTOCOL_VERSION));
         client.call("get_tree", Value::Null).expect("第二次必须成功");
 
         let w = stub.written();
         assert_eq!(w.len(), 2, "两次调用写两行");
         assert_eq!(
-            w[0], r#"{"id":1,"method":"hello","params":{"protocol":1}}"#,
+            w[0], r#"{"id":1,"method":"hello","params":{"protocol":2}}"#,
             "第一条请求的形状是跨进程契约（设计规格 §5.1 的原文）"
         );
         assert_eq!(
@@ -1555,14 +1562,14 @@ mod tests {
     fn protocol_level_errors_become_alerts_and_the_answer_is_still_paired_by_id() {
         let stub = StubChannel::new(vec![
             line(r#"{"id":0,"ok":false,"error":{"code":"bad_request","message":"请求行超过 8 MiB 上限"}}"#),
-            line(r#"{"id":1,"ok":true,"result":{"protocol":1}}"#),
+            line(r#"{"id":1,"ok":true,"result":{"protocol":2}}"#),
         ]);
         let client = CoreClient::new(Box::new(stub.clone()));
 
         let v = client
-            .call("hello", json!({"protocol": 1}))
+            .call("hello", json!({"protocol":2}))
             .expect("id==0 的协议级错误不该打断这次请求");
-        assert_eq!(v["protocol"], json!(1), "配到的必须是 id==1 那条");
+        assert_eq!(v["protocol"], json!(crate::protocol::PROTOCOL_VERSION), "配到的必须是 id==1 那条");
 
         let alerts = client.protocol_alerts();
         assert_eq!(alerts.items.len(), 1, "协议级错误必须被留成告警");
@@ -1592,7 +1599,7 @@ mod tests {
         let client = CoreClient::new(Box::new(stub.clone()));
 
         client
-            .call("hello", json!({"protocol": 1}))
+            .call("hello", json!({"protocol":2}))
             .expect("告警再多也不影响配对");
 
         let alerts = client.protocol_alerts();
@@ -1614,7 +1621,7 @@ mod tests {
         let stub = StubChannel::new(vec![line(r#"{"id":7,"ok":true,"result":{}}"#)]);
         let client = CoreClient::new(Box::new(stub.clone()));
 
-        match client.call("hello", json!({"protocol": 1})).expect_err("失步必须报错") {
+        match client.call("hello", json!({"protocol":2})).expect_err("失步必须报错") {
             ClientError::Desync { expected, got } => {
                 assert_eq!(expected, 1, "壳在等的是自己刚发出去那条");
                 assert_eq!(got, 7, "内核回的是另一条");
@@ -1629,7 +1636,7 @@ mod tests {
         let stub = StubChannel::new(vec![Reply::Eof]);
         let client = CoreClient::new(Box::new(stub.clone()));
         let err = client
-            .call("hello", json!({"protocol": 1}))
+            .call("hello", json!({"protocol":2}))
             .expect_err("内核进程没了必须报错");
         assert!(matches!(err, ClientError::KernelGone), "实际 {err:?}");
     }
@@ -1645,7 +1652,7 @@ mod tests {
             .call("transfer_list", Value::Null)
             .expect_err("ok:false 必须报错")
         {
-            ClientError::Kernel { code, message } => {
+            ClientError::Kernel { code, message, .. } => {
                 assert_eq!(code, codes::ENGINE_NOT_STARTED, "壳按这个值分支");
                 assert_eq!(message, "引擎还没起来", "message 原文照登，不加工");
             }
@@ -1670,7 +1677,7 @@ mod tests {
     fn a_read_failure_is_not_reported_as_eof() {
         let stub = StubChannel::new(vec![Reply::ReadFailed]);
         let client = CoreClient::new(Box::new(stub.clone()));
-        match client.call("hello", json!({"protocol": 1})) {
+        match client.call("hello", json!({"protocol":2})) {
             Err(ClientError::ReadFailed { .. }) => {}
             other => panic!("应为 ReadFailed，实际 {other:?}"),
         }
@@ -1687,7 +1694,7 @@ mod tests {
         let client = CoreClient::new(Box::new(stub.clone()));
         let pad = "x".repeat(MAX_REQUEST_LINE_BYTES);
         match client
-            .call("hello", json!({"protocol": 1, "pad": pad}))
+            .call("hello", json!({"protocol":2, "pad": pad}))
             .expect_err("超长请求必须被本地拒绝")
         {
             ClientError::RequestTooLong { bytes, limit } => {
@@ -2170,7 +2177,7 @@ mod tests {
         assert_eq!(stub.closes(), 1, "通道只关一次");
 
         let err = client
-            .call("hello", json!({"protocol": 1}))
+            .call("hello", json!({"protocol":2}))
             .expect_err("收尾之后不再收请求");
         assert!(matches!(err, ClientError::Closed), "实际 {err:?}");
     }
@@ -2289,6 +2296,7 @@ mod tests {
         let e = ErrorBody {
             code: codes::BAD_REQUEST.to_string(),
             message: "x".to_string(),
+            class: None,
         };
         assert_eq!(e.clone().code, codes::BAD_REQUEST);
     }
@@ -2597,7 +2605,7 @@ mod tests {
     #[test]
     fn every_kernel_call_is_logged_with_the_shells_own_words_on_failure() {
         let stub = StubChannel::new(vec![
-            line(r#"{"id":1,"ok":true,"result":{"protocol":1}}"#),
+            line(r#"{"id":1,"ok":true,"result":{"protocol":2}}"#),
             line(r#"{"id":2,"ok":true,"result":{}}"#),
             line(r#"{"id":3,"ok":true,"result":{}}"#),
             line(
@@ -2610,7 +2618,7 @@ mod tests {
         //    零告警口径下还可能给非测试构建带出一条 `dead_code`）。
         client.verbose_sink = sink;
 
-        client.call("hello", json!({"protocol": 1})).expect("第一拍成功");
+        client.call("hello", json!({"protocol":2})).expect("第一拍成功");
         client.call("get_state", Value::Null).expect("第二拍成功");
         client.call("get_state", Value::Null).expect("第三拍成功");
         let failure = client

@@ -248,6 +248,29 @@ public final class AppModel: ObservableObject {
     /// 挂着一条旧错误吓人。抛错路径（`listDir`/`enqueue`/…）由调用方在原地显示，不落这里。
     @Published public private(set) var lastError: String?
 
+    // -------------------------------------------------------------------------
+    // 双语与只读装饰（T7 / 规格 W2–W4）
+    // -------------------------------------------------------------------------
+
+    /// 界面语言 —— **内核在握手回执里落定的那一格**（规格 I-1）。
+    ///
+    /// ⚠️ 壳**不自己看系统 locale**：语言只由内核解析一次（`hello` 回执的 `language`），
+    ///    壳抄一份到这一格、全壳的壳侧文案都查它。两端各算一次就会出现"内核说英文、
+    ///    壳说中文"的半句话。握手还没成 / 内核没回这一格 ⇒ 中文（0.2.x 的既有界面）。
+    @Published public private(set) var language: Lang = .zh
+    /// 八类错误卡的当前上屏内容（`error_recent` 的**已合并**快照 → 壳的句子）。
+    ///
+    /// ⚠️ 它的顺序就是上屏顺序（严重度降序、同类合并、最多 3 张）—— 判据在
+    ///    `ErrorCards.from`，视图只按数组顺序画，**不许**在视图里再排一次。
+    @Published public private(set) var errorCards: [ErrorCard] = []
+    /// 自动重启进度（`restart_progress`）。`nil` = 没在重启 / 取不到 / 未知状态。
+    ///
+    /// ⚠️ 取不到时**回到 `nil`**而不是升级成红条：这是只读装饰（与 Windows 的
+    ///    `restart_progress` 命令一致），真正的故障由引擎横幅说。
+    @Published public private(set) var restartNotice: RestartNotice?
+    /// 解析交付码的过程行 —— **每一行都是内核成好的句子**，壳逐行显示、不拼。
+    @Published public private(set) var deliveryProgressLines: [String] = []
+
     /// 最近一次**换码**的结果（`nil` = 还没有换过码，或用户已经收起了那一行）。
     ///
     /// ⚠️ **它存在的唯一理由是"结果必须活过面板"**（任务 2 复审重要 ②/③）：
@@ -520,7 +543,12 @@ public final class AppModel: ObservableObject {
     ///
     /// ⚠️ 这里**不做**错误处置 —— 处置分两种落点，由下面两个包装器决定
     /// （抛错路径由调用方在原地显示原文，非抛错路径落在 `lastError` 上）。
-    private func call(_ method: String, _ params: JSONValue) async throws -> JSONValue {
+    ///
+    /// ⚠️ `clearsLastError: false` 是给**后台装饰刷新**（错误卡 / 重启进度 / 解析进度）
+    ///    用的：那几拍不是客户发起的，一次"恰好成功"的轮询**不许**把刚刚上屏的失败原文
+    ///    顺手抹掉（与 `pollUpdateStatus` 那道闸同一条理由，只是这里改从源头保住）。
+    private func call(_ method: String, _ params: JSONValue,
+                      clearsLastError: Bool = true) async throws -> JSONValue {
         guard let client else {
             throw CoreError.transport("内核没有起来（\(engineReason)）")
         }
@@ -530,7 +558,7 @@ public final class AppModel: ObservableObject {
             // ⚠️ **值没变就不写**：`@Published` 与 `@Observable` 不同 —— 后者对 Equatable
             //    属性做等值抑制，前者不做。这一行在**每条成功请求**上都会跑（含 200 ms 的
             //    传输轮询），无条件写会让整棵视图树每秒重算 5 次。
-            if lastError != nil { lastError = nil }
+            if clearsLastError, lastError != nil { lastError = nil }
             // ⚠️ **必须在清空 `lastError` 之后**：新出现的协议级告警也是写进它的
             //    （约束 5 的界面落点，见 `syncProtocolAlerts`），先收告警再清空
             //    就把刚收到的告警自己抹掉了。
@@ -633,6 +661,10 @@ public final class AppModel: ObservableObject {
             settings = handshake.settings
             lastCode = handshake.lastCode
             kernelProtocolVersion = handshake.protocolVersion
+            // 语言只在这里落一次：内核在 `hello` 里已经解析好（`system` ⇒ 具体语言），
+            // 壳照抄。⚠️ 放在成功分支里——一次失败的握手不该把界面语言改掉
+            // （旧内核 / 超时时维持上一轮 / 默认中文）。
+            language = Lang.fromHello(handshake.language)
             // 内核只在 `enqueue` 里起引擎（`op_enqueue` 的 `ensure_engine`），而这个内核进程
             // 是壳刚起的 —— 所以握手完成后「引擎未启动」是**事实**，不是猜测。
             engine = .notStarted
@@ -694,6 +726,8 @@ public final class AppModel: ObservableObject {
         let lastCode: String
         /// 内核**自报**的协议版本（`hello` 回执那一格）—— 见 `kernelProtocolVersion`。
         let protocolVersion: UInt32
+        /// 内核**落定**的界面语言（`hello` 回执的 `language`；旧内核没有 ⇒ `nil`）。
+        let language: String?
     }
 
     /// 真正发请求的那一段。**在后台的竞速任务里跑**，所以它是 `@Sendable` 的调用目标。
@@ -705,7 +739,8 @@ public final class AppModel: ObservableObject {
         return Handshake(choices: hello.minSplitSizeChoices,
                          settings: current.settings,
                          lastCode: current.lastCode,
-                         protocolVersion: hello.protocolVersion)
+                         protocolVersion: hello.protocolVersion,
+                         language: hello.language)
     }
 
     /// 有界等待：把 `operation` 与一个计时器赛跑，**谁先完成用谁**。
@@ -1717,6 +1752,70 @@ public final class AppModel: ObservableObject {
     public func pollUpdateStatus() async {
         guard lastError == nil || updateStatus == nil else { return }
         await refreshUpdateStatus()
+    }
+
+    // MARK: - 双语装饰：错误卡 / 重启进度 / 解析进度（T7 / 规格 W2–W4）
+
+    /// 装饰刷新的节拍（秒）。与 Windows 那侧 `INTERVALS_MS.restart_progress = 3000` 同值：
+    /// 重启与解析都不是 200 ms 级的变化，3 s 足够"跟得上"，也不会为一行提示多打内核。
+    public nonisolated static let noticePollInterval: Double = 3
+
+    /// 后台那一拍：拉一次重启进度与错误卡。
+    ///
+    /// ⚠️ 三条都是**只读装饰**，所以走 `clearsLastError: false`：拍子本身成功了，
+    ///    也不许顺手抹掉一条刚上屏的失败原文（那是 `lastError` 的契约，见它的文档）。
+    /// ⚠️ 失败一律静默（保持上一帧 / 回到空），**不碰 `lastError`、不碰 `engine`** ——
+    ///    与 Windows 的 `restart_progress` / `delivery_progress` 命令同款。
+    public func pollNotices() async {
+        await refreshRestartNotice()
+        await refreshErrorCards()
+    }
+
+    /// 拉一次 `restart_progress`，把结构化状态换成一句已落定语言的话。
+    public func refreshRestartNotice() async {
+        do {
+            let progress = try await call("restart_progress", .null,
+                                          clearsLastError: false)
+                .decoded(RestartProgressResult.self)
+            restartNotice = RestartNotice.of(state: progress.state,
+                                             attempt: progress.attempt,
+                                             budget: progress.budget,
+                                             lang: language)
+        } catch {
+            // 只读装饰：取不到 ⇒ 不显示（真正的故障在引擎横幅上）。
+            restartNotice = nil
+        }
+    }
+
+    /// 拉一次 `error_recent`，把内核**已合并**的"类 + 次数"换成壳的三句话。
+    ///
+    /// ⚠️ 内核不认识的 / 缺 `class` 的条目**跳过**（`ErrorClass.ofWire` 返回 nil）：
+    ///    不猜是哪一类，也就不会编一句不相干的解释。
+    public func refreshErrorCards() async {
+        do {
+            let recent = try await call("error_recent", .null,
+                                        clearsLastError: false)
+                .decoded(ErrorRecentResult.self)
+            let observations = recent.entries.compactMap { entry -> ErrorObservation? in
+                guard let kind = ErrorClass.ofWire(entry.errorClass) else { return nil }
+                return ErrorObservation(errorClass: kind, count: entry.count)
+            }
+            errorCards = ErrorCards.from(observations, lang: language)
+        } catch {
+            // 只读装饰：保持上一帧（内核重启的瞬间会短暂取不到，没有理由清屏）。
+        }
+    }
+
+    /// 拉一次 `delivery_progress`。`lines` 是**内核按当前语言成好的句子**，逐行照画。
+    public func refreshDeliveryProgress() async {
+        do {
+            let progress = try await call("delivery_progress", .null,
+                                          clearsLastError: false)
+                .decoded(DeliveryProgressResult.self)
+            deliveryProgressLines = progress.lines
+        } catch {
+            deliveryProgressLines = []
+        }
     }
 
     /// 设置页那个「启动时检查更新」勾选框。

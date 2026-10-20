@@ -51,24 +51,49 @@ use crate::protocol::{HelloResult, SettingsResult};
 ///    "上次用的码"，界面上那一格读它。**它是运行状态、不是用户参数**（`settings_form`
 ///    的头注记着"为什么它不在那里"）。
 pub fn payload(current: &SettingsResult, handshake_reply: Option<&str>) -> Value {
+    payload_for(current, handshake_reply, crate::i18n::Lang::Zh)
+}
+
+/// 同 [`payload`]，但**语言那一行**按界面语言给标签（规格 W1）。
+///
+/// ⚠️ 语言选项的**值与顺序**由 [`SettingsForm::LANGUAGE_VALUES`] 一处给，
+///    前端只按序画三个按钮 —— 它不拼 `"zh"` 这种线上值，也不翻译选项名。
+pub fn payload_for(
+    current: &SettingsResult,
+    handshake_reply: Option<&str>,
+    lang: crate::i18n::Lang,
+) -> Value {
     let form = SettingsForm::new(
         &current.settings,
         min_split_size_choices(handshake_reply),
     );
+    let language_choices: Vec<Value> = SettingsForm::LANGUAGE_VALUES
+        .iter()
+        .zip(SettingsForm::language_labels(lang))
+        .map(|(value, label)| json!({"value": value, "label": label}))
+        .collect();
     envelope::ok(json!({
         // 七个字段用 `Settings` 自己编码（字段名就是线上键名，见 `protocol.rs`）。
         "settings": to_wire(&current.settings),
         "last_code": current.last_code,
-        "parameters": to_wire(&SettingsForm::parameters()),
+        // 界面语言那一行：**当前值 + 三个选项**（值与顺序在 Rust，标签按界面语言）。
+        "language": {
+            "title": crate::i18n::t(lang, crate::i18n::Key::SettingsLanguageTitle),
+            "note": crate::i18n::t(lang, crate::i18n::Key::SettingsLanguageNote),
+            "value": current.settings.language,
+            "field": "language",
+            "choices": language_choices,
+        },
+        "parameters": to_wire(&SettingsForm::parameters(lang)),
         "min_split_size_options": to_wire(&form.min_split_size_options()),
-        "min_split_size_note": form.min_split_size_note(),
+        "min_split_size_note": form.min_split_size_note(lang),
         "notes": {
-            "limit_mbps": SettingsForm::LIMIT_MBPS_NOTE,
-            "apply": SettingsForm::APPLY_NOTE,
+            "limit_mbps": SettingsForm::limit_mbps_note(lang),
+            "apply": SettingsForm::apply_note(lang),
         },
         "banner": {
-            "unsaved": SettingsForm::UNSAVED_BANNER,
-            "clean": SettingsForm::CLEAN_BANNER,
+            "unsaved": SettingsForm::unsaved_banner(lang),
+            "clean": SettingsForm::clean_banner(lang),
         },
         // ⚠️ 三格都取**既有的**那一个函数（`save_help` 是三态判据，本文件不重写它）：
         //    前两格传 `engine_allows_actions = true` 是**故意的** —— 引擎不可用的那一档
@@ -113,6 +138,7 @@ mod tests {
                 limit_mbps: 0,
                 max_tries: 3,
                 retry_wait: 1,
+                language: "system".to_string(),
             },
             last_code: last_code.to_string(),
         }
@@ -122,7 +148,7 @@ mod tests {
     /// `call` 回的是 `result` 那一格，不是整条响应行）。
     fn a_handshake(choices: &[&str]) -> String {
         serde_json::json!({
-            "protocol": 1,
+            "protocol":2,
             "min_split_size_choices": choices,
         })
         .to_string()
@@ -201,7 +227,7 @@ mod tests {
     /// 而真机上的表现是"打开设置就报错"—— 用户连改都没得改（明明只有 `-k` 那一格缺信息）。
     #[test]
     fn an_unreadable_handshake_reply_leaves_the_choices_empty_instead_of_failing() {
-        for reply in [None, Some(""), Some("{not json"), Some(r#"{"protocol":1}"#)] {
+        for reply in [None, Some(""), Some("{not json"), Some(r#"{"protocol":2}"#)] {
             let v = payload(&a_receipt("21M", ""), reply);
             assert_eq!(v["ok"], json!(true), "回执读不出来不该让整个设置屏失败：{v}");
             assert_eq!(
@@ -247,6 +273,30 @@ mod tests {
         );
     }
 
+
+    /// 判据（规格 W1）：语言那一行**值与顺序都来自 Rust**，标签随界面语言。
+    #[test]
+    fn the_language_row_comes_from_one_place() {
+        let receipt = a_receipt("20M", "");
+        let zh = payload(&receipt, None);
+        let choices = zh["data"]["language"]["choices"].as_array().expect("三个选项");
+        assert_eq!(choices.len(), 3);
+        assert_eq!(choices[0]["value"], json!("system"));
+        assert_eq!(choices[0]["label"], json!("跟随系统"));
+        assert_eq!(choices[2]["value"], json!("en"));
+        assert_eq!(choices[2]["label"], json!("English"));
+        assert_eq!(zh["data"]["language"]["field"], json!("language"));
+        assert_eq!(zh["data"]["language"]["value"], json!("system"));
+
+        let en = payload_for(&receipt, None, crate::i18n::Lang::En);
+        assert_eq!(en["data"]["language"]["choices"][0]["label"], json!("Follow system"));
+        assert_eq!(
+            en["data"]["language"]["value"],
+            json!("system"),
+            "当前值不翻译（它是线上值）"
+        );
+    }
+
     /// 七个值**两两不同**的那一份也要原样发出去（免得只看 `parallel` 一格就以为对了）。
     #[test]
     fn a_receipt_with_distinct_values_is_carried_verbatim() {
@@ -263,7 +313,7 @@ mod tests {
             json!({
                 "parallel": 3, "connections": 4, "splits": 5,
                 "min_split_size": "21M", "limit_mbps": 100_000,
-                "max_tries": 7, "retry_wait": 60,
+                "max_tries": 7, "retry_wait": 60, "language": "system",
             }),
             "七个值必须逐格对位（串格在这里就会露出来）：{v}"
         );

@@ -2036,3 +2036,40 @@ Intel 那份直接复用了 `dist/` 里已经修过 minOS 的 x86_64 包。
   盘内自验（脚本自己挂载一遍）：包内三个二进制与 Info.plist 的 minOS 都在 13.0 之内、单架构、
   `已损坏修复.command` 与 `/Applications` 符号链接齐全。⚠️ 同既有口径：**不签名、不公证**；
   x86_64 那一份只在本机经 Rosetta 跑过，不等于在真 Intel 上验过。
+
+### 0.3.0 中英双语 / 八类错误 / 自动重启 / 双域名（2026-10-21）验收登记（macOS 侧）
+
+规格与计划：`docs/superpowers/specs/2026-10-20-v0.3.0-i18n-errors-engines-domains-design.md`、
+`docs/superpowers/plans/2026-10-20-v0.3.0-i18n-errors-engines-domains.md`。
+
+本端这一轮只做 `T7`（壳侧双语与提示），**范围如实标注**：落点是
+引擎状态徽标与设置页那句、重试按钮、八类错误卡、自动重启进度、解析进度行；
+**其余界面仍只有中文**（空态页标题、设置表单、传输列表、校验页、更新提示、工具栏），
+这些等下一轮补，不在本版宣称"整壳双语"。
+
+代码落点：
+
+* `BenagenCoreKit/I18n.swift` —— `Lang{zh,en}`、`fromHello`（`en`/`en-US`/`en_US` ⇒ en，
+  其余含 `nil`/`system`/`fr` ⇒ zh）、封闭 `Key` + `t`/`tf` 两张 switch（漏写一条是编译错误）。
+  中文逐字沿用既有客户文案；英文新增。
+* `BenagenCoreKit/Presentation/ErrorCard.swift` —— 八类线上词、`title/explain/action` 中英、
+  `severity` 60/59/50/40/30/20/19/18、`ErrorCards.from`（同类取最大、严重度降序、上限 3）。
+* `BenagenCoreKit/Presentation/RestartNotice.swift` —— 等待/验证/放弃三档句子（与 Windows 逐字一致）。
+* `AppModel.swift` —— 握手落定 `language`；`pollNotices` 3 s 一拍、只读、失败静默
+  （**不写 `lastError`、不升级红条**）；`errorCards`/`restartNotice`/`deliveryProgressLines` 三个 `@Published`。
+* `Views/RootView.swift` —— 重启进度行与错误卡行；`Views/EmptyState.swift` —— 加载中逐行显示解析进度。
+
+协议：`kProtocolVersion = 2`（与内核、Windows 壳同批升）。0.3.0 壳连 0.2.x 内核会收到
+`protocol_mismatch`，这是有意的（`hello` 多了 `language`/`language_chosen`、`ErrorBody` 多了 `class`）。
+
+读数：`bash scripts/test.sh --disable-sandbox` ⇒ **624 passed / 4 suites**
+（580 → 624，本轮新增 44：`I18nTests` 11、`ErrorCardTests` 18、`RestartNoticeTests` 6、
+`AppModelNoticeTests` 9）。字体门不覆盖 macOS，但文案表与 Windows 逐字同源
+（`windows/scripts/check_presentation_mirrors.sh` 第 ④ 节钉住八类三句）。
+
+⚠️ 既有 `AppModelTimeoutTests` 的两条时序用例（`startTimeoutLeavesTheOldManifestAlone`、
+`aFastHandshakeNeverTimesOut`）在并行负载下偶发红（1 s 注入超时被击穿），单测过滤运行通过、
+连跑四轮完整套件全绿；**没有放宽超时**，属既有测试基础设施问题，下一轮可考虑串行化。
+
+真机未验（与 Windows 同一份清单，见规格 §8）：首次弹窗、真实断网/拔盘、挂起内核看三档重启、
+国际域名解析。本机没有这些现场条件，如实标注。

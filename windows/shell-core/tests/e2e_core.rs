@@ -296,7 +296,7 @@ fn an_over_long_line_is_answered_with_a_structured_error_and_the_core_keeps_serv
         .write_line(&payload)
         .expect("写本身不该失败（管道是好的，超限是内核那边的事）");
     channel
-        .write_line(r#"{"id":1,"method":"hello","params":{"protocol":1}}"#)
+        .write_line(r#"{"id":1,"method":"hello","params":{"protocol":2}}"#)
         .expect("超长行之后必须还能写");
 
     let mut alerts: Vec<String> = Vec::new();

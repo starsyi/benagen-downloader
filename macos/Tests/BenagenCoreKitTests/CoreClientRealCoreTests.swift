@@ -45,7 +45,7 @@ func realCoreAnswersHello() throws {
     let v = try c.callSync("hello", .object(["protocol": .integer(Int64(kProtocolVersion))]))
     let hello = try v.decoded(HelloResult.self)
 
-    #expect(hello.protocolVersion == 1)
+    #expect(hello.protocolVersion == UInt32(kProtocolVersion))
     // ⚠️ **100 项，不是 3 项**：任务 1 的夹具把 `min_split_size_choices` 截短过，
     //    这条专门挡"夹具与真内核的偏差"（枚举控件是照它建的，见契约 §2.3）。
     #expect(hello.minSplitSizeChoices.count == 100)
@@ -112,5 +112,5 @@ func realCoreUnknownMethodYieldsUnknownMethodCode() throws {
     // 一条业务错误不得把连接带坏：同一条连接上的下一条请求照常
     let hello = try c.callSync("hello", .object(["protocol": .integer(Int64(kProtocolVersion))]))
         .decoded(HelloResult.self)
-    #expect(hello.protocolVersion == 1)
+    #expect(hello.protocolVersion == UInt32(kProtocolVersion))
 }

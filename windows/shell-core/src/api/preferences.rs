@@ -36,19 +36,19 @@ use crate::storage::preferences::Preferences;
 ///   * `display` —— 那一行**显示**什么（未配置时是"默认（…，由内核决定）"，
 ///     **不是**一个空行 —— 空行在界面上与"这一行坏了"分不开）；
 ///   * `section_note` —— 那一段的脚注（"没有设置过时壳不指定下载目录…网络盘会让界面变慢"）。
-pub fn current(preferences: &Preferences) -> Value {
+pub fn current(lang: crate::i18n::Lang, preferences: &Preferences) -> Value {
     envelope::ok(json!({
         "dir": preferences.download_dir,
         "display": DownloadDirectory::display(&preferences.download_dir),
-        "section_note": DownloadDirectory::SECTION_NOTE,
+        "section_note": DownloadDirectory::section_note(lang),
         // ---- 「详细日志」那一个勾选框（任务 3，规格 §2.4）--------------------
         // ⚠️ 标签与说明**跟着载荷下来**（不是 `index.html` 里的结构文案）：
         //    那个控件是运行时画的（JS 要按 `verbose_logging` 设 `checked`），
         //    两句话跟它一起走就不必在 HTML 与 Rust 里各存一份。
         //    ⇒ 前端一个字都不用自己造（`check_frontend_copy.sh` 的判据因此不用动）。
         "verbose_logging": preferences.verbose_logging,
-        "verbose_label": DiagnosticsToggle::LABEL,
-        "verbose_note": DiagnosticsToggle::NOTE,
+        "verbose_label": DiagnosticsToggle::label(lang),
+        "verbose_note": DiagnosticsToggle::note(lang),
     }))
 }
 
@@ -75,11 +75,11 @@ pub fn plan(check: Option<String>, confirmation: String) -> Value {
 ///     （完整路径铺在一行里会把常驻回执那一行撑高，锚在底边的两处一起被顶出窗口）；
 ///   * `notice_text` 是那条回执**完整的一句话**（防回归的锚）；
 ///   * `is_failure` 决定前端挑哪个图标与颜色。
-pub fn change(change: &DownloadDirChange) -> Value {
+pub fn change(lang: crate::i18n::Lang, change: &DownloadDirChange) -> Value {
     receipt(
-        change.headline(),
+        change.headline(lang),
         change.path_detail(),
-        Some(change.notice_text()),
+        Some(change.notice_text(lang)),
         change.is_failure(),
     )
 }
@@ -92,11 +92,11 @@ pub fn change(change: &DownloadDirChange) -> Value {
 ///    ⚠️ 但**那三句话取自另一个类型**：`DownloadDirChange` 的三句把主词写死成
 ///       "下载目录"，拿它报一次勾选框的改动会让用户读到一句假话 ——
 ///       理由逐条写在 `VerboseLoggingChange` 的类型文档里。
-pub fn verbose_change(change: &VerboseLoggingChange) -> Value {
+pub fn verbose_change(lang: crate::i18n::Lang, change: &VerboseLoggingChange) -> Value {
     receipt(
-        change.headline(),
+        change.headline(lang),
         change.path_detail(),
-        Some(change.notice_text()),
+        Some(change.notice_text(lang)),
         change.is_failure(),
     )
 }
@@ -265,7 +265,7 @@ mod tests {
     /// 三格都在，而且各自干各自的活（未配置那一档显示的是**一句人话**，不是空行）。
     #[test]
     fn the_current_state_carries_the_dir_the_display_and_the_note() {
-        let v = current(&prefs("/Volumes/Data/交付"));
+        let v = current(crate::i18n::Lang::Zh, &prefs("/Volumes/Data/交付"));
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["data"]["dir"], json!("/Volumes/Data/交付"));
         assert_eq!(v["data"]["display"], json!("/Volumes/Data/交付"));
@@ -278,7 +278,7 @@ mod tests {
         );
 
         // 未配置：`dir` 是空串（判"没改动"要用它），而 `display` 是一句人话。
-        let v = current(&prefs(""));
+        let v = current(crate::i18n::Lang::Zh, &prefs(""));
         assert_eq!(v["data"]["dir"], json!(""));
         assert_eq!(
             v["data"]["display"],
@@ -296,19 +296,19 @@ mod tests {
     ///   · 把值写成恒 `false` ⇒ 第二条断言红（开着的那一份必须发 `true`）。
     #[test]
     fn the_current_state_carries_the_diagnostics_toggle() {
-        let off = current(&prefs("/Volumes/Data/交付"));
+        let off = current(crate::i18n::Lang::Zh, &prefs("/Volumes/Data/交付"));
         assert_eq!(off["data"]["verbose_logging"], json!(false));
         assert_eq!(
             off["data"]["verbose_label"],
-            json!(DiagnosticsToggle::LABEL),
+            json!(DiagnosticsToggle::label(crate::i18n::Lang::Zh)),
             "标签必须跟着载荷下来（前端一个字都不许自己造）"
         );
-        assert_eq!(off["data"]["verbose_note"], json!(DiagnosticsToggle::NOTE));
+        assert_eq!(off["data"]["verbose_note"], json!(DiagnosticsToggle::note(crate::i18n::Lang::Zh)));
 
-        let on = current(&Preferences::new("/Volumes/Data/交付").setting_verbose_logging(true));
+        let on = current(crate::i18n::Lang::Zh, &Preferences::new("/Volumes/Data/交付").setting_verbose_logging(true));
         assert_eq!(on["data"]["verbose_logging"], json!(true), "开着的那一份要发 true");
         // 未配置那一份同样带着这三格（开关与"配没配过目录"是两件事）。
-        let empty = current(&Preferences::empty());
+        let empty = current(crate::i18n::Lang::Zh, &Preferences::empty());
         assert_eq!(empty["data"]["verbose_logging"], json!(false));
         assert!(empty["data"]["verbose_label"].is_string());
     }
@@ -319,10 +319,10 @@ mod tests {
     /// 而真机上的表现是设置窗口里那条回执**安静地少一行**（`undefined`）。
     #[test]
     fn both_receipts_carry_the_same_four_keys() {
-        let dir = change(&DownloadDirChange::Changed {
+        let dir = change(crate::i18n::Lang::Zh, &DownloadDirChange::Changed {
             dir: "/data/交付".to_string(),
         });
-        let verbose = verbose_change(&VerboseLoggingChange::Changed { on: true });
+        let verbose = verbose_change(crate::i18n::Lang::Zh, &VerboseLoggingChange::Changed { on: true });
         let keys = |v: &Value| {
             let mut k: Vec<String> = v["data"]
                 .as_object()
@@ -397,7 +397,7 @@ mod tests {
         let changed = DownloadDirChange::Changed {
             dir: "/data/交付".to_string(),
         };
-        let v = change(&changed);
+        let v = change(crate::i18n::Lang::Zh, &changed);
         assert_eq!(v["data"]["headline"], json!("下载目录已改（内核已按新目录重启）"));
         assert_eq!(v["data"]["path_detail"], json!("/data/交付"));
         assert_eq!(
@@ -415,19 +415,19 @@ mod tests {
         );
 
         // 恢复默认：没有路径行（`null`，不是一个空串）。
-        let v = change(&DownloadDirChange::Changed { dir: String::new() });
+        let v = change(crate::i18n::Lang::Zh, &DownloadDirChange::Changed { dir: String::new() });
         assert!(v["data"]["path_detail"].is_null(), "{v}");
         assert_eq!(v["data"]["headline"], json!("已恢复默认下载目录（内核已按默认目录重启）"));
 
         // 没改动：内核没重启（那句"正在跑的任务会停"说的是**真的改了**的时候）。
-        let v = change(&DownloadDirChange::Unchanged {
+        let v = change(crate::i18n::Lang::Zh, &DownloadDirChange::Unchanged {
             dir: "/x".to_string(),
         });
         assert_eq!(v["data"]["headline"], json!("下载目录没有变化，没有重启内核"));
         assert_eq!(v["data"]["is_failure"], json!(false));
 
         // 失败：**原文照登**（内核/系统的原话），而且 `is_failure` 要翻。
-        let v = change(&DownloadDirChange::Failed {
+        let v = change(crate::i18n::Lang::Zh, &DownloadDirChange::Failed {
             message: "内核重启失败：内核无响应（等待超过 5 秒）".to_string(),
         });
         assert_eq!(

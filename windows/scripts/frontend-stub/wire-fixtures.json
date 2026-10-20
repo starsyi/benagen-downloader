@@ -11,6 +11,14 @@
     },
     "ok": true
   },
+  "deliveryProgress": {
+    "lines": [
+      "正在向国内服务器索取清单…",
+      "国内没有应答，正在试国际服务器…",
+      "国际服务器已应答，正在校验清单…",
+      "清单已拿到。"
+    ]
+  },
   "diagnosticsExportCancelled": {
     "data": {
       "headline": "没有导出（你取消了选择文件夹）",
@@ -376,6 +384,7 @@
         {
           "current": {
             "connections": 16,
+            "language": "system",
             "limit_mbps": 0,
             "max_tries": 3,
             "min_split_size": "21M",
@@ -386,6 +395,7 @@
           "dirty": false,
           "form": {
             "connections": 16,
+            "language": "system",
             "limit_mbps": 0,
             "max_tries": 3,
             "min_split_size": "21M",
@@ -399,6 +409,7 @@
         {
           "current": {
             "connections": 16,
+            "language": "system",
             "limit_mbps": 0,
             "max_tries": 3,
             "min_split_size": "21M",
@@ -409,6 +420,7 @@
           "dirty": true,
           "form": {
             "connections": 16,
+            "language": "system",
             "limit_mbps": 0,
             "max_tries": 3,
             "min_split_size": "21M",
@@ -422,6 +434,7 @@
         {
           "current": {
             "connections": 16,
+            "language": "system",
             "limit_mbps": 0,
             "max_tries": 3,
             "min_split_size": "21M",
@@ -432,6 +445,7 @@
           "dirty": false,
           "form": {
             "connections": 16,
+            "language": "system",
             "limit_mbps": 0,
             "max_tries": 3,
             "min_split_size": "21M",
@@ -445,6 +459,7 @@
         {
           "current": {
             "connections": 16,
+            "language": "system",
             "limit_mbps": 0,
             "max_tries": 3,
             "min_split_size": "21M",
@@ -455,6 +470,7 @@
           "dirty": true,
           "form": {
             "connections": 16,
+            "language": "system",
             "limit_mbps": 0,
             "max_tries": 3,
             "min_split_size": "20M",
@@ -468,6 +484,7 @@
         {
           "current": {
             "connections": 16,
+            "language": "system",
             "limit_mbps": 0,
             "max_tries": 3,
             "min_split_size": "21M",
@@ -478,6 +495,7 @@
           "dirty": true,
           "form": {
             "connections": 1,
+            "language": "system",
             "limit_mbps": 100,
             "max_tries": 100,
             "min_split_size": "1M",
@@ -491,6 +509,7 @@
         {
           "current": {
             "connections": 4,
+            "language": "system",
             "limit_mbps": 250,
             "max_tries": 7,
             "min_split_size": "5M",
@@ -501,6 +520,7 @@
           "dirty": false,
           "form": {
             "connections": 4,
+            "language": "system",
             "limit_mbps": 250,
             "max_tries": 7,
             "min_split_size": "5M",
@@ -606,11 +626,48 @@
     },
     "ok": true
   },
+  "restartProgress": {
+    "exhausted": {
+      "text": "自动重启没能恢复下载引擎，请手动点「重试」"
+    },
+    "idle": {
+      "text": null
+    },
+    "verifying": {
+      "text": "引擎已重启，正在确认它能正常工作…"
+    },
+    "waiting": {
+      "text": "正在重启下载引擎（第 2/3 次）…"
+    },
+    "waitingEn": {
+      "text": "Restarting the download engine (attempt 2/3)…"
+    }
+  },
   "settingsGet": {
     "data": {
       "banner": {
         "clean": "与内核当前参数一致",
         "unsaved": "有未保存的改动"
+      },
+      "language": {
+        "choices": [
+          {
+            "label": "跟随系统",
+            "value": "system"
+          },
+          {
+            "label": "中文",
+            "value": "zh"
+          },
+          {
+            "label": "English",
+            "value": "en"
+          }
+        ],
+        "field": "language",
+        "note": "选择后可以随时在设置里改。",
+        "title": "界面语言",
+        "value": "system"
       },
       "last_code": "R.a1b2C3d4E5f6G7h8I9j",
       "min_split_size_note": "当前值「21M」不在内核给出的取值集合里。保存会按这个原值下发，由内核校验。",
@@ -672,6 +729,7 @@
       },
       "settings": {
         "connections": 16,
+        "language": "system",
         "limit_mbps": 0,
         "max_tries": 3,
         "min_split_size": "21M",
@@ -686,14 +744,26 @@
     "data": {
       "allows_requests": false,
       "banner": null,
+      "disk": null,
       "engine": {
         "icon": "questionmark.circle",
         "kind": "connecting",
         "text": "正在连接内核…",
         "tooltip": "内核尚未握手（壳正在启动它）"
       },
+      "error_cards": [
+        {
+          "action": "换到内置盘，或把「并行文件数」调到 1–2。",
+          "class": "disk_slow",
+          "count": 2,
+          "explain": "目标磁盘写得比下载慢：下载会跟着慢，长时间写不动还会看起来像卡住。",
+          "severity": 40,
+          "title": "目标磁盘写得太慢（2 次）"
+        }
+      ],
       "fallback_notice": null,
       "handshake_reply": null,
+      "language_chosen": true,
       "last_error": null,
       "load": {
         "kind": "loaded",
@@ -717,6 +787,7 @@
         "shows_retry": true,
         "text": "内核进程已退出"
       },
+      "disk": null,
       "engine": {
         "icon": "exclamationmark.triangle.fill",
         "kind": "unavailable",
@@ -724,8 +795,19 @@
         "text": "引擎不可用：内核进程已退出",
         "tooltip": "内核进程已退出"
       },
+      "error_cards": [
+        {
+          "action": "换到内置盘，或把「并行文件数」调到 1–2。",
+          "class": "disk_slow",
+          "count": 2,
+          "explain": "目标磁盘写得比下载慢：下载会跟着慢，长时间写不动还会看起来像卡住。",
+          "severity": 40,
+          "title": "目标磁盘写得太慢（2 次）"
+        }
+      ],
       "fallback_notice": null,
       "handshake_reply": null,
+      "language_chosen": true,
       "last_error": "上一次请求失败了",
       "load": {
         "kind": "loaded",
@@ -740,6 +822,44 @@
     },
     "ok": true
   },
+  "stateEnglish": {
+    "data": {
+      "allows_requests": true,
+      "banner": null,
+      "disk": null,
+      "engine": {
+        "icon": "bolt.fill",
+        "kind": "running",
+        "text": "Running",
+        "tooltip": "The download engine is running"
+      },
+      "error_cards": [
+        {
+          "action": "换到内置盘，或把「并行文件数」调到 1–2。",
+          "class": "disk_slow",
+          "count": 2,
+          "explain": "目标磁盘写得比下载慢：下载会跟着慢，长时间写不动还会看起来像卡住。",
+          "severity": 40,
+          "title": "目标磁盘写得太慢（2 次）"
+        }
+      ],
+      "fallback_notice": null,
+      "handshake_reply": null,
+      "language_chosen": true,
+      "last_error": null,
+      "load": {
+        "kind": "loaded",
+        "summary": {
+          "code": "R.a1b2C3d4E5f6G7h8I9j",
+          "expired_badge_text": null,
+          "files_text": "128 files",
+          "size_text": "412.6 GB",
+          "validity_text": "Valid until 2026-03-18 23:59"
+        }
+      }
+    },
+    "ok": true
+  },
   "stateHandshakeTimeout": {
     "data": {
       "allows_requests": false,
@@ -749,6 +869,7 @@
         "shows_retry": true,
         "text": "内核无响应（等待超过 5 秒）"
       },
+      "disk": null,
       "engine": {
         "icon": "exclamationmark.triangle.fill",
         "kind": "unavailable",
@@ -756,8 +877,19 @@
         "text": "内核无响应（等待超过 5 秒）",
         "tooltip": "内核可能正卡在系统授权对话框上（例如\"想访问下载文件夹\"）。请查看屏幕上是否有该对话框并点「允许」，然后点「重试」。"
       },
+      "error_cards": [
+        {
+          "action": "换到内置盘，或把「并行文件数」调到 1–2。",
+          "class": "disk_slow",
+          "count": 2,
+          "explain": "目标磁盘写得比下载慢：下载会跟着慢，长时间写不动还会看起来像卡住。",
+          "severity": 40,
+          "title": "目标磁盘写得太慢（2 次）"
+        }
+      ],
       "fallback_notice": null,
       "handshake_reply": null,
+      "language_chosen": true,
       "last_error": null,
       "load": {
         "kind": "loaded",
@@ -776,14 +908,26 @@
     "data": {
       "allows_requests": true,
       "banner": null,
+      "disk": null,
       "engine": {
         "icon": "bolt.fill",
         "kind": "running",
         "text": "运行中",
         "tooltip": "下载引擎正在运行"
       },
+      "error_cards": [
+        {
+          "action": "换到内置盘，或把「并行文件数」调到 1–2。",
+          "class": "disk_slow",
+          "count": 2,
+          "explain": "目标磁盘写得比下载慢：下载会跟着慢，长时间写不动还会看起来像卡住。",
+          "severity": 40,
+          "title": "目标磁盘写得太慢（2 次）"
+        }
+      ],
       "fallback_notice": null,
       "handshake_reply": null,
+      "language_chosen": true,
       "last_error": null,
       "load": {
         "kind": "loaded",

@@ -10,7 +10,7 @@ import Foundation
 // ---------------------------------------------------------------------------
 
 /// 协议版本。握手时协商（`core/src/protocol.rs:26` 的 `PROTOCOL_VERSION`）。
-public let kProtocolVersion: UInt32 = 1
+public let kProtocolVersion: UInt32 = 2
 
 // ---------------------------------------------------------------------------
 // 信封
@@ -240,10 +240,17 @@ public struct HelloResult: Decodable, Sendable {
     /// **它必须从协议里取**，不能写成壳里的一份硬编码：客户端的枚举控件就是照它建的
     /// （契约 §2.3 的"让客户不可能输错"）。
     public let minSplitSizeChoices: [String]
+    /// 内核**落定**的界面语言（`"zh"` / `"en"`，**永远不会是 `"system"`**）。
+    ///
+    /// ⚠️ **可选、缺键 ⇒ `nil`**：0.2.x 的内核没有这一格，而一个非可选的 `String`
+    ///    会让整个握手解码失败 —— "语言字段缺失"绝不该让客户端启动不了。
+    ///    `nil` 由 [`Lang.fromHello`] 按默认中文处理（与旧界面一致）。
+    public let language: String?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol"
         case minSplitSizeChoices
+        case language
     }
 }
 
@@ -545,4 +552,93 @@ public struct StateEntry: Decodable, Sendable {
     /// 秒级浮点时间戳（`engine::mtime_secs` 那一份换算的产物）。
     public let mtime: Double
     public let crc64: String
+}
+
+// ---------------------------------------------------------------------------
+// 只读装饰命令的三条回执（规格 W2–W4）
+//
+// 这三条都是"装饰"：取不到时界面上什么都不说（或只说上一帧），**不许**升级成错误。
+// 所以字段一律宽松解码（缺键 ⇒ 默认值），旧内核少回一格不该让整条载荷失败。
+// ---------------------------------------------------------------------------
+
+/// `restart_progress` 的回执（`core/src/kernel.rs` 的 `op_restart_progress`）。
+public struct RestartProgressResult: Decodable, Sendable {
+    /// 已尝试次数 / 预算（`attempt` 从 1 起；`budget` 是上限）。
+    public let attempt: UInt32
+    public let budget: UInt32
+    /// `idle` / `waiting` / `verifying` / `exhausted`，**逐字**（壳只认这四个）。
+    public let state: String
+    /// 这一档从什么时候开始（毫秒时间戳）。壳目前不画它，留着是为了不丢协议事实。
+    public let sinceMs: UInt64?
+    /// 这一轮已经失败过几次。同上：壳目前不画。
+    public let fails: UInt32?
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        attempt = try c.decodeIfPresent(UInt32.self, forKey: .attempt) ?? 0
+        budget = try c.decodeIfPresent(UInt32.self, forKey: .budget) ?? 0
+        state = try c.decodeIfPresent(String.self, forKey: .state) ?? "idle"
+        sinceMs = try c.decodeIfPresent(UInt64.self, forKey: .sinceMs)
+        fails = try c.decodeIfPresent(UInt32.self, forKey: .fails)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case attempt, budget, state, sinceMs, fails
+    }
+}
+
+/// `delivery_progress` 的回执（`core/src/kernel.rs` 的 `op_delivery_progress`）。
+///
+/// ⚠️ `lines` **每一行都是内核按当前语言拼好的完整句子** —— 壳直接逐行画，
+///    **不许**再拼前缀、加序号、合并成一段（那会与内核的语言/措辞分叉）。
+public struct DeliveryProgressResult: Decodable, Sendable {
+    /// `resolving` / `done` / …（逐字；壳目前只拿它判断有没有内容可画）。
+    public let state: String
+    /// 双域名解析用到的源（逐字；壳不解释它）。
+    public let origin: String?
+    /// 内核成好句的进度行。
+    public let lines: [String]
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        state = try c.decodeIfPresent(String.self, forKey: .state) ?? "idle"
+        origin = try c.decodeIfPresent(String.self, forKey: .origin)
+        lines = try c.decodeIfPresent([String].self, forKey: .lines) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey { case state, origin, lines }
+}
+
+/// `error_recent` 的回执（`core/src/kernel.rs` 的 `op_error_recent`）。
+///
+/// 内核已经做过 30 秒窗口内的同类合并，这里拿到的 `entries` 是**合并后**的：
+/// `count` 是窗口内的次数，`repeats` 是"同一类反复出现"的累计标记。
+/// 壳**只用 `class` + `count`** —— 标题/解释/动作由壳按自己的语言表生成
+/// （两份句子必须逐字一致，见 `Presentation/ErrorCard.swift` 的文件头）。
+public struct ErrorRecentResult: Decodable, Sendable {
+    public let entries: [ErrorRecentEntry]
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        entries = try c.decodeIfPresent([ErrorRecentEntry].self, forKey: .entries) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey { case entries }
+}
+
+public struct ErrorRecentEntry: Decodable, Sendable {
+    /// 线上键是 `class`（无下划线，`.convertFromSnakeCase` 原样透传）。
+    public let errorClass: String?
+    public let count: Int
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        errorClass = try c.decodeIfPresent(String.self, forKey: .errorClass)
+        count = try c.decodeIfPresent(Int.self, forKey: .count) ?? 1
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case errorClass = "class"
+        case count
+    }
 }

@@ -614,10 +614,9 @@ impl Transport for UreqTransport {
                 Ok(buf)
             }
             // 404 单独给文案：交付码打错是最常见的失败，值得一句能照做的提示。
-            Err(ureq::Error::Status(404, _)) => Err(http_status_error(
-                404,
-                &format!("清单不存在（404）——请确认交付码是否正确：{url}"),
-            )),
+            // ⚠️ 传输层**不造句**（它拿不到语言）：404 走与其它 4xx 同一个 helper，
+            //    保留状态码（`http_status` 的判据要靠它），句子由 `fetch_with` 按语言拼。
+            Err(ureq::Error::Status(404, _)) => Err(http_status_error(404, "")),
             Err(ureq::Error::Status(code, _)) if code >= 500 => {
                 Err(http_status_error(code, &format!("服务端错误 {code}")))
             }
@@ -649,8 +648,13 @@ impl Transport for UreqTransport {
 /// 拉取清单：超时 + 指数退避重试；**4xx 不重试**。
 ///
 /// 重试覆盖网络错误与 5xx；4xx 是确定性失败，不重试——重试一个 404 只是浪费客户时间。
-pub fn fetch<T: Transport>(t: &T, base_url: &str, code: &str) -> Result<Manifest, String> {
-    fetch_with(t, base_url, code, FETCH_BASE_DELAY, std::thread::sleep)
+pub fn fetch<T: Transport>(
+    t: &T,
+    base_url: &str,
+    code: &str,
+    lang: crate::i18n::Lang,
+) -> Result<Manifest, String> {
+    fetch_with(t, base_url, code, lang, FETCH_BASE_DELAY, std::thread::sleep)
 }
 
 /// [`fetch`] 的本体：退避基数与睡眠函数由调用方给，测试借此跑真实循环而不真睡。
@@ -658,6 +662,7 @@ fn fetch_with<T: Transport>(
     t: &T,
     base_url: &str,
     code: &str,
+    lang: crate::i18n::Lang,
     base_delay: Duration,
     mut sleep: impl FnMut(Duration),
 ) -> Result<Manifest, String> {
@@ -686,6 +691,14 @@ fn fetch_with<T: Transport>(
                 return Ok(m);
             }
             Err(e) => {
+                // 404：一句按客户语言拼好的话（句子只在这一处）
+                if http_status(&e) == Some(404) {
+                    return Err(crate::i18n::text::tf(
+                        lang,
+                        crate::i18n::text::MsgKey::DeliveryNotFound,
+                        &[("url", &url)],
+                    ));
+                }
                 // 确定性失败立即返回（Go 侧 `once` 的 retryable=false），不包"已尝试"文案
                 if !is_retryable(&e) {
                     return Err(e);
@@ -1495,7 +1508,7 @@ mod tests {
     fn fetch_worst_case_stays_inside_the_booked_91_5_seconds() {
         let t = Stub::always(network_error("connection refused"));
         let mut slept: Vec<Duration> = Vec::new();
-        let r = fetch_with(&t, STUB_BASE, "X", FETCH_BASE_DELAY_PROD, |d| slept.push(d));
+        let r = fetch_with(&t, STUB_BASE, "X", crate::i18n::Lang::Zh, FETCH_BASE_DELAY_PROD, |d| slept.push(d));
         assert!(r.is_err(), "持续失败时应当报错");
         let worst = t.calls() as f64 * FETCH_TIMEOUT.as_secs_f64()
             + slept.iter().map(Duration::as_secs_f64).sum::<f64>();
@@ -1515,7 +1528,7 @@ mod tests {
     #[test]
     fn fetch_success() {
         let t = Stub::new(vec![Ok(r#"{"code":"AbC123","files":[]}"#)]);
-        let m = match fetch(&t, STUB_BASE, "AbC123") {
+        let m = match fetch(&t, STUB_BASE, "AbC123", crate::i18n::Lang::Zh) {
             Ok(m) => m,
             Err(e) => panic!("拉取失败: {e}"),
         };
@@ -1540,7 +1553,7 @@ mod tests {
             Err(http_status_error(503, "服务端错误 503")),
             Ok(r#"{"code":"X"}"#),
         ]);
-        if let Err(e) = fetch(&t, STUB_BASE, "X") {
+        if let Err(e) = fetch(&t, STUB_BASE, "X", crate::i18n::Lang::Zh) {
             panic!("重试后仍失败: {e}");
         }
         assert_eq!(t.calls(), 3, "请求次数");
@@ -1556,7 +1569,7 @@ mod tests {
         // 三种码都要测，通用分支才有人守护。
         for status in [403u16, 404, 410] {
             let t = Stub::always(http_status_error(status, ""));
-            let err = match fetch(&t, STUB_BASE, "X") {
+            let err = match fetch(&t, STUB_BASE, "X", crate::i18n::Lang::Zh) {
                 Err(e) => e,
                 Ok(_) => panic!("HTTP {status} 应当报错"),
             };
@@ -1566,6 +1579,26 @@ mod tests {
                 "4xx 是确定性失败，不应重试（HTTP {status}）；实际报错 {err}"
             );
         }
+    }
+
+    /// 判据（T2 闭集）：**同一个 404**，壳说中文见中文、说英文见英文，
+    /// 两句都点名 URL（客户要照着它核对交付码）。句子只在 `fetch` 里造一次。
+    #[test]
+    fn a_missing_manifest_says_the_same_thing_in_both_languages() {
+        let not_found = || http_status_error(404, "");
+        let t = Stub::always(not_found());
+        let zh = fetch(&t, STUB_BASE, "AbCdEfGhIjKlMnOpQrSt", crate::i18n::Lang::Zh)
+            .expect_err("404 必须是错");
+        assert!(zh.contains("清单不存在") && zh.contains("AbCdEfGhIjKlMnOpQrSt"), "{zh}");
+
+        let t = Stub::always(not_found());
+        let en = fetch(&t, STUB_BASE, "AbCdEfGhIjKlMnOpQrSt", crate::i18n::Lang::En)
+            .expect_err("404 必须是错");
+        assert!(
+            !en.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            "英文界面里蹦出了中文: {en}"
+        );
+        assert!(en.contains("404") && en.contains("AbCdEfGhIjKlMnOpQrSt"), "{en}");
     }
 
     #[test]
@@ -1580,7 +1613,7 @@ mod tests {
             Err(network_error("connection refused")),
             Ok(r#"{"code":"X"}"#),
         ]);
-        let m = match fetch(&t, STUB_BASE, "X") {
+        let m = match fetch(&t, STUB_BASE, "X", crate::i18n::Lang::Zh) {
             Ok(m) => m,
             Err(e) => panic!("网络错误应当被重试并在恢复后成功: {e}"),
         };
@@ -1591,7 +1624,7 @@ mod tests {
         // 网络错误持续存在时，重试耗尽后必须报错——且必须真的重试过
         let always_fail = Stub::always(network_error("connection refused"));
         assert!(
-            fetch(&always_fail, STUB_BASE, "X").is_err(),
+            fetch(&always_fail, STUB_BASE, "X", crate::i18n::Lang::Zh).is_err(),
             "网络错误且重试耗尽后应当报错"
         );
         assert_eq!(always_fail.calls(), FETCH_RETRIES, "重试耗尽时 get 次数");
@@ -1609,7 +1642,7 @@ mod tests {
         // 非法基址**一个请求都不该发出**。
         for b in ["file:///etc", "http://x/\r  dir=/tmp"] {
             let t = Stub::always(network_error("不该走到网络层"));
-            let err = match fetch(&t, b, "AbCdEfGhIjKlMnOpQrSt") {
+            let err = match fetch(&t, b, "AbCdEfGhIjKlMnOpQrSt", crate::i18n::Lang::Zh) {
                 Err(e) => e,
                 Ok(_) => panic!("基址 {b:?} 应当被拒"),
             };
@@ -1627,7 +1660,7 @@ mod tests {
         // 拒绝」即可；用一个必然连不上的地址验证它走到了网络层而不是被校验拦下。
         // 这一条走**真实** `UreqTransport`（127.0.0.1:1 立刻 ECONNREFUSED），
         // 与 Go 侧用真实 http.Client 的形态一致。
-        let err = match fetch(&UreqTransport::new(), "http://127.0.0.1:1/", "AbCdEfGhIjKlMnOpQrSt") {
+        let err = match fetch(&UreqTransport::new(), "http://127.0.0.1:1/", "AbCdEfGhIjKlMnOpQrSt", crate::i18n::Lang::Zh) {
             Err(e) => e,
             Ok(_) => String::new(),
         };

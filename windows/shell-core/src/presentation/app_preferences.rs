@@ -248,9 +248,9 @@ impl DownloadDirectory {
     ///    🔴 这句话是**壳自己写的**：内核不会为一件它还没遇到的慢因说话。
     ///
     /// 上游 `DownloadDirectory.sectionNote`（逐字，含那两对 `**`）。
-    pub const SECTION_NOTE: &'static str = "没有设置过时，壳**不指定**下载目录，由内核用它自己的默认值。\
-改变目录会立刻重启内核（正在跑的任务会停）。\
-请尽量选**本机磁盘**上的目录：网络盘（NFS / SMB）会让界面明显变慢。";
+    pub fn section_note(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::PrefDirSectionNote)
+    }
 
     /// 当前下载目录只读显示的文字。空串 = 未配置 ⇒ 说"默认"，而不是画一个空行。
     ///
@@ -434,7 +434,9 @@ impl DiagnosticsToggle {
     /// ⚠️ 它**进的是载荷**（不是 `index.html` 的结构文案）：勾选框是运行时由 JS 画出来的
     ///    （`settings.js:paintPreferences` 要按偏好的当前值去设 `checked`），
     ///    字跟着那一格一起下来，就不必在 HTML 与 Rust 里各存一份。
-    pub const LABEL: &'static str = "详细日志";
+    pub fn label(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::PrefVerboseLabel)
+    }
 
     /// 标签下面那句说明。**三件事缺一不可**：
     ///   * 它**是什么用的**（排查问题）—— 否则用户会以为这是个"性能档"；
@@ -442,11 +444,12 @@ impl DiagnosticsToggle {
     ///   * **改了会重启内核**（与下载目录那条同一后果，不说的话用户会在一次
     ///     正在跑的下载被停掉时才莫名其妙）。
     ///
-    /// ⚠️ 最后那半句与 [`DownloadDirectory::SECTION_NOTE`] 说的是**同一件事**
+    /// ⚠️ 最后那半句与 [`DownloadDirectory::section_note(crate::i18n::Lang::Zh)`] 说的是**同一件事**
     ///    （那次重启），措辞也尽可能同源 —— 但**不许**为了"少一句话"就把它省掉：
     ///    这是本面板上第二处会让内核重启的控件。
-    pub const NOTE: &'static str = "打开后日志会详细很多（用于排查问题），排查完请关掉。\
-改动会立刻重启内核（正在跑的任务会停）。";
+    pub fn note(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::PrefVerboseNote)
+    }
 }
 
 /// 一次「改详细日志」的结果。
@@ -486,24 +489,23 @@ impl VerboseLoggingChange {
     /// 成功那支的**固定标题**（**两个方向各一句**：开着与关着是两件事，
     /// 说成同一句会让用户分不清自己那一下把它改成了什么）。
     ///
-    /// ⚠️ 它不含任何**长度不受控**的东西（没有路径、没有批次号）——
-    ///    与 `DownloadDirChange::headline` 同一条纪律：这条回执是**常驻**的那一行，
-    ///    高度不许由外部文本决定（那是一次真实布局事故的根因）。
-    const CHANGED_ON: &'static str = "详细日志已打开（内核已按详细档重启）";
-    const CHANGED_OFF: &'static str = "详细日志已关闭（内核已按普通档重启）";
 
-    /// 没改动那一支的固定全文（与 `DownloadDirChange::UNCHANGED` 逐字同构）。
-    const UNCHANGED_ON: &'static str = "详细日志没有变化，没有重启内核";
 
     /// **这条回执的第一行**：固定短的标题，任何情况下都不含外部文本。
     ///
     /// ⚠️ `Failed` 那一格**照登原文**（内核的失败原因 / 写盘失败的系统文本），
     ///    不加工、不截断成"标题"—— 与 `DownloadDirChange::headline` 逐字同一条。
-    pub fn headline(&self) -> String {
+    pub fn headline(&self, lang: crate::i18n::Lang) -> String {
         match self {
-            VerboseLoggingChange::Changed { on: true } => Self::CHANGED_ON.to_string(),
-            VerboseLoggingChange::Changed { on: false } => Self::CHANGED_OFF.to_string(),
-            VerboseLoggingChange::Unchanged { .. } => Self::UNCHANGED_ON.to_string(),
+            VerboseLoggingChange::Changed { on: true } => {
+                crate::i18n::t(lang, crate::i18n::Key::PrefVerboseChangedOn).to_string()
+            }
+            VerboseLoggingChange::Changed { on: false } => {
+                crate::i18n::t(lang, crate::i18n::Key::PrefVerboseChangedOff).to_string()
+            }
+            VerboseLoggingChange::Unchanged { .. } => {
+                crate::i18n::t(lang, crate::i18n::Key::PrefVerboseUnchangedOn).to_string()
+            }
             VerboseLoggingChange::Failed { message } => message.clone(),
         }
     }
@@ -520,8 +522,8 @@ impl VerboseLoggingChange {
     /// 这条回执**完整的一句话**。
     ///
     /// ⚠️ 没有路径可拆 ⇒ 全文就是 [`Self::headline`]（两处不可能分叉）。
-    pub fn notice_text(&self) -> String {
-        self.headline()
+    pub fn notice_text(&self, lang: crate::i18n::Lang) -> String {
+        self.headline(lang)
     }
 
     /// 这一行说的是"没成"吗（调用方据此选图标与颜色）。
@@ -560,18 +562,12 @@ impl DownloadDirChange {
     /// ⚠️ 别往这里塞路径、也别塞批次号 / 时间戳之类**长度不受控**的东西：
     ///    它的全部意义就是"**长度固定**"（见下面 `headline` 的注释）。
     ///
-    /// 上游 `DownloadDirChange.changedTitle`。
-    const CHANGED_TITLE: &'static str = "下载目录已改（内核已按新目录重启）";
 
     /// 恢复默认那支的**固定全文**（本来就短，没有路径可拆）。
     ///
-    /// 上游 `DownloadDirChange.restoredDefault`。
-    const RESTORED_DEFAULT: &'static str = "已恢复默认下载目录（内核已按默认目录重启）";
 
     /// 没改动那一支的固定全文。
     ///
-    /// 上游 `DownloadDirChange.headline` 的 `.unchanged` 支。
-    const UNCHANGED: &'static str = "下载目录没有变化，没有重启内核";
 
     /// **这条回执的第一行**：固定短的标题，**任何情况下都不含路径**。
     ///
@@ -586,16 +582,19 @@ impl DownloadDirChange {
     ///    ⚠️ 别在值这一层替它做长度限制：那是**丢证据**，不是排版。
     ///
     /// 上游 `DownloadDirChange.headline`。
-    pub fn headline(&self) -> String {
+    pub fn headline(&self, lang: crate::i18n::Lang) -> String {
         match self {
             DownloadDirChange::Changed { dir } => {
-                if dir.is_empty() {
-                    Self::RESTORED_DEFAULT.to_string()
+                let key = if dir.is_empty() {
+                    crate::i18n::Key::PrefDirRestoredDefault
                 } else {
-                    Self::CHANGED_TITLE.to_string()
-                }
+                    crate::i18n::Key::PrefDirChangedTitle
+                };
+                crate::i18n::t(lang, key).to_string()
             }
-            DownloadDirChange::Unchanged { .. } => Self::UNCHANGED.to_string(),
+            DownloadDirChange::Unchanged { .. } => {
+                crate::i18n::t(lang, crate::i18n::Key::PrefDirUnchangedTitle).to_string()
+            }
             DownloadDirChange::Failed { message } => message.clone(),
         }
     }
@@ -631,14 +630,18 @@ impl DownloadDirChange {
     ///    守那件事的是 `theHeadlineIsFixedNoMatterHowLongThePathIs`。
     ///
     /// 上游 `DownloadDirChange.noticeText`。
-    pub fn notice_text(&self) -> String {
+    pub fn notice_text(&self, lang: crate::i18n::Lang) -> String {
         match self {
             DownloadDirChange::Changed { .. } => match self.path_detail() {
-                Some(path) => format!("下载目录已改为 {path}（内核已按新目录重启）"),
-                None => self.headline(),
+                Some(path) => crate::i18n::tf(
+                    lang,
+                    crate::i18n::Key::PrefDirChangedFull,
+                    &[("path", &path)],
+                ),
+                None => self.headline(lang),
             },
             DownloadDirChange::Unchanged { .. } | DownloadDirChange::Failed { .. } => {
-                self.headline()
+                self.headline(lang)
             }
         }
     }
@@ -1028,18 +1031,18 @@ mod tests {
         let changed = DownloadDirChange::Changed {
             dir: "/Volumes/Data/交付".to_string(),
         };
-        assert!(changed.notice_text().contains("/Volumes/Data/交付"));
-        assert!(changed.notice_text().contains("重启"));
+        assert!(changed.notice_text(crate::i18n::Lang::Zh).contains("/Volumes/Data/交付"));
+        assert!(changed.notice_text(crate::i18n::Lang::Zh).contains("重启"));
         assert!(DownloadDirChange::Changed {
             dir: String::new()
         }
-        .notice_text()
+        .notice_text(crate::i18n::Lang::Zh)
         .contains("默认"), "恢复默认那一格不能说成'已改为 '（一个空路径）");
         assert!(
             DownloadDirChange::Unchanged {
                 dir: "/x".to_string()
             }
-            .notice_text()
+            .notice_text(crate::i18n::Lang::Zh)
             .contains("没有"),
             "没改动就要说没改动（用户得知道自己那次点击是有结果的）"
         );
@@ -1049,7 +1052,7 @@ mod tests {
             message: "内核重启失败：内核无响应（等待超过 5 秒）".to_string(),
         };
         assert_eq!(
-            failure.notice_text(),
+            failure.notice_text(crate::i18n::Lang::Zh),
             "内核重启失败：内核无响应（等待超过 5 秒）"
         );
         assert!(failure.is_failure());
@@ -1081,11 +1084,11 @@ mod tests {
         let short = DownloadDirChange::Changed {
             dir: "/x".to_string(),
         }
-        .headline();
+        .headline(crate::i18n::Lang::Zh);
         let long = DownloadDirChange::Changed {
             dir: A_VERY_LONG_PATH.to_string(),
         }
-        .headline();
+        .headline(crate::i18n::Lang::Zh);
         assert_eq!(
             short, long,
             "标题不许随路径变化：短路径 {short} / 长路径 {long}"
@@ -1104,7 +1107,7 @@ mod tests {
             DownloadDirChange::Changed {
                 dir: "/Volumes/A".to_string()
             }
-            .headline()
+            .headline(crate::i18n::Lang::Zh)
             .contains("重启"),
             "改成功那一支要说内核重启过"
         );
@@ -1112,7 +1115,7 @@ mod tests {
             DownloadDirChange::Changed {
                 dir: String::new()
             }
-            .headline()
+            .headline(crate::i18n::Lang::Zh)
             .contains("默认"),
             "恢复默认那一支要说回到默认（不许说成「已改为 」一个空路径）"
         );
@@ -1120,7 +1123,7 @@ mod tests {
             DownloadDirChange::Unchanged {
                 dir: "/x".to_string()
             }
-            .headline()
+            .headline(crate::i18n::Lang::Zh)
             .contains("没有"),
             "没改动就要说没改动"
         );
@@ -1128,7 +1131,7 @@ mod tests {
             DownloadDirChange::Failed {
                 message: "内核重启失败：内核无响应（等待超过 5 秒）".to_string()
             }
-            .headline(),
+            .headline(crate::i18n::Lang::Zh),
             "内核重启失败：内核无响应（等待超过 5 秒）",
             "失败那一支是**内核原文逐字**：标题就是全文，壳不加工、不加前缀"
         );
@@ -1193,28 +1196,28 @@ mod tests {
             DownloadDirChange::Changed {
                 dir: "/Volumes/Data/交付".to_string()
             }
-            .notice_text(),
+            .notice_text(crate::i18n::Lang::Zh),
             "下载目录已改为 /Volumes/Data/交付（内核已按新目录重启）"
         );
         assert_eq!(
             DownloadDirChange::Changed {
                 dir: String::new()
             }
-            .notice_text(),
+            .notice_text(crate::i18n::Lang::Zh),
             "已恢复默认下载目录（内核已按默认目录重启）"
         );
         assert_eq!(
             DownloadDirChange::Unchanged {
                 dir: "/x".to_string()
             }
-            .notice_text(),
+            .notice_text(crate::i18n::Lang::Zh),
             "下载目录没有变化，没有重启内核"
         );
         assert_eq!(
             DownloadDirChange::Failed {
                 message: "内核重启失败：内核无响应（等待超过 5 秒）".to_string()
             }
-            .notice_text(),
+            .notice_text(crate::i18n::Lang::Zh),
             "内核重启失败：内核无响应（等待超过 5 秒）"
         );
 
@@ -1224,7 +1227,7 @@ mod tests {
         };
         assert!(
             with_path
-                .notice_text()
+                .notice_text(crate::i18n::Lang::Zh)
                 .contains(with_path.path_detail().unwrap_or_default().as_str()),
             "路径必须进那句完整的话"
         );
@@ -1232,11 +1235,11 @@ mod tests {
             DownloadDirChange::Changed {
                 dir: String::new()
             }
-            .notice_text(),
+            .notice_text(crate::i18n::Lang::Zh),
             DownloadDirChange::Changed {
                 dir: String::new()
             }
-            .headline(),
+            .headline(crate::i18n::Lang::Zh),
             "恢复默认：没有路径可拆 ⇒ 全文就是标题（两处不可能分叉）"
         );
     }
@@ -1246,8 +1249,8 @@ mod tests {
     fn the_section_note_explains_what_unconfigured_means() {
         // ⚠️ 它是本功能唯一反直觉的地方（"没有设置"也是一种设置），而这一句是用户
         //    唯一能读到它的地方 —— 别在改文案时把它删掉。
-        assert!(DownloadDirectory::SECTION_NOTE.contains("默认"));
-        assert!(DownloadDirectory::SECTION_NOTE.contains("重启"));
+        assert!(DownloadDirectory::section_note(crate::i18n::Lang::Zh).contains("默认"));
+        assert!(DownloadDirectory::section_note(crate::i18n::Lang::Zh).contains("重启"));
     }
 
     /// 上游 `theSectionNoteWarnsAboutNetworkVolumes`。
@@ -1257,12 +1260,12 @@ mod tests {
         //    持着锁对每个路径 stat 一遍 —— 网络盘的 stat 是秒级 ⇒ 内核的同步读循环停摆。
         //    形态是**变慢**、不是变错，所以**不改内核**，只把这件事**说出来**。
         assert!(
-            DownloadDirectory::SECTION_NOTE.contains("网络盘"),
+            DownloadDirectory::section_note(crate::i18n::Lang::Zh).contains("网络盘"),
             "要在设置里说清楚网络盘会变慢：{}",
-            DownloadDirectory::SECTION_NOTE
+            DownloadDirectory::section_note(crate::i18n::Lang::Zh)
         );
         assert!(
-            DownloadDirectory::SECTION_NOTE.contains("本机磁盘"),
+            DownloadDirectory::section_note(crate::i18n::Lang::Zh).contains("本机磁盘"),
             "光说「网络盘」不够 —— 要说出该选什么"
         );
     }
@@ -1278,8 +1281,8 @@ mod tests {
     /// 也不知道这一下会把正在跑的任务停掉）。
     #[test]
     fn the_diagnostics_toggle_explains_what_it_does_and_what_it_costs() {
-        assert_eq!(DiagnosticsToggle::LABEL, "详细日志", "规格 §2.4 逐字");
-        let note = DiagnosticsToggle::NOTE;
+        assert_eq!(DiagnosticsToggle::label(crate::i18n::Lang::Zh), "详细日志", "规格 §2.4 逐字");
+        let note = DiagnosticsToggle::note(crate::i18n::Lang::Zh);
         assert!(note.contains("排查"), "要说清它是干什么用的：{note}");
         assert!(note.contains("关"), "要提醒用完关掉（详细档一直在记）：{note}");
         assert!(
@@ -1297,41 +1300,41 @@ mod tests {
     #[test]
     fn the_verbose_receipts_never_talk_about_the_download_directory() {
         let opened = VerboseLoggingChange::Changed { on: true };
-        assert!(opened.headline().contains("详细日志"));
-        assert!(opened.headline().contains("打开"));
-        assert!(opened.headline().contains("重启"), "要说出内核重启过");
+        assert!(opened.headline(crate::i18n::Lang::Zh).contains("详细日志"));
+        assert!(opened.headline(crate::i18n::Lang::Zh).contains("打开"));
+        assert!(opened.headline(crate::i18n::Lang::Zh).contains("重启"), "要说出内核重启过");
         assert!(!opened.is_failure());
         assert_eq!(opened.path_detail(), None, "这一格没有路径可显示");
         assert_eq!(
-            opened.notice_text(),
-            opened.headline(),
+            opened.notice_text(crate::i18n::Lang::Zh),
+            opened.headline(crate::i18n::Lang::Zh),
             "没有路径可拆 ⇒ 全文就是标题（两处不可能分叉）"
         );
 
         // 关掉那一支与打开那一支**必须说得出区别**（说成同一句 = 用户不知道自己那一下
         // 把它改成了什么）。
         let closed = VerboseLoggingChange::Changed { on: false };
-        assert!(closed.headline().contains("关闭"));
-        assert_ne!(closed.headline(), opened.headline());
+        assert!(closed.headline(crate::i18n::Lang::Zh).contains("关闭"));
+        assert_ne!(closed.headline(crate::i18n::Lang::Zh), opened.headline(crate::i18n::Lang::Zh));
 
         // 没改动：内核没重启（那句"正在跑的任务会停"说的是**真的改了**的时候）。
         let unchanged = VerboseLoggingChange::Unchanged { on: true };
-        assert!(unchanged.headline().contains("没有"));
+        assert!(unchanged.headline(crate::i18n::Lang::Zh).contains("没有"));
         assert!(!unchanged.is_failure());
 
         // 失败：**原文照登**，不加工、不加前缀。
         let failed = VerboseLoggingChange::Failed {
             message: "内核重启失败：内核无响应（等待超过 5 秒）".to_string(),
         };
-        assert_eq!(failed.headline(), "内核重启失败：内核无响应（等待超过 5 秒）");
+        assert_eq!(failed.headline(crate::i18n::Lang::Zh), "内核重启失败：内核无响应（等待超过 5 秒）");
         assert!(failed.is_failure());
         assert_eq!(failed.path_detail(), None);
 
         for text in [
-            opened.headline(),
-            closed.headline(),
-            unchanged.headline(),
-            failed.headline(),
+            opened.headline(crate::i18n::Lang::Zh),
+            closed.headline(crate::i18n::Lang::Zh),
+            unchanged.headline(crate::i18n::Lang::Zh),
+            failed.headline(crate::i18n::Lang::Zh),
         ] {
             assert!(
                 !text.contains("下载目录"),

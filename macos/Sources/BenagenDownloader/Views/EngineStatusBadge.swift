@@ -23,10 +23,12 @@ import BenagenCoreKit
 ///    断言不出有意义的东西；`Presentation/` 不为了它引入 SwiftUI 依赖。
 struct EngineStatusBadge: View {
     let engine: AppModel.EngineState
+    /// 已落定的界面语言（握手回执里的那一格，`AppModel.language`）。
+    let lang: Lang
 
     var body: some View {
         Label(
-            EngineStatusPresentation.text(for: engine),
+            EngineStatusPresentation.text(for: engine, lang: lang),
             systemImage: EngineStatusPresentation.systemImage(for: engine)
         )
         // ⚠️ 这一行是**修 bug**，不是装饰：macOS 的统一工具栏默认把 `Label` 渲染成
@@ -39,7 +41,7 @@ struct EngineStatusBadge: View {
         .foregroundStyle(tint)
         .lineLimit(1)
         .truncationMode(.middle)
-        .help(EngineStatusPresentation.tooltip(for: engine))
+        .help(EngineStatusPresentation.tooltip(for: engine, lang: lang))
     }
 
     /// `.notStarted` 用 secondary 而**不是**红/黄：没 enqueue 过就没有引擎，

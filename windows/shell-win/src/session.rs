@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use shell_core::client::CoreClient;
+use shell_core::presentation::disk_notice::DiskNotice;
 use shell_core::protocol::{EngineState, LoadState};
 
 /// 一次读取拿到的那份状态快照（`state()` 命令就返回它）。
@@ -69,6 +70,14 @@ struct Inner {
     last_error: Option<String>,
     fallback_notice: Option<String>,
     handshake_reply: Option<String>,
+    /// 界面语言（规格 W1）：**只从握手回执落定**，默认中文。
+    lang: shell_core::i18n::Lang,
+    /// 首启判据（规格 W1）：握手回执说"还没选过" ⇒ 界面弹一次语言询问。
+    language_chosen: bool,
+    /// 错误卡片账本（规格 W2）：同类 30 秒内只加计数，按严重度置顶。
+    cards: shell_core::presentation::error_card::CardBook,
+    /// 目标盘写入太慢时的那一句（粘滞，换目录时重测）。
+    disk: Option<DiskNotice>,
     /// 「找内核 + 握手」的注入点。`None` = 还没装（见 [`Session::connector`]）。
     connector: Option<Arc<Connector>>,
     /// 「记住的交付码」的查询口（见 [`RememberedLookup`]）。`None` = 还没装 ⇒ 不自动加载。
@@ -118,7 +127,11 @@ impl Session {
                 load: LoadState::Idle,
                 last_error: None,
                 fallback_notice: None,
+            disk: None,
                 handshake_reply: None,
+                lang: shell_core::i18n::Lang::Zh,
+                language_chosen: false,
+                cards: shell_core::presentation::error_card::CardBook::default(),
                 connector: None,
                 remembered_lookup: None,
                 load_request: None,
@@ -148,6 +161,60 @@ impl Session {
         self.inner.lock().expect("会话锁中毒").client.take()
     }
 
+    /// 记下"客户这次明确选过语言了"（规格 W1 首启判据）。
+    ///
+    /// 写入点是**保存设置**那一条（`settings_set`）：那一刻起，设置文件里就有 `language`
+    /// 那一格了，下一次握手内核自己也会这么说；这里同步一次是为了让**本次会话**
+    /// 立刻停止再问（否则要点两次才消失）。
+    /// `chosen` 是客户刚选的**线上值**（`system` / `zh` / `en`）。
+    ///
+    /// `system` 时**不改**当前语言：壳不知道系统的 locale（那是内核算的），
+    /// 下一拍 `/api/state` 仍按内核握手给的那一档画；真正切过去要等下次握手。
+    pub fn note_language_chosen(&self, chosen: &str) {
+        let mut inner = self.inner.lock().expect("会话锁中毒");
+        inner.language_chosen = true;
+        match chosen {
+            "zh" => inner.lang = shell_core::i18n::Lang::Zh,
+            "en" => inner.lang = shell_core::i18n::Lang::En,
+            _ => {}
+        }
+    }
+
+    /// 记一次带分型的失败（规格 W2）：同类 30 秒内只加计数。
+    ///
+    /// ⚠️ 由 `commands::note_failure` 调（它是**唯一**记失败的地方）：那条路手上拿的是
+    /// `CallFailure`，分型就在它身上（`Classified`）。
+    pub fn note_error_class(&self, class: &str) {
+        let Some(kind) = shell_core::presentation::error_card::ClassKind::of_wire(class) else {
+            return; // 不认识的分型**不猜**：界面按"意料之外的错误"处置
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let lang = self.lang();
+        let mut inner = self.inner.lock().expect("会话锁中毒");
+        inner.cards.observe(kind, now, lang);
+    }
+
+    /// 当前该显示的错误卡片（`/api/state` 用；顺序与上限由 `CardBook` 定）。
+    pub fn error_cards(&self) -> Vec<shell_core::presentation::error_card::ErrorCard> {
+        let lang = self.lang();
+        let inner = self.inner.lock().expect("会话锁中毒");
+        inner.cards.cards(lang)
+    }
+
+    /// 一次动作成功了 ⇒ 卡片全部收起（它们说的是"上一次的动作没成"）。
+    pub fn clear_error_cards(&self) {
+        let mut inner = self.inner.lock().expect("会话锁中毒");
+        inner.cards.clear();
+    }
+
+    /// 当前界面语言（规格 W1）：`/api/state`、设置页那一行都读它。
+    pub fn lang(&self) -> shell_core::i18n::Lang {
+        self.inner.lock().expect("会话锁中毒").lang
+    }
+
     pub fn view(&self) -> SessionView {
         let inner = self.inner.lock().expect("会话锁中毒");
         SessionView {
@@ -156,6 +223,10 @@ impl Session {
             last_error: inner.last_error.clone(),
             fallback_notice: inner.fallback_notice.clone(),
             handshake_reply: inner.handshake_reply.clone(),
+            disk: inner.disk.clone(),
+            lang: inner.lang,
+            language_chosen: inner.language_chosen,
+            error_cards: inner.cards.cards(inner.lang),
         }
     }
 
@@ -217,7 +288,21 @@ impl Session {
 
     /// ⚠️ **只在"这一次请求成了"时传 `None`** —— 那一格的契约是**非粘滞**的。
     pub fn set_last_error(&self, error: Option<String>) {
-        self.inner.lock().expect("会话锁中毒").last_error = error;
+        let mut inner = self.inner.lock().expect("会话锁中毒");
+        // 失败清掉的那一刻，**错误卡片一起收起**（规格 W2）：它们说的是"上一次动作没成"，
+        // 而"上一次"已经被下一次成功取代了 —— 留着就成了没有对应的旧话。
+        // ⚠️ `Some(_)` 不清：那是又一次失败，卡片由 `note_error_class` 自己更新计数。
+        if error.is_none() {
+            inner.cards.clear();
+        }
+        inner.last_error = error;
+    }
+
+    /// 目标盘写入速度的提示（`None` = 不提示）。**只在量完的那一刻写**。
+    ///
+    /// ⚠️ 粘滞：写入速度是盘的性质，不该被一次成功请求清掉（与 `fallback_notice` 同一条）。
+    pub fn set_disk(&self, notice: Option<DiskNotice>) {
+        self.inner.lock().expect("会话锁中毒").disk = notice;
     }
 
     /// W-2 披露。**只有内核查找那一处会写它**。
@@ -363,6 +448,15 @@ impl Session {
         let old = {
             let mut inner = self.inner.lock().expect("会话锁中毒");
             let old = inner.client.replace(client);
+            // 界面语言从**握手回执**里落定（规格 W1）：解析一次、存进会话，
+            // 此后所有壳侧构造点都读那一格 —— 壳不自己看环境变量。
+            let parsed: Option<shell_core::protocol::HelloResult> =
+                serde_json::from_str(&handshake_reply).ok();
+            inner.lang = shell_core::i18n::Lang::from_hello(
+                parsed.as_ref().and_then(|h| h.language.as_deref()),
+            );
+            // 0.2.x 的内核没有这一格 ⇒ `false` = 还没选过（开发期协议 v1）。
+            inner.language_chosen = parsed.map(|h| h.language_chosen).unwrap_or(false);
             inner.handshake_reply = Some(handshake_reply);
             old
         };
@@ -370,6 +464,15 @@ impl Session {
         //    它不是"顺手写的"—— 挪回花括号里就会把临界区变回"可能阻塞 5 秒"。
         drop(old);
     }
+}
+
+/// 从 `hello` 回执的**原文**里取语言（`{"protocol":2,...}` 那一行）。
+///
+/// ⚠️ 解不开就当没给（默认中文）：一个语言字段不许让整条连接作废 ——
+///    那会让客户"启动不了"，比"界面语言不对"贵得多。
+fn hello_language(reply: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(reply).ok()?;
+    Some(v.get("result")?.get("language")?.as_str()?.to_string())
 }
 
 /// 告诉**这条连接**：写进 `diag-shell.log` 之前，哪几个字面串必须抹掉（规格 §2.3 B）。
@@ -435,7 +538,7 @@ pub fn spawn_load(session: &Arc<Session>, client: Arc<CoreClient>, code: String,
     let spawned = std::thread::Builder::new()
         .name("load-delivery".to_string())
         .spawn(move || {
-            match crate::kernel::load_delivery(&client, &code, &base_url) {
+            match crate::kernel::load_delivery(worker.lang(), &client, &code, &base_url) {
                 Ok(info) => {
                     // ⚠️ **两件事是同一个事实的两面**（成功加载了哪一批）：先记下**请求**，
                     //    再落加载态。下次内核重启时要按这一格重放（见 `remember_load_request`）。
@@ -488,6 +591,15 @@ pub fn spawn_load(session: &Arc<Session>, client: Arc<CoreClient>, code: String,
                     shell_core::presentation::kernel_death::CallFailure::EngineNotStarted(t) => {
                         worker.note_engine_not_started();
                         worker.set_load(LoadState::Failed(t));
+                    }
+                    // 带分型的失败：文字照旧落 `Failed`，**另外**记一张卡片
+                    // （加载这一条路不经过 `note_failure`，所以这里自己记）。
+                    shell_core::presentation::kernel_death::CallFailure::Classified {
+                        text,
+                        class,
+                    } => {
+                        worker.set_load(LoadState::Failed(text));
+                        worker.note_error_class(&class);
                     }
                 },
             }
@@ -616,6 +728,39 @@ impl Default for Session {
 
 #[cfg(test)]
 mod tests {
+
+    /// 判据（规格 W1）：语言**只从握手回执**里读；解不开就按默认，不许让连接作废。
+    #[test]
+    fn the_language_comes_from_the_handshake_and_never_fails_it() {
+        assert_eq!(
+            hello_language("{\"result\":{\"protocol\":1,\"language\":\"en\"}}").as_deref(),
+            Some("en")
+        );
+        assert_eq!(hello_language("{\"result\":{\"protocol\":1}}"), None);
+        assert_eq!(hello_language("不是 JSON"), None);
+        assert_eq!(
+            shell_core::i18n::Lang::from_hello(hello_language("不是 JSON").as_deref()),
+            shell_core::i18n::Lang::Zh
+        );
+    }
+    /// 判据（规格 W1 的"切换立刻生效"）：保存设置之后，**本次会话**立刻换语言，
+    /// 且"问过没有"这一格翻成 `true`（否则首启弹窗要点两次才消失）。
+    ///
+    /// 判别力：把 `note_language_chosen` 里那两个 `inner.lang = …` 删掉 ⇒ 本用例红。
+    #[test]
+    fn choosing_a_language_takes_effect_in_this_session_at_once() {
+        let s = std::sync::Arc::new(Session::new());
+        assert_eq!(s.lang(), shell_core::i18n::Lang::Zh);
+        assert!(!s.view().language_chosen, "刚建出来的会话还没问过语言");
+        s.note_language_chosen("en");
+        assert_eq!(s.lang(), shell_core::i18n::Lang::En);
+        assert!(s.view().language_chosen);
+        // `system` 只翻"问过"那一格，**不改**当前语言（系统 locale 是内核算的）。
+        s.note_language_chosen("system");
+        assert_eq!(s.lang(), shell_core::i18n::Lang::En);
+        assert!(s.view().language_chosen);
+    }
+
     use super::*;
     use shell_core::protocol::LoadState;
 

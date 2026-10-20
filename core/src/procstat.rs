@@ -53,6 +53,34 @@ pub fn delta(prev: Option<&Counters>, cur: &Counters) -> Delta {
     }
 }
 
+/// 一次资源读数是否说明**进程在干活**（写盘 或 烧 CPU）。
+///
+/// 这是"RPC 不回话 ≠ 引擎死了"那条判据的**唯一实现**：
+///   * 真死掉的进程不再有任何读写、CPU 也不再增长；
+///   * 正在写盘的进程 IO 计数每秒都在涨，哪怕它的 RPC 线程被写盘卡住。
+///
+/// ⚠️ **第一次采样必须回答"不知道"（`None`）**：没有基线时增量恒为 0，若把它读成"闲"
+///    就会在引擎刚起来、还没写第一块的那一拍判它死 —— 那正是最不该重启的时刻。
+pub fn is_busy(d: &Delta) -> Option<bool> {
+    if d.first {
+        None
+    } else {
+        Some(d.io_write > 0 || d.cpu_ms > 0)
+    }
+}
+
+/// 采一次样并回答"这个进程在干活吗"（`prev` 由调用方持有，每拍更新）。
+///
+/// 读不到（非 Windows / 进程已退出 / 权限不足）⇒ `None`：**不知道**，
+/// 调用方必须退回旧口径（按"没在干活"处理），不得把它当成"闲"。
+pub fn busy(pid: Option<u32>, prev: &mut Option<Counters>) -> Option<bool> {
+    let pid = pid?;
+    let cur = read(pid).ok()?;
+    let d = delta(prev.as_ref(), &cur);
+    *prev = Some(cur);
+    is_busy(&d)
+}
+
 /// 读 `pid` 的累计读数。非 Windows 平台恒为 `Err("unsupported")`。
 #[cfg(not(windows))]
 pub fn read(_pid: u32) -> Result<Counters, String> {
@@ -197,6 +225,38 @@ mod tests {
     #[test]
     fn off_windows_there_is_no_reading() {
         assert_eq!(read(1).unwrap_err(), "unsupported");
+    }
+
+    /// 首拍没有基线 ⇒ **不知道**（不是"闲"）。
+    /// 判别力：把 `d.first` 那一支改成 `Some(false)` ⇒ 红。
+    #[test]
+    fn the_first_sample_answers_unknown_not_idle() {
+        assert_eq!(is_busy(&delta(None, &c(5000, 9, 9, 120))), None);
+    }
+
+    /// 写盘算在干活；只有读也算（引擎可能正在读缓存/校验）。
+    /// 判别力：把判据写成 `d.io_write > 0` ⇒ 第二个断言红。
+    #[test]
+    fn writing_or_burning_cpu_counts_as_busy() {
+        assert_eq!(is_busy(&delta(Some(&c(1000, 0, 0, 90)), &c(1000, 0, 65536, 90))), Some(true));
+        assert_eq!(is_busy(&delta(Some(&c(1000, 0, 0, 90)), &c(1200, 0, 0, 90))), Some(true));
+    }
+
+    /// 一点都不动才是"闲"——真死掉的引擎就是这个样子。
+    /// ⚠️ 句柄数**不算**在动：进程死了句柄也会掉，那不是"干活"。
+    /// 判别力：把 `handles` 加进判据 ⇒ 这个用例红。
+    #[test]
+    fn an_idle_process_is_the_only_thing_called_dead() {
+        assert_eq!(is_busy(&delta(Some(&c(1000, 5, 5, 90)), &c(1000, 5, 5, 87))), Some(false));
+    }
+
+    /// 读不到进程（已退出 / 非 Windows）⇒ `None`，调用方退回旧口径。
+    #[test]
+    fn no_reading_answers_unknown() {
+        let mut prev = None;
+        assert_eq!(busy(None, &mut prev), None);
+        #[cfg(not(windows))]
+        assert_eq!(busy(Some(1), &mut prev), None);
     }
 
     /// 非 Windows 上不写任何日志；这里只验证它不 panic、不更新基线。

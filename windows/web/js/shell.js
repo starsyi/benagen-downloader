@@ -64,6 +64,11 @@ export function mountShell(handlers = {}) {
     // ---- 更新提示条（规格 §4）：**壳级的**，任何分区都看得见 --------------------
     //  ⚠️ 它不属于任何一屏（0.2.8 修的一场：原先长在文件页模板里 ⇒ 不站在文件页上
     //     就永远看不见）。判据在 `render.js:updateNoticeFromStatus`，本文件只摆。
+    // ---- 自动重启的进度条（规格 W3）--------------------------------------
+    //  ⚠️ 同样是**壳级**的：重启发生在任何分区下都要看得见（客户可能站在传输列表上）。
+    //     句子来自 `presentation::restart_notice`（Rust），本文件一个字都不拼。
+    _restartBar: byId("restart-bar"),
+    _restartText: byId("restart-bar-text"),
     _updateBar: byId("update-bar"),
     _updateLatest: byId("update-bar-latest"),
     _updateCurrent: byId("update-bar-current"),
@@ -345,6 +350,20 @@ export function mountShell(handlers = {}) {
    *    就是上一次摆进来的那一个 —— 与"屏幕上写着哪个版本、点下去就去下哪个版本"
    *    是同一份数据，不会出现"提示条已经换成 0.2.9、点下去还是 0.2.8 的链接"。
    */
+  /**
+   * 自动重启的进度条。`desc` 为 `null` ⇒ 整条不渲染（`idle` 与"取不到"都走这条）。
+   *
+   * @param {{text: string}|null} desc
+   *   ⚠️ 判据在 `presentation::restart_notice::RestartNotice::of`（内核给状态、Rust 给句子），
+   *      本函数收到 `null` 就是"现在不该说"，**不再自己判一遍**。
+   */
+  shell.setRestartNotice = (desc) => {
+    const text = desc && typeof desc.text === "string" ? desc.text : "";
+    writeText(shell._restartText, text);
+    const hidden = text.length === 0;
+    if (shell._restartBar.hidden !== hidden) shell._restartBar.hidden = hidden;
+  };
+
   shell.setUpdateNotice = (desc) => {
     if (!desc) {
       if (!shell._updateBar.hidden) shell._updateBar.hidden = true;

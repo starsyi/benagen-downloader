@@ -54,7 +54,7 @@ BIN_NAME="BenagenDownloader"
 # 版本号（规格 W-7：版本资源里要能看到版本号）。默认 0.2.8 与 macOS 侧同口径。
 # ⚠️ 它同时喂给 `shell-win/build.rs`（写进 .rc）、交付形态文件名、与第 5 步的自验
 #    （grep 交付形态里的那一串）——**同一个**变量，不然"自验"就是拿脚本自己编的数核自己。
-BENAGEN_VERSION="${VERSION:-0.2.8}"
+BENAGEN_VERSION="${VERSION:-0.3.0}"
 export BENAGEN_VERSION
 # 交付形态的名字（规格 §11.4：产物名自解释；2026-10-14 起带版本段，
 # 与 `core/src/update.rs::asset_name` 同格式——那是「有新版本」下载链接的契约）。

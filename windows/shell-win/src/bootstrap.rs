@@ -538,7 +538,7 @@ mod bounded_handshake {
             let client = Arc::new(CoreClient::new(Box::new(stub.clone())));
 
             let started = Instant::now();
-            let result = call_with_deadline(&client, "hello", json!({ "protocol": 1 }), TIMEOUT);
+            let result = call_with_deadline(&client, "hello", json!({ "protocol":2 }), TIMEOUT);
             let took = started.elapsed();
 
             // ② 界面上那句话（**逐字**，判别式认得它）。

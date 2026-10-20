@@ -418,7 +418,7 @@ private func percentEncodedPath(_ path: String) -> String {
     defer { client.shutdown() }
 
     // ── 3a) hello 握手 ──────────────────────────────────────────────────────
-    let hello = try await client.callAsync("hello", .object(["protocol": .integer(1)]))
+    let hello = try await client.callAsync("hello", .object(["protocol": .integer(Int64(kProtocolVersion))]))
         .decoded(HelloResult.self)
     #expect(hello.protocolVersion == kProtocolVersion, "握手协议号不是 1")
     #expect(client.protocolAlerts.isEmpty, "内核发过协议级告警：\(client.protocolAlerts)")
@@ -660,7 +660,7 @@ private func percentEncodedPath(_ path: String) -> String {
             "shutdown() 之后内核进程还在：\(kernelGone)——收尾没有把子进程带走")
     // 壳这一侧也必须显式收场：连接关上之后不再接新请求（不是静默失败）
     var thrown: Error?
-    do { _ = try client.callSync("hello", .object(["protocol": .integer(1)])) } catch { thrown = error }
+    do { _ = try client.callSync("hello", .object(["protocol": .integer(Int64(kProtocolVersion))])) } catch { thrown = error }
     guard case .transport(let msg)? = thrown as? CoreError else {
         Issue.record("shutdown 之后的请求必须回一条 transport 错误，实际 \(String(describing: thrown))")
         return

@@ -73,6 +73,10 @@ const FIELDS = Object.freeze([
   "retry_wait",
 ]);
 
+/** 界面语言那一格的线上键名（`protocol::Settings.language`）。它是**字符串**，
+ *  不是那六项数值之一，所以不在 `FIELDS` 里（`save()` 会把它编成数字就糟了）。 */
+const LANGUAGE_FIELD = "language";
+
 /** `-k` 那一个字段名。它与其余六项的区别（枚举面来自内核的 `hello`）**由 Rust 说**：
  *  `parameters[i]` 的 `min`/`max` 同时为 `null` 就是它（见 `Parameter` 的文档）。 */
 const ENUM_FIELD = "min_split_size";
@@ -129,6 +133,9 @@ export function openSettings(ctx, hooks) {
   const exportReceiptTextEl = byIdIn(root, "set-export-receipt-text");
   const exportReceiptDismissEl = byIdIn(root, "set-export-receipt-dismiss");
   const paramsRowsEl = byIdIn(root, "set-params-rows");
+  const languageSectionEl = byIdIn(root, "set-language-section");
+  const languageTitleEl = byIdIn(root, "set-language-title");
+  const languageRowEl = byIdIn(root, "set-language-row");
   const paramsNotesEl = byIdIn(root, "set-params-notes");
   const unavailableEl = byIdIn(root, "set-unavailable");
   const unavailableTextEl = byIdIn(root, "set-unavailable-text");
@@ -305,6 +312,36 @@ export function openSettings(ctx, hooks) {
     }
   }
 
+  /** 界面语言那一行：标题与三个选项名**全部来自载荷**（Rust），这里只摆位置。 */
+  function paintLanguage() {
+    const spec = payload && payload.language ? payload.language : null;
+    if (!spec || !edited) {
+      languageSectionEl.hidden = true;
+      clear(languageRowEl);
+      return;
+    }
+    languageSectionEl.hidden = false;
+    setText(languageTitleEl, spec.title);
+    clear(languageRowEl);
+    for (const choice of spec.choices) {
+      const checked = String(edited[LANGUAGE_FIELD]) === String(choice.value);
+      const button = h("button", {
+        class: "set__lang",
+        type: "button",
+        text: choice.label,
+        role: "radio",
+        "aria-checked": checked ? "true" : "false",
+      });
+      button.addEventListener("click", () => {
+        if (!edited || edited[LANGUAGE_FIELD] === choice.value) return;
+        edited[LANGUAGE_FIELD] = choice.value;
+        paintLanguage();
+        paintFooter();
+      });
+      languageRowEl.append(button);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // 保存条
   // ---------------------------------------------------------------------------
@@ -314,7 +351,7 @@ export function openSettings(ctx, hooks) {
     if (!edited || !payload || !payload.settings) return false;
     return FIELDS.some(
       (field) => String(edited[field]) !== String(payload.settings[field])
-    );
+    ) || String(edited[LANGUAGE_FIELD]) !== String(payload.settings[LANGUAGE_FIELD]);
   }
 
   /**
@@ -834,12 +871,15 @@ export function openSettings(ctx, hooks) {
     if (!settings) {
       edited = null;
       paintParams();
+      paintLanguage();
       paintFooter();
       return;
     }
     edited = {};
     for (const field of FIELDS) edited[field] = settings[field];
+    edited[LANGUAGE_FIELD] = settings[LANGUAGE_FIELD];
     paintParams();
+    paintLanguage();
     paintFooter();
   }
 
@@ -916,6 +956,9 @@ export function openSettings(ctx, hooks) {
     for (const field of FIELDS) {
       body[field] = field === enumField ? edited[field] : Number(edited[field]);
     }
+    // 语言是**字符串**（`system`/`zh`/`en`），必须原样带上：
+    // 内核的 `set_settings` 是整份替换，漏掉它 = 改一次并行数就把语言重置回跟随系统。
+    body[LANGUAGE_FIELD] = edited[LANGUAGE_FIELD];
     try {
       payload = await ctx.call(ctx.CMD.settingsSet, { settings: body });
       seed();

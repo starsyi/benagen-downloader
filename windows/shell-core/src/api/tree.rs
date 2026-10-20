@@ -32,7 +32,7 @@
 //!    ② 两个都是 `&str` ⇒ 平铺成六个位置参数时，调用点把
 //!       `button_title` 与 `empty_selection_hint` 写反**照样编译得过**
 //!       （而那种错误在界面上是"按钮写着提示句、旁边写着按钮名"，不会有东西变红）；
-//!    ③ 日后 `DownloadTargets::help_text()` 要接上时是**往这个对象里加一格**，
+//!    ③ 日后 `DownloadTargets::help_text(lang)` 要接上时是**往这个对象里加一格**，
 //!       而不是再往顶层加一个键（那里已经有五格了）。
 //!
 //! ⚠️ **③ 那条路在任务 17 第一次真的走了一遍**：加进来的是
@@ -72,12 +72,12 @@ use crate::presentation::verify_summary::ProgressSummary;
 ///    `BrowserRow::of` 的文档里写着这条）。它是**入参**，本函数不重算：
 ///    "界面上的层级链与列表必须是同一层"这条判据（见 [`level_failure`]）靠调用方
 ///    把**同一个** `Breadcrumb` 交给两边。
-pub fn level(bc: &Breadcrumb, rows: &[BrowserRow]) -> Value {
+pub fn level(lang: crate::i18n::Lang, bc: &Breadcrumb, rows: &[BrowserRow]) -> Value {
     envelope::ok(serde_json::json!({
         "breadcrumb": to_wire(bc),
         // ⚠️ 逐行过一遍 [`row_wire`]（不是 `to_wire(rows)`）：那一行要多带两格，
         //    而少了它们的后果是**状态列整列空白**（见那个函数的文档）。
-        "rows": rows.iter().map(row_wire).collect::<Vec<Value>>(),
+        "rows": rows.iter().map(|r| row_wire(lang, r)).collect::<Vec<Value>>(),
     }))
 }
 
@@ -113,7 +113,7 @@ pub fn level(bc: &Breadcrumb, rows: &[BrowserRow]) -> Value {
 ///    `a_loaded_level_carries_the_breadcrumb_and_the_rows`（九格恒在）与
 ///    `the_wire_forms_of_kind_and_color_are_pinned`（`kind` 与 `state_color`
 ///    这两个**枚举名**的线上形态 —— 前端就是照那两个字符串比的）。
-fn row_wire(row: &BrowserRow) -> Value {
+fn row_wire(lang: crate::i18n::Lang, row: &BrowserRow) -> Value {
     let mut wire = match to_wire(row) {
         Value::Object(map) => map,
         // 到不了：`BrowserRow` 是个结构体，`to_wire` 出来一定是对象。
@@ -125,7 +125,7 @@ fn row_wire(row: &BrowserRow) -> Value {
     // 再补上状态列真正显示的那两句（值来自 `presentation` 的方法，见上面那段）。
     wire.insert(
         "state_label".to_string(),
-        Value::String(row.state.label().to_string()),
+        Value::String(row.state.label(lang).to_string()),
     );
     wire.insert("state_color".to_string(), to_wire(&row.state.color()));
     Value::Object(wire)
@@ -263,9 +263,9 @@ mod tests {
         let set: std::collections::BTreeSet<String> =
             selected.iter().map(|s| (*s).to_string()).collect();
         DownloadAction {
-            button_title: DownloadTargets::button_title(&set),
+            button_title: DownloadTargets::button_title(crate::i18n::Lang::Zh, &set),
             empty_selection_hint: if set.is_empty() {
-                Some(DownloadTargets::empty_selection_hint().to_string())
+                Some(DownloadTargets::empty_selection_hint(crate::i18n::Lang::Zh).to_string())
             } else {
                 None
             },
@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn a_loaded_level_carries_the_breadcrumb_and_the_rows() {
         let bc = Breadcrumb::new("01.RawData/02.CleanData");
-        let v = level(&bc, &[a_row("a.fq.gz"), a_row("b.fq.gz")]);
+        let v = level(crate::i18n::Lang::Zh, &bc, &[a_row("a.fq.gz"), a_row("b.fq.gz")]);
         assert_eq!(v["ok"], serde_json::json!(true), "{v}");
         assert_eq!(v["data"]["breadcrumb"]["path"], serde_json::json!("01.RawData/02.CleanData"));
         assert_eq!(v["data"]["rows"][0]["name"], serde_json::json!("a.fq.gz"));
@@ -369,7 +369,7 @@ mod tests {
 
     fn level_wire_rows(json: &str) -> Value {
         let rows = level_rows_from_kernel_wire(json, "01.RawData");
-        level(&Breadcrumb::new("01.RawData"), &rows)
+        level(crate::i18n::Lang::Zh, &Breadcrumb::new("01.RawData"), &rows)
     }
 
     /// 🔴 **每一行都要带上状态列的那两句显示值**（`state_label` / `state_color`）。
