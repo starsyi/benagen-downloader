@@ -129,6 +129,12 @@ pub struct Kernel {
     /// 来源依次是：`hello.language` > `settings.language` > 系统 locale。
     /// 所有客户可见文案（错误、提示、进度）都查这一格，不各自去读环境变量。
     pub language: crate::i18n::Lang,
+    /// 壳在 `hello` 里交回来的系统界面语言（`zh-Hans-CN` …）。
+    ///
+    /// 为什么留着它：设置页改「跟随系统」时也要按**系统语言**解析一次，而
+    /// `set_settings` 的入参里没有这一格 —— 记下来，别退回去读环境变量
+    /// （图形壳里那是空的，见 `protocol::HelloParams::system_locale`）。
+    pub system_locale: Option<String>,
     /// 「客户/壳有没有明确选过界面语言」（规格 W1 的首启判据）。
     ///
     /// 判据是设置文件里**有没有 `language` 这个键**（见 `settings::load_from_with_flag`），
@@ -323,6 +329,8 @@ impl Kernel {
             settings,
             language,
             language_chosen,
+            // 握手之前不知道壳那边的系统语言（GUI 里 `LANG` 通常是空的）。
+            system_locale: None,
             manifest: None,
             last_code,
             update_path,
@@ -2122,9 +2130,13 @@ fn op_hello(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, ErrorB
     let requested = protocol::requested_lang(params);
     // 语言从哪来：壳交的系统语言 > 本进程环境变量（CLI / 测试）。
     // ⚠️ 只在"跟随系统"时才用得到它；客户选了 zh/en 时 `resolve` 会直接返回那个值。
-    let locale = protocol::requested_system_locale(params)
+    let reported = protocol::requested_system_locale(params);
+    let locale = reported
+        .clone()
         .unwrap_or_else(crate::i18n::system_locale);
     with_kernel(kernel, |k| {
+        // 记下来：设置页改「跟随系统」时还要用它（`op_set_settings`）。
+        k.system_locale = reported;
         let lang = requested.unwrap_or(k.settings.language).resolve(&locale);
         k.language = lang;
         hello.language = lang;
@@ -4177,9 +4189,18 @@ pub fn op_set_settings(k: &mut Kernel, params: &Value) -> Result<Value, ErrorBod
     s.save_to(&k.settings_path)
         .map_err(|e| ErrorBody::new(codes::INTERNAL, format!("保存设置失败：{e}")))?;
     k.settings = s.clone();
-    // ④ 语言也要跟着换：客户在设置里点「英文」应当立刻生效，而不是等下次启动
+    // ④ 这份文件从此**带 language 键**了 ⇒ 「首次启动要不要问语言」的判据也要跟着翻。
+    //    🔴 漏了这一格就是真机那个死循环：首启窗选完语言 → 壳重问 `hello` → 内核还回答
+    //    `language_chosen: false` → 窗子又弹回来，客户只能杀进程（文件已写，重开才不弹）。
+    k.language_chosen = true;
+    // ⑤ 语言也要跟着换：客户在设置里点「英文」应当立刻生效，而不是等下次启动
     //    （规格 §2.2）。这里是"设置页改语言"的唯一落点。
-    k.language = s.language.resolve(&crate::i18n::system_locale());
+    //    解析用的系统语言取握手记下的那一份（`set_settings` 的入参里没有它）。
+    let locale = k
+        .system_locale
+        .clone()
+        .unwrap_or_else(crate::i18n::system_locale);
+    k.language = s.language.resolve(&locale);
 
     // ⑤ 引擎在跑就即时生效（改参数不重启引擎）
     if let Some(d) = k.daemon.clone() {
@@ -5407,6 +5428,102 @@ mod tests {
         let (echoed, stored) = hello_with(Some("system"));
         assert_ne!(echoed.as_deref(), Some("system"), "回给壳的必须是解析后的语言");
         assert_ne!(stored, crate::i18n::Lang::System);
+    }
+
+    /// 首启语言窗选完就**不许再弹**：这次真机事故（选什么都在弹，只能杀进程）的根因。
+    ///
+    /// 判据是「设置文件里有没有 `language` 键」，而 `set_settings` 落盘之后那份文件
+    /// 一定带这一格 ⇒ 内核的 `language_chosen` 必须同时翻成 true。漏了它，壳重问 `hello`
+    /// 拿到的还是 `false`，窗口就再弹回来 —— 这正是客户看到的样子。
+    #[test]
+    fn choosing_a_language_marks_the_first_run_as_done() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let settings_path = dir.join("s.json");
+        // 全新安装：设置文件根本还不存在
+        let kernel = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), settings_path.clone())));
+
+        let hello_now = || {
+            let req = protocol::Request {
+                id: 1,
+                method: "hello".to_string(),
+                params: serde_json::json!({
+                    "protocol": protocol::PROTOCOL_VERSION,
+                    "system_locale": "zh-Hans-CN",
+                }),
+            };
+            let (resp, _) = dispatch(&kernel, &req);
+            let v = serde_json::to_value(&resp).unwrap();
+            (
+                v["result"]["language_chosen"].as_bool(),
+                v["result"]["language"].as_str().map(str::to_string),
+            )
+        };
+
+        // ① 没选过 ⇒ 壳据此弹首启窗
+        assert_eq!(hello_now().0, Some(false), "全新安装必须先问一次语言");
+
+        // ② 客户在首启窗里选了英文（整份设置回传，与设置页保存同一个形状）
+        let mut s = settings::default_settings();
+        s.language = crate::i18n::Lang::En;
+        let req = protocol::Request {
+            id: 2,
+            method: "set_settings".to_string(),
+            params: serde_json::json!({"settings": s}),
+        };
+        let (resp, _) = dispatch(&kernel, &req);
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true), "保存语言不该失败：{v}");
+
+        // ③ 再握手 ⇒ 已经选过、语言是英文（首启窗不会再弹）
+        let (chosen, lang) = hello_now();
+        assert_eq!(chosen, Some(true), "选过之后 flag 必须翻，否则首启窗会一直弹");
+        assert_eq!(lang.as_deref(), Some("en"));
+    }
+
+    /// 设置页把语言切回「跟随系统」时，解析要用**壳交过的系统语言**（握手记下的那份），
+    /// 而不是环境变量：图形壳里 `LANG` 是空的，读它等于把中文系统又判成英文。
+    #[test]
+    fn switching_back_to_follow_system_uses_the_locale_the_shell_reported() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let settings_path = dir.join("s.json");
+        let mut initial = settings::default_settings();
+        initial.language = crate::i18n::Lang::En;
+        initial.save_to(&settings_path).expect("写设置失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), settings_path)));
+
+        // 壳说系统是中文
+        let req = protocol::Request {
+            id: 1,
+            method: "hello".to_string(),
+            params: serde_json::json!({
+                "protocol": protocol::PROTOCOL_VERSION,
+                "system_locale": "zh-Hans-CN",
+            }),
+        };
+        let (resp, _) = dispatch(&kernel, &req);
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap()["result"]["language"],
+            serde_json::json!("en"),
+            "客户显式选了英文，就先说英文"
+        );
+
+        // 客户把设置里的语言切回「跟随系统」
+        let mut s = settings::default_settings();
+        s.language = crate::i18n::Lang::System;
+        let req = protocol::Request {
+            id: 2,
+            method: "set_settings".to_string(),
+            params: serde_json::json!({"settings": s}),
+        };
+        let _ = dispatch(&kernel, &req);
+
+        assert_eq!(
+            lock(&kernel).language,
+            crate::i18n::Lang::Zh,
+            "「跟随系统」必须按壳交的 zh-Hans-CN 解析，不能读空的环境变量"
+        );
     }
 
     /// 壳把**系统界面语言**交回来时，"跟随系统"必须照着它解析，而不是照着环境变量。

@@ -2081,6 +2081,10 @@ public final class AppModel: ObservableObject {
         // 落状态的是**内核回执**那一份（`-k` 会被内核归一成规范串）。
         settings = echoed.settings
         lastCode = echoed.lastCode
+        // 保存成功后**就地**翻掉首启判据：这份设置已经带 `language` 了。
+        // 为什么不能只等 `refreshLanguage()`：那一步是只读装饰，失败静默（超时/引擎忙），
+        // 一旦它没回来，首启窗就会一直弹 —— 客户只能杀进程（0.3.0 真机事故）。
+        languageChosen = true
         // 语言立刻生效：回执里是**原始值**（可能是 `system`），而界面要的是解析后的
         // `zh`/`en` —— 问一次 `hello`（内核每次都按设置重新解析并回填 `k.language`），
         // 这样"设置里点 English"与"首启窗点 English"走的是同一条路。

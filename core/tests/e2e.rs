@@ -706,12 +706,23 @@ impl Env {
 
     /// 轮询 `verify_status`，直到六类里任意一类非空。
     fn wait_verified(&mut self) -> Value {
+        self.wait_verified_all(1)
+    }
+
+    /// 等到**至少 `want` 个**文件出现在校验结果里。
+    ///
+    /// ⚠️ 为什么不能到处用 `wait_verified(1)`：校验是一轮一轮跑的，第一批落盘就先出结果。
+    /// 多文件的用例只等"有一条"会拿到**半份**回执 —— 在本机（macOS）两个文件常在同一轮里
+    /// 校验完，看不出问题；Linux 构建机上第二个文件慢半拍，`verify_reports_pass_for_matching_crc`
+    /// 就红在"`t/./verbatim.txt` 不在 ok 里"（0.3.0 出包时真踩到）。
+    fn wait_verified_all(&mut self, want: usize) -> Value {
         wait_for("verify_status 出结果", || {
             let r = self.core.ok("verify_status", json!({}));
-            let any = ["ok", "bad", "missing", "size_mismatch", "unverifiable", "unreadable"]
+            let seen: usize = ["ok", "bad", "missing", "size_mismatch", "unverifiable", "unreadable"]
                 .iter()
-                .any(|k| r[k].as_array().map(|a| !a.is_empty()).unwrap_or(false));
-            if any {
+                .map(|k| r[k].as_array().map(|a| a.len()).unwrap_or(0))
+                .sum();
+            if seen >= want {
                 Some(r)
             } else {
                 None
@@ -980,7 +991,8 @@ fn verify_reports_pass_for_matching_crc() {
     env.load();
     env.core.ok("enqueue", json!({"paths": ["t/readme.txt", "t/./verbatim.txt"]}));
 
-    let r = env.wait_verified();
+    // 两个文件都在才收：只等"有一条"会拿到半份回执（见 `wait_verified_all` 的注释）。
+    let r = env.wait_verified_all(2);
     let ok = names(&r["ok"]);
     assert!(
         ok.contains(&"t/readme.txt".to_string()),
