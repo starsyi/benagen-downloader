@@ -52,6 +52,15 @@ pub const HANDSHAKE_TIMEOUT_MESSAGE: &str = "内核无响应（等待超过 5 �
 /// 英文那一句（判据与 [`HANDSHAKE_TIMEOUT_MESSAGE`] 一样逐字：改一个就得改另一个的判别式）。
 pub const HANDSHAKE_TIMEOUT_MESSAGE_EN: &str = "The core is not responding (waited more than 5 seconds)";
 
+/// 握手超时那句话，按界面语言取。**判别式认的是同一个字符串**（中英两份都在
+/// [`EngineStatusPresentation::is_handshake_timeout`] 的名单里）。
+pub fn handshake_timeout_message(lang: crate::i18n::Lang) -> &'static str {
+    match lang {
+        crate::i18n::Lang::En => HANDSHAKE_TIMEOUT_MESSAGE_EN,
+        crate::i18n::Lang::Zh => HANDSHAKE_TIMEOUT_MESSAGE,
+    }
+}
+
 /// Swift `Character.isNewline` 的**逐字对位**：U+000A–U+000D、U+0085、U+2028、U+2029。
 ///
 /// ⚠️ W-6：本函数在 Swift 源里没有对应物 —— 那里直接用 `\.isNewline`。写成显式集合是因为

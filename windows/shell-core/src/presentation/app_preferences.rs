@@ -230,10 +230,11 @@ impl DownloadDirectory {
     /// 上游 `DownloadDirectory.defaultDisplay`（那边是 `static let` 内插；
     /// 这里写成函数，从**唯一一份** [`Self::KERNEL_DEFAULT_DISPLAY_PATH`] 派生 ——
     /// 形态偏离同 `delivery_summary.rs` 的 `too_long_hint`，保住的正是"改一处不会打架"）。
-    pub fn default_display() -> String {
-        format!(
-            "默认（{}，由内核决定）",
-            Self::KERNEL_DEFAULT_DISPLAY_PATH
+    pub fn default_display(lang: crate::i18n::Lang) -> String {
+        crate::i18n::tf(
+            lang,
+            crate::i18n::Key::PrefsDefault,
+            &[("path", Self::KERNEL_DEFAULT_DISPLAY_PATH)],
         )
     }
 
@@ -255,9 +256,9 @@ impl DownloadDirectory {
     /// 当前下载目录只读显示的文字。空串 = 未配置 ⇒ 说"默认"，而不是画一个空行。
     ///
     /// 上游 `DownloadDirectory.display(_:)`。
-    pub fn display(path: &str) -> String {
+    pub fn display(lang: crate::i18n::Lang, path: &str) -> String {
         if path.is_empty() {
-            Self::default_display()
+            Self::default_display(lang)
         } else {
             path.to_string()
         }
@@ -292,20 +293,32 @@ impl DownloadDirectory {
     /// 🔴 **本 crate 里唯一碰文件系统的判据**（例外申报见模块头）。
     ///
     /// 上游 `DownloadDirectory.check(_:)`。
-    pub fn check(path: &str) -> Option<String> {
+    pub fn check(lang: crate::i18n::Lang, path: &str) -> Option<String> {
         if path.is_empty() {
             return None;
         }
         if !path_exists(path) {
-            return Some(format!("这个位置不存在：{path}"));
+            return Some(crate::i18n::tf(
+                lang,
+                crate::i18n::Key::PrefsMissingPath,
+                &[("path", path)],
+            ));
         }
         if !path_is_directory(path) {
-            return Some(format!("这是一个文件，不是文件夹：{path}"));
+            return Some(crate::i18n::tf(
+                lang,
+                crate::i18n::Key::PrefsIsFile,
+                &[("path", path)],
+            ));
         }
         // ⚠️ 探针**只在这两步都过了之后**才跑：路径不存在或不是目录时往里建文件
         //    要么失败得更难看、要么在别的地方留下垃圾。
         if !probe_writable(path) {
-            return Some(format!("这个文件夹不可以写入（没有权限）：{path}"));
+            return Some(crate::i18n::tf(
+                lang,
+                crate::i18n::Key::PrefsNotWritable,
+                &[("path", path)],
+            ));
         }
         None
     }
@@ -346,16 +359,11 @@ impl DownloadDirectory {
     ///    不会发生的事做决定 —— 而这条文案的全部价值就是让他知道**会发生什么**。
     ///
     /// 上游 `DownloadDirectory.confirmation(from:to:)`（逐字，含那个空行）。
-    pub fn confirmation(from: &str, to: &str) -> String {
-        format!(
-            "下载目录将从「{}」改为「{}」。\n\
-             \n\
-             改完会立刻重启内核，三条后果：\n\
-             1. 正在跑的任务会停（内核重启），没传完的文件要重新点一次下载；\n\
-             2. 新目录里没有记录的文件会重新校验（内核的状态文件就在下载目录里）；\n\
-             3. 旧目录里的文件不会被删、也不会被搬走。",
-            Self::display(from),
-            Self::display(to)
+    pub fn confirmation(lang: crate::i18n::Lang, from: &str, to: &str) -> String {
+        crate::i18n::tf(
+            lang,
+            crate::i18n::Key::PrefsChangeWarning,
+            &[("from", &Self::display(lang, from)), ("to", &Self::display(lang, to))],
         )
     }
 }
@@ -962,7 +970,7 @@ mod tests {
     /// 上游 `theConfirmationNamesAllThreeConsequences`。
     #[test]
     fn the_confirmation_names_all_three_consequences() {
-        let text = DownloadDirectory::confirmation("", "/Volumes/Data/交付");
+        let text = DownloadDirectory::confirmation(crate::i18n::Lang::Zh, "", "/Volumes/Data/交付");
 
         assert!(
             text.contains("正在跑的任务会停"),
@@ -986,7 +994,7 @@ mod tests {
     ///    而用户会照着它做决定。
     #[test]
     fn the_confirmation_never_claims_every_file_will_be_reverified() {
-        let text = DownloadDirectory::confirmation("/old", "/new");
+        let text = DownloadDirectory::confirmation(crate::i18n::Lang::Zh, "/old", "/new");
         assert!(!text.contains("一定会重新校验"));
         assert!(!text.contains("所有文件"));
         assert!(!text.contains("全部重新校验"));
@@ -996,12 +1004,12 @@ mod tests {
     #[test]
     fn the_confirmation_says_what_the_current_directory_is() {
         // 两边都要说：只说"改成什么"的话，用户在**换回旧目录**时看不出自己现在在哪。
-        let text = DownloadDirectory::confirmation("/Volumes/A", "/Volumes/B");
+        let text = DownloadDirectory::confirmation(crate::i18n::Lang::Zh, "/Volumes/A", "/Volumes/B");
         assert!(text.contains("/Volumes/A"));
         assert!(text.contains("/Volumes/B"));
 
         // 未配置那一侧显示的是"默认"，而不是一个空串（空串在界面上读起来像"坏了"）。
-        let from_default = DownloadDirectory::confirmation("", "/Volumes/B");
+        let from_default = DownloadDirectory::confirmation(crate::i18n::Lang::Zh, "", "/Volumes/B");
         assert!(from_default.contains("默认"));
         assert!(!from_default.contains("「」"), "不许出现一对空引号");
     }
@@ -1009,11 +1017,11 @@ mod tests {
     /// 上游 `theDisplayFallsBackToTheDefaultLabelWhenUnconfigured`。
     #[test]
     fn the_display_falls_back_to_the_default_label_when_unconfigured() {
-        assert_eq!(DownloadDirectory::display("/Volumes/Data/交付"), "/Volumes/Data/交付");
-        assert!(DownloadDirectory::display("").contains("默认"));
-        assert!(!DownloadDirectory::display("").is_empty());
+        assert_eq!(DownloadDirectory::display(crate::i18n::Lang::Zh, "/Volumes/Data/交付"), "/Volumes/Data/交付");
+        assert!(DownloadDirectory::display(crate::i18n::Lang::Zh, "").contains("默认"));
+        assert!(!DownloadDirectory::display(crate::i18n::Lang::Zh, "").is_empty());
         assert_eq!(
-            DownloadDirectory::display(""),
+            DownloadDirectory::display(crate::i18n::Lang::Zh, ""),
             "默认（~/Downloads/Benagen，由内核决定）",
             "整句逐字（含全角括号与逗号）"
         );
@@ -1381,7 +1389,7 @@ mod tests {
     #[test]
     fn a_writable_existing_directory_passes_the_check() {
         let dir = TempDirectory::new();
-        assert_eq!(DownloadDirectory::check(&dir.path()), None);
+        assert_eq!(DownloadDirectory::check(crate::i18n::Lang::Zh, &dir.path()), None);
     }
 
     /// 上游 `aMissingDirectoryIsRejectedWithAnExplanation`。
@@ -1390,7 +1398,7 @@ mod tests {
         let dir = TempDirectory::new();
         let missing = format!("{}/还不存在/再深一层", dir.path());
 
-        let problem = DownloadDirectory::check(&missing);
+        let problem = DownloadDirectory::check(crate::i18n::Lang::Zh, &missing);
         assert!(
             problem.is_some(),
             "不存在的目录不许放行 —— 否则要等重启完才发现"
@@ -1409,7 +1417,7 @@ mod tests {
         let file = format!("{}/我是一个文件", dir.path());
         std::fs::write(&file, b"x").expect("放一个文件");
 
-        let problem = DownloadDirectory::check(&file);
+        let problem = DownloadDirectory::check(crate::i18n::Lang::Zh, &file);
         assert!(
             problem.is_some(),
             "选中的是一个文件 ⇒ 报错，不许当成目录用"
@@ -1450,7 +1458,7 @@ mod tests {
             created
         };
 
-        let problem = DownloadDirectory::check(&locked);
+        let problem = DownloadDirectory::check(crate::i18n::Lang::Zh, &locked);
 
         // 恢复可写（**先恢复再断言**：断言失败时不该把现场留在只读状态，
         // `TempDirectory::drop` 的 `remove_dir_all` 也要能删掉它）。
@@ -1479,7 +1487,7 @@ mod tests {
         std::fs::write(format!("{}/原有的文件", dir.path()), b"x").expect("放一个文件");
 
         // 可写目录：走的是"建成功 ⇒ 删掉 ⇒ 返回 nil"那条路。
-        assert_eq!(DownloadDirectory::check(&dir.path()), None);
+        assert_eq!(DownloadDirectory::check(crate::i18n::Lang::Zh, &dir.path()), None);
 
         let mut names: Vec<String> = std::fs::read_dir(&dir.url)
             .expect("读目录")
@@ -1504,6 +1512,6 @@ mod tests {
     fn the_unconfigured_path_is_not_checked_because_the_kernel_owns_its_default() {
         // 「恢复默认」的目标是**空串** —— 它不是一个路径，壳也无从检查
         //（内核会用自己的默认值，并在启动时建它）。
-        assert_eq!(DownloadDirectory::check(""), None);
+        assert_eq!(DownloadDirectory::check(crate::i18n::Lang::Zh, ""), None);
     }
 }

@@ -2073,3 +2073,28 @@ Intel 那份直接复用了 `dist/` 里已经修过 minOS 的 x86_64 包。
 
 真机未验（与 Windows 同一份清单，见规格 §8）：首次弹窗、真实断网/拔盘、挂起内核看三档重启、
 国际域名解析。本机没有这些现场条件，如实标注。
+
+### 0.3.0 续（2026-10-21）：界面语言入口 + 全量双语
+
+真机反馈"DMG 里找不到语言切换"——查下来 macOS 侧**从来没有语言入口**：`Settings` 结构体
+里没有 `language` 这一格（旧版每次保存设置都会把它重置），设置页没有「界面语言」段，
+也没有首启询问。已补齐：
+
+* `Protocol.Settings.language`（缺键兜 `"system"`，**编码时一定带上**）、
+  `HelloResult.languageChosen`；
+* `Settings/LanguageSection.swift`：三档「跟随系统 / 中文 / English」，选中立刻生效
+  （重问一次 `hello` 拿内核解析结果，整壳当场换语言）；
+* `Views/LanguageSheet.swift`：首启询问，判据是 `language_chosen == false`（**不是**
+  "值等于 system"——客户主动选过跟随系统也不该再弹），不许 Esc 跳过，只弹一次；
+* `I18n.swift` 的 `Key` 从 22 条增到 **271 条**，视图层/呈现层/诊断导出（`诊断说明.txt`
+  的标题与说明句）全部按 `language` 成句；新增 `BilingualSweepTests` 守门：扫
+  `Sources/` 的非注释字符串字面量，出现 CJK 就红（白名单逐条登记理由，不整目录放行）；
+* `hello` 入参统一到 `AppModel.helloParams` 并带 `system_locale`
+  （`Locale.preferredLanguages.first`）——在此之前"跟随系统"在图形应用里其实跟不到，
+  因为内核只读 `LANG`，而 `.app` 不继承登录 shell 的环境。
+
+读数：`bash macos/scripts/test.sh --disable-sandbox` = **634 passed**（基线 631 + 3 条守门）。
+
+仍未双语化（如实记账）：内核原文逐字显示不翻译；日志正文与 `os_log` 保持中文（规格 I-2）；
+`ErrorCard.swift` 自带 zh/en 两表（行为双语，形态未收进 `I18n.swift`）；
+跨端稳定文件名（`诊断日志-*`、`说明.txt`、`diag-kernel.log`）不翻译。

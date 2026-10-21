@@ -301,10 +301,11 @@ impl SettingsForm {
     ///
     /// ⚠️ **原文逐字**：这句话从 `kernel.rs` 搬过来时**一个字都没改**
     ///    （搬的理由正是上面那段"让那条路可测"）。
-    pub fn encode_failure_text(error: &serde_json::Error) -> String {
-        format!(
-            "这七项参数没能编码成内核认识的形状（{error}）：这是壳自己的序列化失败。\
-             补救：把这条原样发给我们。"
+    pub fn encode_failure_text(lang: crate::i18n::Lang, error: &serde_json::Error) -> String {
+        crate::i18n::tf(
+            lang,
+            crate::i18n::Key::SettingsEncodeFailure,
+            &[("error", &error.to_string())],
         )
     }
 
@@ -460,14 +461,18 @@ impl SettingsForm {
     /// ⚠️ "引擎不可用"那一支**不重抄**：它直接返回既有的
     ///    [`EngineGate::UNAVAILABLE_HELP`]（那条提示指向那处真的存在的动作：
     ///    点顶部的「重试」）。抄一份的结局是"同一个状态在两处说不同的话"。
-    pub fn save_help(engine_allows_actions: bool, has_unsaved_changes: bool) -> &'static str {
+    pub fn save_help(
+        lang: crate::i18n::Lang,
+        engine_allows_actions: bool,
+        has_unsaved_changes: bool,
+    ) -> &'static str {
         if !engine_allows_actions {
-            return EngineGate::UNAVAILABLE_HELP;
+            return EngineGate::unavailable_help(lang);
         }
         if has_unsaved_changes {
-            "把七项参数下发给内核（set_settings）"
+            crate::i18n::t(lang, crate::i18n::Key::SettingsSaveHelp)
         } else {
-            "与内核当前参数一致：没有要保存的改动"
+            crate::i18n::t(lang, crate::i18n::Key::SettingsSaveClean)
         }
     }
 }
@@ -771,7 +776,7 @@ mod tests {
         .expect_err("编码失败必须回 Err —— 既不许 panic，也不许回落成一份少键的载荷");
 
         // 调用方（`kernel.rs::set_settings`）拿它换回来的那句话：
-        let text = SettingsForm::encode_failure_text(&error);
+        let text = SettingsForm::encode_failure_text(crate::i18n::Lang::Zh, &error);
         assert!(!text.trim().is_empty(), "失败原文不许是空的（静默降级）");
         assert!(
             text.contains("没能编码成内核认识的形状"),
@@ -1023,23 +1028,23 @@ mod tests {
     #[test]
     fn the_save_button_help_follows_the_same_three_states() {
         assert_eq!(
-            SettingsForm::save_help(true, true),
+            SettingsForm::save_help(crate::i18n::Lang::Zh, true, true),
             "把七项参数下发给内核（set_settings）"
         );
         assert_eq!(
-            SettingsForm::save_help(true, false),
+            SettingsForm::save_help(crate::i18n::Lang::Zh, true, false),
             "与内核当前参数一致：没有要保存的改动"
         );
         // 引擎不可用时**压过**上面两支：那句提示指向那处真的存在的动作（重试），
         // 而不是让用户对着一个点不动的按钮猜。
         assert_eq!(
-            SettingsForm::save_help(false, true),
-            crate::presentation::transfer_row::EngineGate::UNAVAILABLE_HELP
+            SettingsForm::save_help(crate::i18n::Lang::Zh, false, true),
+            crate::presentation::transfer_row::EngineGate::unavailable_help(crate::i18n::Lang::Zh)
         );
         assert_eq!(
-            SettingsForm::save_help(false, false),
-            crate::presentation::transfer_row::EngineGate::UNAVAILABLE_HELP
+            SettingsForm::save_help(crate::i18n::Lang::Zh, false, false),
+            crate::presentation::transfer_row::EngineGate::unavailable_help(crate::i18n::Lang::Zh)
         );
-        assert!(SettingsForm::save_help(false, true).contains("重试"));
+        assert!(SettingsForm::save_help(crate::i18n::Lang::Zh, false, true).contains("重试"));
     }
 }

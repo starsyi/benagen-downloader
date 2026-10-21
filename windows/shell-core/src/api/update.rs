@@ -60,7 +60,9 @@ pub fn update_status(kernel: &Value) -> Value {
 /// ⚠️ 它不是"内核报的错"：这是**壳自己**的第二道锁在说话（规格 §1：写死之后，
 ///    即使接口被篡改，客户被带到的仍然是那个官方仓库页面）。判据在
 ///    `shell_win::openurl::is_allowed`，本常量只负责"拒绝时说一句人话"。
-pub const REFUSED: &str = "这条链接不是官方发布页的地址，已拒绝打开。";
+pub fn refused(lang: crate::i18n::Lang) -> Value {
+    envelope::err(crate::i18n::t(lang, crate::i18n::Key::OpenRefused))
+}
 
 /// 一次「去下载」成功了（已经交给系统浏览器）。
 ///
@@ -74,14 +76,15 @@ pub fn opened() -> Value {
 ///
 /// ⚠️ 那句话点名了**是哪一步**（起不了默认浏览器）+ **可执行的补救**（手动去官方页），
 ///    与 `NO_KERNEL` / `NO_VERIFY_SUMMARY` 同一条 W-2 口径。
-pub fn open_failed(why: &str) -> Value {
-    envelope::err(&format!("打开浏览器失败：{why}。补救：手动打开官方发布页。"))
+pub fn open_failed(lang: crate::i18n::Lang, why: &str) -> Value {
+    envelope::err(&crate::i18n::tf(
+        lang,
+        crate::i18n::Key::OpenBrowserFailed,
+        &[("why", why)],
+    ))
 }
 
-/// 一条不在白名单里的 URL ⇒ **拒绝**（走失败信封，把 [`REFUSED`] 交出去）。
-pub fn refused() -> Value {
-    envelope::err(REFUSED)
-}
+
 
 // ===========================================================================
 // 「立即检测」那一次动作的回执（规格 §2）—— 判决在 presentation，这里只装帧
@@ -106,8 +109,8 @@ pub fn refused() -> Value {
 ///    只是发一次网络请求 + 落盘一个时间戳）。所以它**不落** `session.last_error`、
 ///    也不清它（那是 [`update_status`] 的口径；这一条比它更"用户动作"一点，
 ///    但失败仍然是"你刚才那一下没成"，由回执那一格说，不上升成常驻提示）。
-pub fn checked(check: &UpdateCheck) -> Value {
-    crate::api::preferences::receipt(check.headline(), None, None, check.is_failure())
+pub fn checked(check: &UpdateCheck, lang: crate::i18n::Lang) -> Value {
+    crate::api::preferences::receipt(check.headline(lang), None, None, check.is_failure())
 }
 
 #[cfg(test)]
@@ -179,20 +182,21 @@ mod tests {
     /// 把 [`REFUSED`] 删成一句空话 ⇒ `contains` 那两条红。
     #[test]
     fn refused_is_a_failure_envelope_with_the_reason() {
+        let refused_text = crate::i18n::t(crate::i18n::Lang::Zh, crate::i18n::Key::OpenRefused);
         assert!(
-            REFUSED.contains("官方") || REFUSED.contains("发布页"),
-            "这句拒绝要说清它拦的是什么（官方发布页之外的一律不放行）：{REFUSED}"
+            refused_text.contains("官方") || refused_text.contains("发布页"),
+            "这句拒绝要说清它拦的是什么（官方发布页之外的一律不放行）：{refused_text}"
         );
-        let v = refused();
+        let v = refused(crate::i18n::Lang::Zh);
         assert_eq!(v["ok"], json!(false));
-        assert_eq!(v["error"]["message"], json!(REFUSED), "原文逐字、不加工");
+        assert_eq!(v["error"]["message"], json!(refused_text), "原文逐字、不加工");
         assert!(v.get("data").is_none(), "失败正文里不该有 data");
     }
 
     /// `open_failed(&why)` 把系统原文带进那句话里（点名是哪一步 + 补救）。
     #[test]
     fn open_failed_keeps_the_system_wording_and_names_the_next_step() {
-        let v = open_failed("ShellExecuteW 返回 2（不超过 32 都是错误码）");
+        let v = open_failed(crate::i18n::Lang::Zh, "ShellExecuteW 返回 2（不超过 32 都是错误码）");
         assert_eq!(v["ok"], json!(false));
         let msg = v["error"]["message"].as_str().expect("失败信封里有 message");
         assert!(msg.contains("ShellExecuteW 返回 2"), "系统原文要逐字带上：{msg}");
@@ -210,7 +214,7 @@ mod tests {
             "enabled": true, "current": "0.2.7", "latest": "0.2.9",
             "has_newer": true, "last_check_ok": true
         }));
-        let v = checked(&check);
+        let v = checked(&check, crate::i18n::Lang::Zh);
         assert_eq!(v["ok"], json!(true));
         let data = v["data"].as_object().expect("回执是对象");
         let mut keys: Vec<&String> = data.keys().collect();
@@ -235,7 +239,7 @@ mod tests {
             "enabled": true, "current": "0.2.7", "latest": "0.2.7",
             "has_newer": false, "last_check_ok": false
         }));
-        let v = checked(&check);
+        let v = checked(&check, crate::i18n::Lang::Zh);
         assert_eq!(v["data"]["is_failure"], json!(true));
         let headline = v["data"]["headline"].as_str().expect("有 headline");
         assert!(headline.contains("没查成"), "{headline}");
@@ -249,7 +253,7 @@ mod tests {
         let check = UpdateCheck::of(&json!({
             "enabled": false, "current": "0.2.7", "has_newer": false, "last_check_ok": true
         }));
-        let v = checked(&check);
+        let v = checked(&check, crate::i18n::Lang::Zh);
         assert_eq!(v["data"]["is_failure"], json!(true));
         assert!(
             v["data"]["headline"]

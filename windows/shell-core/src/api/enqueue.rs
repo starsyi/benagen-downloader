@@ -80,7 +80,7 @@ mod tests {
     /// `data` **就是**那份反馈（不包一层 `feedback` 键：形状多一层，前端多一条读法）。
     #[test]
     fn the_feedback_is_the_data_itself() {
-        let fb = EnqueueFeedback::of(&a_result());
+        let fb = EnqueueFeedback::of(crate::i18n::Lang::Zh, &a_result());
         let v = enqueue(&fb);
         assert_eq!(v["ok"], serde_json::json!(true), "{v}");
         assert!(v["data"].get("summary").is_some(), "data 该是那份回执：{v}");
@@ -93,7 +93,7 @@ mod tests {
     /// 而真机上的表现是"已加入 N 个"旁边那几条拒绝理由不见了（用户以为全下上了）。
     #[test]
     fn both_the_added_count_and_every_rejection_reach_the_client() {
-        let v = enqueue(&EnqueueFeedback::of(&a_result()));
+        let v = enqueue(&EnqueueFeedback::of(crate::i18n::Lang::Zh, &a_result()));
         assert_eq!(v["data"]["summary"], serde_json::json!("已加入 1 个下载任务"), "{v}");
         let rejections = v["data"]["rejections"].as_array().expect("rejections 是个数组");
         assert_eq!(rejections.len(), 1, "逐条拒绝理由必须都在：{v}");
@@ -110,7 +110,10 @@ mod tests {
     #[test]
     fn an_empty_added_list_still_says_so_in_words() {
         // ⚠️ 夹具是**空回执**：`added` 与 `rejected` 都空（D-2 那条真实回执）。
-        let fb = EnqueueFeedback::of(&EnqueueResult { added: vec![], rejected: vec![], pending: 0 });
+        let fb = EnqueueFeedback::of(
+            crate::i18n::Lang::Zh,
+            &EnqueueResult { added: vec![], rejected: vec![], pending: 0 },
+        );
         let v = enqueue(&fb);
         assert_eq!(v["data"]["summary"], serde_json::json!("没有需要下载的文件"), "{v}");
         assert_eq!(v["data"]["rejections"], serde_json::json!([]));

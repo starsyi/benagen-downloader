@@ -12,6 +12,7 @@
 //    （经 `invoke.js` 的 `CMD`）与内部标识符。
 
 import { mountShell, SECTIONS } from "./js/shell.js";
+import { applyCopy, applyCopyToTemplates } from "./js/dom.js";
 import { call, CMD, failureText } from "./js/invoke.js";
 import { Poller, INTERVALS_MS } from "./js/poll.js";
 import { screenFor } from "./js/screens/registry.js";
@@ -557,6 +558,13 @@ async function tickState() {
   // `last_error` —— 那一格由 Rust 决定什么时候消失（`SessionView` 的语义）。
   localFailure = null;
   lastState = state;
+  // 静态文案（侧栏/工具栏/表头/模板里的按钮）全部由 Rust 按 `state.lang` 成句，
+  // 这里只把 `data-copy*` 标记的位置填上。模板先填，之后克隆出来的屏才不是空的。
+  applyCopy(document, state.copy);
+  applyCopyToTemplates(state.copy);
+  if (typeof state.lang === "string") {
+    document.documentElement.lang = state.lang === "en" ? "en" : "zh-CN";
+  }
   // 首启语言询问（规格 W1）：判据是 `language_chosen === false`（**设置文件里有没有
   // 那一格**，由内核在握手时说的）。只问一次；问过之后由壳自己记住本次会话不再问。
   void maybeAskLanguage(state);

@@ -45,17 +45,42 @@ import Foundation
 
 /// 一次「立即检测」的结局 → **要摆到屏幕上的那句话** + 它是成功档还是失败档。
 public struct UpdateCheckReceipt: Equatable, Sendable {
-    /// **这句话整句都来自这里**（视图一个字符都不拼，约束 3 / 8）。
-    public let text: String
+    /// 判决本身（五档之一）。**话在取用时才成句** ⇒ 同一份判决可以按当前界面语言
+    /// 重画（`text(lang:)`），切换语言后回执不会停在旧语言上。
+    private enum Verdict: Equatable, Sendable {
+        case disabled
+        case upToDate(current: String)
+        case unreachable
+        case noAnswer
+        case newer(latest: String, current: String)
+    }
+
+    private let verdict: Verdict
+
     /// 视图据此挑图标（`exclamationmark.triangle` / `checkmark.circle`）。
     ///
     /// ⚠️ **前两档也是"失败"**（开关关着：你这一下没查；内核没给那一格：说不清）——
     ///    按"是不是错误"来分会让那句"刚才没有去查"配一个绿勾，读起来像"已经是最新的"。
     public let isFailure: Bool
 
-    private init(_ text: String, isFailure: Bool) {
-        self.text = text
+    private init(_ verdict: Verdict, isFailure: Bool) {
+        self.verdict = verdict
         self.isFailure = isFailure
+    }
+
+    /// **这句话的中文版**（既有调用点与单测读它）。
+    public var text: String { text(lang: .zh) }
+
+    /// 同一份判决按**当前界面语言**成句。
+    public func text(lang: Lang) -> String {
+        switch verdict {
+        case .disabled: return lang.t(.updateReceiptDisabled)
+        case .upToDate(let current): return lang.tf(.updateReceiptUpToDate, ["current": current])
+        case .unreachable: return lang.t(.updateReceiptUnreachable)
+        case .noAnswer: return lang.t(.updateReceiptNoAnswer)
+        case .newer(let latest, let current):
+            return lang.tf(.updateReceiptNewer, ["latest": latest, "current": current])
+        }
     }
 
     /// 判决：`update_check_now`（或 `update_status`）回的**那一份状态** → 五档之一。
@@ -87,7 +112,7 @@ public struct UpdateCheckReceipt: Equatable, Sendable {
                 // "有新版"却说不出是哪个版本 ⇒ 不猜（宁可不说话）。
                 return noAnswer()
             }
-            return UpdateCheckReceipt("有新版本 \(latest)（当前 \(st.current)）。", isFailure: false)
+            return UpdateCheckReceipt(.newer(latest: latest, current: st.current), isFailure: false)
         }
     }
 
@@ -101,23 +126,18 @@ public struct UpdateCheckReceipt: Equatable, Sendable {
     // -----------------------------------------------------------------------
 
     private static func disabled() -> UpdateCheckReceipt {
-        UpdateCheckReceipt(
-            "自动检查更新是关着的，刚才没有去查。补救：打开上面那个开关，再点一次「立即检测」。",
-            isFailure: true)
+        UpdateCheckReceipt(.disabled, isFailure: true)
     }
 
     private static func upToDate(_ current: String) -> UpdateCheckReceipt {
-        UpdateCheckReceipt("已经是最新的（当前 \(current)）。", isFailure: false)
+        UpdateCheckReceipt(.upToDate(current: current), isFailure: false)
     }
 
     private static func unreachable() -> UpdateCheckReceipt {
-        UpdateCheckReceipt(
-            "没查成：这次没连上发布页。补救：确认这台机器能上网，或者过一会儿再点一次。",
-            isFailure: true)
+        UpdateCheckReceipt(.unreachable, isFailure: true)
     }
 
     private static func noAnswer() -> UpdateCheckReceipt {
-        UpdateCheckReceipt("没查到结果：内核回的这份检查状态不全。补救：重开一次客户端再试。",
-                           isFailure: true)
+        UpdateCheckReceipt(.noAnswer, isFailure: true)
     }
 }

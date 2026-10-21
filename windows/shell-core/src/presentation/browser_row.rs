@@ -91,7 +91,7 @@ impl BrowserRow {
     /// ⚠️ `parent` 只有**目录项**用得上：`list_dir` 的目录项**没有 `path` 键**，
     ///    路径只能由壳拼（[`Breadcrumb::join`]）；文件项有 `path`，逐字用它 ——
     ///    不要"顺手"重新拼一遍文件路径，那是在拿壳的拼接覆盖内核给的原文（约束 3）。
-    pub fn of(entry: &DirEntry, parent: &str) -> BrowserRow {
+    pub fn of(lang: crate::i18n::Lang, entry: &DirEntry, parent: &str) -> BrowserRow {
         match entry {
             DirEntry::Dir {
                 name,
@@ -102,7 +102,11 @@ impl BrowserRow {
                 path: Breadcrumb::join(parent, name),
                 children_count: Some(*children_count),
                 size: None,
-                detail_text: format!("{children_count} 项"),
+                detail_text: crate::i18n::tf(
+                    lang,
+                    crate::i18n::Key::BrowserChildrenCount,
+                    &[("n", &children_count.to_string())],
+                ),
                 // 目录**没有**"源文件时间"这回事（与它的大小同理：那得等内核展开才知道，
                 // 而壳不展开目录，约束 1）—— 恒为占位字形。
                 source_time_text: SourceTimeText::NO_VALUE.to_string(),
@@ -137,8 +141,9 @@ impl BrowserRow {
     ///    既有 NFC 又有 NFD 写法时才有先后之别 —— 而清单里的名字是内核从文件系统逐字搬来的
     ///    原文（约束 3），要客户端机器上真的并存两份仅归一化形态不同的名字才会撞上。
     ///    **判据（目录在前 + 名字升序 + 与语言环境无关）逐条不变。**
-    pub fn rows(entries: &[DirEntry], parent: &str) -> Vec<BrowserRow> {
-        let mut out: Vec<BrowserRow> = entries.iter().map(|e| BrowserRow::of(e, parent)).collect();
+    pub fn rows(lang: crate::i18n::Lang, entries: &[DirEntry], parent: &str) -> Vec<BrowserRow> {
+        let mut out: Vec<BrowserRow> =
+            entries.iter().map(|e| BrowserRow::of(lang, e, parent)).collect();
         // 上游的 `if a.kind != b.kind { return a.kind == .dir }`：两组之间恒目录在前，
         // 组内才比名字。写成穷尽的 `match`，别用 `default` 盖掉。
         out.sort_by(|a, b| match (a.kind, b.kind) {
@@ -729,7 +734,11 @@ impl SelectionSummary {
     ///    trap），这里用 `checked_add` —— 判据逐字一致（溢出即夹到 `i64::MAX`，
     ///    此后任何非负增量都保持夹住），只是 Rust 的对应物。一组畸形（或恶意）的大小
     ///    不该让整个进程垮掉（同 `PercentFormat` 的乘法守卫）。
-    pub fn of(selected: &BTreeSet<String>, sizes: &BTreeMap<String, i64>) -> SelectionSummary {
+    pub fn of(
+        lang: crate::i18n::Lang,
+        selected: &BTreeSet<String>,
+        sizes: &BTreeMap<String, i64>,
+    ) -> SelectionSummary {
         let mut total: i64 = 0;
         for path in selected {
             let Some(one) = sizes.get(path) else {
@@ -738,8 +747,16 @@ impl SelectionSummary {
             total = total.checked_add((*one).max(0)).unwrap_or(i64::MAX);
         }
         SelectionSummary {
-            count_text: format!("已选 {} 项", selected.len()),
-            size_text: "合计 ".to_string() + &ByteFormat::text(total),
+            count_text: crate::i18n::tf(
+                lang,
+                crate::i18n::Key::SelectionCount,
+                &[("n", &selected.len().to_string())],
+            ),
+            size_text: crate::i18n::tf(
+                lang,
+                crate::i18n::Key::SelectionTotal,
+                &[("size", &ByteFormat::text(total))],
+            ),
         }
     }
 
@@ -870,7 +887,7 @@ mod tests {
     }
 
     fn rows(json: &str, parent: &str) -> Vec<BrowserRow> {
-        BrowserRow::rows(&entries(json), parent)
+        BrowserRow::rows(crate::i18n::Lang::Zh, &entries(json), parent)
     }
 
     fn row(name: &str) -> BrowserRow {
@@ -1412,12 +1429,12 @@ mod tests {
     fn selection_summary_counts_items_and_sums_known_sizes() {
         let index = SelectionSummary::size_index(&tree(TREE_WIRE).flat);
 
-        let s = SelectionSummary::of(&set(&["a.bin", "b.bin"]), &index);
+        let s = SelectionSummary::of(crate::i18n::Lang::Zh, &set(&["a.bin", "b.bin"]), &index);
         assert_eq!(s.count_text, "已选 2 项");
         assert_eq!(s.size_text, "合计 5.0 KB", "2048 + 3072 = 5120 → 5.0 KB（1024 进制）");
 
         // 空选择：说 0，不是空白（约束 4）。
-        let empty = SelectionSummary::of(&set(&[]), &index);
+        let empty = SelectionSummary::of(crate::i18n::Lang::Zh, &set(&[]), &index);
         assert_eq!(empty.count_text, "已选 0 项");
         assert_eq!(empty.size_text, "合计 0 B");
     }
@@ -1430,6 +1447,7 @@ mod tests {
         // 目录在 `flat` 里没有大小（`flat` 只有文件）。它的**项数**照样算，
         // 大小只能按 0 计 —— 壳不自己展开目录去猜（约束 1）。
         let s = SelectionSummary::of(
+            crate::i18n::Lang::Zh,
             &set(&["client-test/C24-8_×_25WS024/Figure", "a.bin"]),
             &index,
         );

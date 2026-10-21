@@ -41,12 +41,13 @@ extension RawEnvelope {
     /// 结果是改一处、另一条路径静默保持旧措辞——而这两条文案都会显示给客户。
     /// 钉住它的是 `callSyncAndUnwrapShareTheRpcErrorMessage` /
     /// `callSyncAndUnwrapShareTheMissingResultMessage`（两条入口产物全等比较 + 文案全等）。
-    public func unwrapResult() throws -> JSONValue {
+    public func unwrapResult(lang: Lang = .zh) throws -> JSONValue {
         guard ok else {
             throw CoreError.rpc(code: error?.code ?? "", message: error?.message ?? "")
         }
         guard let result else {
-            throw CoreError.malformedResponse("ok:true 的响应里没有 result（id \(id)）")
+            throw CoreError.malformedResponse(
+                lang.tf(.protocolMissingResult, ["id": String(id)]))
         }
         return result
     }
@@ -59,13 +60,15 @@ extension RawEnvelope {
     /// 只在"调用方自己要强类型"时才走这里的编解码；只要原始 [`JSONValue`] 的调用方
     /// （`CoreClient.callSync`）走 [`unwrapResult`]，不必来回编码一趟
     /// （`.integer` / `.number` 是分开的两个 case，二次编解码会丢这个区分）。
-    public func unwrap<T: Decodable>(_ t: T.Type) throws -> T {
-        let value = try unwrapResult()
+    public func unwrap<T: Decodable>(_ t: T.Type, lang: Lang = .zh) throws -> T {
+        let value = try unwrapResult(lang: lang)
         do {
             let data = try CoreJSON.encoder.encode(value)
             return try CoreJSON.decoder.decode(T.self, from: data)
         } catch {
-            throw CoreError.malformedResponse("id \(id) 的 result 与 \(T.self) 的形状不符: \(error)")
+            throw CoreError.malformedResponse(
+                lang.tf(.protocolShapeMismatch,
+                        ["id": String(id), "type": "\(T.self)", "reason": "\(error)"]))
         }
     }
 }
@@ -246,11 +249,30 @@ public struct HelloResult: Decodable, Sendable {
     ///    会让整个握手解码失败 —— "语言字段缺失"绝不该让客户端启动不了。
     ///    `nil` 由 [`Lang.fromHello`] 按默认中文处理（与旧界面一致）。
     public let language: String?
+    /// 「客户有没有明确选过界面语言」（内核 `HelloResult.language_chosen`）。
+    ///
+    /// ⚠️ **缺键 ⇒ `false`**：0.2.x 的内核没有这一格，缺了就当作"没选过"——
+    ///    首启弹窗会弹一次，而**旧内核**下选完也只是写进设置文件（内核不认这一格）。
+    ///    这与 `language` 的缺键处理同一条纪律：协议新增格绝不能让握手解码失败。
+    public let languageChosen: Bool
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol"
         case minSplitSizeChoices
         case language
+        // ⚠️ **不带 raw value**：解码器开着 `.convertFromSnakeCase`，线上的
+        //    `language_chosen` 会先被转成 `languageChosen` 再找键 —— 写成
+        //    `= "language_chosen"` 反而永远匹配不上（`helloWithLanguageChosenReadsTheFlag` 钉着）。
+        case languageChosen
+    }
+
+    /// 自定义解码：只为给 `language` / `languageChosen` 兜默认值。
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        protocolVersion = try c.decode(UInt32.self, forKey: .protocolVersion)
+        minSplitSizeChoices = try c.decode([String].self, forKey: .minSplitSizeChoices)
+        language = try c.decodeIfPresent(String.self, forKey: .language)
+        languageChosen = try c.decodeIfPresent(Bool.self, forKey: .languageChosen) ?? false
     }
 }
 
@@ -271,9 +293,16 @@ public struct Settings: Codable, Equatable, Sendable {
     public var limitMbps: Int64       // 0 = 不限速
     public var maxTries: Int32        // 1–100
     public var retryWait: Int32       // 0–60 秒
+    /// 界面语言：`"system"` / `"zh"` / `"en"`（`core/src/settings.rs` 的 `language`）。
+    ///
+    /// 🔴 **必须原样回传**：内核的 `set_settings` 是**整份替换**，少了这一格就等于
+    ///    把它重置成 `system` —— 客户改一次并行文件数，界面语言就悄悄被换掉。
+    ///    钉住它的是 `settingsEncodeCarriesTheLanguage`。
+    public var language: String
 
     public init(parallel: Int32, connections: Int32, splits: Int32, minSplitSize: String,
-                limitMbps: Int64, maxTries: Int32, retryWait: Int32) {
+                limitMbps: Int64, maxTries: Int32, retryWait: Int32,
+                language: String = "system") {
         self.parallel = parallel
         self.connections = connections
         self.splits = splits
@@ -281,6 +310,25 @@ public struct Settings: Codable, Equatable, Sendable {
         self.limitMbps = limitMbps
         self.maxTries = maxTries
         self.retryWait = retryWait
+        self.language = language
+    }
+
+    /// 自定义解码：`language` 缺键 ⇒ `"system"`（0.2.x 内核 / 手写的旧设置文件）。
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        parallel = try c.decode(Int32.self, forKey: .parallel)
+        connections = try c.decode(Int32.self, forKey: .connections)
+        splits = try c.decode(Int32.self, forKey: .splits)
+        minSplitSize = try c.decode(String.self, forKey: .minSplitSize)
+        limitMbps = try c.decode(Int64.self, forKey: .limitMbps)
+        maxTries = try c.decode(Int32.self, forKey: .maxTries)
+        retryWait = try c.decode(Int32.self, forKey: .retryWait)
+        language = (try c.decodeIfPresent(String.self, forKey: .language)) ?? "system"
+    }
+
+    /// 线上键的形状（`CoreJSON.requestEncoder` 会把 `minSplitSize` 换成 `min_split_size`）。
+    enum CodingKeys: String, CodingKey {
+        case parallel, connections, splits, minSplitSize, limitMbps, maxTries, retryWait, language
     }
 }
 

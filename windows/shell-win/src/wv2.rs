@@ -82,8 +82,8 @@ pub const LOADER_SHA256: &str = env!("BENAGEN_WV2_LOADER_SHA256");
 /// ⚠️ **本函数不缓存失败**：它只在进程启动时被调一次（`main.rs` 第一步），
 ///    成功之后 5 个 `OnceLock` 就永远是满的。**没有重试语义**（重试需要重启进程）。
 #[cfg(all(windows, not(target_env = "msvc")))]
-pub fn install() -> Result<(), String> {
-    gnu::install()
+pub fn install(lang: shell_core::i18n::Lang) -> Result<(), String> {
+    gnu::install(lang)
 }
 
 /// 宿主（macOS）靶与 MSVC 靶：**没有这一套**（模块头那两段说了为什么）。
@@ -97,7 +97,7 @@ pub fn install() -> Result<(), String> {
 /// ⚠️ 它**不**用 `#[cfg]` 把调用点也关掉：`main.rs` 里那一步必须是**无条件**的一行
 ///   （"仅 Windows 靶"这件事由一个函数的两支实现表达，而不是散在调用点）。
 #[cfg(not(all(windows, not(target_env = "msvc"))))]
-pub fn install() -> Result<(), String> {
+pub fn install(_lang: shell_core::i18n::Lang) -> Result<(), String> {
     Ok(())
 }
 
@@ -121,8 +121,8 @@ pub fn install() -> Result<(), String> {
 const LOADER: ReleaseSpec = ReleaseSpec {
     prefix: "WebView2Loader",
     suffix: ".dll",
-    subject: "内嵌的 WebView2Loader.dll",
-    noun: "WebView2Loader.dll",
+    subject: shell_core::i18n::Key::EmbedSubjectLoader,
+    noun: shell_core::i18n::Key::EmbedNounLoader,
     space_hint: None,
     escape: None,
 };
@@ -222,6 +222,7 @@ mod tests {
             b"whatever",
             &"0".repeat(64),
             &blocker.join("cache"),
+            shell_core::i18n::Lang::Zh,
         )
         .expect_err("缓存目录建不出来 ⇒ 释放必须失败");
 
@@ -298,7 +299,7 @@ mod gnu {
     > = OnceLock::new();
 
     /// **`install` 的本体**：释放 → 装载 → 解析 5 个符号。三步任何一步失败都指名道姓。
-    pub fn install() -> Result<(), String> {
+    pub fn install(lang: shell_core::i18n::Lang) -> Result<(), String> {
         // ---- 1) 释放到 %LOCALAPPDATA%\BenagenDownloader\cache\ ----
         //
         // ⚠️ **这一步用的是 `shell-core` 那套机制**（本模块一度自带过一份，删掉了：
@@ -310,12 +311,14 @@ mod gnu {
         let cache_dir = shell_core::embedded_core::cache_dir_from(
             &super::LOADER,
             std::env::var_os("LOCALAPPDATA"),
+            lang,
         )?;
         let path = shell_core::embedded_core::extract_into(
             &super::LOADER,
             LOADER_DLL,
             LOADER_SHA256,
             &cache_dir,
+            lang,
         )?;
 
         // ---- 2) LoadLibraryW（**绝对路径**）----

@@ -101,9 +101,9 @@ pub fn payload_for(
         //    这里只把**那句话**交给它。第三格直接给 `EngineGate::UNAVAILABLE_HELP`
         //    （`save_help` 也是在那一档返回它，两处指的是同一句）。
         "save_help": {
-            "unsaved": SettingsForm::save_help(true, true),
-            "clean": SettingsForm::save_help(true, false),
-            "engine_unavailable": EngineGate::UNAVAILABLE_HELP,
+            "unsaved": SettingsForm::save_help(lang, true, true),
+            "clean": SettingsForm::save_help(lang, true, false),
+            "engine_unavailable": EngineGate::unavailable_help(lang),
         },
     }))
 }
@@ -269,7 +269,7 @@ mod tests {
         );
         assert_eq!(
             data["save_help"]["engine_unavailable"],
-            json!(EngineGate::UNAVAILABLE_HELP)
+            json!(EngineGate::unavailable_help(crate::i18n::Lang::Zh))
         );
     }
 

@@ -111,23 +111,20 @@ impl UpdateCheck {
     ///
     /// ⚠️ 失败那三档都点名了**是哪一步** + **可执行的补救**（W-2 口径）：
     /// 只报一句"没查成"而不说下一步，等于把客户扔在原地。
-    pub fn headline(&self) -> String {
+    pub fn headline(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::{t, tf, Key};
         match self {
-            UpdateCheck::Disabled => {
-                "自动检查更新是关着的，刚才没有去查。补救：打开上面那个开关，再点一次「立即检测」。"
-                    .to_string()
+            UpdateCheck::Disabled => t(lang, Key::UpdateCheckDisabled).to_string(),
+            UpdateCheck::Newer { latest, current } => tf(
+                lang,
+                Key::UpdateCheckNewer,
+                &[("latest", latest), ("current", current)],
+            ),
+            UpdateCheck::UpToDate { current } => {
+                tf(lang, Key::UpdateCheckUpToDate, &[("current", current)])
             }
-            UpdateCheck::Newer { latest, current } => {
-                format!("有新版本 {latest}（当前 {current}）。")
-            }
-            UpdateCheck::UpToDate { current } => format!("已经是最新的（当前 {current}）。"),
-            UpdateCheck::Unreachable => {
-                "没查成：这次没连上发布页。补救：确认这台机器能上网，或者过一会儿再点一次。"
-                    .to_string()
-            }
-            UpdateCheck::NoAnswer => {
-                "没查到结果：内核回的这份检查状态不全。补救：重开一次客户端再试。".to_string()
-            }
+            UpdateCheck::Unreachable => t(lang, Key::UpdateCheckUnreachable).to_string(),
+            UpdateCheck::NoAnswer => t(lang, Key::UpdateCheckNoAnswer).to_string(),
         }
     }
 
@@ -168,11 +165,11 @@ mod tests {
         let check = UpdateCheck::of(&st);
         assert_eq!(check, UpdateCheck::Unreachable);
         assert!(
-            !check.headline().contains("已经是最新"),
+            !check.headline(crate::i18n::Lang::Zh).contains("已经是最新"),
             "断网时一个字都不许说『已经是最新的』：{}",
-            check.headline()
+            check.headline(crate::i18n::Lang::Zh)
         );
-        assert!(check.headline().contains("补救"), "要说下一步：{}", check.headline());
+        assert!(check.headline(crate::i18n::Lang::Zh).contains("补救"), "要说下一步：{}", check.headline(crate::i18n::Lang::Zh));
         assert!(check.is_failure());
     }
 
@@ -216,7 +213,7 @@ mod tests {
                 current: "0.2.7".to_string()
             }
         );
-        assert!(check.headline().contains("0.2.7"), "{}", check.headline());
+        assert!(check.headline(crate::i18n::Lang::Zh).contains("0.2.7"), "{}", check.headline(crate::i18n::Lang::Zh));
         assert!(!check.is_failure());
     }
 
@@ -234,7 +231,7 @@ mod tests {
                 current: "0.2.7".to_string()
             }
         );
-        let line = check.headline();
+        let line = check.headline(crate::i18n::Lang::Zh);
         assert!(line.contains("0.2.9") && line.contains("0.2.7"), "{line}");
         assert!(!check.is_failure());
     }
@@ -251,8 +248,8 @@ mod tests {
         st["latest"] = json!("0.2.9");
         let check = UpdateCheck::of(&st);
         assert_eq!(check, UpdateCheck::Disabled);
-        assert!(!check.headline().contains("0.2.9"), "{}", check.headline());
-        assert!(check.headline().contains("补救"), "{}", check.headline());
+        assert!(!check.headline(crate::i18n::Lang::Zh).contains("0.2.9"), "{}", check.headline(crate::i18n::Lang::Zh));
+        assert!(check.headline(crate::i18n::Lang::Zh).contains("补救"), "{}", check.headline(crate::i18n::Lang::Zh));
         assert!(check.is_failure(), "点了没查，不该配成功档的图标");
     }
 
@@ -271,7 +268,7 @@ mod tests {
             UpdateCheck::Unreachable,
             UpdateCheck::NoAnswer,
         ];
-        let lines: Vec<String> = all.iter().map(UpdateCheck::headline).collect();
+        let lines: Vec<String> = all.iter().map(|c| c.headline(crate::i18n::Lang::Zh)).collect();
         for line in &lines {
             assert!(!line.trim().is_empty(), "每一档都要有一句话");
         }
@@ -281,10 +278,10 @@ mod tests {
             }
         }
         // 失败那三档都要说下一步；两档好消息不该带"补救"（没有要补的东西）。
-        assert!(all[0].headline().contains("补救"));
-        assert!(all[3].headline().contains("补救"));
-        assert!(all[4].headline().contains("补救"));
-        assert!(!all[1].headline().contains("补救"));
-        assert!(!all[2].headline().contains("补救"));
+        assert!(all[0].headline(crate::i18n::Lang::Zh).contains("补救"));
+        assert!(all[3].headline(crate::i18n::Lang::Zh).contains("补救"));
+        assert!(all[4].headline(crate::i18n::Lang::Zh).contains("补救"));
+        assert!(!all[1].headline(crate::i18n::Lang::Zh).contains("补救"));
+        assert!(!all[2].headline(crate::i18n::Lang::Zh).contains("补救"));
     }
 }

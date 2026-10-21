@@ -52,7 +52,7 @@ public struct AppPreferencesStore: Sendable {
     /// ⚠️ 失败**抛**而不是吞：一次"以为存上了"的静默失败，用户要等到**下一次启动**
     ///    才会发现（设置又变回去了）—— 而那时已经无从归因。所以调用方
     ///    （`AppModel.changeDownloadDir`）必须有机会**中止**并说一句。
-    public func save(_ preferences: AppPreferences) throws {
-        try files.write(try preferences.serialized(), to: url)
+    public func save(_ preferences: AppPreferences, lang: Lang = .zh) throws {
+        try files.write(try preferences.serialized(), to: url, lang: lang)
     }
 }

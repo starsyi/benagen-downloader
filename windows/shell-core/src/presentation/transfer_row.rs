@@ -98,7 +98,9 @@ impl TransferRow {
     ///
     /// 这一句是**壳自己写的**（同 `AppModel.busyReason` 的性质）：内核发的是一个 `null`，
     /// 没有可登的原文，而把 `null` 呈现成空白或字面量 "nil" 都是约束 4 说的静默失效。
-    pub const UNKNOWN_PATH: &'static str = "（未知路径）";
+    pub fn unknown_path(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::TransferUnknownPath)
+    }
 
     /// aria2 里"已暂停"的原始状态串（`core/src/engine/status.rs` 的透传值）。
     pub const PAUSED_RAW_STATUS: &'static str = "paused";
@@ -117,7 +119,7 @@ impl TransferRow {
         let is_paused = Self::is_paused(item);
         Self {
             gid: item.gid.clone(),
-            title: path.unwrap_or(Self::UNKNOWN_PATH).to_string(),
+            title: path.unwrap_or(Self::unknown_path(lang)).to_string(),
             manifest_path: path.map(str::to_string),
             progress_text: format!(
                 "{} / {}",
@@ -501,7 +503,9 @@ impl EngineGate {
     /// 它是**壳自己写的**（同 `AppModel.busyReason` / `DirLoadFailure.notice` 的性质）：
     /// 它描述的是**壳侧动作**（"去点那一处"），内核不知道也没有对应的话可说。
     /// 约束 3 管的是"内核说了什么"，不是"壳对自己的元素怎么指路"。
-    pub const UNAVAILABLE_HELP: &'static str = "引擎不可用，请先点顶部的「重试」";
+    pub fn unavailable_help(lang: crate::i18n::Lang) -> &'static str {
+        crate::i18n::t(lang, crate::i18n::Key::EngineUnavailableHelp)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,7 +1549,7 @@ mod tests {
         )));
         // 提示语是壳写的**动作说明**（同 `DirLoadFailure.notice` 的性质），不是内核原文。
         assert!(
-            EngineGate::UNAVAILABLE_HELP.contains("重试"),
+            EngineGate::unavailable_help(crate::i18n::Lang::Zh).contains("重试"),
             "提示必须指向那处真的存在的动作"
         );
     }

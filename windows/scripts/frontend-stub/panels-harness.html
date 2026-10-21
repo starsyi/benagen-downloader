@@ -382,6 +382,45 @@ async function runAll() {
     JSON.stringify(firstEnqueue && firstEnqueue.args));
 
   // =========================================================================
+  // ①½ 屏幕骨架的静态文案：**逐字来自 `state.copy`**（任务：i18n 双语化）
+  // =========================================================================
+  // ⚠️ 这一组判的是"文案的家在 Rust"：`index.html` 里只剩 `data-copy` 标记，
+  //    文字由 `dom.js:applyCopy` 从载荷填。判别力：把 `applyCopy` 改坏 ⇒ ①e/①f 红；
+  //    把某条中文抄回 HTML ⇒ `check_frontend_copy.sh` 红（§3.2 的白名单已清零）。
+  {
+    const COPY = FIX.stateLoaded.data.copy;
+    check("①e 侧栏三项文案逐字来自 `state.copy`",
+      txt("#nav-files .nav-label") === COPY.UiNavFiles
+        && txt("#nav-transfers .nav-label") === COPY.UiNavTransfers
+        && txt("#nav-verify .nav-label") === COPY.UiNavVerify,
+      JSON.stringify([
+        txt("#nav-files .nav-label"),
+        txt("#nav-transfers .nav-label"),
+        txt("#nav-verify .nav-label"),
+      ]));
+    check("①f 属性类文案（aria-label / title / placeholder）也来自载荷",
+      q("#update-bar-dismiss").getAttribute("aria-label") === COPY.UiDismiss
+        && doc().querySelector("#tpl-screen-empty").content.querySelector("#empty-code").placeholder === COPY.UiCodeLabel
+        && doc().querySelector("#tpl-screen-files").content.querySelector('[data-copy-title="UiReloadFolder"]').getAttribute("title") === COPY.UiReloadFolder,
+      JSON.stringify({
+        dismiss: q("#update-bar-dismiss").getAttribute("aria-label"),
+        placeholder: doc().querySelector("#tpl-screen-empty").content.querySelector("#empty-code").placeholder,
+      }));
+    check("①g `<html lang>` 跟着载荷里的界面语言走", doc().documentElement.lang === "zh-CN", doc().documentElement.lang);
+    // 🔴 **负控制**：把载荷里那一格改成一个哨兵串 ⇒ 下一拍必须**跟着变**。
+    //    没有这一条，"文案恰好等于 HTML 里写死的那份"也能全绿（那是 R-5 的形状）。
+    const original = statePayload.data.copy.UiNavFiles;
+    statePayload.data.copy.UiNavFiles = "哨兵-文案-来自载荷";
+    await sleep(1300);
+    check("①h 负控制：改载荷那一格 ⇒ 下一拍界面跟着变（不是写死在 HTML 里）",
+      txt("#nav-files .nav-label") === "哨兵-文案-来自载荷",
+      txt("#nav-files .nav-label"));
+    statePayload.data.copy.UiNavFiles = original;
+    await sleep(1300);
+    check("①i 还原之后回到载荷里的那一句", txt("#nav-files .nav-label") === original, txt("#nav-files .nav-label"));
+  }
+
+  // =========================================================================
   // ② 换码面板
   // =========================================================================
   click(q("#tb-code"));

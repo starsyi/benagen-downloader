@@ -279,6 +279,16 @@ pub struct HelloParams {
     /// 就按系统 locale 解析（老壳、测试、以及 CLI 不传时都是这条路）。
     #[serde(default)]
     pub language: Option<String>,
+    /// 壳提供的**操作系统界面语言**（`"zh-Hans-CN"` / `"en-US"` …）。
+    ///
+    /// 🔴 为什么需要它：内核自己的 [`crate::i18n::system_locale`] 只读 `LC_ALL/LC_MESSAGES/LANG`
+    ///    —— 而**图形壳里这三个环境变量通常是空的**（Windows 基本没有，macOS 的 GUI 应用
+    ///    也拿不到登录 shell 的 `LANG`）。只靠环境变量，"跟随系统语言"在中文系统上会
+    ///    解析成英文（空串按英文兜底）。壳最清楚系统语言，所以由壳交回来。
+    ///
+    /// 可选：老壳不传 ⇒ 退回环境变量（CLI 与测试走的就是这条路）。
+    #[serde(default)]
+    pub system_locale: Option<String>,
 }
 
 /// `hello` 的结果。
@@ -345,6 +355,16 @@ pub fn hello(params: &Value) -> Result<HelloResult, ErrorBody> {
 ///
 /// 认 `"zh"`/`"en"`/`"system"` 与 `zh-CN` 这类写法，**不认识就当没传**
 /// （规格 §2.1：语言不值得让握手失败——真失败了客户连界面都看不到）。
+/// 壳交回来的系统界面语言（`hello.params.system_locale`）。缺 / 空 / 非字符串 ⇒ `None`。
+pub fn requested_system_locale(params: &Value) -> Option<String> {
+    params
+        .get("system_locale")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 pub fn requested_lang(params: &Value) -> Option<crate::i18n::Lang> {
     params
         .get("language")

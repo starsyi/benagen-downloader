@@ -128,7 +128,8 @@ public final class AppModel: ObservableObject {
     /// 「暂停全部 / 一键开始」两颗按钮的状态（判据在 `BatchControl.of`，视图只读）。
     public var batchControl: BatchControl {
         BatchControl.of(rows: (transfers?.items ?? []).map(TransferRow.init),
-                        resumePending: resumePending, migrate: migrate, migrateFailure: migrateFailure)
+                        resumePending: resumePending, migrate: migrate, migrateFailure: migrateFailure,
+                        lang: language)
     }
     /// `verify_status` 的快照。
     ///
@@ -257,7 +258,18 @@ public final class AppModel: ObservableObject {
     /// ⚠️ 壳**不自己看系统 locale**：语言只由内核解析一次（`hello` 回执的 `language`），
     ///    壳抄一份到这一格、全壳的壳侧文案都查它。两端各算一次就会出现"内核说英文、
     ///    壳说中文"的半句话。握手还没成 / 内核没回这一格 ⇒ 中文（0.2.x 的既有界面）。
-    @Published public private(set) var language: Lang = .zh
+    @Published public private(set) var language: Lang = .zh {
+        didSet {
+            // 壳自己写的诊断（通道 / 协议 / 偏好写盘）在**生成那一刻**按这一格取句，
+            // 所以客户一改语言，客户端实例也得跟着改；改不了的（测试替身）就跳过。
+            (client as? CoreClient)?.lang = language
+        }
+    }
+    /// 「客户有没有明确选过界面语言」（`hello` 回执的 `language_chosen`）。
+    ///
+    /// ⚠️ 默认 **true**：握手还没成之前不许弹首启窗（否则每次启动都会闪一下）。
+    ///    握手成功后由 `bindHandshake` 落成真值；旧内核缺这一格 ⇒ `false` ⇒ 弹一次。
+    @Published public private(set) var languageChosen = true
     /// 八类错误卡的当前上屏内容（`error_recent` 的**已合并**快照 → 壳的句子）。
     ///
     /// ⚠️ 它的顺序就是上屏顺序（严重度降序、同类合并、最多 3 张）—— 判据在
@@ -550,7 +562,7 @@ public final class AppModel: ObservableObject {
     private func call(_ method: String, _ params: JSONValue,
                       clearsLastError: Bool = true) async throws -> JSONValue {
         guard let client else {
-            throw CoreError.transport("内核没有起来（\(engineReason)）")
+            throw CoreError.transport(language.tf(.coreNotStarted, ["reason": engineReason]))
         }
         do {
             let value = try await client.callAsync(method, params)
@@ -665,6 +677,7 @@ public final class AppModel: ObservableObject {
             // 壳照抄。⚠️ 放在成功分支里——一次失败的握手不该把界面语言改掉
             // （旧内核 / 超时时维持上一轮 / 默认中文）。
             language = Lang.fromHello(handshake.language)
+            languageChosen = handshake.languageChosen
             // 内核只在 `enqueue` 里起引擎（`op_enqueue` 的 `ensure_engine`），而这个内核进程
             // 是壳刚起的 —— 所以握手完成后「引擎未启动」是**事实**，不是猜测。
             engine = .notStarted
@@ -728,19 +741,37 @@ public final class AppModel: ObservableObject {
         let protocolVersion: UInt32
         /// 内核**落定**的界面语言（`hello` 回执的 `language`；旧内核没有 ⇒ `nil`）。
         let language: String?
+        /// 「客户选过没有」（`hello` 回执的 `language_chosen`；旧内核缺格 ⇒ `false`）。
+        let languageChosen: Bool
+    }
+
+    /// 系统界面语言（`zh-Hans-CN` / `en-US` …）。
+    ///
+    /// 🔴 为什么要交给内核：内核只读 `LC_ALL/LC_MESSAGES/LANG`，而**图形应用里那些变量
+    ///    通常是空的**（不继承登录 shell 的环境），空串会按英文兜底 —— 中文 macOS 上
+    ///    首启就成了英文界面。`Locale.preferredLanguages` 才是系统「首选语言」的正解。
+    static var systemLocale: String {
+        Locale.preferredLanguages.first ?? ""
+    }
+
+    /// `hello` 的入参（两处调用共用一份，免得一处改了另一处忘）。
+    static var helloParams: JSONValue {
+        .object([
+            "protocol": .integer(Int64(kProtocolVersion)),
+            "system_locale": .string(systemLocale),
+        ])
     }
 
     /// 真正发请求的那一段。**在后台的竞速任务里跑**，所以它是 `@Sendable` 的调用目标。
     private func performHandshake() async throws -> Handshake {
-        let hello = try await call("hello",
-                                   .object(["protocol": .integer(Int64(kProtocolVersion))]))
-            .decoded(HelloResult.self)
-        let current = try await call("get_settings", .null).decoded(SettingsResult.self)
+        let hello = try await call("hello", Self.helloParams).decoded(HelloResult.self, lang: language)
+        let current = try await call("get_settings", .null).decoded(SettingsResult.self, lang: language)
         return Handshake(choices: hello.minSplitSizeChoices,
                          settings: current.settings,
                          lastCode: current.lastCode,
                          protocolVersion: hello.protocolVersion,
-                         language: hello.language)
+                         language: hello.language,
+                         languageChosen: hello.languageChosen)
     }
 
     /// 有界等待：把 `operation` 与一个计时器赛跑，**谁先完成用谁**。
@@ -833,7 +864,7 @@ public final class AppModel: ObservableObject {
         // ⚠️ 这条早退**不写 `lastSwitchOutcome`**：那条通道归**正在飞的那一次**所有，
         //    由它结束时落定。在这里写会被它随即覆盖，只会留下一次无意义的闪动。
         guard !switching else {
-            return .failed(message: "上一次换码还在进行中，请等它结束。")
+            return .failed(message: language.t(.switchBusy))
         }
         // 同 `loadDelivery`：这是用户的显式动作 = 新一轮，复位自动重启预算。
         restartAttempted = false
@@ -849,7 +880,7 @@ public final class AppModel: ObservableObject {
             let info = try await performLoadDelivery(code: code, baseURL: baseURL, mode: .switching)
             outcome = .switched(code: info.code)
         } catch let e as CoreError {
-            outcome = .failed(message: Self.message(of: e))
+            outcome = .failed(message: Self.message(of: e, lang: language))
         } catch {
             outcome = .failed(message: "\(error)")
         }
@@ -999,10 +1030,10 @@ public final class AppModel: ObservableObject {
         history = updated
         guard let historyStore else { return }
         do {
-            try historyStore.save(updated)
+            try historyStore.save(updated, lang: language)
             historyWriteFailure = nil
         } catch {
-            historyWriteFailure = "历史记录写入失败：\(error)"
+            historyWriteFailure = language.tf(.historyWriteFailed, ["reason": "\(error)"])
         }
     }
 
@@ -1071,8 +1102,8 @@ public final class AppModel: ObservableObject {
             // 🔴 这句话是**壳自己写的**（约束 3 的例外，理由写明）：内核**还不知道**
             //    这件事（我们还没动它），没有原文可登 —— 而写盘失败必须有落点，
             //    否则就是一次"以为存上了"的静默失败（E-2 的注释里那句）。
-            saveFailure: { "下载目录没有改成（偏好写入失败：\($0)）" },
-            restartBlocked: "内核还在重启中，这一次没有改成。下载目录已经记下来了，下次启动会按它生效。",
+            saveFailure: { language.tf(.downloadDirSaveFailed, ["reason": "\($0)"]) },
+            restartBlocked: language.t(.downloadDirRestartBlocked),
             apply: { updated in
                 downloadDir = updated.downloadDir
                 // ⚠️ **校验快照跟着作废**（同 `performLoadDelivery` 里那条"换批即作废"的纪律，
@@ -1106,7 +1137,7 @@ public final class AppModel: ObservableObject {
         // 报出「内核还在重启中，这一次没有改成」，所以这一次不会静默换目录。
         guard client != nil, !restarting else { return nil }
         try? await taskAction(.pauseAll, gid: nil)
-        return try? await call("get_download_dir", .null).decoded(DownloadDirResult.self).dir
+        return try? await call("get_download_dir", .null).decoded(DownloadDirResult.self, lang: language).dir
     }
 
     /// 换完目录之后：置 `resumePending`，并（有旧目录、有批次时）让新内核把旧文件搬过来，
@@ -1137,18 +1168,19 @@ public final class AppModel: ObservableObject {
                     await self.absorb(coreError)
                 }
                 self.migrate = nil
-                self.migrateFailure = BatchControl.migrateStartFailedNote(reason: Self.message(of: error))
+                self.migrateFailure = BatchControl.migrateStartFailedNote(
+                    reason: Self.message(of: error, lang: language), lang: language)
                 return
             }
             var failures = 0
             while true {
                 do {
-                    let status = try await self.call("migrate_status", .null).decoded(MigrateStatus.self)
+                    let status = try await self.call("migrate_status", .null).decoded(MigrateStatus.self, lang: language)
                     failures = 0
                     // 启动时已同步置 `running`：轮询到「既不在跑也没完成」⇒ 任务已随内核丢失（内核重启过）。
                     guard status.running || status.finished else {
                         self.migrate = nil
-                        self.migrateFailure = BatchControl.migrateProgressLostNote
+                        self.migrateFailure = BatchControl.migrateProgressLostNote(lang: language)
                         return
                     }
                     self.migrate = status
@@ -1170,7 +1202,7 @@ public final class AppModel: ObservableObject {
                     failures += 1
                     if failures >= Self.migrateGiveUpAfterFailures {
                         self.migrate = nil
-                        self.migrateFailure = BatchControl.migrateProgressLostNote
+                        self.migrateFailure = BatchControl.migrateProgressLostNote(lang: language)
                         return
                     }
                 }
@@ -1222,12 +1254,11 @@ public final class AppModel: ObservableObject {
         let result = await performPreferenceChange(
             to: updated,
             unchanged: updated.verboseLogging == verboseLogging,
-            saveFailure: { "详细日志没有改成（偏好写入失败：\($0)）" },
+            saveFailure: { language.tf(.verboseLoggingSaveFailed, ["reason": "\($0)"]) },
             // ⚠️ 与 Windows 那份（`api::preferences::verbose_restart_timed_out`）**逐字同源**：
             //    内核那半句与"下次启动会按它生效"那半句**与改的是哪一格无关**，两处必须一样；
             //    只有点名哪一格的那半句不同（那是 Windows 那一侧的同一条判据钉住的）。
-            restartBlocked: "内核还在重启中，这一次没有改成。详细日志开关已经记下来了，"
-                + "下次启动会按它生效。",
+            restartBlocked: language.t(.verboseLoggingRestartBlocked),
             apply: { updated in
                 verboseLogging = updated.verboseLogging
                 // 🔴 **两处 `configure` 调用点之二：开关被改时**（另一处在 `live()`，
@@ -1281,7 +1312,7 @@ public final class AppModel: ObservableObject {
 
         if let preferencesStore {
             do {
-                try preferencesStore.save(updated)
+                try preferencesStore.save(updated, lang: language)
             } catch {
                 return .failed(saveFailure(error))
             }
@@ -1391,9 +1422,9 @@ public final class AppModel: ObservableObject {
         // ⚠️ 位置：必须在 `loadState = .loading` / `busyReason` **之前** ——
         //    否则会留下一个"没有任何请求在飞的转圈"（同 `enqueue` 那条守卫的纪律）。
         if DeliveryCodeEntry.tooLong(code) {
-            let why = "交付码长 \(code.utf8.count) 字节，已超过安全上限（\(DeliveryCodeEntry.maximumText)）。"
-                + "超限的请求内核不会回话、也不会报错，只会一直等下去——"
-                + "请只粘贴交付码本身或交付页链接。"
+            let why = language.tf(.deliveryCodeTooLongReason,
+                                  ["bytes": String(code.utf8.count),
+                                   "limit": DeliveryCodeEntry.maximumText])
             if mode == .initial { loadState = .failed(why) }
             throw CoreError.transport(why)
         }
@@ -1407,9 +1438,9 @@ public final class AppModel: ObservableObject {
         //    内核用自己的默认交付服务器）。所以判据要先排掉空串，否则
         //    `isEmpty` 的语义会在两个地方各判一次、迟早分叉。
         if let baseURL, !baseURL.isEmpty, DeliveryCodeEntry.tooLong(baseURL) {
-            let why = "自定义下载地址长 \(baseURL.utf8.count) 字节，已超过安全上限"
-                + "（\(DeliveryCodeEntry.maximumText)）。超限的请求内核不会回话、也不会报错，"
-                + "只会一直等下去——请确认粘贴的内容确实是交付页的地址。"
+            let why = language.tf(.deliveryBaseURLTooLongReason,
+                                  ["bytes": String(baseURL.utf8.count),
+                                   "limit": DeliveryCodeEntry.maximumText])
             if mode == .initial { loadState = .failed(why) }
             throw CoreError.transport(why)
         }
@@ -1418,7 +1449,7 @@ public final class AppModel: ObservableObject {
         //    本任务要修的观感，转圈期间用户手上的清单会消失）。`busyReason` 两种模式都设 ——
         //    它是"正在做事"的指示（工具栏/侧边栏据此显示进行中），与"哪个批次在屏上"无关。
         if mode == .initial { loadState = .loading }
-        busyReason = "正在加载交付清单…"
+        busyReason = language.t(.busyLoadingDelivery)
         defer { busyReason = nil }
 
         // 🔴 **在这个码被发出去之前**就告诉这条连接该抹什么（规格 §2.3 B）。
@@ -1430,7 +1461,7 @@ public final class AppModel: ObservableObject {
         if let baseURL, !baseURL.isEmpty { params["base_url"] = .string(baseURL) }
 
         do {
-            let info = try await call("load_delivery", .object(params)).decoded(DeliveryInfo.self)
+            let info = try await call("load_delivery", .object(params)).decoded(DeliveryInfo.self, lang: language)
             // ⚠️ **换批即作废**：`verify` 是**按批次**的快照，而 `VerifyStatus` 自己没有交付码
             //    字段（协议里就没有），所以"这份结果属于哪一批"只能由壳记着 —— 记法就是
             //    `loadedCode`。不消掉它的后果是**一个没有任何提示的错数**：
@@ -1544,7 +1575,7 @@ public final class AppModel: ObservableObject {
                 // `.switching` 时 `mode == .initial` 为假 ⇒ 连这条兜底都不进：
                 // 它自己的 `loadState` 从来没被置成 `.loading`（见 ②），没什么可兜的。
                 if mode == .initial, case .loading = loadState {
-                    loadState = .failed(Self.message(of: e))
+                    loadState = .failed(Self.message(of: e, lang: language))
                 }
             }
             throw e
@@ -1617,7 +1648,7 @@ public final class AppModel: ObservableObject {
     public func getTree() async throws -> TreeResult {
         try requireUsableEngine()
         let fresh = try await absorbing {
-            try await call("get_tree", .null).decoded(TreeResult.self)
+            try await call("get_tree", .null).decoded(TreeResult.self, lang: language)
         }
         tree = fresh
         treeCode = loadedCode
@@ -1634,7 +1665,7 @@ public final class AppModel: ObservableObject {
     public func listDir(_ path: String) async throws -> ListDirResult {
         try requireUsableEngine()
         return try await absorbing {
-            try await call("list_dir", .object(["path": .string(path)])).decoded(ListDirResult.self)
+            try await call("list_dir", .object(["path": .string(path)])).decoded(ListDirResult.self, lang: language)
         }
     }
 
@@ -1677,7 +1708,7 @@ public final class AppModel: ObservableObject {
         defer { pollInFlight = false }
 
         let fresh = await surfacing {
-            try await call("transfer_list", .null).decoded(TransferListResult.self)
+            try await call("transfer_list", .null).decoded(TransferListResult.self, lang: language)
         }
         guard let fresh else { return }        // 失败：保持上一帧快照，不报错（约束 15）
         transfers = fresh
@@ -1720,7 +1751,7 @@ public final class AppModel: ObservableObject {
     ///    而本功能的契约是"取不到时界面什么都不说"（§5）。失败时保持上一帧快照。
     public func refreshUpdateStatus() async {
         do {
-            updateStatus = try await call("update_status", .null).decoded(UpdateStatus.self)
+            updateStatus = try await call("update_status", .null).decoded(UpdateStatus.self, lang: language)
         } catch {
             // 静默：`updateStatus` 原样留着（"数据停在上一次成功的快照上"，与轮询同一条）。
         }
@@ -1776,7 +1807,7 @@ public final class AppModel: ObservableObject {
         do {
             let progress = try await call("restart_progress", .null,
                                           clearsLastError: false)
-                .decoded(RestartProgressResult.self)
+                .decoded(RestartProgressResult.self, lang: language)
             restartNotice = RestartNotice.of(state: progress.state,
                                              attempt: progress.attempt,
                                              budget: progress.budget,
@@ -1795,7 +1826,7 @@ public final class AppModel: ObservableObject {
         do {
             let recent = try await call("error_recent", .null,
                                         clearsLastError: false)
-                .decoded(ErrorRecentResult.self)
+                .decoded(ErrorRecentResult.self, lang: language)
             let observations = recent.entries.compactMap { entry -> ErrorObservation? in
                 guard let kind = ErrorClass.ofWire(entry.errorClass) else { return nil }
                 return ErrorObservation(errorClass: kind, count: entry.count)
@@ -1811,7 +1842,7 @@ public final class AppModel: ObservableObject {
         do {
             let progress = try await call("delivery_progress", .null,
                                           clearsLastError: false)
-                .decoded(DeliveryProgressResult.self)
+                .decoded(DeliveryProgressResult.self, lang: language)
             deliveryProgressLines = progress.lines
         } catch {
             deliveryProgressLines = []
@@ -1834,12 +1865,12 @@ public final class AppModel: ObservableObject {
             // 客户发起的动作 ⇒ 走 `absorbing`（transport 失败要像别处一样触发内核崩溃处置）。
             let fresh = try await absorbing {
                 try await call("update_set_enabled", .object(["enabled": .bool(enabled)]))
-                    .decoded(UpdateStatus.self)
+                    .decoded(UpdateStatus.self, lang: language)
             }
             updateStatus = fresh
             return nil
         } catch {
-            return Self.message(of: error)
+            return Self.message(of: error, lang: language)
         }
     }
 
@@ -1868,7 +1899,7 @@ public final class AppModel: ObservableObject {
         do {
             // 客户发起的动作 ⇒ 走 `absorbing`（transport 失败要像别处一样触发内核崩溃处置）。
             let fresh = try await absorbing {
-                try await call("update_check_now", .null).decoded(UpdateStatus.self)
+                try await call("update_check_now", .null).decoded(UpdateStatus.self, lang: language)
             }
             updateStatus = fresh
             updateCheckReceipt = UpdateCheckReceipt.of(fresh)
@@ -1878,7 +1909,7 @@ public final class AppModel: ObservableObject {
             //    留着它会与调用方摆出的失败原文并排挂着，读起来像"刚才那一次的结论仍然成立"
             //    —— 而它说的是**上一次**（可能几天前）那一份，两句话并排就是一次误导。
             updateCheckReceipt = nil
-            return Self.message(of: error)
+            return Self.message(of: error, lang: language)
         }
     }
 
@@ -1936,7 +1967,7 @@ public final class AppModel: ObservableObject {
     ///    钉住它的是 `anOversizedEnqueueNeverReachesTheKernel` 里的 `factory.madeCount == 0`。
     public func enqueue(paths: [String]) async throws -> EnqueueResult {
         try requireUsableEngine()
-        busyReason = "正在添加下载任务…"
+        busyReason = language.t(.busyAddingTasks)
         defer { busyReason = nil }
         // 大批量不再被拒（2026-10-12）：超出单条请求预算的路径串切成若干块**依次**发给内核；
         // 内核对每块只同步提交前 100 个、其余后台陆续加入（`pending`），所以每块都很快返回。
@@ -1945,7 +1976,7 @@ public final class AppModel: ObservableObject {
         //   · 单条就超预算的路径不进任何一块，同样作为 rejected 交代（发出去内核也只会不回话）。
         // 整批全选的 `paths` 为空：发一条空的（= 全部待下载），见 `DownloadTargets.paths(for:allPaths:)`。
         let chunks = paths.isEmpty ? [[]] : DownloadTargets.chunks(paths)
-        let oversizedWhy = "这一项路径太长，超过单次请求上限，没有发送"
+        let oversizedWhy = language.t(.enqueuePathTooLong)
         var merged = EnqueueResult(
             added: [],
             rejected: DownloadTargets.oversized(in: paths).map { RejectedTask(path: $0, reason: oversizedWhy) },
@@ -1956,7 +1987,7 @@ public final class AppModel: ObservableObject {
             do {
                 let r = try await absorbing {
                     try await call("enqueue", .object(["paths": .array(chunk.map { .string($0) })]))
-                        .decoded(EnqueueResult.self)
+                        .decoded(EnqueueResult.self, lang: language)
                 }
                 merged = EnqueueResult(added: merged.added + r.added,
                                        rejected: merged.rejected + r.rejected,
@@ -1965,7 +1996,8 @@ public final class AppModel: ObservableObject {
             } catch {
                 if first { throw error }
                 allSent = false
-                let why = "未提交：\(AppModel.message(of: error))"
+                let why = language.tf(.enqueueNotSubmitted,
+                                      ["reason": AppModel.message(of: error, lang: language)])
                 let rest = chunks[i...].flatMap { $0 }
                 merged = EnqueueResult(added: merged.added,
                                        rejected: merged.rejected + rest.map { RejectedTask(path: $0, reason: why) },
@@ -2044,11 +2076,26 @@ public final class AppModel: ObservableObject {
             let data = try CoreJSON.requestEncoder.encode(s)
             let payload = try CoreJSON.decoder.decode(JSONValue.self, from: data)
             return try await call("set_settings", .object(["settings": payload]))
-                .decoded(SettingsResult.self)
+                .decoded(SettingsResult.self, lang: language)
         }
         // 落状态的是**内核回执**那一份（`-k` 会被内核归一成规范串）。
         settings = echoed.settings
         lastCode = echoed.lastCode
+        // 语言立刻生效：回执里是**原始值**（可能是 `system`），而界面要的是解析后的
+        // `zh`/`en` —— 问一次 `hello`（内核每次都按设置重新解析并回填 `k.language`），
+        // 这样"设置里点 English"与"首启窗点 English"走的是同一条路。
+        await refreshLanguage()
+    }
+
+    /// 只读地问一次 `hello`，把内核解析后的语言与"选过没有"落到本对象。
+    ///
+    /// ⚠️ 失败**静默**（只读装饰，不是动作）：下一次握手会再来一次。
+    private func refreshLanguage() async {
+        guard let reply = try? await absorbing({ () -> HelloResult in
+            try await call("hello", Self.helloParams).decoded(HelloResult.self, lang: language)
+        }) else { return }
+        language = Lang.fromHello(reply.language)
+        languageChosen = reply.languageChosen
     }
 
     // MARK: - 校验
@@ -2076,7 +2123,7 @@ public final class AppModel: ObservableObject {
     public func refreshVerify() async {
         if case .unavailable = engine { return }
         // 失败时保留上一份结果（与传输列表同一条：数据停在上一次成功的快照上）。
-        if let fresh = await surfacing({ try await call("verify_status", .null).decoded(VerifyStatus.self) }) {
+        if let fresh = await surfacing({ try await call("verify_status", .null).decoded(VerifyStatus.self, lang: language) }) {
             verify = fresh
         }
     }
@@ -2097,7 +2144,7 @@ public final class AppModel: ObservableObject {
     ///      但**不自动恢复传输列表**（规格 §8.3：断点续传恒开，用户重新点下载即可接着传）；
     ///   ③ 重启失败（或本次已是重启后的失败）不再重试，置 `.unavailable` 等用户动作。
     private func onKernelDeath(_ reason: String) async {
-        engine = .unavailable("下载引擎已断开：\(reason)")
+        engine = .unavailable(language.tf(.engineDisconnected, ["reason": reason]))
         await restartIfAllowed()
     }
 
@@ -2133,7 +2180,7 @@ public final class AppModel: ObservableObject {
     private func restartKernel() async -> Bool {
         guard !restarting else { return false }
         restarting = true
-        busyReason = "下载引擎已断开，正在重启…"
+        busyReason = language.t(.engineRestartingBusy)
         defer { restarting = false; busyReason = nil }
 
         // ⚠️ **先收尾旧的客户端，再新建**（任务 4b）——顺序不能反，也不能省：
@@ -2158,6 +2205,8 @@ public final class AppModel: ObservableObject {
 
         do {
             client = try await spawnClient()
+            // 新客户端一开始只知道中文；语言已经落定过的话，这里补上（与 didSet 同一个理由）。
+            (client as? CoreClient)?.lang = language
             // 🔴 **新连接 = 空的可抹清单**（`setRedactions` 挂在连接上，不是进程全局）
             //    ⇒ 这里必须**立刻**重推一遍，否则"改了下载目录 ⇒ 重启内核"之后，
             //    新连接上再没有东西挡着客户目录名了（见 `rememberRedactions` 的文档）。
@@ -2188,7 +2237,7 @@ public final class AppModel: ObservableObject {
                 //    并把这份脆弱性复制到两个地方。
                 engine = why == Self.handshakeTimeoutMessage
                     ? .unavailable(why)
-                    : .unavailable("内核重启失败：\(why)")
+                    : .unavailable(language.tf(.kernelRestartFailed, ["reason": why]))
                 // 这一次重启**跑了**（旧内核被收尾、新进程被起过）—— 只是它没能说话。
                 return true
             }
@@ -2196,7 +2245,8 @@ public final class AppModel: ObservableObject {
             // `.initial`：失败写 `loadState`（与改动前逐字相同），抛出来的那份在这里丢掉。
             _ = try? await performLoadDelivery(code: code, baseURL: loadedBaseURL)
         } catch {
-            engine = .unavailable("内核重启失败：\(Self.message(of: error))")
+            engine = .unavailable(language.tf(.engineRestartFailed,
+                                              ["reason": Self.message(of: error, lang: language)]))
         }
         return true
     }
@@ -2275,7 +2325,7 @@ public final class AppModel: ObservableObject {
             // 超时 ≠ 内核死亡：内核可能只是慢/卡住，进程还活着。
             // 不走 `onKernelDeath`（自动重启）——那会杀掉一个可能健康的内核。
             // 通道若已判死，下一次调用会以 transport（内核没了那类）失败并触发重启。
-            return .verbatim("内核响应超时")
+            return .verbatim(language.t(.coreResponseTimedOut))
         case .malformedResponse(let why):
             // 内核还在，但它发来的东西不是一条合法响应 —— 这是壳/内核之间的契约问题，
             // 不是引擎状态，原文照样得让人看见。
@@ -2300,7 +2350,7 @@ public final class AppModel: ObservableObject {
                 // 内核那句"内核是 1，请求方是 2"客户看不懂，
                 // 而这句是客户唯一能照着做点什么的话。**不重试** —— 重启不会让版本变对
                 // （自动重启只由 transport 触发，这一条天然不会被重试）。
-                engine = .unavailable("客户端与内核版本不匹配，请更新客户端或内核后重试（内核：\(message)）")
+                engine = .unavailable(language.tf(.protocolMismatchNote, ["kernel": message]))
                 return .absorbed
             case .noDelivery?:
                 resetToEmptyState()      // 批次已经作废/还没加载 → 回空态
@@ -2340,9 +2390,9 @@ public final class AppModel: ObservableObject {
     /// `EngineState` → 一句人话（"内核没有起来"那条 transport 错误用它）。
     private var engineReason: String {
         switch engine {
-        case .unknown: return "内核还没有握手"
-        case .notStarted: return "下载引擎尚未启动"
-        case .running: return "内核正在运行"
+        case .unknown: return language.t(.engineReasonNoHandshake)
+        case .notStarted: return language.t(.engineReasonNotStarted)
+        case .running: return language.t(.engineReasonRunning)
         case .unavailable(let why): return why
         }
     }
@@ -2354,11 +2404,16 @@ public final class AppModel: ObservableObject {
     ///    无隔离的纯函数（`DirLoadFailure.of` 就用它）。理由与 `defaultHandshakeTimeout`
     ///    相同：把隔离去掉不会让任何可变状态暴露出去，而留着它只会逼出一个副本。
     nonisolated static func message(of error: Error) -> String {
+        message(of: error, lang: .zh)
+    }
+
+    /// 同一句话的**当前语言**版本。内核原文照登（约束 3），只有壳自己写的那一格取表。
+    nonisolated static func message(of error: Error, lang: Lang) -> String {
         guard let e = error as? CoreError else { return "\(error)" }
         switch e {
         case .transport(let m), .malformedResponse(let m): return m
         case .rpc(_, let m): return m
-        case .timedOut: return "内核响应超时"
+        case .timedOut: return lang.t(.coreResponseTimedOut)
         }
     }
 }

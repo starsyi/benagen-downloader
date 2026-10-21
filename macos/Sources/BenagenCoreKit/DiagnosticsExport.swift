@@ -186,9 +186,9 @@ public enum DiagnosticsExport {
     ///    "内核说的"变成了"我们以为的"）。判据：`theProtocolVersionIsTheKernelsNotOurs`。
     public static func header(appVersion: String, coreBinary: URL?, protocolVersion: Int?,
                               verboseLogging: Bool, os: String, arch: String,
-                              at: Date) -> Header {
+                              at: Date, lang: Lang = .zh) -> Header {
         Header(appVersion: appVersion,
-               coreSha256: coreSha256(ofBinaryAt: coreBinary),
+               coreSha256: coreSha256(ofBinaryAt: coreBinary, lang: lang),
                protocolVersion: protocolVersion,
                // 取值与内核的 `--log-level` **逐字同两个**（`diagnostics::parse_level` 认的就是
                // 这两个串）—— 看日志的人靠这一格判断"这份日志为什么只有这么几行"。
@@ -204,42 +204,30 @@ public enum DiagnosticsExport {
     /// 三段（规格 §2.6 / §2.7）：**风险**（在第一屏）、**有什么**（字段表）、**没有什么**
     /// ——最后那段说的是"这份导出**不**做什么"（不打包、不加锁、不过滤），
     /// 它们各自都是一种**显式的接受**，写在纸上比默认发生强。
-    public static func headerText(_ header: Header) -> String {
+    /// 那份 `说明.txt` 的全文（**纯函数**：同样的 [`Header`] + 同样的 [`Lang`] ⇒ 同样的文本）。
+    ///
+    /// 三段（规格 §2.6 / §2.7）：**风险**（在第一屏）、**有什么**（字段表）、**没有什么**
+    /// ——最后那段说的是"这份导出**不**做什么"（不打包、不加锁、不过滤），
+    /// 它们各自都是一种**显式的接受**，写在纸上比默认发生强。
+    ///
+    /// ⚠️ **字段名保持稳定英文**（`app_version` / `core_sha256` / `protocol_version` /
+    ///    `log_level` / `os` / `arch` / `exported_at`）：它们是排查时被 grep 的键，
+    ///    与 Windows 那一侧的导出说明同形 —— **不随界面语言变**。
+    ///    翻译的是给人读的标题、说明句与那一格的值（见 `I18n.swift` 的 `diag*`）。
+    public static func headerText(_ header: Header, lang: Lang = .zh) -> String {
         // ⚠️ **这是一份给人看的纯文本**（他在文本编辑里打开它）⇒ 正文里**不用**
         //    Markdown 的强调记号（`**` 在那里只是噪音）。分节与缩进是它唯一的排版。
         var out = ""
-        out += "诊断日志导出说明\n"
+        out += lang.t(.diagHeaderTitle) + "\n"
         out += "================\n"
-        out += "这份文件是这次导出的清单：它说的不是「日志里有什么内容」，\n"
-        out += "而是「这个文件夹里有哪些文件、每一份覆盖了哪一段时间」。\n\n"
+        out += lang.t(.diagHeaderIntro) + "\n\n"
 
         // ---- 第一屏：风险（规格 §2.7 的第 1 处明说）--------------------------------
-        out += "⚠️ 风险先说：这份日志会离开你的机器，里面可能有下载地址片段\n"
-        out += "（下载引擎的原始报错会原样带上它）。我们没有做自动过滤 —— 要可靠地\n"
-        out += "抹掉它，得先能识别它，而我们识别不了任意第三方文案；做一个不可靠的\n"
-        out += "过滤器比不做更糟（它会让人以为已经安全了）。\n"
-        out += "发送之前，你可以自己打开看一眼。\n\n"
-        // ⚠️ **这一段在 2026-10-06 之前是一句绝对句，而它是假的**（终审实测）：交付码与
-        //    客户目录名从**内核原文**（那条 404 的 URL、preflight 那句）进得来。
-        //    ⇒ 现在分两句：**按构造抹掉的**（那两个串，壳自己知道）与**抹不掉的**
-        //    （第三方文案里以别的写法出现的片段）。**与 Windows 那一份逐字相同**
-        //    （规格 §2.6 的契约：文案可以有细微差别，这两句**故意**没有）。
-        // ⚠️⚠️ **"抹不掉的"是两条，不是一条**（修复轮 2 订正，与 Windows 同一条）：
-        //    除了第三方写法那一条，还有**内核自己那条默认下载目录** —— **没配置下载目录**
-        //    （默认状态）时壳推下去的是空串（`redact` 跳过它）、也不传 `--download-dir`，
-        //    内核于是回落到**它自己**的默认路径（`core/src/paths.rs` →
-        //    `C:\Users\<用户名>\Downloads\Benagen` / `~/Downloads/Benagen`）。那个串
-        //    **壳不知道**（本仓的 `kernelDefaultDisplayPath` 明说了它只是显示用的），而它
-        //    出现在内核 `preflight` 的失败文案里时**是逐字落的**（`core/src/main.rs`：
-        //    `目标目录不可写（{dir}）`）⇒ 壳抹不掉它。
-        //    **行为是对的**（猜一条客户机上的路径去抹，比不抹更糟）；错的是把话说满。
-        out += "本来就不记的：交付码本身、文件路径本身、rpc-secret、客户的目录名。\n"
-        out += "（其中交付码与下载目录在写进日志之前会被按字面抹成 [已隐去]；但没配置\n"
-        out += "下载目录时，内核会用它自己的默认路径——那一条壳不知道，抹不掉。抹不\n"
-        out += "掉的还有第三方文案里以别的写法出现的那一份——见上。）\n\n"
+        out += lang.t(.diagHeaderRisk) + "\n\n"
+        out += lang.t(.diagHeaderNotRecorded) + "\n\n"
 
         // ---- 有什么（规格 §2.6 那张表，逐行点名）-----------------------------------
-        out += "这里面有什么\n"
+        out += lang.t(.diagHeaderContents) + "\n"
         out += "------------\n"
         out += "app_version: \(header.appVersion)\n"
         out += "core_sha256: \(header.coreSha256)\n"
@@ -247,7 +235,7 @@ public enum DiagnosticsExport {
             out += "protocol_version: \(version)\n"
         } else {
             // ⚠️ 连不上内核**不是失败**：这一格如实写"未连上"（编一个版本号比不写更坏）。
-            out += "protocol_version: 未连上\n"
+            out += "protocol_version: \(lang.t(.diagProtocolNotConnected))\n"
         }
         out += "log_level: \(header.logLevel)\n"
         out += "os: \(header.os)\n"
@@ -256,52 +244,42 @@ public enum DiagnosticsExport {
         out += "\n"
 
         // ---- 每份文件（名字 / 字节数 / sha256 / 覆盖范围）--------------------------
-        out += "日志文件（每份：名字 / 字节数 / sha256 / 覆盖时间范围）\n"
+        out += lang.t(.diagLogFilesHeading) + "\n"
         out += "----------------------------------------------------\n"
         let present = header.files.map(\.name)
         let absent = allLogNames().filter { !present.contains($0) }
         if header.files.isEmpty {
-            // ⚠️ 括号里那句**指路要指对**（与 Windows 那一份逐字同一条订正）：指的
-            //    是**紧下面那六行**（每一行都写着「尚未产生」）以及上面那两格
-            //    （`log_level` 与 `exported_at`），**不是**"没有什么"那一节
-            //    （那一节讲的是"没有压缩包 / 没有加锁 / 没有过滤"，回答不了"为什么一份都没有"）。
-            out += "没有任何日志文件（下面每一行都写着「尚未产生」）。\n"
+            out += lang.t(.diagNoLogFiles) + "\n"
         }
         for file in header.files {
-            out += "\(file.name)  \(file.bytes) 字节  sha256=\(file.sha256)  覆盖范围: \(coverage(file))\n"
+            out += lang.tf(.diagFileLine, ["name": file.name,
+                                           "bytes": String(file.bytes),
+                                           "sha": file.sha256,
+                                           "coverage": coverage(file, lang: lang)]) + "\n"
         }
         for name in absent {
-            out += "\(name)  尚未产生（这一份日志还没有生成过）\n"
+            out += lang.tf(.diagAbsentLine, ["name": name]) + "\n"
         }
         out += "\n"
 
         // ---- 没有什么 --------------------------------------------------------------
-        out += "没有什么（都是显式的选择，不是漏做）\n"
+        out += lang.t(.diagNotDoingHeading) + "\n"
         out += "--------------------------------------\n"
-        out += "· 没有压缩包：导出就是一个文件夹，本文件是它的清单；\n"
-        out += "· 没有加锁、也没有做快照：导出时日志可能仍在被写 ⇒\n"
-        out += "  某一份的最后一行可能是写到一半的（代价远大于收益，规格 §4）；\n"
-        out += "· 没有敏感信息自动过滤（理由见第一屏那段）。注意「把交付码与下载目录按字面\n"
-        out += "  抹成 [已隐去]」不是过滤：抹的是壳自己知道的那两个串本身，不是去识别\n"
-        out += "  任意文案里像不像它。\n\n"
+        out += lang.t(.diagNotDoing) + "\n\n"
 
         // ---- 怎么读 ----------------------------------------------------------------
-        out += "怎么读\n"
+        out += lang.t(.diagHowToReadHeading) + "\n"
         out += "------\n"
-        out += "每份日志一行一条记录，形状是：ts=<unix 秒> event=<事件名> 键=值 …\n"
-        out += "那个时间是 UTC 的 unix 秒（macOS `date -r <ts>`、Linux `date -d @<ts>`）。\n"
-        out += "「覆盖范围」那一格取的是这份日志的头尾两行：一眼就能看出它有没有\n"
-        out += "覆盖到出问题的那一段时间。没覆盖到的那一刻只有等下一次现场 ——\n"
-        out += "所以请在复现之前把详细日志打开，导出之后可以再关掉。\n"
+        out += lang.t(.diagHowToRead) + "\n"
         return out
     }
 
     /// 一份文件的"覆盖时间范围"那一格：头尾两个 `ts=`，**读不到就写"未知"**。
-    static func coverage(_ file: FileFact) -> String {
+    static func coverage(_ file: FileFact, lang: Lang = .zh) -> String {
         if let first = file.firstTs, let last = file.lastTs {
             return "\(first) → \(last)"
         }
-        return "未知"
+        return lang.t(.diagCoverageUnknown)
     }
 
     // MARK: - 时刻（UTC，历法自己算）
@@ -411,9 +389,9 @@ public enum DiagnosticsExport {
     /// 🔴 **三处失败各有各的说法**（本函数 / [`copyFailureText`] / [`headerFailureText`]）：
     ///    它们**不是同一件事**，共用一句模板的后果是**对用户说错东西** —— 拷一份日志失败时
     ///    告诉他"建不了文件夹"，他会去查一个**建得出来**的位置，而真正出错的是那一份文件。
-    public static func folderFailureText(folder: String, cause: String) -> String {
-        "诊断日志没有导出：建不了文件夹 \(folder)（系统原话：\(cause)）。"
-            + "补救：换一个能写的文件夹再试一次（比如桌面），或检查那个位置是不是一个文件、磁盘是不是满了。"
+    public static func folderFailureText(folder: String, cause: String,
+                                         lang: Lang = .zh) -> String {
+        lang.tf(.diagFolderFailed, ["folder": folder, "cause": cause])
     }
 
     /// **某一份日志拷不进去**那句话（第二档：建目录成了、拷这一份时失败）。
@@ -424,15 +402,15 @@ public enum DiagnosticsExport {
     /// ⚠️ Windows 那一份这里是"记事本"（`windows/shell-core/src/export.rs:248`）：**文案
     ///    允许有细微差别**（规格 §2.6 的口径），macOS 上对应的程序叫"文本编辑"。
     ///    这是两端**有意**的一处用词差异，不是漏改。
-    public static func copyFailureText(file: String, cause: String) -> String {
-        "诊断日志没有导出：拷不进 \(file)（系统原话：\(cause)）。"
-            + "补救：确认那一份文件还在、且没有被别的程序独占（比如你正用文本编辑打开着它），然后重试一次。"
+    public static func copyFailureText(file: String, cause: String,
+                                       lang: Lang = .zh) -> String {
+        lang.tf(.diagCopyFailed, ["file": file, "cause": cause])
     }
 
     /// **说明文件写不进去**那句话（第三档：日志都拷好了、清单写不下去）。
-    public static func headerFailureText(file: String, cause: String) -> String {
-        "诊断日志没有导出：说明文件写不进去（\(file)；系统原话：\(cause)）。"
-            + "补救：检查目标磁盘是不是满了、那个文件夹是不是只读，然后重试一次。"
+    public static func headerFailureText(file: String, cause: String,
+                                         lang: Lang = .zh) -> String {
+        lang.tf(.diagHeaderWriteFailed, ["file": file, "cause": cause])
     }
 
     /// 把日志与说明文件拷进 `<目标>/诊断日志-YYYYMMDD-HHMMSS/`。**返回那个目录**。
@@ -463,14 +441,16 @@ public enum DiagnosticsExport {
     ///    本文件能钉住的是"`now` 决定了文件夹名"（`theExportFolderHoldsTheLogsAndAMeasuredHeader`
     ///    把那个时刻同时印在目录名与 `exported_at` 上）。
     public static func export(from logDir: URL, to target: URL,
-                              header: Header, now: Date) throws -> URL {
+                              header: Header, now: Date,
+                              lang: Lang = .zh) throws -> URL {
         let folder = target.appendingPathComponent(subdirectoryName(at: now), isDirectory: true)
         // 🔴 **不许吞掉**：建不出来就往上抛（界面要说"这次没成"）。
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         } catch {
             throw ExportFailure(message: folderFailureText(folder: folder.path,
-                                                           cause: error.localizedDescription))
+                                                           cause: error.localizedDescription,
+                                                           lang: lang))
         }
 
         // 只拷**存在的**那些：详细日志刚打开时后几代还没有（不存在不算失败）。
@@ -482,20 +462,22 @@ public enum DiagnosticsExport {
                 try FileManager.default.copyItem(at: logDir.appendingPathComponent(name), to: to)
             } catch {
                 throw ExportFailure(message: copyFailureText(file: to.path,
-                                                             cause: error.localizedDescription))
+                                                             cause: error.localizedDescription,
+                                                             lang: lang))
             }
             // ⚠️ 事实从**落进导出文件夹的那一份**上量（模块头那段：源文件还在长）。
             facts.append(measure(to, name: name))
         }
 
         // 说明文件最后写：它要说的是"这个文件夹里**已经**有什么"。
-        let text = headerText(header.withFiles(facts))
+        let text = headerText(header.withFiles(facts), lang: lang)
         let headerPath = folder.appendingPathComponent(headerFileName)
         do {
             try Data(text.utf8).write(to: headerPath)
         } catch {
             throw ExportFailure(message: headerFailureText(file: headerPath.path,
-                                                           cause: error.localizedDescription))
+                                                           cause: error.localizedDescription,
+                                                           lang: lang))
         }
         return folder
     }
@@ -562,13 +544,14 @@ public enum DiagnosticsExport {
     /// ⚠️ 拿不到（文件不在预期位置、读不动）⇒ 如实写"取不到"，**不编一个哈希**。
     ///    Windows 那一侧的对应文案是"（宿主构建：没有内嵌内核）"—— 那边宿主**根本没有**内核，
     ///    而这边是"有这个文件但没找到"，两句话说的是两件事，所以不逐字照抄。
-    public static func coreSha256(ofBinaryAt url: URL?) -> String {
-        guard let url, let data = try? Data(contentsOf: url) else { return missingCoreText }
+    public static func coreSha256(ofBinaryAt url: URL?, lang: Lang = .zh) -> String {
+        guard let url, let data = try? Data(contentsOf: url) else { return missingCoreText(lang: lang) }
         return sha256Hex(data)
     }
 
     /// [`coreSha256(ofBinaryAt:)`] 取不到那一格时写的字（**不是**一个哈希值）。
-    public static let missingCoreText = "（取不到：内核可执行文件不在预期位置）"
+    public static var missingCoreText: String { missingCoreText(lang: .zh) }
+    public static func missingCoreText(lang: Lang) -> String { lang.t(.diagMissingCore) }
 
     /// sha256（64 位小写十六进制）。
     ///
@@ -588,17 +571,17 @@ public enum DiagnosticsExport {
     ///    换个系统版本那句文案的形状就可能变，解析出来的东西一旦对不上就是一句
     ///    "看起来很正常"的假话（Windows 那一份拒绝把 build 号翻译成"Win10/11"
     ///    是同一条理由）。
-    public static func osVersion() -> String {
-        osField(versionString: ProcessInfo.processInfo.operatingSystemVersionString)
+    public static func osVersion(lang: Lang = .zh) -> String {
+        osField(versionString: ProcessInfo.processInfo.operatingSystemVersionString, lang: lang)
     }
 
     /// **拼装那一格**（纯函数 —— 判据在宿主上跑得了，`os:` 那一格才有判别力）。
     ///
     /// 取不到（空串 / `nil`）⇒ 如实写"版本取不到"，**不编一个数**，也**不退化成平台名**
     /// （退化的表现是这一格回答不了它存在的问题，而没有任何东西会变红）。
-    public static func osField(versionString: String?) -> String {
+    public static func osField(versionString: String?, lang: Lang = .zh) -> String {
         let text = (versionString ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return "macOS（版本取不到）" }
+        guard !text.isEmpty else { return lang.t(.diagOsUnknown) }
         return "macOS \(text)"
     }
 
@@ -626,18 +609,29 @@ public enum DiagnosticsExport {
     ///    比不做更糟 —— 它会让人以为已经安全了）。⇒ 于是把它**说出来**，
     ///    由用户自己决定要不要先打开看一眼。
     /// ⚠️ 与 Windows 那一份的 `api::diagnostics::PRIVACY_NOTE` **逐字同源**。
-    public static let privacyNote = "这份日志可能包含下载地址片段，发送前你可以自己打开看一眼。"
+    public static var privacyNote: String { privacyNote(lang: .zh) }
+
+    /// 同一句话的**当前语言**版本。
+    public static func privacyNote(lang: Lang) -> String { lang.t(.diagnosticsPrivacyNote) }
 
     /// 那颗按钮的标题（与 Windows 那一侧 `index.html` 的 `#set-export` **逐字同源**：
     /// 两端给客户看的是同一个入口名）。
-    public static let buttonLabel = "导出诊断日志…"
+    public static var buttonLabel: String { buttonLabel(lang: .zh) }
+
+    /// 同一句话的**当前语言**版本。
+    public static func buttonLabel(lang: Lang) -> String { lang.t(.diagnosticsExportButton) }
 
     /// 那颗按钮的 `.help`（说明它**做什么**，以及"会建一个子目录"这件用户看不见的事）。
-    public static let buttonHelp = "把日志与一份说明文件拷进你选的文件夹"
-        + "（里面会新建一个带时间戳的子目录，导多少次都不会互相覆盖）"
+    public static var buttonHelp: String { buttonHelp(lang: .zh) }
+
+    /// 同一句话的**当前语言**版本。
+    public static func buttonHelp(lang: Lang) -> String { lang.t(.diagnosticsExportButtonHelp) }
 
     /// 选择目标文件夹那张面板上的一句话（与既有那个选目录面板同款）。
-    public static let panelMessage = "诊断日志会导出到这个文件夹里"
+    public static var panelMessage: String { panelMessage(lang: .zh) }
+
+    /// 同一句话的**当前语言**版本。
+    public static func panelMessage(lang: Lang) -> String { lang.t(.diagnosticsExportPanelMessage) }
 
     /// 一次「导出诊断日志…」的结果。**三档都不是错误**（取消也一样），
     /// `isFailure` 决定界面画什么图标/颜色。
@@ -662,10 +656,13 @@ public enum DiagnosticsExport {
         /// **这条回执的第一行**：固定短的标题，**任何情况下都不含路径**
         /// （`.failed` 那一格是例外：它是系统/内核原文，照登 —— 但它是**路径**那一格的来源
         /// 不是标题的来源，视图那边照 `DownloadDirChange` 的规矩把高度封顶）。
-        public var headline: String {
+        public var headline: String { headline(lang: .zh) }
+
+        /// 同一句话的**当前语言**版本。
+        public func headline(lang: Lang) -> String {
             switch self {
-            case .done: return "诊断日志已导出"
-            case .cancelled: return "没有导出（你取消了选择文件夹）"
+            case .done: return lang.t(.diagnosticsExportDone)
+            case .cancelled: return lang.t(.diagnosticsExportCancelled)
             case .failed(let message): return message
             }
         }
@@ -683,8 +680,11 @@ public enum DiagnosticsExport {
         }
 
         /// 那句隐私提醒。**只在成功那一档有值**（没导出东西的时候没有什么可提醒的）。
-        public var privacyNote: String? {
-            if case .done = self { return DiagnosticsExport.privacyNote }
+        public var privacyNote: String? { privacyNote(lang: .zh) }
+
+        /// 同一句话的**当前语言**版本。
+        public func privacyNote(lang: Lang) -> String? {
+            if case .done = self { return DiagnosticsExport.privacyNote(lang: lang) }
             return nil
         }
     }

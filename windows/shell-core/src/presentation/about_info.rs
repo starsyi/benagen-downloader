@@ -76,17 +76,16 @@ impl AboutInfo {
     /// 对位的是上游的 `AboutInfo.buildVersionKey`（`CFBundleVersion`）。
     pub const PACKAGE_VERSION_ENV: &'static str = "CARGO_PKG_VERSION";
 
-    /// 两条回落都落空时的那句话。**绝不返回空串**。
+    /// 两条回落都落空时的判定（句子在 [`crate::i18n::Key::AboutVersionUnknown`]）。
     ///
     /// 不写成"未知"两个字：要把**缺的是哪一处**说出来 —— 看到这句话的人
     /// （客户 / 分发方）才知道该去查什么。这一条与上游逐字同源，
     /// 只是把 plist 的键名换成了 Windows 侧那一处来源。
     ///
     /// 上游 `AboutInfo.unknownVersionText`。
-    pub const UNKNOWN_VERSION_TEXT: &'static str =
-        "版本未知（构建时取不到版本号：shell-win/build.rs 没交来 BENAGEN_VERSION 或 CARGO_PKG_VERSION）";
+    pub const UNKNOWN_VERSION_TEXT_KEY: crate::i18n::Key = crate::i18n::Key::AboutVersionUnknown;
 
-    /// 版本号：短版本 → 构建号 → [`Self::UNKNOWN_VERSION_TEXT`]。
+    /// 版本号：短版本 → 构建号 → [`Self::UNKNOWN_VERSION_TEXT_KEY`] 那句。
     ///
     /// 上游 `AboutInfo.version(from:)`。
     ///
@@ -97,12 +96,16 @@ impl AboutInfo {
     ///    `Option<&str>`，"不是字符串"在类型上构造不出来，所以那一支整个消失 ——
     ///    见测试 `a_missing_value_falls_back_instead_of_being_invented` 上的形态偏离记账。
     ///    **不替打包脚本格式化**这条判据仍在：这里只 trim，绝不把 `123` 变成 `"123"`。
-    pub fn version(short_version: Option<&str>, build_version: Option<&str>) -> String {
+    pub fn version(
+        lang: crate::i18n::Lang,
+        short_version: Option<&str>,
+        build_version: Option<&str>,
+    ) -> String {
         // `str::trim()` 去掉的是 Unicode 的 `White_Space`，与上游
         // `whitespacesAndNewlines` 是同一个集合（同 `batch_history.rs` 那条注释）。
         text(short_version)
             .or_else(|| text(build_version))
-            .unwrap_or_else(|| Self::UNKNOWN_VERSION_TEXT.to_string())
+            .unwrap_or_else(|| crate::i18n::t(lang, Self::UNKNOWN_VERSION_TEXT_KEY).to_string())
     }
 }
 
@@ -147,7 +150,7 @@ mod tests {
     fn the_short_version_is_used_when_present() {
         // 短版本是给人看的版本号（"1.2.3"），优先用它。
         assert_eq!(
-            AboutInfo::version(Some("1.2.3"), Some("45")),
+            AboutInfo::version(crate::i18n::Lang::Zh, Some("1.2.3"), Some("45")),
             "1.2.3"
         );
     }
@@ -156,10 +159,10 @@ mod tests {
     #[test]
     fn an_empty_short_version_falls_back_to_the_build_number() {
         // 有来源、值是空串：与"没有这个来源"同解 —— 都是一行空白。
-        assert_eq!(AboutInfo::version(Some(""), Some("45")), "45");
+        assert_eq!(AboutInfo::version(crate::i18n::Lang::Zh, Some(""), Some("45")), "45");
         // 只有空白字符同理（" " 渲染出来同样是什么都看不到）。
-        assert_eq!(AboutInfo::version(Some(" \n "), Some("45")), "45");
-        assert_eq!(AboutInfo::version(None, Some("45")), "45");
+        assert_eq!(AboutInfo::version(crate::i18n::Lang::Zh, Some(" \n "), Some("45")), "45");
+        assert_eq!(AboutInfo::version(crate::i18n::Lang::Zh, None, Some("45")), "45");
     }
 
     /// 上游 `aNonStringValueFallsBackInsteadOfBeingFormatted`（**形态偏离**）。
@@ -172,13 +175,13 @@ mod tests {
     #[test]
     fn a_missing_value_falls_back_instead_of_being_invented() {
         assert_eq!(
-            AboutInfo::version(None, None),
-            AboutInfo::UNKNOWN_VERSION_TEXT,
+            AboutInfo::version(crate::i18n::Lang::Zh, None, None),
+            crate::i18n::t(crate::i18n::Lang::Zh, AboutInfo::UNKNOWN_VERSION_TEXT_KEY),
             "两个来源都没有 ⇒ 兜底文案（**不是**空串、也不是 `0.0.0` 这种编出来的号）"
         );
         assert_eq!(
-            AboutInfo::version(Some("   "), None),
-            AboutInfo::UNKNOWN_VERSION_TEXT,
+            AboutInfo::version(crate::i18n::Lang::Zh, Some("   "), None),
+            crate::i18n::t(crate::i18n::Lang::Zh, AboutInfo::UNKNOWN_VERSION_TEXT_KEY),
             "只有空白 = 没有"
         );
     }
@@ -193,7 +196,7 @@ mod tests {
             (Some(""), Some("   ")),
             (Some("  "), Some("")),
         ] {
-            let text = AboutInfo::version(short, build);
+            let text = AboutInfo::version(crate::i18n::Lang::Zh, short, build);
             assert!(!text.is_empty(), "版本号不得为空串");
             assert!(
                 text.contains("版本号"),
@@ -210,15 +213,15 @@ mod tests {
     /// Windows 上根本没有 plist，照着它去查只会查到一个不存在的地方。
     #[test]
     fn the_fallback_text_does_not_name_plist_keys() {
-        assert!(!AboutInfo::UNKNOWN_VERSION_TEXT.contains("CFBundle"));
-        assert!(!AboutInfo::UNKNOWN_VERSION_TEXT.contains("plist"));
+        assert!(!crate::i18n::t(crate::i18n::Lang::Zh, AboutInfo::UNKNOWN_VERSION_TEXT_KEY).contains("CFBundle"));
+        assert!(!crate::i18n::t(crate::i18n::Lang::Zh, AboutInfo::UNKNOWN_VERSION_TEXT_KEY).contains("plist"));
     }
 
     /// 增量（上游没有）：值两边的空白要去掉 —— 否则界面上会出现一行
     /// " 1.2.3 "（首尾空格在等宽字体里看不太出来，但它会进标题栏与报障邮件）。
     #[test]
     fn the_version_is_trimmed() {
-        assert_eq!(AboutInfo::version(Some("  1.2.3  "), None), "1.2.3");
-        assert_eq!(AboutInfo::version(None, Some(" 45\n")), "45");
+        assert_eq!(AboutInfo::version(crate::i18n::Lang::Zh, Some("  1.2.3  "), None), "1.2.3");
+        assert_eq!(AboutInfo::version(crate::i18n::Lang::Zh, None, Some(" 45\n")), "45");
     }
 }

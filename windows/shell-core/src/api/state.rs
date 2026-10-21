@@ -31,7 +31,18 @@ use crate::session_view::SessionView;
 ///    不是笔误。这里**以参数为准**（`view.handshake_reply` 在函数体内不再被读）：
 ///    一个值只从一个地方取，免得两个来源将来各说各话。
 pub fn state(view: &SessionView, handshake: Option<&str>) -> Value {
+    // 前端骨架的静态文案（侧栏、工具栏、模板里的表头/按钮）只留位置：
+    // 句子全部由这里按 `view.lang` 成句下发，键就是 [`crate::i18n::UI`] 里的 Debug 名。
+    let mut copy = serde_json::Map::new();
+    for &key in crate::i18n::UI {
+        copy.insert(
+            format!("{key:?}"),
+            serde_json::Value::String(crate::i18n::t(view.lang, key).to_string()),
+        );
+    }
     envelope::ok(serde_json::json!({
+        "lang": view.lang.wire(),
+        "copy": copy,
         "engine": engine_wire(view.lang, &view.engine),
         "load": load_wire(view.lang, &view.load),
         "last_error": &view.last_error,
@@ -169,6 +180,33 @@ mod tests {
         }
     }
 
+
+    /// 静态骨架文案（侧栏/工具栏/模板里的按钮）也只从这一格下发：
+    /// 中文握手给中文，英文握手给英文，且**一份拷贝都不能漏翻**。
+    #[test]
+    fn the_static_shell_copy_follows_the_handshake_language() {
+        let zh = state(&a_view(), None);
+        assert_eq!(zh["data"]["lang"], serde_json::json!("zh"));
+        assert_eq!(zh["data"]["copy"]["UiNavFiles"], serde_json::json!("文件"));
+        assert_eq!(zh["data"]["copy"]["UiSettings"], serde_json::json!("设置"));
+
+        // 负控制：同一格在英文握手下必须是英文 —— 不是"多给了一份中文"。
+        let mut en_view = a_view();
+        en_view.lang = crate::i18n::Lang::En;
+        let en = state(&en_view, None);
+        assert_eq!(en["data"]["lang"], serde_json::json!("en"));
+        assert_eq!(en["data"]["copy"]["UiNavFiles"], serde_json::json!("Files"));
+        let copy = en["data"]["copy"].as_object().expect("copy 必须是对象");
+        assert_eq!(copy.len(), crate::i18n::UI.len(), "UI 表里每个键都要下发");
+        for (key, value) in copy {
+            let text = value.as_str().expect("每个键都要有字符串");
+            assert!(
+                !text.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
+                "{key} 的英文里还有汉字：{text}"
+            );
+        }
+        assert_ne!(zh["data"]["copy"], en["data"]["copy"], "两种语言不能是同一份拷贝");
+    }
 
     /// 判据（规格 W1/I-2）：语言由握手落定，**同一个引擎状态按语言给出两份文案**。
     /// 前端一个字的业务逻辑都不加（I-1）—— 这里不给，界面就只能是中文。

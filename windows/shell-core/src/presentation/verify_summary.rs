@@ -24,7 +24,7 @@
 //!    由 `shell-win` 决定。**不许**把它改写成"没有图标"。
 
 use serde::Serialize;
-use super::error_text::error_text;
+use super::error_text::error_text_in;
 use super::format::{ByteFormat, PercentFormat, SpeedFormat};
 use super::transfer_row::TransferRow;
 use super::RowColor;
@@ -615,8 +615,8 @@ impl ProgressSummary {
 pub enum VerifyRefreshFailure {}
 
 impl VerifyRefreshFailure {
-    pub fn message_of(error: &ClientError) -> String {
-        error_text(error)
+    pub fn message_of(lang: crate::i18n::Lang, error: &ClientError) -> String {
+        error_text_in(lang, error)
     }
 }
 
@@ -1363,16 +1363,27 @@ mod tests {
         // 调用方自己不做映射：`VerifyRefreshFailure` 是这一层的入口，
         // 内部走 `error_text`（`ClientError` → 客户可见文案的唯一实现）。
         assert_eq!(
-            VerifyRefreshFailure::message_of(&ClientError::Kernel {
+            VerifyRefreshFailure::message_of(crate::i18n::Lang::Zh, &ClientError::Kernel {
                 code: "invalid_params".to_string(),
                 message: "内核原文".to_string(),
                 class: None,
             }),
             "内核原文"
         );
+        // 传输层故障按**界面语言**成句（`error_text_in` 是那句话的唯一实现）。
+        // 中文这一支给的是可执行的下一步（「重试」），不再是给日志看的那句原文。
+        let gone = VerifyRefreshFailure::message_of(crate::i18n::Lang::Zh, &ClientError::KernelGone);
         assert_eq!(
-            VerifyRefreshFailure::message_of(&ClientError::KernelGone),
-            "内核进程已退出（管道结束）"
+            gone,
+            crate::presentation::error_text::error_text_in(
+                crate::i18n::Lang::Zh,
+                &ClientError::KernelGone
+            ),
+            "壳自己写的传输层故障必须走 error_text_in（唯一的文案实现）"
+        );
+        assert!(
+            gone.contains("重试"),
+            "失败话术要给可执行的下一步：{gone}"
         );
     }
 }

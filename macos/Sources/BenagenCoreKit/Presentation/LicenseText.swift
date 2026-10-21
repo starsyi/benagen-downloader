@@ -28,8 +28,10 @@ public enum LicenseError: Error, Equatable {
     case missingResource
     /// 找到了，但内容是空的（或只有空白字符）—— 界面表现与"找不到"一样是空白页。
     case emptyResource
-    /// 路径在，但读不出来（权限 / IO 错误 / 非 UTF-8）。括号里是系统原文。
+    /// 路径在，但读不出来（权限 / IO 错误）。括号里是系统原文。
     case unreadable(String)
+    /// 读到了，但不是 UTF-8 文本。括号里是文件名。
+    case notUTF8(String)
 
     /// 给用户看的那句话。**恒非空**（`aMissingResourceIsAnExplicitErrorNotABlankPage` 钉住）。
     ///
@@ -37,17 +39,19 @@ public enum LicenseError: Error, Equatable {
     /// 任何 message 可登（约束 3 管的是"内核说了什么"，而这件事内核根本不知道）。
     /// 两处细节是刻意的：把**文件名**写出来（能照着找、能拿这句去问分发方），
     /// 以及明确说"这是打包缺陷"（否则用户会以为是自己点错了什么）。
-    public var message: String {
+    public var message: String { message(lang: .zh) }
+
+    /// 同上，按当前语言取句（视图用这一支）。
+    public func message(lang: Lang) -> String {
         switch self {
         case .missingResource:
-            return "应用包内找不到 GPLv2 全文（Contents/Resources/COPYING-GPLv2.txt）。"
-                + "这是打包缺陷，不是您操作有误：请重新安装客户端；"
-                + "若手上这份是别人拷来的，请向分发方索取一份许可副本。"
+            return lang.t(.licenseMissingResource)
         case .emptyResource:
-            return "应用包内的 GPLv2 全文是空的（Contents/Resources/COPYING-GPLv2.txt）。"
-                + "这是打包缺陷，不是您操作有误：请重新安装客户端，并向分发方索取许可副本。"
+            return lang.t(.licenseEmptyResource)
         case .unreadable(let why):
-            return "读取 GPLv2 全文失败：\(why)"
+            return lang.tf(.licenseUnreadable, ["reason": why])
+        case .notUTF8(let name):
+            return lang.tf(.licenseNotUTF8, ["name": name])
         }
     }
 }
@@ -83,7 +87,7 @@ public enum LicenseText {
             throw LicenseError.unreadable("\(error)")
         }
         guard let text = String(data: data, encoding: .utf8) else {
-            throw LicenseError.unreadable("文件不是 UTF-8 文本（\(url.lastPathComponent)）")
+            throw LicenseError.notUTF8(url.lastPathComponent)
         }
         // ⚠️ 这一条不是"多余的健壮性"：一个 0 字节的 COPYING 在界面上与"找不到"完全一样
         //    —— 都是一个空白页，而空白页**没有任何提示**，谁都不会去查（GPL 分发义务里

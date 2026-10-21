@@ -39,7 +39,7 @@ use crate::storage::preferences::Preferences;
 pub fn current(lang: crate::i18n::Lang, preferences: &Preferences) -> Value {
     envelope::ok(json!({
         "dir": preferences.download_dir,
-        "display": DownloadDirectory::display(&preferences.download_dir),
+        "display": DownloadDirectory::display(lang, &preferences.download_dir),
         "section_note": DownloadDirectory::section_note(lang),
         // ---- 「详细日志」那一个勾选框（任务 3，规格 §2.4）--------------------
         // ⚠️ 标签与说明**跟着载荷下来**（不是 `index.html` 里的结构文案）：
@@ -166,14 +166,18 @@ pub fn core_arguments(preferences: &Preferences) -> Vec<String> {
 ///
 /// ⚠️ 文案与 macOS 逐字同源（`下载目录没有改成（偏好写入失败：…）`），只把系统的
 ///    错误原文接在括号里：它是**可复制的证据**（磁盘满 / 权限 / 只读介质各说各的）。
-pub fn save_failed(cause: &str) -> String {
-    format!("下载目录没有改成（偏好写入失败：{cause}）")
+pub fn save_failed(lang: crate::i18n::Lang, cause: &str) -> String {
+    crate::i18n::tf(lang, crate::i18n::Key::PrefsSaveFailed, &[("cause", cause)])
 }
 
 /// [`save_failed`] 的同一件事，但这一次**已经把全部任务暂停了**：话里要点明，
 /// 否则客户只看到"没改成"，却不知道下载已经停了。
-pub fn save_failed_after_pause(cause: &str) -> String {
-    format!("下载目录没有改成（偏好写入失败：{cause}）。已暂停全部任务，需要的话点「一键开始」继续。")
+pub fn save_failed_after_pause(lang: crate::i18n::Lang, cause: &str) -> String {
+    crate::i18n::tf(
+        lang,
+        crate::i18n::Key::PrefsSaveFailedPaused,
+        &[("cause", cause)],
+    )
 }
 
 /// 「详细日志」那一格**写盘失败**那句话。
@@ -181,8 +185,8 @@ pub fn save_failed_after_pause(cause: &str) -> String {
 /// 🔴 与 [`save_failed`] **同一个理由、同一个位置**（壳自己写的：那一刻内核还不知道
 ///    这件事），但**不是同一句话** —— 那一句的主词是"下载目录"，而这一下用户改的是
 ///    一个开关、一个目录都没动。两件事共用一句 = 用户读到一句假话。
-pub fn verbose_save_failed(cause: &str) -> String {
-    format!("详细日志开关没有改成（偏好写入失败：{cause}）")
+pub fn verbose_save_failed(lang: crate::i18n::Lang, cause: &str) -> String {
+    crate::i18n::tf(lang, crate::i18n::Key::PrefsVerboseSaveFailed, &[("cause", cause)])
 }
 
 /// 改下载目录之后"内核重启**有没有落地**"的等待上界。
@@ -219,8 +223,8 @@ pub const RESTART_DEADLINE: Duration = Duration::from_secs(20);
 ///    初稿写的是我自己的句子（「内核重启没有在期限内落地…」并追加了「重试」那半句），
 ///    控制者按"同一件事不许两处说不同的话"订正掉了 —— 那句补救也已经在 macOS 那句里
 ///    （"下次启动会按它生效"），不需要我们再加一句。
-pub fn restart_timed_out() -> &'static str {
-    "内核还在重启中，这一次没有改成。下载目录已经记下来了，下次启动会按它生效。"
+pub fn restart_timed_out(lang: crate::i18n::Lang) -> &'static str {
+    crate::i18n::t(lang, crate::i18n::Key::PrefsRestartTimedOut)
 }
 
 /// 「详细日志」那一格的**同一件事**：内核重启没有在期限内落地。
@@ -232,8 +236,8 @@ pub fn restart_timed_out() -> &'static str {
 /// ⚠️ 这一句与上面那句由**调用方**挑（`commands::restart_kernel` 收一个"超时该说什么"
 ///    的参数）：那一刻**只有调用方知道**这一次改的是哪一格，
 ///    而 `wait_for_the_kernel` 手上只有内核的状态。合成一句的结局就是其中一半场合说错话。
-pub fn verbose_restart_timed_out() -> &'static str {
-    "内核还在重启中，这一次没有改成。详细日志开关已经记下来了，下次启动会按它生效。"
+pub fn verbose_restart_timed_out(lang: crate::i18n::Lang) -> &'static str {
+    crate::i18n::t(lang, crate::i18n::Key::PrefsVerboseRestartTimedOut)
 }
 
 /// 原生「选择文件夹」对话框里那句话（**它自己那一格的标题**）。
@@ -250,8 +254,8 @@ pub fn verbose_restart_timed_out() -> &'static str {
 ///      **这个文件夹会拿来干什么**，比一个光秃秃的"选择文件夹"有用；
 ///      按钮名那一格由系统给（中文系统上是"确定"），壳管不着。
 ///    这是平台能力的差别，不是漏做：记在这里免得后来者去追一句不存在的对位。
-pub fn picker_title() -> &'static str {
-    "交付文件会下载到这个文件夹"
+pub fn picker_title(lang: crate::i18n::Lang) -> &'static str {
+    crate::i18n::t(lang, crate::i18n::Key::PickerTitle)
 }
 
 #[cfg(test)]
@@ -361,18 +365,18 @@ mod tests {
     /// 而真机上的表现是用户改了一个开关、却看到一句"下载目录没有改成"。
     #[test]
     fn the_verbose_save_failure_names_the_switch_not_the_directory() {
-        let message = verbose_save_failed("磁盘空间不足");
+        let message = verbose_save_failed(crate::i18n::Lang::Zh, "磁盘空间不足");
         assert!(message.contains("详细日志"), "主词必须是这一下改的那一格：{message}");
         assert!(message.contains("偏好写入失败"), "要说清是哪一步失败了：{message}");
         assert!(message.contains("磁盘空间不足"), "系统原文必须照登：{message}");
         assert!(!message.contains("下载目录"), "一个目录都没改，不许提目录：{message}");
-        assert_ne!(message, save_failed("磁盘空间不足"));
+        assert_ne!(message, save_failed(crate::i18n::Lang::Zh, "磁盘空间不足"));
     }
 
     /// 确认文案**含三条后果**，且 `check` 的两档形状分明（`null` = 可以用）。
     #[test]
     fn the_plan_carries_both_the_check_and_the_confirmation() {
-        let confirmation = DownloadDirectory::confirmation("", "/data/交付");
+        let confirmation = DownloadDirectory::confirmation(crate::i18n::Lang::Zh, "", "/data/交付");
         let blocked = plan(Some("这个位置不存在：/nope".to_string()), confirmation.clone());
         assert_eq!(blocked["data"]["check"], json!("这个位置不存在：/nope"));
         assert!(
@@ -492,7 +496,7 @@ mod tests {
     /// 而真机上的表现是"用户以为内核没重启成功，于是又改了一遍"。
     #[test]
     fn the_save_failure_names_the_preference_write_and_keeps_the_cause() {
-        let message = save_failed("磁盘空间不足");
+        let message = save_failed(crate::i18n::Lang::Zh, "磁盘空间不足");
         assert!(
             message.contains("偏好写入失败"),
             "必须说清是哪一步失败了（偏好写盘，不是内核）：{message}"
@@ -505,30 +509,30 @@ mod tests {
     ///
     /// 判别力：删掉"已经记下来了"那半句，第二条断言立刻红 —— 而真机上的表现是
     /// 用户以为**整个操作**都失败了，于是**再改一遍**（多写一次盘、多重启一次内核）。
-    /// ⚠️ 期望值是**字面量**（不是再调一遍 `restart_timed_out()`）：那样写等于
+    /// ⚠️ 期望值是**字面量**（不是再调一遍 `restart_timed_out(crate::i18n::Lang::Zh)`）：那样写等于
     ///    `f() == f()`，改一个字都不会红。
     #[test]
     fn the_restart_timeout_is_the_macos_sentence_verbatim() {
         assert_eq!(
-            restart_timed_out(),
+            restart_timed_out(crate::i18n::Lang::Zh),
             "内核还在重启中，这一次没有改成。下载目录已经记下来了，下次启动会按它生效。",
             "这句话逐字来自 macOS 的 AppModel.swift:937（同一件事不许两处说不同的话）"
         );
         assert!(
-            restart_timed_out().contains("已经记下来了"),
+            restart_timed_out(crate::i18n::Lang::Zh).contains("已经记下来了"),
             "偏好那一半**已经成立**必须说出来（否则用户会再改一遍）"
         );
     }
 
     /// 🔴 **超时那句话有两句、而且只有中间那半句不同**（改的是哪一格只有调用方知道）。
     ///
-    /// 判别力：让 `verbose_logging_set` 去用 `restart_timed_out()`（那一句说"下载目录
+    /// 判别力：让 `verbose_logging_set` 去用 `restart_timed_out(crate::i18n::Lang::Zh)`（那一句说"下载目录
     /// 已经记下来了"），第一条断言立刻红 —— 而真机上的表现是用户**改了一个勾选框**、
     /// 却读到一句关于下载目录的话（两件事他都没做错，是界面在说假话）。
     #[test]
     fn the_two_restart_timeouts_differ_only_in_what_was_recorded() {
-        let dir = restart_timed_out();
-        let verbose = verbose_restart_timed_out();
+        let dir = restart_timed_out(crate::i18n::Lang::Zh);
+        let verbose = verbose_restart_timed_out(crate::i18n::Lang::Zh);
         assert!(verbose.contains("详细日志"), "要说清记下来的是哪一格：{verbose}");
         assert!(!verbose.contains("下载目录"), "这一个目录都没改：{verbose}");
         // ⚠️ 另两句**逐字相同**（同一件事不许两处说不同的话）：内核那一半、以及

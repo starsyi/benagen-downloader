@@ -44,7 +44,7 @@ struct VerifyView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("总进度")
+                Text(model.language.t(.verifyOverallProgress))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 if let progress = progressSummary {
@@ -76,7 +76,7 @@ struct VerifyView: View {
                 Button {
                     Task { await refresh() }
                 } label: {
-                    Label("刷新", systemImage: "arrow.clockwise")
+                    Label(model.language.t(.commonRefresh), systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.borderless)
                 // ⚠️ 这一行不是装饰：macOS 的统一工具栏默认把 `Label` 渲染成只有图标，
@@ -89,24 +89,24 @@ struct VerifyView: View {
                 //    不触发任何文件校验），校验由内核的 `spawn_landing_watcher` 按 200ms
                 //    一拍**自动**推进。按旧文案理解，客户会以为"点一下才会校验"，
                 //    而事实是"点不点都在校验，这里只是取一次当前结果"。
-                .help(engineAllowsActions ? "重新取一次内核当前的校验结果与总进度"
-                                          : EngineGate.unavailableHelp)
+                .help(engineAllowsActions ? model.language.t(.verifyRefreshHelp)
+                                          : EngineGate.unavailableHelp(lang: model.language))
             }
 
             if let summary = verifySummary {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Image(systemName: summary.headlineIcon)
                         .foregroundStyle(tint(summary.headlineColor))
-                    Text(summary.headline)
+                    Text(summary.headline(lang: model.language))
                         .font(.title3.weight(.semibold))
                         .textSelection(.enabled)
-                    Text(summary.classifiedText)
+                    Text(summary.classifiedText(lang: model.language))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
             } else {
-                Text("还没有校验结果")
+                Text(model.language.t(.verifyNoResults))
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(.secondary)
             }
@@ -137,10 +137,10 @@ struct VerifyView: View {
                 Image(systemName: "checkmark.seal")
                     .font(.largeTitle)
                     .foregroundStyle(.tertiary)
-                Text("还没有校验结果")
+                Text(model.language.t(.verifyNoResults))
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                Text(engineAllowsActions ? "点右上角「刷新」取一次" : EngineGate.unavailableHelp)
+                Text(engineAllowsActions ? model.language.t(.verifyNoResultsHint) : EngineGate.unavailableHelp(lang: model.language))
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
@@ -160,7 +160,7 @@ struct VerifyView: View {
                     .foregroundStyle(tint(row.color))
                 Text(row.label)
                     .font(.callout.weight(.semibold))
-                Text(row.countText)
+                Text(row.countText(lang: model.language))
                     .font(.callout)
                     .monospacedDigit()
                     .foregroundStyle(row.count == 0 ? .tertiary : .secondary)
@@ -204,7 +204,7 @@ struct VerifyView: View {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.borderless)
-            .help("收起这条提示")
+            .help(model.language.t(.commonDismissNotice))
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 8)
@@ -214,7 +214,7 @@ struct VerifyView: View {
     // MARK: - 取值
 
     /// 六类 + 总结的界面值（`nil` = 还没取过校验结果）。
-    private var verifySummary: VerifySummary? { VerifySummary.of(model.verify) }
+    private var verifySummary: VerifySummary? { VerifySummary.of(model.verify, lang: model.language) }
 
     /// 总进度（`get_tree` 的 `progress`）。树不属于这一批时是 `nil`（见 `ProgressSummary.of`）。
     private var progressSummary: ProgressSummary? {

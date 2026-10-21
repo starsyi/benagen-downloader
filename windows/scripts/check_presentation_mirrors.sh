@@ -365,6 +365,11 @@ failures.extend(error_failures)
 #    Swift 写 `\(latest)` / `\(st.current)`。比对前先归一成 `{latest}` / `{current}`。
 UPDATE_CHECK_RS = "windows/shell-core/src/presentation/update_check.rs"
 UPDATE_CHECK_SWIFT = "macos/Sources/BenagenCoreKit/Presentation/UpdateCheckReceipt.swift"
+# ⚠️ 那五句话的**家已经搬进语言表**（Windows 双语化把中文/英文都收进 `i18n.rs`；
+#    macOS 同轮搬进 `I18n.swift`）⇒ 判据必须读**实现 + 语言表**两处，否则它会在
+#    "句子还在、只是换了文件"时假红，逼着人把文案再抄回实现里（那就是第二份真相源）。
+UPDATE_CHECK_I18N_RS = "windows/shell-core/src/i18n.rs"
+UPDATE_CHECK_I18N_SWIFT = "macos/Sources/BenagenCoreKit/I18n.swift"
 
 # 那五句话的**规范形状**：这张表就是"两份真相源该说什么"的那一份账。
 # 改文案 ⇒ 两个实现与这一张表**一起**改（这张表过期时它会红，而不是静默放过）。
@@ -396,12 +401,12 @@ def canonical(sentence):
     return text
 
 
-rust_literals = {canonical(s) for s in literals(read(UPDATE_CHECK_RS))}
-swift_literals = {canonical(s) for s in literals(read(UPDATE_CHECK_SWIFT))}
+rust_literals = {canonical(s) for s in literals(read(UPDATE_CHECK_RS)) | literals(read(UPDATE_CHECK_I18N_RS))}
+swift_literals = {canonical(s) for s in literals(read(UPDATE_CHECK_SWIFT)) | literals(read(UPDATE_CHECK_I18N_SWIFT))}
 
 for label, sentence in UPDATE_SENTENCES:
-    for side, pool, rel in (("Rust", rust_literals, UPDATE_CHECK_RS),
-                            ("Swift", swift_literals, UPDATE_CHECK_SWIFT)):
+    for side, pool, rel in (("Rust", rust_literals, f"{UPDATE_CHECK_RS} + {UPDATE_CHECK_I18N_RS}"),
+                            ("Swift", swift_literals, f"{UPDATE_CHECK_SWIFT} + {UPDATE_CHECK_I18N_SWIFT}")):
         if canonical(sentence) not in pool:
             failures.append(
                 f"「立即检测」那五句话里，**{side} 那一侧说的不是这一句**（{label}）：\n"

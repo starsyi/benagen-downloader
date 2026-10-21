@@ -104,11 +104,19 @@ pub fn watch_interval(window_visible: bool) -> Duration {
 }
 
 /// 托盘悬停文案。有下载时带上数量，让用户不开窗口也知道它在干活。
-pub fn tray_tip(unfinished: usize) -> String {
+///
+/// ⚠️ 启动期就要用（握手之前，窗口可能还没建起来）⇒ 语言由调用方给：
+///    `shell-win` 用 `locale::startup_lang()`，握手之后换成 `Session::lang()`。
+pub fn tray_tip(lang: crate::i18n::Lang, unfinished: usize) -> String {
     if unfinished == 0 {
-        "Benagen 数据下载工具".to_string()
+        crate::i18n::t(lang, crate::i18n::Key::UiAppTitle).to_string()
     } else {
-        format!("Benagen 数据下载工具：{unfinished} 个任务进行中")
+        let n = unfinished.to_string();
+        crate::i18n::tf(
+            lang,
+            crate::i18n::Key::StartupTrayTip,
+            &[("app", crate::i18n::t(lang, crate::i18n::Key::UiAppTitle)), ("n", &n)],
+        )
     }
 }
 
@@ -179,7 +187,18 @@ mod tests {
 
     #[test]
     fn the_tip_mentions_the_count_only_when_there_is_work() {
-        assert!(!tray_tip(0).contains("进行中"));
-        assert!(tray_tip(7).contains("7 个任务进行中"));
+        assert!(!tray_tip(crate::i18n::Lang::Zh, 0).contains("进行中"));
+        assert!(tray_tip(crate::i18n::Lang::Zh, 7).contains("7 个任务进行中"));
+    }
+
+    /// 启动期托盘文案随语言切换：中英不同、英文里没有汉字（握手前的语言来自系统）。
+    #[test]
+    fn the_tray_tip_speaks_the_startup_language() {
+        use crate::i18n::Lang;
+        let zh = tray_tip(Lang::Zh, 3);
+        let en = tray_tip(Lang::En, 3);
+        assert_ne!(zh, en, "中英两份托盘文案不能是同一句");
+        assert!(!en.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)), "英文托盘文案里不许有汉字：{en}");
+        assert_eq!(tray_tip(Lang::En, 0), "Benagen Data Downloader");
     }
 }

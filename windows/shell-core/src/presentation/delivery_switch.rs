@@ -38,9 +38,13 @@ impl DeliverySwitch {
     ///      而"界面自己换了一批"必须有个落点，否则取消之后的那次成功换码在用户眼里
     ///      就是一次**没有来源的界面变化**。这句话只陈述一个**内核给的事实**
     ///      （新批次的码就是它回的 `code`），不添加任何判断或建议。
-    pub fn notice_text(&self) -> String {
+    pub fn notice_text(&self, lang: crate::i18n::Lang) -> String {
         match self {
-            DeliverySwitch::Switched { code } => format!("已换到批次 {code}"),
+            DeliverySwitch::Switched { code } => crate::i18n::tf(
+                lang,
+                crate::i18n::Key::SwitchDone,
+                &[("code", code)],
+            ),
             DeliverySwitch::Failed { message } => message.clone(),
         }
     }
@@ -135,7 +139,7 @@ mod tests {
             DeliverySwitch::Failed {
                 message: error_text(&e),
             }
-            .notice_text(),
+            .notice_text(crate::i18n::Lang::Zh),
             "拉取交付清单失败：HTTP 404"
         );
     }
@@ -152,7 +156,7 @@ mod tests {
             DeliverySwitch::Failed {
                 message: kernel_said.to_string()
             }
-            .notice_text(),
+            .notice_text(crate::i18n::Lang::Zh),
             kernel_said,
             "那一行必须逐字是内核原文"
         );
@@ -167,7 +171,7 @@ mod tests {
         let text = DeliverySwitch::Switched {
             code: "C24-8_×_25WS024".to_string(),
         }
-        .notice_text();
+        .notice_text(crate::i18n::Lang::Zh);
         assert!(
             text.contains("C24-8_×_25WS024"),
             "必须报出**新批次**的码（内核回的那个 code）"

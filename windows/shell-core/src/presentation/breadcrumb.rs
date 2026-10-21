@@ -166,7 +166,7 @@ impl DirLoadFailure {
     }
 
     /// 退回上一层时那句提示。
-    const FALLBACK_NOTICE: &'static str = "已返回上一层";
+    const FALLBACK_NOTICE_KEY: crate::i18n::Key = crate::i18n::Key::DirFallbackNotice;
 
     pub fn of(lang: crate::i18n::Lang, error: &ClientError, current_path: &str) -> Self {
         let message = crate::presentation::error_text::error_text_in(lang, error);
@@ -182,10 +182,7 @@ impl DirLoadFailure {
                     return Self {
                         message,
                         path: parent,
-                        notice: Some(match lang {
-                            crate::i18n::Lang::Zh => Self::FALLBACK_NOTICE.to_string(),
-                            _ => "Back to the parent folder".to_string(),
-                        }),
+                        notice: Some(crate::i18n::t(lang, Self::FALLBACK_NOTICE_KEY).to_string()),
                     };
                 }
             }

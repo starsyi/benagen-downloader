@@ -88,12 +88,14 @@ pub fn detect(system_locale: &str) -> Lang {
     }
 }
 
-/// 本进程看到的系统 locale（CLI 用）。
+/// 本进程看到的系统 locale（CLI 用；壳会通过 `hello.system_locale` 自己交一份）。
 ///
-/// ⚠️ **Windows 上基本取不到**：那里没有 `LANG`/`LC_ALL` 这套变量，真实语言
-/// 要问 `GetUserDefaultUILanguage`。Windows 壳自己知道客户选的是什么，会通过
-/// `hello.language` 传进来；本函数只是给 CLI 与"壳没传"的场合兜底，
-/// 取不到就落到英文（[`detect`] 的空串分支）。
+/// 顺序：`LC_ALL` → `LC_MESSAGES` → `LANG` →（Windows）问系统 → 空串（[`Lang::En`]）。
+///
+/// ⚠️ 为什么最后要问系统：Windows **没有** `LANG`/`LC_ALL` 这套变量，只读环境变量时
+///    中文 Windows 上的命令行工具会一路落到英文 —— 而 CLI 也一样要"默认跟系统"。
+///    手法与 `procstat`/`free_bytes` 相同：`#[link]` + 裸 `extern "system"`，不引 crate、
+///    不加 `windows-sys` feature（`kernel32` 本来就在导入表里）。
 pub fn system_locale() -> String {
     for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
         if let Ok(v) = std::env::var(key) {
@@ -102,7 +104,31 @@ pub fn system_locale() -> String {
             }
         }
     }
+    #[cfg(windows)]
+    {
+        // SAFETY: 无参数、无所有权转移，返回 LANGID。
+        let langid = unsafe { GetUserDefaultUILanguage() };
+        return primary_locale(langid).to_string();
+    }
+    #[cfg(not(windows))]
     String::new()
+}
+
+/// 把 LANGID 归成 [`detect`] 认得的形态（主语言中文 ⇒ `zh-CN`，其余 ⇒ `en-US`）。
+///
+/// 抽成纯函数是为了**在非 Windows 机器上也能测**：这条链路上唯一有分支的就是归类规则。
+pub fn primary_locale(langid: u16) -> &'static str {
+    if langid & 0x03FF == 0x04 {
+        "zh-CN"
+    } else {
+        "en-US"
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetUserDefaultUILanguage() -> u16;
 }
 
 #[cfg(test)]
@@ -110,6 +136,20 @@ mod tests {
     use super::*;
 
     /// 判据：`zh` 开头给中文，其他给英文，空串给英文。
+    /// LANGID 归类：中文三种变体都进中文界面，别的语言进英文界面。
+    ///
+    /// 这条钉的是 Windows CLI 的"默认跟系统"——`LANG` 在那台机器上根本不存在。
+    #[test]
+    fn the_system_language_id_maps_to_one_of_the_two_languages() {
+        assert_eq!(primary_locale(0x0804), "zh-CN"); // 简体
+        assert_eq!(primary_locale(0x0404), "zh-CN"); // 繁体
+        assert_eq!(primary_locale(0x0C04), "zh-CN"); // 香港
+        assert_eq!(primary_locale(0x0409), "en-US"); // 英文
+        assert_eq!(primary_locale(0x0411), "en-US"); // 日文（界面只有两门语言）
+        assert_eq!(detect(primary_locale(0x0804)), Lang::Zh);
+        assert_eq!(detect(primary_locale(0x0411)), Lang::En);
+    }
+
     #[test]
     fn only_zh_opens_the_chinese_door() {
         let cases = [

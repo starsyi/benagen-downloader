@@ -15,6 +15,9 @@ import BenagenCoreKit
 /// ⚠️ 本文件**只有绑定**（全局约束 8）：资源查找、读取、空文件判定、错误文案
 ///    全在 `LicenseText` 里；这里只把那个 `Result` 摆到屏幕上。
 struct LicenseView: View {
+    /// 当前界面语言（默认中文：既有调用点不变）。
+    var lang: Lang = .zh
+
     @Environment(\.dismiss) private var dismiss
 
     /// 进程内只读一次。GPLv2 全文中约 18 KB，而 `body` 会因为滚动、窗口尺寸等
@@ -68,14 +71,14 @@ struct LicenseView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline) {
-                Text("开源许可")
+                Text(lang.t(.licenseTitle))
                     .font(.title3.weight(.semibold))
                 Spacer(minLength: 8)
-                Button("关闭") { dismiss() }
+                Button(lang.t(.commonClose)) { dismiss() }
                     .keyboardShortcut(.cancelAction)
             }
             // 说清楚"为什么这一页在这里"：内嵌的 aria2 是 GPLv2。
-            Text("本应用内嵌 aria2（GPLv2 许可），因此随附下列许可全文。")
+            Text(lang.t(.licenseIntro))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -102,9 +105,9 @@ struct LicenseView: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.largeTitle)
                 .foregroundStyle(.red)
-            Text("GPLv2 全文没能读出来")
+            Text(lang.t(.licenseReadFailed))
                 .font(.headline)
-            Text(error.message)
+            Text(error.message(lang: lang))
                 .font(.callout)
                 .textSelection(.enabled)          // 原文可复制（能拿这句去问分发方）
                 .multilineTextAlignment(.center)

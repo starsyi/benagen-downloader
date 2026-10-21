@@ -53,12 +53,22 @@ public enum DownloadDirectory {
     public static let kernelDefaultDisplayPath = "~/Downloads/Benagen"
 
     /// 未配置时在设置窗口里显示的那一行。
-    public static let defaultDisplay = "默认（\(kernelDefaultDisplayPath)，由内核决定）"
+    public static var defaultDisplay: String { defaultDisplay(lang: .zh) }
+
+    /// 同一句话的**当前语言**版本（视图按 `model.language` 取）。
+    public static func defaultDisplay(lang: Lang) -> String {
+        lang.tf(.downloadDirDefaultDisplay, ["path": kernelDefaultDisplayPath])
+    }
 
     /// 当前下载目录只读显示的文字。空串 = 未配置 ⇒ 说"默认"，而不是画一个空行
     ///（空行在界面上读起来与"这一行坏了"分不开）。
     public static func display(_ path: String) -> String {
-        path.isEmpty ? defaultDisplay : path
+        display(path, lang: .zh)
+    }
+
+    /// 同一行文字的**当前语言**版本。
+    public static func display(_ path: String, lang: Lang) -> String {
+        path.isEmpty ? defaultDisplay(lang: lang) : path
     }
 
     /// 设置窗口里那一段的脚注。**说明"未配置"是什么意思** —— 它是本功能唯一
@@ -74,10 +84,12 @@ public enum DownloadDirectory {
     ///    形态是**变慢**、不是变错（裁定 D3 原文），所以**不改内核**（那是裁定），
     ///    只把这件事**说出来**（这一句 + `macos/README.md` 的已知限制那一节）。
     ///    🔴 这句话是**壳自己写的**（约束 3 的例外）：内核不会为一件它还没遇到的慢因说话。
-    public static let sectionNote =
-        "没有设置过时，壳**不指定**下载目录，由内核用它自己的默认值。"
-        + "改变目录会立刻重启内核（正在跑的任务会停）。"
-        + "请尽量选**本机磁盘**上的目录：网络盘（NFS / SMB）会让界面明显变慢。"
+    public static var sectionNote: String { sectionNote(lang: .zh) }
+
+    /// 同一段脚注的**当前语言**版本。
+    public static func sectionNote(lang: Lang) -> String {
+        lang.t(.downloadDirSectionNote)
+    }
 
     // MARK: - E-5：该不该传 `--download-dir`
 
@@ -104,17 +116,22 @@ public enum DownloadDirectory {
     ///    这件事（它还没被起起来），没有原文可登。而"选了一个不能写的目录"必须有落点
     ///    —— 否则用户会在重启之后看到引擎报一句他看不懂的错，或者更糟：什么都没看到。
     public static func check(_ path: String) -> String? {
+        check(path, lang: .zh)
+    }
+
+    /// 同一判据的**当前语言**版本（判据本身与语言无关）。
+    public static func check(_ path: String, lang: Lang) -> String? {
         guard !path.isEmpty else { return nil }
 
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else {
-            return "这个位置不存在：\(path)"
+            return lang.tf(.downloadDirCheckMissing, ["path": path])
         }
         guard isDirectory.boolValue else {
-            return "这是一个文件，不是文件夹：\(path)"
+            return lang.tf(.downloadDirCheckNotDirectory, ["path": path])
         }
         guard FileManager.default.isWritableFile(atPath: path) else {
-            return "这个文件夹不可以写入（没有权限）：\(path)"
+            return lang.tf(.downloadDirCheckNotWritable, ["path": path])
         }
         return nil
     }
@@ -130,14 +147,15 @@ public enum DownloadDirectory {
     ///    ⚠️ **别把它"说全"**：一句断言式的"所有文件都会重新校验"会让用户为一件
     ///    不会发生的事做决定 —— 而这条文案的全部价值就是让他知道**会发生什么**。
     public static func confirmation(from current: String, to target: String) -> String {
-        """
-        下载目录将从「\(display(current))」改为「\(display(target))」。
+        confirmation(from: current, to: target, lang: .zh)
+    }
 
-        改完会立刻重启内核，三条后果：
-        1. 正在跑的任务会停（内核重启），没传完的文件要重新点一次下载；
-        2. 新目录里没有记录的文件会重新校验（内核的状态文件就在下载目录里）；
-        3. 旧目录里的文件不会被删、也不会被搬走。
-        """
+    /// 同一段确认文案的**当前语言**版本。
+    public static func confirmation(from current: String, to target: String, lang: Lang) -> String {
+        lang.tf(.downloadDirConfirmation, [
+            "current": display(current, lang: lang),
+            "target": display(target, lang: lang),
+        ])
     }
 }
 
@@ -195,11 +213,6 @@ public enum DownloadDirChange: Equatable, Sendable {
     ///
     /// ⚠️ 别往这里塞路径、也别塞批次号 / 时间戳之类**长度不受控**的东西：
     ///    这个属性存在的全部意义就是"**长度固定**"（见上面那段）。
-    private static let changedTitle = "下载目录已改（内核已按新目录重启）"
-
-    /// 恢复默认那支的**固定全文**（本来就短，没有路径可拆）。
-    private static let restoredDefault = "已恢复默认下载目录（内核已按默认目录重启）"
-
     /// **这条回执的第一行**：固定短的标题，**任何情况下都不含路径**。
     ///
     /// ⚠️ `dir` 在这里**只用来区分"改了"与"恢复默认"两个格子**，绝不参与拼字符串 ——
@@ -212,15 +225,18 @@ public enum DownloadDirChange: Equatable, Sendable {
     ///    `Views/ResidentNotice.swift` 的 `BoundedNoticeArea`（放得下按自然高显示、
     ///    放不下就钉在 48pt 上**可滚动**），**全文始终都在**，没有截断。
     ///    ⚠️ 别在值这一层替它做长度限制：那是**丢证据**，不是排版。
-    public var headline: String {
+    public var headline: String { headline(lang: .zh) }
+
+    /// **这条回执第一行**的当前语言版本。固定短、不含路径（判据与语言无关）。
+    public func headline(lang: Lang) -> String {
         switch self {
         case .changed(let dir):
             // 🔴 这两句是**壳自己写的**（约束 3 的例外）：内核不会为一次成功的重启
             //    主动说话，它回的是 argv 与 JSON 字段。而"我按了确认之后发生了什么"
             //    必须有个落点，否则那个确认框就像按了个寂寞。
-            return dir.isEmpty ? Self.restoredDefault : Self.changedTitle
+            return dir.isEmpty ? lang.t(.downloadDirRestoredDefault) : lang.t(.downloadDirChangedTitle)
         case .unchanged:
-            return "下载目录没有变化，没有重启内核"
+            return lang.t(.downloadDirUnchanged)
         case .failed(let message):
             return message
         }
@@ -263,13 +279,16 @@ public enum DownloadDirChange: Equatable, Sendable {
     ///    根本不经过 `headline`，所以标题被改坏时它照样是绿的 ——
     ///    守那件事的是 `theHeadlineIsFixedNoMatterHowLongThePathIs`
     ///    （实测：把路径塞回 `headline`，那条红 4 个断言，这条一个都不红）。
-    public var noticeText: String {
+    public var noticeText: String { noticeText(lang: .zh) }
+
+    /// 同一句话的**当前语言**版本（仍由 `headline` + `pathDetail` 组合而成）。
+    public func noticeText(lang: Lang) -> String {
         switch self {
         case .changed:
-            guard let path = pathDetail else { return headline }
-            return "下载目录已改为 \(path)（内核已按新目录重启）"
+            guard let path = pathDetail else { return headline(lang: lang) }
+            return lang.tf(.downloadDirChangedNotice, ["path": path])
         case .unchanged, .failed:
-            return headline
+            return headline(lang: lang)
         }
     }
 

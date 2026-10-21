@@ -41,6 +41,9 @@ struct SelectionBar: View {
     let onClearSelection: () -> Void
     let onDownload: () -> Void
 
+    /// 当前界面语言（默认中文：既有调用点不变）。
+    var lang: Lang = .zh
+
     var body: some View {
         HStack(spacing: 6) {
             // 提示在**最左边、项数之前**（它解释的是"接下来会发生什么"，
@@ -63,12 +66,12 @@ struct SelectionBar: View {
 
             // ⚠️ `.borderless`：默认样式在底栏里会变成两颗大按钮，把主按钮挤到边上，
             //    而"全选 / 全不选"是辅助动作、不是这一栏的主角。
-            Button("全选", action: onSelectAll)
+            Button(lang.t(.selectAll), action: onSelectAll)
                 .buttonStyle(.borderless)
-                .help("勾上整批的全部文件（不含目录）")
-            Button("全不选", action: onClearSelection)
+                .help(lang.t(.selectAllHelp))
+            Button(lang.t(.deselectAll), action: onClearSelection)
                 .buttonStyle(.borderless)
-                .help("清空勾选面")
+                .help(lang.t(.clearSelectionHelp))
 
             // ⚠️ 任务 7 已接线：`onDownload` 由 `FileBrowser` 转发给 `RootView` 的 `download(_:)`
             //    ——那是本动作的**唯一实现**（工具栏那颗按钮走的是同一条路）。
@@ -76,7 +79,7 @@ struct SelectionBar: View {
                 .buttonStyle(.borderedProminent)
                 // 悬停提示与工具栏共用一份（`DownloadTargets.helpText`）：
                 // 两个入口各写一句，改一处就会出现"同一个按钮两个说法"。
-                .help(DownloadTargets.helpText)
+                .help(DownloadTargets.helpText(lang: lang))
         }
         .font(.callout)
         .lineLimit(1)

@@ -59,13 +59,13 @@ pub fn pick_outcome(picked: Option<String>) -> Option<String> {
 ///    而这在一个"选完就把目录改掉"的动作上很容易出事。取句柄那一半在
 ///    `commands::owner_hwnd`（那里才有 Tauri 的窗口对象）。
 ///    宿主那一支本来就不需要它（`osascript` 那个选择框由系统管模态）。
-pub fn pick_folder(owner: *mut std::ffi::c_void) -> Option<String> {
-    pick_outcome(browse_for_folder(owner))
+pub fn pick_folder(lang: shell_core::i18n::Lang, owner: *mut std::ffi::c_void) -> Option<String> {
+    pick_outcome(browse_for_folder(lang, owner))
 }
 
 /// 把"选一个文件夹"交给系统。**平台专属**（见模块头）。
 #[cfg(target_os = "windows")]
-fn browse_for_folder(owner: *mut std::ffi::c_void) -> Option<String> {
+fn browse_for_folder(lang: shell_core::i18n::Lang, owner: *mut std::ffi::c_void) -> Option<String> {
     use windows_sys::Win32::Foundation::MAX_PATH;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{
@@ -81,7 +81,7 @@ fn browse_for_folder(owner: *mut std::ffi::c_void) -> Option<String> {
     let mut path = [0u16; MAX_PATH as usize];
     // 标题那句来自 `shell-core`（R-24：面向用户的字符串不留在命令层）——
     // 再补一个 NUL（`LPCWSTR` 的契约）。
-    let title: Vec<u16> = shell_core::api::preferences::picker_title()
+    let title: Vec<u16> = shell_core::api::preferences::picker_title(shell_core::i18n::Lang::Zh)
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -152,7 +152,7 @@ fn browse_for_folder(owner: *mut std::ffi::c_void) -> Option<String> {
 ///    的空指针）。⇒ 这里**一律回 `None`**，不再分"取消"与"真出错"——
 ///    分不出来的话，前端要么看到一个假的错误，要么在取消时什么都不发生（后者是对的）。
 #[cfg(not(target_os = "windows"))]
-fn browse_for_folder(_owner: *mut std::ffi::c_void) -> Option<String> {
+fn browse_for_folder(_lang: shell_core::i18n::Lang, _owner: *mut std::ffi::c_void) -> Option<String> {
     // ⚠️ 标题那句**来自 `shell-core`**（R-24），不在这里另写一份：
     //    两处各写一遍的话，Windows 与宿主上的对话框会随着哪边先改而分叉。
     //    ⚠️ 它被拼进一段 AppleScript **源码**里 ⇒ 里面不能有双引号
@@ -161,7 +161,7 @@ fn browse_for_folder(_owner: *mut std::ffi::c_void) -> Option<String> {
     //     这条约束的可执行版本是下面那条 `the_picker_title_cannot_break_the_applescript`）。
     let script = format!(
         "POSIX path of (choose folder with prompt \"{}\")",
-        shell_core::api::preferences::picker_title()
+        shell_core::api::preferences::picker_title(shell_core::i18n::Lang::Zh)
     );
     let output = std::process::Command::new("osascript")
         .arg("-e")
@@ -225,7 +225,7 @@ mod tests {
     /// 判别力：往 `picker_title()` 里塞一个 `"`，这一条立刻红。
     #[test]
     fn the_picker_title_cannot_break_the_applescript() {
-        let title = shell_core::api::preferences::picker_title();
+        let title = shell_core::api::preferences::picker_title(shell_core::i18n::Lang::Zh);
         assert!(
             !title.contains('"') && !title.contains('\\'),
             "标题会被拼进 AppleScript 源码，不许带引号或反斜杠：{title:?}"
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn the_host_branch_really_opens_a_picker() {
         // 宿主那一支不需要属主窗口（`osascript` 那个选择框由系统管模态）。
-        let picked = pick_folder(std::ptr::null_mut());
+        let picked = pick_folder(shell_core::i18n::Lang::Zh, std::ptr::null_mut());
         // 人点「取消」⇒ None；真选了一个 ⇒ 一个非空字符串。两档都算这条链路通。
         if let Some(path) = picked {
             assert!(!path.trim().is_empty(), "选出来的路径不许是空的：{path:?}");

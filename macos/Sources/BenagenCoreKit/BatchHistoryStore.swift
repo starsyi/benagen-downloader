@@ -50,7 +50,7 @@ public struct BatchHistoryStore: Sendable {
     ///
     /// ⚠️ 失败**抛**而不是吞：历史存不下来是一件用户能感知的事（重启后什么都没了），
     ///    调用方必须有机会说一句（`AppModel.historyWriteFailure`）。
-    public func save(_ history: BatchHistory) throws {
-        try files.write(try history.serialized(), to: url)
+    public func save(_ history: BatchHistory, lang: Lang = .zh) throws {
+        try files.write(try history.serialized(), to: url, lang: lang)
     }
 }

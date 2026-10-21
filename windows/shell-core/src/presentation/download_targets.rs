@@ -24,7 +24,7 @@
 
 use serde::Serialize;
 use crate::client::ClientError;
-use crate::presentation::error_text::error_text;
+use crate::presentation::error_text::error_text_in;
 use crate::protocol::EnqueueResult;
 use std::collections::BTreeSet;
 
@@ -303,19 +303,27 @@ impl EnqueueFeedback {
     ///    一句内核随时会改的措辞 —— 而"壳不解析内核文案"（约束 2/3）与"不改 `core/`"
     ///    （约束 10）是底线；宁可整条原文照登（约束 4 的"不静默少交"已经满足：
     ///    用户看得到全部信息）。
-    pub fn of(result: &EnqueueResult) -> EnqueueFeedback {
+    pub fn of(lang: crate::i18n::Lang, result: &EnqueueResult) -> EnqueueFeedback {
+        use crate::i18n::{tf, Key};
         EnqueueFeedback {
             summary: if result.added.is_empty() && result.pending == 0 {
-                "没有需要下载的文件".to_string()
+                crate::i18n::t(lang, Key::EnqueueNothing).to_string()
             } else if result.pending > 0 {
                 // 大批量是分批加入的：先让客户看到任务开始，其余的在下载的同时陆续加入。
-                format!(
-                    "已加入 {} 个下载任务，另有 {} 个正在后台继续加入",
-                    result.added.len(),
-                    result.pending
+                tf(
+                    lang,
+                    Key::EnqueueAddedPending,
+                    &[
+                        ("added", &result.added.len().to_string()),
+                        ("pending", &result.pending.to_string()),
+                    ],
                 )
             } else {
-                format!("已加入 {} 个下载任务", result.added.len())
+                tf(
+                    lang,
+                    Key::EnqueueAdded,
+                    &[("added", &result.added.len().to_string())],
+                )
             },
             rejections: result
                 .rejected
@@ -346,9 +354,9 @@ impl EnqueueFeedback {
     ///   2. **丢了实参标签 `of`**：`of` 在 Rust 里不是关键字，写不出 `failure(of error: …)`
     ///      这种形状 ⇒ 签名是 `failure(error:)`。**方法名逐字保留**，丢的只是标签。
     ///   3. 同 [`EnqueueFeedback::of`] 的 `of(_ result:)`（上游的 `_` 标签在 Rust 里也不存在）。
-    pub fn failure(error: &ClientError) -> EnqueueFeedback {
+    pub fn failure(lang: crate::i18n::Lang, error: &ClientError) -> EnqueueFeedback {
         EnqueueFeedback {
-            summary: error_text(error),
+            summary: error_text_in(lang, error),
             rejections: Vec::new(),
             switches_to_transfers: false,
         }
@@ -403,18 +411,22 @@ impl DownloadNotice {
     ///
     /// ⚠️ `code` 取 `Option<&str>` 而不是 `Option<String>`：这是 Rust 侧对 `String?` 的
     ///    常用形态，调用方给字面量或借用都不必先造一个 `String`。
-    pub fn of(result: &EnqueueResult, code: Option<&str>) -> DownloadNotice {
+    pub fn of(
+        result: &EnqueueResult,
+        code: Option<&str>,
+        lang: crate::i18n::Lang,
+    ) -> DownloadNotice {
         DownloadNotice {
             code: code.map(str::to_string),
-            feedback: EnqueueFeedback::of(result),
+            feedback: EnqueueFeedback::of(lang, result),
         }
     }
 
     /// 失败（抛错路径）→ 带批次码的这条回执。
-    pub fn failure(error: &ClientError, code: Option<&str>) -> DownloadNotice {
+    pub fn failure(lang: crate::i18n::Lang, error: &ClientError, code: Option<&str>) -> DownloadNotice {
         DownloadNotice {
             code: code.map(str::to_string),
-            feedback: EnqueueFeedback::failure(error),
+            feedback: EnqueueFeedback::failure(lang, error),
         }
     }
 
@@ -436,14 +448,17 @@ impl DownloadNotice {
     ///
     /// ⚠️ **形态偏离（W-6）**：上游的实参标签 `currentCode`（`summary(currentCode:)`）
     ///    在 Rust 里没有对应物 ⇒ 签名是 `summary(current_code:)`。**方法名逐字保留**。
-    pub fn summary(&self, current_code: Option<&str>) -> String {
+    pub fn summary(&self, current_code: Option<&str>, lang: crate::i18n::Lang) -> String {
         if self.belongs_to(current_code) {
             return self.feedback.summary.clone();
         }
-        format!(
-            "批次 {}：{}",
-            self.code.as_deref().unwrap_or("—"),
-            self.feedback.summary
+        crate::i18n::tf(
+            lang,
+            crate::i18n::Key::NoticeBatchPrefix,
+            &[
+                ("code", self.code.as_deref().unwrap_or("—")),
+                ("summary", &self.feedback.summary),
+            ],
         )
     }
 }
@@ -850,7 +865,7 @@ mod tests {
     /// 上游 `addedTasksSwitchToTheTransfersSection`。
     #[test]
     fn added_tasks_switch_to_the_transfers_section() {
-        let f = EnqueueFeedback::of(&enqueued(PARTIAL_WIRE));
+        let f = EnqueueFeedback::of(crate::i18n::Lang::Zh, &enqueued(PARTIAL_WIRE));
 
         assert!(f.switches_to_transfers, "`added` 非空 → 切到传输列表");
         assert_eq!(
@@ -867,7 +882,7 @@ mod tests {
         // ⚠️ 挂的是**真实形状**：部分成功（`added` 非空 + `rejected` 非空）。
         //    全拒那条路上内核回的是**错误**、根本没有回执 —— 见
         //    `an_all_rejected_enqueue_arrives_as_an_error_and_is_shown_whole`。
-        let f = EnqueueFeedback::of(&enqueued(PARTIAL_WIRE));
+        let f = EnqueueFeedback::of(crate::i18n::Lang::Zh, &enqueued(PARTIAL_WIRE));
 
         // **逐条**、**原文**（约束 3：不转义、不规范化），顺序按内核给的；
         // 两条理由都是内核里真实存在的那两句，其中一条带 `×`/空格、一条带内核自己 Debug 引号。
@@ -903,7 +918,7 @@ mod tests {
         //    内核算出来的待下载集合是空的，即**没有需要下载的文件**。
         //    ⚠️ 措辞只陈述事实：**不加判断**（不说"可能已经全部下载完成"——那是壳替内核下结论，
         //       而壳手里没有"为什么是空的"这份知识）、**不加建议**（不说"请稍后再试"）。
-        let nothing = EnqueueFeedback::of(&enqueued(NOTHING_AT_ALL_WIRE));
+        let nothing = EnqueueFeedback::of(crate::i18n::Lang::Zh, &enqueued(NOTHING_AT_ALL_WIRE));
 
         assert!(
             !nothing.switches_to_transfers,
@@ -917,7 +932,7 @@ mod tests {
     /// 判别力：把 `pending > 0` 那一支删掉 ⇒ 第一条红（客户看不到"还在加"）。
     #[test]
     fn a_partly_queued_batch_says_how_many_are_still_coming() {
-        let f = EnqueueFeedback::of(&enqueued(
+        let f = EnqueueFeedback::of(crate::i18n::Lang::Zh, &enqueued(
             r#"{"added":[{"gid":"g1","path":"a.bin"}],"rejected":[],"pending":3}"#,
         ));
         assert_eq!(f.summary, "已加入 1 个下载任务，另有 3 个正在后台继续加入");
@@ -935,7 +950,7 @@ mod tests {
         //    而"逐条"那条路只在**部分成功**这条真实形状上做（约束 10：不为这个改 core）。
         //    约束 4 仍然满足：用户看得到内核说的**全部**信息（每条 path 与 reason 都在那串里）。
         // 变异体：哪天有人"顺手"去解析这句串、把 rejections 填出来，这条断言就会红。
-        let f = EnqueueFeedback::failure(&ClientError::Kernel {
+        let f = EnqueueFeedback::failure(crate::i18n::Lang::Zh, &ClientError::Kernel {
             code: "invalid_params".to_string(),
             message: ALL_REJECTED_ERROR.to_string(),
             class: None,
@@ -955,7 +970,7 @@ mod tests {
         // `engine_start_failed` / `preflight_failed` → **原地显示内核原文**，不切走。
         // 走**真错误**（而不是直接塞一个字符串）：这条链是 `ClientError` → 呈现文案
         // → 用户眼前那句话，中间任何一段换成"壳自己编的措辞"都会被下面的逐字断言判红。
-        let f = EnqueueFeedback::failure(&ClientError::Kernel {
+        let f = EnqueueFeedback::failure(crate::i18n::Lang::Zh, &ClientError::Kernel {
             code: "engine_start_failed".to_string(),
             message: "启动下载引擎失败：端口 6800 被占用".to_string(),
             class: None,
@@ -973,11 +988,11 @@ mod tests {
     /// 上游 `aNoticeKnowsWhichBatchItBelongsTo`。
     #[test]
     fn a_notice_knows_which_batch_it_belongs_to() {
-        let n = DownloadNotice::of(&enqueued(PARTIAL_WIRE), Some("AAA-1"));
+        let n = DownloadNotice::of(&enqueued(PARTIAL_WIRE), Some("AAA-1"), crate::i18n::Lang::Zh);
 
         assert!(n.belongs_to(Some("AAA-1")));
         assert_eq!(
-            n.summary(Some("AAA-1")),
+            n.summary(Some("AAA-1"), crate::i18n::Lang::Zh),
             "已加入 3 个下载任务",
             "属于当前批：不加前缀（否则每一行都挂一个批次码，噪声）"
         );
@@ -990,9 +1005,9 @@ mod tests {
         // ⚠️ 换批**不**把这条清掉（约束 4：拒绝理由不能因为用户换了批次就消失），
         //    代价是它可能属于上一批 —— 所以**不属于当前批时前面必须带批次码**，
         //    否则"已加入 3 个下载任务"会被读成**新批次**的结果。
-        let n = DownloadNotice::of(&enqueued(PARTIAL_WIRE), Some("AAA-1"));
+        let n = DownloadNotice::of(&enqueued(PARTIAL_WIRE), Some("AAA-1"), crate::i18n::Lang::Zh);
 
-        assert_eq!(n.summary(Some("BBB-2")), "批次 AAA-1：已加入 3 个下载任务");
+        assert_eq!(n.summary(Some("BBB-2"), crate::i18n::Lang::Zh), "批次 AAA-1：已加入 3 个下载任务");
         assert_eq!(n.feedback.rejections.len(), 2, "换批之后拒绝理由仍然在手（它们还能被摆出来）");
     }
 
@@ -1000,6 +1015,7 @@ mod tests {
     #[test]
     fn a_failed_notice_carries_its_batch_too() {
         let f = DownloadNotice::failure(
+            crate::i18n::Lang::Zh,
             &ClientError::Kernel {
                 code: "preflight_failed".to_string(),
                 message: "磁盘空间不足：需要 10 GB，可用 2 GB".to_string(),
@@ -1008,19 +1024,19 @@ mod tests {
             Some("AAA-1"),
         );
 
-        assert_eq!(f.summary(Some("AAA-1")), "磁盘空间不足：需要 10 GB，可用 2 GB");
+        assert_eq!(f.summary(Some("AAA-1"), crate::i18n::Lang::Zh), "磁盘空间不足：需要 10 GB，可用 2 GB");
         assert_eq!(
-            f.summary(Some("BBB-2")),
+            f.summary(Some("BBB-2"), crate::i18n::Lang::Zh),
             "批次 AAA-1：磁盘空间不足：需要 10 GB，可用 2 GB"
         );
         assert!(!f.feedback.switches_to_transfers);
 
         // 没有批次码（理论上到不了：没有生效批次时那个动作不可用）时不该凭空冒出一个批次字样。
-        let no_code = DownloadNotice::of(&enqueued(NOTHING_AT_ALL_WIRE), None);
+        let no_code = DownloadNotice::of(&enqueued(NOTHING_AT_ALL_WIRE), None, crate::i18n::Lang::Zh);
         assert!(no_code.belongs_to(None), "None == None 算属于自己，别凭空写「批次 —」");
-        assert_eq!(no_code.summary(None), "没有需要下载的文件");
+        assert_eq!(no_code.summary(None, crate::i18n::Lang::Zh), "没有需要下载的文件");
         assert_eq!(
-            no_code.summary(Some("AAA-1")),
+            no_code.summary(Some("AAA-1"), crate::i18n::Lang::Zh),
             "批次 —：没有需要下载的文件",
             "真有码可比且对不上时，宁可写占位也不冒充新批次"
         );

@@ -73,9 +73,8 @@ pub fn verdict(already_exists: bool) -> Verdict {
 ///
 /// ⚠️ 措辞里**不许出现"历史""备注"那类字**的教训见 `storage/mod.rs` 的模块头
 ///    （第二条 `--check` 会拦：内嵌字体子集必须覆盖源码里的每一个非 ASCII 字）。
-pub fn already_running_message() -> &'static str {
-    "Benagen 数据下载工具已经在运行了。请用已经打开的那个窗口。\
-     它可能被别的窗口盖着，或者已经最小化到了任务栏角落的图标里——点一下那个图标就能把窗口叫回来。"
+pub fn already_running_message(lang: shell_core::i18n::Lang) -> &'static str {
+    shell_core::i18n::t(lang, shell_core::i18n::Key::StartupAlreadyRunning)
 }
 
 /// 建互斥体、读一次 `GetLastError()`，把结论交回来。
@@ -172,7 +171,7 @@ mod tests {
     /// 用户以为程序坏了、于是**反复双击**（每双击一次就多看到一次这个框）。
     #[test]
     fn the_message_says_it_is_running_and_where_to_look() {
-        let message = already_running_message();
+        let message = already_running_message(shell_core::i18n::Lang::Zh);
         assert!(message.contains("已经在运行"), "要说清事实：{message}");
         assert!(message.contains("已经打开的那个窗口"), "要给出下一步：{message}");
         assert!(
@@ -180,6 +179,16 @@ mod tests {
             "要说清「为什么看不到那个窗口」（否则用户会反复双击）：{message}"
         );
         assert!(!message.is_empty());
+    }
+
+    /// 启动期（握手之前）这句话也要能说英文：两门语言不同、英文里没有汉字。
+    #[test]
+    fn the_already_running_message_speaks_both_startup_languages() {
+        use shell_core::i18n::Lang;
+        let zh = already_running_message(Lang::Zh);
+        let en = already_running_message(Lang::En);
+        assert_ne!(zh, en, "中英两份不能是同一句");
+        assert!(!en.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)), "英文里有汉字：{en}");
     }
 
     /// 宿主上 `acquire()` 恒 `First`（**如实**：本平台不做单实例，见模块头）。

@@ -364,7 +364,7 @@ mod tests {
     fn level_rows_from_kernel_wire(json: &str, parent: &str) -> Vec<BrowserRow> {
         let result: crate::protocol::ListDirResult =
             serde_json::from_str(json).expect("这是内核会发的线上 JSON，必须解得出");
-        BrowserRow::rows(&result.entries, parent)
+        BrowserRow::rows(crate::i18n::Lang::Zh, &result.entries, parent)
     }
 
     fn level_wire_rows(json: &str) -> Value {

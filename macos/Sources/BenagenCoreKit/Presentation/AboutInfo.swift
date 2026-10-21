@@ -24,8 +24,12 @@ public enum AboutInfo {
     ///
     /// 不写成"未知"两个字：要把**缺的是哪个键**说出来 ——
     /// 看到这句话的人（客户 / 分发方）才知道该去查什么。
-    public static let unknownVersionText =
-        "版本未知（应用包缺少 CFBundleShortVersionString / CFBundleVersion）"
+    public static var unknownVersionText: String { unknownVersionText(lang: .zh) }
+
+    /// 同上，按当前语言取句（视图用这一支）。
+    public static func unknownVersionText(lang: Lang) -> String {
+        lang.t(.aboutVersionUnknown)
+    }
 
     /// 版本号：`CFBundleShortVersionString` → `CFBundleVersion` → `unknownVersionText`。
     ///
@@ -34,13 +38,13 @@ public enum AboutInfo {
     ///
     /// ⚠️ 值不是字符串时（plist 里放了个数字之类）也走回落，**不替打包脚本格式化**：
     ///    版本号长什么样是打包那边的事，壳没有资格猜。
-    public static func version(from info: [String: Any]?) -> String {
-        text(info?[shortVersionKey]) ?? text(info?[buildVersionKey]) ?? unknownVersionText
+    public static func version(from info: [String: Any]?, lang: Lang = .zh) -> String {
+        text(info?[shortVersionKey]) ?? text(info?[buildVersionKey]) ?? unknownVersionText(lang: lang)
     }
 
     /// 便利入口：应用包 `Info.plist` 那一份。
-    public static func version(in bundle: Bundle = .main) -> String {
-        version(from: bundle.infoDictionary)
+    public static func version(in bundle: Bundle = .main, lang: Lang = .zh) -> String {
+        version(from: bundle.infoDictionary, lang: lang)
     }
 
     /// plist 里的一项 → 可显示的版本号；不是非空字符串时回 `nil`。

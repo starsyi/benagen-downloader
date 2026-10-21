@@ -89,14 +89,12 @@
 #         把数字改大**不是**理由（那只是把同一句话再说一遍）。
 #
 #   ⚠️ **今天合法的只有两类**，两类**性质完全不同**，别把它们的理由混起来读：
-#     · **类 1：结构文案（只可能出现在 `.html` 里）** —— 导航项名、按钮名、分组名、
-#       标题句那一类**与数据无关、任何状态下都一样**的字。它们住在 HTML 里、由浏览器
-#       直接渲染，**JS 一个字都不碰**（JS 只克隆与摆放，见 `dom.js:template()`），
-#       所以它们不落在 §3.2 的管辖面里（§3.2 管的是 **JS** 拼串）。
-#       `index.html` 头部有一整段论证这件事，包括"为什么不由 Rust 给"
-#       （`presentation/` 里没有这些字的模块；macOS 侧它们同样住在视图文件里）
-#       —— **本清单就是那份账的机器可读版本**：哪一句还没进 `presentation/`，
-#       这里逐条看得见。
+#     · 类 1（结构文案）**已经不存在**：0.3.0 双语化之后，`index.html` 里每一个面向
+#       用户的字都换成了 `data-copy` / `data-copy-title` / `data-copy-aria-label` /
+#       `data-copy-placeholder` 标记，句子由 `/api/state` 的 `copy` 对象（Rust
+#       `i18n::UI`，按 `state.lang` 成句）下发，JS 只按标记写回（`dom.js:applyCopy`）。
+#       ⇒ `.html` 里只剩注释与排版符号；类 1 的登记清零是**迁移的结果**，不是放宽判据。
+#       现在的白名单只有类 2。
 #     · **类 2：引导期诊断（只允许出现在 `.js` 里）** —— "**程序自己坏了**"那一类
 #       （"没有 Tauri"、"找不到挂载点"、"这个屏没注册"）。它们说的是**管线**坏了，
 #       不是"这个世界怎么样了"；而管线坏了的时候 **Rust 那边一个字都给不出来**
@@ -217,7 +215,7 @@ SCAN_EXTENSIONS = (".html", ".css", ".js")
 #    `windows/scripts/frontend-stub/`（常驻夹具）**不在**这里，也**不该**在这里。
 EXPECTED_FILES = [
     # ---- 结构 / 样式 ------------------------------------------------------
-    ("windows/web/index.html", "窗口骨架 + 两块 <template>（结构文案的家）"),
+    ("windows/web/index.html", "窗口骨架 + 两块 <template>（静态文案只留 data-copy 标记）"),
     ("windows/web/app.js", "引导与路由（装配壳、起轮询、每一拍灌载荷）"),
     ("windows/web/app.css", "入口样式表（@font-face + 各屏汇总）"),
     # ---- 内嵌字体（任务 14）-----------------------------------------------
@@ -319,39 +317,9 @@ def twin_problems():
 # ---------------------------------------------------------------------------
 WHITELIST = {
     # =====================================================================
-    # 类 1：结构文案（只出现在 `.html` 里；浏览器直接渲染，JS 不碰）
+    # 类 1（结构文案）已清零：`index.html` 的字全部改由 `/api/state.copy` 下发，
+    # 文件里只剩注释；下面只有类 2（引导期诊断）。
     # =====================================================================
-    # 文件：windows/web/index.html
-    # 理由（对下面每一条都成立）：它是**结构**——与数据无关、任何状态下都一样的字
-    #   （导航项名 / 按钮名 / 分组名 / 标题句 / 输入框占位符）。JS 只**克隆与摆放**
-    #   它们（`dom.js:template()`），不拼串 ⇒ 不在 §3.2 的管辖面里。
-    #   `index.html` 头部有完整论证，包括"为什么不由 Rust 给"：`presentation/` 里
-    #   没有这些字的模块，而 macOS 侧它们同样住在视图文件里（`Sidebar.swift` 的
-    #   `SidebarSection.title`、`EmptyState.swift`、`RootView.swift` 的「设置」）。
-    #   ⚠️ **本表就是那份"哪些字还没有 Rust 的家"的账**：任务 9 的报告里逐条列过它们。
-    ("windows/web/index.html", "数据下载工具"): (2, "窗口标题（`<title>`；`tauri.conf.json` 的 windows[0].title 是同一句）＋ 任务 13 关于窗口里的应用名（`AboutView.swift` 那一行）"),
-    ("windows/web/index.html", "文件"): (1, "侧栏分区名（`SidebarSection.title`，macOS 逐字）"),
-    ("windows/web/index.html", "传输列表"): (1, "侧栏分区名（同上）"),
-    ("windows/web/index.html", "校验结果"): (1, "侧栏分区名（同上）"),
-    ("windows/web/index.html", "批次摘要"): (1, "底栏摘要的分组名（`DeliverySummary` 的那一块的标题）"),
-    ("windows/web/index.html", "·"): (3, "摘要里的分隔符（`<span>·</span>`，夹在文件数与大小之间）"
-                                        " ＋ 文件页底栏的两个（`SelectionBar.swift:51,56` 那两处 Text(\"·\")）"),
-    ("windows/web/index.html", "交付码"): (3, "工具栏那一格的静态标签（有生效批次时让位给真码 —— 真码来自 `summary.code`）"
-                                                "＋ 空态屏输入框的占位符（`placeholder`）＋ 任务 13 换码面板输入框的占位符（`SwitchDeliverySheet.swift` 的 `TextField(\"交付码\")`）"),
-    ("windows/web/index.html", "立即检测"): (1, "设置窗口「更新」那一节里那颗按钮的名字（规格 §2 的手动查；macOS 侧 `SettingsView.swift` 的 `Button(\"立即检测\")` 是**同一句**）。"
-                                                        "⚠️ 它是**结构**（与数据无关、任何状态下都一样的一句话），而**判决与那五句话**由 Rust（`presentation/update_check.rs`）与 Swift（`UpdateCheckReceipt.swift`）给，两端逐字对位由 `check_presentation_mirrors.sh` 的第 ③ 段判 —— 这一格只是那颗按钮上的字"),
-    ("windows/web/index.html", "设置"): (2, "工具栏那颗按钮的名字（`RootView.swift` 的「设置」）＋ 任务 13 设置窗口的标题（`SettingsView.swift` 那一扇窗）"),
-    ("windows/web/index.html", "重试"): (4, "常驻提示行 `tpl-notice-retry` 里那颗按钮的字"
-                                            "＋ 空态屏失败态那颗「重试」（`empty__retry`）"
-                                            "＋ 文件页读失败那格的「重试」（`FileBrowser.swift:208`）"
-                                            "＋ **传输列表屏行菜单里的「重试」**（任务 11：`TransferRowView.actionItems` 的 `Button(\"重试\")`，对应 `TaskAction::Retry`）"),
-    ("windows/web/index.html", "收起"): (2, "常驻提示行 `tpl-notice-dismiss` 那颗按钮的无障碍名字（`aria-label`）"
-                                              "＋ **更新提示那条的「收起」**（规格 §4；`#files-update-dismiss` 的无障碍名字 —— 与常驻提示行那颗是**同一个词、同一个图形**，两处各留一格 `aria-label`）"),
-    ("windows/web/index.html", "输入交付码开始下载"): (1, "空态屏的标题（`EmptyState.swift` 逐句）"),
-    ("windows/web/index.html", "交付码在交付邮件或交付页链接里（整条链接也可以直接粘进来）"): (1, "空态屏的副标题（同上）"),
-    ("windows/web/index.html", "加载"): (2, "空态屏那颗提交按钮的字（同上）＋ 任务 13 换码面板那颗提交按钮（`SwitchDeliverySheet.swift` 的 `Button(\"加载\")`）"),
-    ("windows/web/index.html", "高级：自定义下载地址"): (1, "空态屏 `<summary>` 的展开文案（同上）"),
-    ("windows/web/index.html", "留空即用默认交付服务器"): (1, "空态屏「高级」里的说明句（同上）"),
 
     # =====================================================================
     # 类 2：引导期诊断（只允许出现在 `.js` 里；**逐条登记，不许放宽**）
@@ -383,63 +351,8 @@ WHITELIST = {
     ("windows/web/js/screens/registry.js", "前端没有名为「」的屏。"): (1, "诊断④：`screenFor()` 抛出的「前端没有名为「<id>」的屏。」（会显示在常驻提示行上）。⚠️ 原文是「前端没有注**册**名为…」—— 任务 10b 改的：那个「册」不在内嵌字体子集里，而这句话**会渲染**；理由写在 `registry.js:screenFor()` 的注释里"),
     ("windows/web/js/screens/registry.js", "若这是任务的屏，检查的里有没有加它那一行；"): (1, "诊断④的第二句（同一个字符串，指到 SCREENS 注册表）"),
     ("windows/web/js/screens/registry.js", "若这是路由算出来的，检查与是否一致。"): (1, "诊断④的第三句（同一个字符串，指到 routeOfState 与 SECTIONS 是否一致）"),
-    ("windows/web/index.html", "下载本目录"): (1, "文件页：面包屑右侧那颗「下载本目录」（`FileBrowser.swift:119` 的 `Label`，图标 + 文字，不许只留图标）"),
-    ("windows/web/index.html", "重新读取这一层"): (2, "文件页：重读那颗纯图标按钮的 tooltip 与无障碍名字（同一个字符串占两格，`FileBrowser.swift:132` 的 `.help`）"),
-    ("windows/web/index.html", "收起这条提示"): (2, "文件页：目录读失败那条说明右上角那颗 ×（tooltip + 无障碍名字，`FileBrowser.swift:182` 的 `.help`）"),
-    ("windows/web/index.html", "名称"): (1, "文件页：四列的第一个列名（`FileBrowser.swift:284`）"),
-    ("windows/web/index.html", "大小"): (1, "文件页：第二个列名（`FileBrowser.swift:286`）"),
-    ("windows/web/index.html", "时间"): (1, "文件页：第三个列名（`FileBrowser.swift:288`）"),
-    ("windows/web/index.html", "状态"): (1, "文件页：第四个列名（`FileBrowser.swift:290`）"),
-    ("windows/web/index.html", "正在读取目录…"): (1, "文件页：读取中那一态（`FileBrowser.swift:196`）"),
-    ("windows/web/index.html", "这一层没能读出来"): (1, "文件页：读失败那一态（`FileBrowser.swift:205`）"),
-    ("windows/web/index.html", "这个目录是空的"): (1, "文件页：空目录那一态（`FileBrowser.swift:216`）"),
-    ("windows/web/index.html", "全选"): (1, "文件页：底栏那颗「全选」（`SelectionBar.swift:66`）"),
-    ("windows/web/index.html", "全不选"): (2, "文件页：底栏那颗「全不选」（`SelectionBar.swift:69`）＋ 右键菜单里同名的那一项（`FileBrowser.swift:250`）"),
-    ("windows/web/index.html", "下载选中项"): (1, "文件页：右键菜单第一项（`FileBrowser.swift:247`）"),
-    ("windows/web/index.html", "全选本层"): (1, "文件页：右键菜单第二项（`FileBrowser.swift:249`）"),
-    ("windows/web/index.html", "总进度"): (1, "校验页顶部那一行的**分组名**（`VerifyView.swift:47` 的 `Text(\"总进度\")`）：它标注的是下面那根进度条，本身不含任何数据"),
-    ("windows/web/index.html", "—"): (1, "总进度**没有归属**时（树还没到 / 不是这一批）的占位符（`VerifyView.swift:69`）。⚠️ 它是**结构**不是数据：真正的数字全部由 `ProgressSummary` 给，连它自己的「—」也是 Rust 给的（`percent_text` 在总量为 0 时）；这一格只在\"连 ProgressSummary 都没有\"时出现"),
-    ("windows/web/index.html", "刷新"): (2, "按钮上的字（`VerifyView.swift:79` 那颗，**逐字**对上游）。它与数据无关、任何状态下都一样。⚠️ 它曾经被写成「重新取一次」（那时 `刷` U+5237 不在子集里）—— 控制者裁定那是因果倒置，已连同一次单独的资产刷新改回来（§12）"
-                                           "＋ **传输列表屏顶部那条栏上的「刷新」**（任务 11：`TransfersView.swift:79-81` 的 `Label(\"刷新\", systemImage: \"arrow.clockwise\")`，与校验页那颗**逐字同名**）"),
-    ("windows/web/index.html", "还没有校验结果"): (1, "还没拿到第一份校验结果时的标题句（`VerifyView.swift:109`）：任何状态下措辞都一样，不随数据变"),
-    ("windows/web/index.html", "加载另一个交付码"): (1, "换码面板的标题（`SwitchDeliverySheet.swift` 的 `Text(\"加载另一个交付码\")`）"),
-    ("windows/web/index.html", "换码会把当前的下载任务从引擎里摘掉（含等待中的）；已经下载到磁盘的文件不会被删除。"): (1, "换码面板里那句**后果说明**（同上）。⚠️ 它是**壳自己写的**：内核不会为一次还没发生的操作主动说话，而这句话必须在用户点「加载」之前就摆在屏幕上"),
-    ("windows/web/index.html", "历史批次"): (1, "历史列表那一组的分组名（`SwitchDeliverySheet.swift` 的 `Text(\"历史批次\")`）"),
-    ("windows/web/index.html", "点一行即可切换到那一批；备注写在这里，重启应用后仍在。"): (1, "历史列表底下那句用法说明（同上）"),
-    ("windows/web/index.html", "取消"): (2, "换码面板那颗「取消」（同上，**有意不禁用**）＋ 改下载目录确认框里那颗「取消」（`SettingsView.swift` 的 `.alert`）"),
-    ("windows/web/index.html", "备注"): (1, "历史行里那个备注输入框的**占位符**（`SwitchDeliverySheet.swift` 的 `TextField(\"备注\")`）"),
-    ("windows/web/index.html", "关闭"): (3, "设置窗口、关于窗口、许可窗口各一颗 × 的**无障碍名字**（`LicenseView.swift` 的 `Button(\"关闭\")` 与两扇窗的同一颗）"),
-    ("windows/web/index.html", "下载到"): (1, "下载目录那一段的标签（`SettingsView.swift` 的 `LabeledContent(\"下载到\")`）"),
-    ("windows/web/index.html", "文件夹路径"): (1, "下载目录那个输入框的占位符。⚠️ macOS 那边这一格是 `NSOpenPanel`（选文件夹），本代**没有**原生目录选择器（见任务 13 报告的偏离 ①）—— 提示词逐字说明要填的是什么"),
-    ("windows/web/index.html", "选择…"): (1, "下载目录那颗「选择…」（对位 `SettingsView.swift:230` 的 `choose()`）。⚠️ 任务 13 报告里那条「本代没有原生目录选择器」的偏离**已经兑现**（2026-09-20 真机反馈）：原生对话框由 `shell-win/src/pickdir.rs` 弹，它自己顶上那句话在 `api::preferences::picker_title`（**这里扫不到**，那是系统对话框）"),
-    ("windows/web/index.html", "导出诊断日志…"): (1, "「诊断」那一节那颗**导出**按钮的名字（规格 §2.5）。⚠️ 它与上面「选择…」/「开源许可…」同一条性质：**静态的按钮名**（任何状态下都一样、与数据无关），浏览器直接渲染、JS 只克隆与摆放 ⇒ 结构文案。这次动作的**回执**（标题 / 目标路径 / 那句隐私提醒）**一格都不在这里** —— 它们全部来自 `api::diagnostics`（壳自己写的话，有单测）"),
-    ("windows/web/index.html", "应用"): (1, "下载目录那颗提交按钮（同上）"),
-    ("windows/web/index.html", "恢复默认"): (1, "下载目录那颗「恢复默认」（同上：空串 = 回到未配置，同时会重启内核）"),
-    ("windows/web/index.html", "内核还没交出参数"): (1, "参数表还没拿到时那句标题（`SettingsView.swift` 的 `Text(\"内核还没有交出参数面板\")`）。⚠️ **原文照登**：下面那一格是内核/宿主给的失败原文，本文件不加工"),
-    ("windows/web/index.html", "关于"): (2, "设置窗口底栏那颗入口（webview 里**没有应用菜单**，macOS 那一边它住在菜单栏）＋ 关于窗口自己的标题"),
-    ("windows/web/index.html", "开源许可…"): (1, "设置窗口底栏那颗许可入口（`SettingsView.swift` 的 `Button(\"开源许可…\")`，含那个省略号）"),
-    ("windows/web/index.html", "保存"): (1, "参数面板那颗「保存」（同上，主按钮）"),
-    ("windows/web/index.html", "这个文件夹不能用"): (1, "目录不可用那个提示框的标题（`SettingsView.swift` 的 `alertTitle` 第一支）"),
-    ("windows/web/index.html", "知道了"): (1, "那个提示框唯一那颗按钮（同上，`Button(\"知道了\")`）"),
-    ("windows/web/index.html", "更改下载目录？"): (1, "确认框的标题（同上，`alertTitle` 第二支）"),
-    ("windows/web/index.html", "更改并重启内核"): (1, "确认框那颗确认按钮（同上）。⚠️ 它的标题把**后果**再说一遍，而不是一句空泛的「确定」"),
-    ("windows/web/index.html", "开源许可"): (1, "许可全文窗口的标题（`LicenseView.swift` 的 `Text(\"开源许可\")`）。两处条目的名字来自载荷（`License.name`），这一格不是"),
-    ("windows/web/index.html", "全文"): (1, "sha256 那一行的小标签（`licenses.rs` 把那个值**发出来**就是为了让它真的出现在界面上：用户能拿它去跟官方发布件核对）"),
-    ("windows/web/index.html", "暂停全部"): (1, "传输列表屏：顶部那颗**列表级**动作（与上面「清空已完成」同族：没有 gid、不属于任何一行）。标题与数据无关、任何状态下都一样 ⇒ 结构文案；**可用与否**不在这里判 —— 由 Rust 的 `BatchControl::can_pause_all` 算好随载荷下来，JS 只读。macOS 侧尚无对位物（本轮只做 Windows），对位时落到 `TransfersView.summaryBar`"),
-    ("windows/web/index.html", "一键开始"): (1, "传输列表屏：与「暂停全部」成对的那颗列表级动作。标题是结构文案；可用与否由 `BatchControl::can_resume_all` 判（含「刚换过下载目录、队列还没补回」那一支 —— 列表里一行都没有，只有 Rust 侧知道）"),
-    ("windows/web/index.html", "清空已完成"): (1, "传输列表屏：顶部那颗**列表级**动作（`TransfersView.summaryBar` 的 `Label(\"清空已完成\")`）。它没有 gid、不属于任何一行 —— `TransferRow::actions` 的注释里写着为什么它不许出现在行级菜单里"),
-    ("windows/web/index.html", "已暂停"): (1, "传输列表屏：行首那颗角标（`TransferRowView.titleLine` 的 `Text(\"已暂停\")`）。⚠️ 它与数据有关的是**显隐**（`shows_paused_badge`，判据只能来自 `raw_status`，裁决 #88），而这两个字本身与数据无关 ⇒ 字住这里、显隐由 JS 切"),
-    ("windows/web/index.html", "这一行的操作"): (1, "传输列表屏：行尾那颗「⋯」的**无障碍名字**（`TransferRowView.actionsMenu` 的 `.help`）。那颗按钮本身是运行时才出现的（从行模板克隆），所以字必须跟着模板走"),
-    ("windows/web/index.html", "暂停"): (1, "传输列表屏：行菜单第一项（`TransferRowView.actionItems` 的 `Button(\"暂停\")`）"),
-    ("windows/web/index.html", "继续"): (1, "传输列表屏：行菜单第二项（同上，`Button(\"继续\")`，对应 `TaskAction::Unpause`）"),
-    ("windows/web/index.html", "在资源管理器中显示"): (1, "传输列表屏：行菜单里的「在资源管理器中显示」（macOS 是 `Button(\"在访达中显示\")`；Windows 的对位写法见设计规格 §9）。⚠️ 这一项**不是** `TaskAction`（协议里没有 `reveal`，规格 §5.2：那是壳的事）"),
-    ("windows/web/index.html", "移除"): (1, "传输列表屏：行菜单最后一项（`TransferRowView.actionItems` 的 `Button(\"移除\", role: .destructive)`）"),
-    ("windows/web/index.html", "正在读取传输列表…"): (1, "传输列表屏：**还没有快照**那一档那一句话（`TransfersView.swift:113-121` 的 `Text(\"正在读取传输列表…\")`，逐字）。⚠️ 它与数据无关、任何状态下都一样（转圈那一档永远是这一句），转圈那一颗是纯 CSS ⇒ 按 §3.2 它是**结构文案**，住 HTML、JS 只切 `hidden`"),
     # ---- 更新提示（规格 §4，本波次）------------------------------------------
     # 文件：windows/web/index.html
-    ("windows/web/index.html", "有新版本（当前）"): (1, "文件页顶部那条更新提示的**框架句**：静态部分住 HTML，两个版本号由 `files.js:paintUpdate` 把内核给的 `latest` / `current` 摆进两个空 `<span>` —— **JS 一个汉字都不拼**（§3.2）。它为什么不由 Rust 给：可变的两格是**内核数据**（不是壳算的界面值），而「壳一个字符都不拼」（W-2 / R20）在这条上的落点就是「框架句留 HTML、数据由内核给、JS 只摆位置」；macOS 侧那句由 `Presentation/UpdateNotice.swift` 拼，本代刻意不复刻成第二个真相源（那会与「壳不改写内核的话」打架）"),
-    ("windows/web/index.html", "去下载"): (1, "更新提示那条上那颗动作按钮的名字（规格 §4；R15）。**静态按钮名**（任何状态下都一样、与数据无关），与常驻提示行那颗「重试」（`.notice__retry`）同一条：浏览器直接渲染、JS 只克隆与摆放。它为什么不由 Rust 给：按钮名没有 `presentation` 的家（macOS 侧同样住在视图字面量里 —— `RootView` 那颗 `Button(\"去下载\")`）"),
-    ("windows/web/index.html", "启动时检查更新"): (1, "设置窗口里那个勾选框的**静态标签**（规格 §4）。与「下载到」/「应用」同一条：与数据无关、任何状态下都一样，浏览器直接渲染。**勾没勾**来自内核（`update_status.enabled`，`settings.js` 读/写），这两个字本身不变。它为什么不由 Rust 给：macOS 侧同样是 `SettingsView` 的视图字面量（`Toggle(\"启动时检查更新\")`），没有 `presentation` 的家"),
 }
 
 # 缺口清单在报错里最多逐条打印这么多处（再多就把真信息淹了；总数仍写在标题里）。

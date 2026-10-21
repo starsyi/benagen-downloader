@@ -51,7 +51,7 @@ struct BenagenApp: App {
             // ⚠️ 文案是**壳自己写的**（全局约束 C-7）：内核一个字都没提到过菜单，
             //    没有原文可登 —— 这是菜单项的标题，只能由壳起名。
             CommandGroup(before: .windowList) {
-                Button("显示主窗口") { MainWindow.openNow() }
+                Button(model.language.t(.appMenuShowMainWindow)) { MainWindow.openNow() }
                     .keyboardShortcut("0", modifiers: .command)
             }
 
@@ -59,7 +59,7 @@ struct BenagenApp: App {
             // 默认那条弹的是系统的关于面板（一个通用图标 + 版本号），
             // 而这一版要的是**自己的品牌资产**（全称 logo）与自己的窗口。
             CommandGroup(replacing: .appInfo) {
-                AboutCommand()
+                AboutCommand(lang: model.language)
             }
 
             // 「设置…」那一项。用 `replacing:` 顶掉系统那条**默认项**：默认项打开的是
@@ -72,7 +72,7 @@ struct BenagenApp: App {
                 // `showSettingsWindow:`）—— 菜单项与工具栏那颗（`RootView`）共用它，
                 // 所以不存在"菜单能开、按钮没反应"的分叉。
                 SettingsEntry {
-                    Label("设置…", systemImage: "gearshape")
+                    Label(model.language.t(.appMenuSettings), systemImage: "gearshape")
                 }
                 // ⚠️ **⌘, 要自己写**：那个快捷键原本挂在系统那条默认的「设置…」上，
                 //    而 `replacing:` 是把**整条**换掉 —— 不写这一行，⌘, 就没反应了
@@ -91,8 +91,8 @@ struct BenagenApp: App {
         // 用 `Window` 而不是 `WindowGroup`：它是**单例**窗口 —— 没有"关于"开第二个的道理，
         // 而且 `openWindow(id:)` 对已存在的窗口是**置前**而不是再开一个。
         // 内容不持有任何状态（`AboutView` 只读包里的资源与 Info.plist）。
-        Window(aboutWindowTitle, id: aboutWindowID) {
-            AboutView()
+        Window(model.language.t(.appAboutWindow), id: aboutWindowID) {
+            AboutView(lang: model.language)
         }
     }
 }
@@ -109,8 +109,8 @@ private let mainWindowID = "main"
 /// "菜单项点了没反应"（不报错、不弹窗）。这里只定义一次，两处引用同一个常量。
 private let aboutWindowID = "about"
 
-/// 窗口标题，同时也是菜单项的文字。
-private let aboutWindowTitle = "关于 Benagen 数据下载工具"
+/// 窗口标题，同时也是菜单项的文字（按当前语言取句）。
+private func aboutWindowTitle(_ lang: Lang) -> String { lang.t(.appAboutWindow) }
 
 /// ⌘ 菜单里那条「关于 …」。
 ///
@@ -118,6 +118,9 @@ private let aboutWindowTitle = "关于 Benagen 数据下载工具"
 ///    独立的 `View`：把它直接写在 `BenagenApp.body` 的 `CommandGroup` 里取不到
 ///    （`CommandGroup` 的内容虽然是个 `ViewBuilder`，但那是 `App` 的上下文）。
 private struct AboutCommand: View {
+    /// 当前界面语言（默认中文：既有构造点不变）。
+    var lang: Lang = .zh
+
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -127,7 +130,7 @@ private struct AboutCommand: View {
             // ⚠️ `.labelStyle(.titleAndIcon)` **不能省**（本项目栽过三次，见 README 第 11 条）：
             //    macOS 的菜单/工具栏默认可能只画图标，文字掉进**悬停才可见**的浮层里 ——
             //    那样这一条就只剩一个圈里一个 "i" 的图标，用户根本不知道它是"关于"。
-            Label(aboutWindowTitle, systemImage: "info.circle")
+            Label(aboutWindowTitle(lang), systemImage: "info.circle")
                 .labelStyle(.titleAndIcon)
         }
     }

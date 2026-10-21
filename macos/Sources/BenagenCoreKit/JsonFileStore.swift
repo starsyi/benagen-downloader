@@ -46,12 +46,14 @@ public struct JsonFileStore: Sendable {
     /// - 任何一步失败都**抛**（简报：写失败要能被上报，不能让用户以为存上了）；
     /// - 失败时目标文件**逐字保持原样**（要么是旧的完整内容，要么是新的完整内容，
     ///   永远不会是半截）。
-    public func write(_ data: Data, to url: URL) throws {
+    public func write(_ data: Data, to url: URL, lang: Lang = .zh) throws {
         let directory = url.deletingLastPathComponent()
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         } catch {
-            throw JsonFileStoreError("建目录失败：\(directory.path)（\(error.localizedDescription)）")
+            throw JsonFileStoreError(
+                lang.tf(.fileStoreMakeDir,
+                        ["path": directory.path, "reason": error.localizedDescription]))
         }
 
         let temporary = directory.appendingPathComponent(Self.temporaryName(for: url))
@@ -61,11 +63,13 @@ public struct JsonFileStore: Sendable {
             // 清掉可能写了一半的临时文件（`try?`：它也可能压根没被创建）。
             // 这个路径是**我们的保留名**（`temporaryName(for:)`），删它是安全的。
             try? FileManager.default.removeItem(at: temporary)
-            throw JsonFileStoreError("写临时文件失败：\(temporary.path)（\(error.localizedDescription)）")
+            throw JsonFileStoreError(
+                lang.tf(.fileStoreWriteTemp,
+                        ["path": temporary.path, "reason": error.localizedDescription]))
         }
 
         do {
-            try Self.replaceAtomically(temporary, url)
+            try Self.replaceAtomically(temporary, url, lang: lang)
         } catch {
             // 目标没被碰过，但临时文件留下了 ⇒ 清掉（不然它会永远躺在那里）。
             try? FileManager.default.removeItem(at: temporary)
@@ -89,7 +93,8 @@ public struct JsonFileStore: Sendable {
     ///    `rename(2)` 一处定义。
     /// ⚠️ 名字刻意**不叫 `rename`**：那样它会与下面这个 C 函数同名，`rename(a, b)`
     ///    会解析成对自己的一次递归调用（已实测：报 "cannot convert 'String' to 'URL'"）。
-    private static func replaceAtomically(_ temporary: URL, _ destination: URL) throws {
+    private static func replaceAtomically(_ temporary: URL, _ destination: URL,
+                                          lang: Lang = .zh) throws {
         #if canImport(Darwin)
         let result = Darwin.rename(temporary.path, destination.path)
         #elseif canImport(Glibc)
@@ -97,8 +102,10 @@ public struct JsonFileStore: Sendable {
         #endif
         guard result == 0 else {
             let code = errno
-            throw JsonFileStoreError("替换 \(destination.path) 失败：rename(2) errno=\(code)"
-                                     + "（\(String(cString: strerror(code)))）")
+            throw JsonFileStoreError(
+                lang.tf(.fileStoreRename,
+                        ["path": destination.path, "code": String(code),
+                         "reason": String(cString: strerror(code))]))
         }
     }
 }

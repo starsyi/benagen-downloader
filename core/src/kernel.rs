@@ -2120,7 +2120,10 @@ fn recheck_complete_on_disk(k: &mut Kernel) {
 fn op_hello(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, ErrorBody> {
     let mut hello = protocol::hello(params)?;
     let requested = protocol::requested_lang(params);
-    let locale = crate::i18n::system_locale();
+    // 语言从哪来：壳交的系统语言 > 本进程环境变量（CLI / 测试）。
+    // ⚠️ 只在"跟随系统"时才用得到它；客户选了 zh/en 时 `resolve` 会直接返回那个值。
+    let locale = protocol::requested_system_locale(params)
+        .unwrap_or_else(crate::i18n::system_locale);
     with_kernel(kernel, |k| {
         let lang = requested.unwrap_or(k.settings.language).resolve(&locale);
         k.language = lang;
@@ -5404,6 +5407,40 @@ mod tests {
         let (echoed, stored) = hello_with(Some("system"));
         assert_ne!(echoed.as_deref(), Some("system"), "回给壳的必须是解析后的语言");
         assert_ne!(stored, crate::i18n::Lang::System);
+    }
+
+    /// 壳把**系统界面语言**交回来时，"跟随系统"必须照着它解析，而不是照着环境变量。
+    ///
+    /// 这条是 0.3.0 的真机反馈（客户在中文系统上首启拿到英文界面）钉下来的：
+    /// 图形壳里 `LANG` 通常是空的，空的按英文兜底 ⇒ 中文系统的默认语言就错了。
+    #[test]
+    fn hello_uses_the_system_locale_the_shell_reports() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let settings_path = dir.join("s.json");
+        // 客户从没选过语言 ⇒ 设置里是 `system`
+        settings::default_settings()
+            .save_to(&settings_path)
+            .expect("写设置失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(dir.join("dl"), settings_path)));
+
+        let hello_with_locale = |locale: &str| {
+            let params = serde_json::json!({
+                "protocol": protocol::PROTOCOL_VERSION,
+                "system_locale": locale,
+            });
+            let req = protocol::Request { id: 1, method: "hello".to_string(), params };
+            let (resp, _) = dispatch(&kernel, &req);
+            let v = serde_json::to_value(&resp).unwrap();
+            v["result"]["language"].as_str().map(str::to_string)
+        };
+
+        // ① 中文系统 ⇒ 中文界面（环境变量在这台机器上是英文或空也不影响）
+        assert_eq!(hello_with_locale("zh-Hans-CN").as_deref(), Some("zh"));
+        // ② 英文系统 ⇒ 英文界面
+        assert_eq!(hello_with_locale("en-US").as_deref(), Some("en"));
+        // ③ 认不出的语言 ⇒ 英文（与 `detect` 同一条规矩）
+        assert_eq!(hello_with_locale("fr-FR").as_deref(), Some("en"));
     }
 
     /// 三个断言各自钉一件事：

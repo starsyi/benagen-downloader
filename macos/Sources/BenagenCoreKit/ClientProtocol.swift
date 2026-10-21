@@ -56,12 +56,14 @@ extension JSONValue {
     /// 与 [`RawEnvelope.unwrap`] 的差别只有一处：这里解的是**已经取出来的** `result`
     /// （`callSync` 的返回值），而 `unwrap` 解的是整个信封。
     /// 两条路都走 [`CoreJSON`]，所以键策略不会在两处分叉。
-    public func decoded<T: Decodable>(_ type: T.Type) throws -> T {
+    public func decoded<T: Decodable>(_ type: T.Type, lang: Lang = .zh) throws -> T {
         do {
             let data = try CoreJSON.encoder.encode(self)
             return try CoreJSON.decoder.decode(T.self, from: data)
         } catch {
-            throw CoreError.malformedResponse("result 与 \(T.self) 的形状不符: \(error)")
+            throw CoreError.malformedResponse(
+                lang.tf(.clientProtocolShapeMismatch,
+                        ["type": "\(T.self)", "reason": "\(error)"]))
         }
     }
 }

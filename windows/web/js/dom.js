@@ -335,3 +335,52 @@ export function icon(name, className = "") {
   }
   return el;
 }
+
+/**
+ * 把壳侧下发的静态文案填进**已经渲染出来**的节点。
+ *
+ * `copy` 就是 `/api/state` 载荷里的 `copy`：键是 Rust `i18n::Key` 的名字，
+ * 值是**已经按语言成句**的整句。这里只做"按标记写回"，不判断、不拼接
+ * （§3.2：面向用户的字符串一律在 Rust 成句）。
+ *
+ * 标记有三种：
+ *   - `data-copy="Key"` → 写 `textContent`
+ *   - `data-copy-title="Key"` → 写 `title`
+ *   - `data-copy-aria-label="Key"` → 写 `aria-label`
+ *   - `data-copy-placeholder="Key"` → 写 `placeholder`
+ *
+ * @param {ParentNode} root
+ * @param {Record<string,string>} copy
+ */
+export function applyCopy(root, copy) {
+  if (!root || !copy) return;
+  for (const el of root.querySelectorAll("[data-copy]")) {
+    const value = copy[el.getAttribute("data-copy")];
+    // ⚠️ **值没变就不碰 DOM**（与 `shell.js:writeText` 同一条纪律）：每一拍都重写
+    //    `textContent` 会把**选区**从用户脚下抽走（客户正选着交付码复制）。
+    if (typeof value === "string" && el.textContent !== value) el.textContent = value;
+  }
+  for (const [attr, marker] of COPY_ATTRS) {
+    for (const el of root.querySelectorAll(`[${marker}]`)) {
+      const value = copy[el.getAttribute(marker)];
+      if (typeof value === "string" && el.getAttribute(attr) !== value) el.setAttribute(attr, value);
+    }
+  }
+}
+
+const COPY_ATTRS = [
+  ["title", "data-copy-title"],
+  ["aria-label", "data-copy-aria-label"],
+  ["placeholder", "data-copy-placeholder"],
+];
+
+/**
+ * 模板里的文案也要填：屏与对话框是**在 state 到达之后**才克隆的，
+ * 不先填模板内容，克隆出来的按钮就是空的。
+ *
+ * @param {Record<string,string>} copy
+ */
+export function applyCopyToTemplates(copy) {
+  if (!copy) return;
+  for (const tpl of document.querySelectorAll("template")) applyCopy(tpl.content, copy);
+}

@@ -64,7 +64,7 @@ struct SwitchDeliverySheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("加载另一个交付码")
+            Text(model.language.t(.switchTitle))
                 .font(.title3.weight(.semibold))
 
             // 后果说明**常驻**，每一条都是：
@@ -74,12 +74,12 @@ struct SwitchDeliverySheet: View {
             //     发生**的操作主动说话，而这句后果必须在用户点「加载」**之前**就在屏幕上。
             //     事实依据是内核的明文设计（`core/src/main.rs` 的 `clear_engine_batch`：
             //     换码时逐个 remove 在跑的任务，**不碰 download_dir**）。
-            Text("换码会把当前的下载任务从引擎里摘掉（含等待中的）；已经下载到磁盘的文件不会被删除。")
+            Text(model.language.t(.switchWarning))
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            TextField("交付码", text: $code)
+            TextField(model.language.t(.deliveryCode), text: $code)
                 .textFieldStyle(.roundedBorder)
                 .disabled(model.switching)
                 .onSubmit(load)
@@ -88,7 +88,7 @@ struct SwitchDeliverySheet: View {
             // "为什么按不动"。文案是 `DeliveryCodeEntry.tooLongHint` —— 壳写的，
             // 理由（内核收不到这条请求、没有原文可登）写在那边的注释里。
             if codeTooLong {
-                Label(DeliveryCodeEntry.tooLongHint, systemImage: "exclamationmark.triangle")
+                Label(DeliveryCodeEntry.tooLongHint(lang: model.language), systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
@@ -120,9 +120,9 @@ struct SwitchDeliverySheet: View {
                 //    面板关不关得掉，不该由一次网络请求决定。代价是那次换码的结果
                 //    会失去面板这个落点 —— 所以结果**同时**落在 `model.lastSwitchOutcome`
                 //    上，由主区那一行常驻提示呈现（失败：内核原文；成功：已换到批次 X）。
-                Button("取消") { dismiss() }
+                Button(model.language.t(.commonCancel)) { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("加载", action: load)
+                Button(model.language.t(.commonLoad), action: load)
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
                     // 正在换的时候禁用（`model.switching`）：一次只发一条 —— 防连点。
@@ -185,7 +185,7 @@ struct SwitchDeliverySheet: View {
     private var historySection: some View {
         if !historyRows.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
-                Text("历史批次")
+                Text(model.language.t(.switchHistoryTitle))
                     .font(.callout.weight(.semibold))
 
                 // 最多 50 条（`BatchHistory.maximumEntries`），所以给一个上界高度、
@@ -222,12 +222,12 @@ struct SwitchDeliverySheet: View {
                             Image(systemName: "xmark")
                         }
                         .buttonStyle(.borderless)
-                        .help("收起这条提示")
+                        .help(model.language.t(.commonDismissNotice))
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                Text("点一行即可切换到那一批；备注写在这里，重启应用后仍在。")
+                Text(model.language.t(.switchHistoryHint))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -285,10 +285,10 @@ struct SwitchDeliverySheet: View {
             //    `.help` 给的是**既有**的那句话，视图不另编（`EngineGate.unavailableHelp`
             //    是同一个做法：禁用 + 把"为什么"挂在 `.help` 上）。
             .disabled(model.switching || !row.isSendable)
-            .help(row.isSendable ? "加载这一批" : DeliveryCodeEntry.tooLongHint)
+            .help(row.isSendable ? model.language.t(.switchLoadThis) : DeliveryCodeEntry.tooLongHint(lang: model.language))
 
             // 就地一行文本输入（规格 §1.4）。空串 = 没写备注。
-            TextField("备注", text: noteBinding(row))
+            TextField(model.language.t(.switchNotePlaceholder), text: noteBinding(row))
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
                 .focused($editingNote, equals: row.code)

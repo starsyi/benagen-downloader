@@ -50,7 +50,7 @@ public struct BrowserRow: Equatable, Sendable, Identifiable {
     /// ⚠️ `parent` 只有**目录项**用得上：`list_dir` 的目录项**没有 `path` 键**，
     ///    路径只能由壳拼（[`Breadcrumb.join`]）；文件项有 `path`，逐字用它 ——
     ///    不要"顺手"重新拼一遍文件路径，那是在拿壳的拼接覆盖内核给的原文（约束 3）。
-    public static func of(_ entry: DirEntry, parent: String) -> BrowserRow {
+    public static func of(_ entry: DirEntry, parent: String, lang: Lang = .zh) -> BrowserRow {
         switch entry {
         case .dir(let name, let childrenCount):
             return BrowserRow(kind: .dir,
@@ -58,7 +58,7 @@ public struct BrowserRow: Equatable, Sendable, Identifiable {
                               path: Breadcrumb.join(parent: parent, name: name),
                               childrenCount: childrenCount,
                               size: nil,
-                              detailText: "\(childrenCount) 项",
+                              detailText: lang.tf(.countItems, ["count": String(childrenCount)]),
                               // 目录**没有**"源文件时间"这回事（与它的大小同理：那得等内核
                               // 展开才知道，而壳不展开目录，约束 1）—— 恒为占位字形。
                               sourceTimeText: SourceTimeText.noValue,
@@ -83,8 +83,8 @@ public struct BrowserRow: Equatable, Sendable, Identifiable {
     /// **不用 `localizedStandardCompare`**：后者的结果随机器语言环境变，
     /// 于是"排序对不对"这件事在客户机上和在测试里是两个答案
     /// （同 `ByteFormat` 不用 `ByteCountFormatter` 的理由）。
-    public static func rows(_ entries: [DirEntry], parent: String) -> [BrowserRow] {
-        entries.map { of($0, parent: parent) }
+    public static func rows(_ entries: [DirEntry], parent: String, lang: Lang = .zh) -> [BrowserRow] {
+        entries.map { of($0, parent: parent, lang: lang) }
             .sorted { a, b in
                 if a.kind != b.kind { return a.kind == .dir }
                 return a.name < b.name
@@ -137,12 +137,15 @@ public enum RowStateStyle: String, CaseIterable, Equatable, Sendable {
     case pending, downloading, complete, failed, none
 
     /// 界面上的标签。**任何一支都不许是空白**（约束 4）。
-    public var label: String {
+    public var label: String { label(lang: .zh) }
+
+    /// 同上，按当前语言取句（视图用这一支；占位符 `—` 不分语言）。
+    public func label(lang: Lang) -> String {
         switch self {
-        case .pending: return "待下载"
-        case .downloading: return "下载中"
-        case .complete: return "已完成"
-        case .failed: return "失败"
+        case .pending: return lang.t(.rowStatePending)
+        case .downloading: return lang.t(.rowStateDownloading)
+        case .complete: return lang.t(.rowStateComplete)
+        case .failed: return lang.t(.rowStateFailed)
         // 占位字形与 `Format.swift` 的 `SpeedFormat`/`PercentFormat` 同一个（`—`）：
         // 空串在界面上就是"什么都没说"，而"这一格没有值"本身也是一件要说出来的事。
         case .none: return "—"
@@ -504,7 +507,7 @@ public struct SelectionSummary: Equatable, Sendable {
     /// - `sizeText` 只累加**在 `sizes` 里有大小**的那些。目录在 `flat` 里没有大小
     ///   （`get_tree` 的 `flat` 只列文件），所以它对合计的贡献是 0。
     ///   壳**不**自己展开目录去猜一份大小（约束 1：展开是内核的事）。
-    public static func of(selected: Set<String>, sizes: [String: Int64]) -> SelectionSummary {
+    public static func of(selected: Set<String>, sizes: [String: Int64], lang: Lang = .zh) -> SelectionSummary {
         // `+=` 会在 Int64 上溢出崩溃；用 `addingReportingOverflow` 夹住——一组畸形
         // （或恶意）的大小不该让整个界面崩掉（同 `PercentFormat` 的乘法守卫）。
         var total: Int64 = 0
@@ -513,8 +516,8 @@ public struct SelectionSummary: Equatable, Sendable {
             let (sum, over) = total.addingReportingOverflow(max(0, one))
             total = over ? Int64.max : sum
         }
-        return SelectionSummary(countText: "已选 \(selected.count) 项",
-                                sizeText: "合计 " + ByteFormat.text(total))
+        return SelectionSummary(countText: lang.tf(.selectionCount, ["count": String(selected.count)]),
+                                sizeText: lang.tf(.selectionTotal, ["size": ByteFormat.text(total)]))
     }
 
     /// `get_tree` 的 `flat[]` → 路径 → 大小。**跨目录**的合计要靠它（当前层只有一部分）。

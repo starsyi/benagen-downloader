@@ -30,6 +30,9 @@ struct TransferRowView: View {
     /// 实现落在 `TransfersView`（那里才有 home 与 AppKit），本视图只负责那一项**什么时候可点**。
     let onReveal: () -> Void
 
+    /// 当前界面语言（默认中文：既有调用点不变）。
+    var lang: Lang = .zh
+
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: stateIcon)
@@ -59,7 +62,7 @@ struct TransferRowView: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 88, alignment: .trailing)
 
-            Text(row.stateLabel)
+            Text(row.stateLabel(lang: lang))
                 .font(.caption)
                 .foregroundStyle(tint(row.stateColor))
                 .frame(width: 64, alignment: .leading)
@@ -70,7 +73,7 @@ struct TransferRowView: View {
         .contentShape(Rectangle())
         // 同一份菜单挂两份：`Menu` 是看得见的入口，右键菜单是习惯动作。
         .contextMenu { actionItems }
-        .help(row.manifestPath ?? row.title)
+        .help(row.manifestPath ?? row.title(lang: lang))
     }
 
     // MARK: - 名称 / 角标
@@ -85,7 +88,7 @@ struct TransferRowView: View {
             if row.showsPausedBadge {
                 // 「已暂停」角标：`state` 里 paused 与 waiting 长得一模一样，
                 // 这个角标是两者在界面上唯一的区别（裁决 #88 / 规格 §8.4）。
-                Text("已暂停")
+                Text(lang.t(.transferPausedBadge))
                     .font(.caption2.weight(.semibold))
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
@@ -125,17 +128,17 @@ struct TransferRowView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
-        .help(engineAllowsActions ? "这一行的操作" : EngineGate.unavailableHelp)
+        .help(engineAllowsActions ? lang.t(.transferRowActions) : EngineGate.unavailableHelp(lang: lang))
     }
 
     /// 行级菜单项。**禁用而不是"点了没反应"**（简报）：
     /// 每一项的可用性都来自 `TransferRow.availableActions`（有单测），并且整体再与引擎闸门相与。
     @ViewBuilder private var actionItems: some View {
-        Button("暂停") { onAction(.pause) }
+        Button(lang.t(.transferPause)) { onAction(.pause) }
             .disabled(!canAct(.pause))
-        Button("继续") { onAction(.unpause) }
+        Button(lang.t(.transferResume)) { onAction(.unpause) }
             .disabled(!canAct(.unpause))
-        Button("重试") { onAction(.retry) }
+        Button(lang.t(.retry)) { onAction(.retry) }
             .disabled(!canAct(.retry))
 
         Divider()
@@ -144,12 +147,12 @@ struct TransferRowView: View {
         //    否则 Windows 壳就要面对一个叫 reveal 却要打开资源管理器的方法）。
         //    `path == nil` 时**禁用**：没有路径就没有文件可定位，点下去什么都不发生
         //    是简报点名不要的静默无效。
-        Button("在访达中显示") { onReveal() }
+        Button(lang.t(.transferReveal)) { onReveal() }
             .disabled(!row.canRevealInFinder)
 
         Divider()
 
-        Button("移除", role: .destructive) { onAction(.remove) }
+        Button(lang.t(.transferRemove), role: .destructive) { onAction(.remove) }
             .disabled(!canAct(.remove))
     }
 

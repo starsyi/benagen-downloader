@@ -136,8 +136,9 @@ use crate::presentation::kernel_death::CallFailure;
 ///
 /// ⚠️ 措辞里的「设置」（`NO_KERNEL` 原文如此）与规格 §2.1 第 9 项那个**设置窗口**是同一个
 ///    落点；本代它的「重试」在设置里（macOS 侧同形）。改这句话之前先确认那一处还在。
-pub const NO_KERNEL: &str = "还没有连上内核，请先点设置里的「重试」。\
-                             这条不是内核报的错——内核此刻还没起来。";
+pub fn no_kernel(lang: crate::i18n::Lang) -> &'static str {
+    crate::i18n::t(lang, crate::i18n::Key::NoKernel)
+}
 
 /// **界面值 → JSON**：本层**唯一**一处 `to_value` 口径。
 ///
@@ -214,23 +215,26 @@ mod tests {
     #[test]
     fn the_no_kernel_message_says_the_cause_and_the_next_step() {
         assert!(
-            NO_KERNEL.contains("内核"),
-            "这句话没说清根因（还没有连上内核）：{NO_KERNEL}"
+            no_kernel(crate::i18n::Lang::Zh).contains("内核"),
+            "这句话没说清根因（还没有连上内核）：{}",
+            no_kernel(crate::i18n::Lang::Zh)
         );
         assert!(
-            NO_KERNEL.contains("重试"),
-            "这句话没给出可执行的下一步（点「重试」）：{NO_KERNEL}"
+            no_kernel(crate::i18n::Lang::Zh).contains("重试"),
+            "这句话没给出可执行的下一步（点「重试」）：{}",
+            no_kernel(crate::i18n::Lang::Zh)
         );
         assert!(
-            NO_KERNEL.contains("不是内核报的错"),
+            no_kernel(crate::i18n::Lang::Zh).contains("不是内核报的错"),
             // ⚠️ 措辞按字体子集的覆盖判据挑过字（`test.sh` 第 0.5 步：这条消息里的每个
             //    非 ASCII 字都必须在 `windows/assets/ui-subset.otf` 里，否则判据变红）。
-            "这句话没排除掉「这是内核报的错」那条误读（用户会拿去查）：{NO_KERNEL}"
+            "这句话没排除掉「这是内核报的错」那条误读（用户会拿去查）：{}",
+            no_kernel(crate::i18n::Lang::Zh)
         );
         // 它是**失败**那一支的原文：信封形状与其余失败一致（前端只有一条解包路径）。
-        let v = envelope::err(NO_KERNEL);
+        let v = envelope::err(no_kernel(crate::i18n::Lang::Zh));
         assert_eq!(v["ok"], serde_json::json!(false));
-        assert_eq!(v["error"]["message"], serde_json::json!(NO_KERNEL), "原文逐字、不加工");
+        assert_eq!(v["error"]["message"], serde_json::json!(no_kernel(crate::i18n::Lang::Zh)), "原文逐字、不加工");
     }
 
     /// ⚠️ **内核死亡那一档发的是 `text` 不是 `reason`**（见函数文档）：

@@ -113,7 +113,10 @@ public enum DownloadTargets {
     }
 
     /// 一项都没勾时，底栏那一行要说的话（**明说**会发生什么，不让用户猜）。
-    public static let emptySelectionHint = "未勾选任何项，将下载全部待下载文件"
+    public static var emptySelectionHint: String { emptySelectionHint(lang: .zh) }
+
+    /// 同上，按当前语言取句（视图用这一支）。
+    public static func emptySelectionHint(lang: Lang) -> String { lang.t(.emptySelectionHint) }
 
     /// 那颗按钮的文案。**未选中任何项时是「全部下载」**（简报）。
     ///
@@ -122,13 +125,16 @@ public enum DownloadTargets {
     ///
     /// ⚠️ 数值上只说"有 / 没有勾选"这一件事，**不拼项数**：项数已经由底部状态栏的
     ///    `SelectionSummary.countText`（「已选 N 项」）说过了，两处各说一遍迟早会不一致。
-    public static func buttonTitle(for selection: Set<String>) -> String {
-        selection.isEmpty ? "全部下载" : "下载选中"
+    public static func buttonTitle(for selection: Set<String>, lang: Lang = .zh) -> String {
+        selection.isEmpty ? lang.t(.downloadAll) : lang.t(.downloadSelected)
     }
 
     /// 那颗按钮的悬停提示。**工具栏与底部状态栏共用这一份** ——
     /// 两个入口各写一句文案，改一处就会出现"同一个按钮两个说法"。
-    public static let helpText = "把选中的文件加入下载队列（未选中时 = 全部待下载文件）"
+    public static var helpText: String { helpText(lang: .zh) }
+
+    /// 同上，按当前语言取句（视图用这一支）。
+    public static func helpText(lang: Lang) -> String { lang.t(.downloadTargetsHelp) }
 }
 
 /// `enqueue` 的**回执** → 界面上要说的话。
@@ -160,13 +166,45 @@ public struct EnqueueFeedback: Equatable, Sendable {
     /// 顶上那句话。成功时是壳写的**计数**（内核只给了数组，没给"几个"这句话 ——
     /// `added` 为空时那句同样是壳写的，理由见 `of`）；
     /// 失败时它就是**内核原文**（约束 3：一个字都不加）。
-    public let summary: String
+    /// 顶上那句话的**种类**：不存成品句子，语言在渲染时才定（见 `summary(lang:)`）。
+    public enum Summary: Equatable, Sendable {
+        case nothing
+        case added(Int)
+        case addedWithPending(added: Int, pending: Int)
+        /// 内核原文（约束 3）：**不翻译**。
+        case verbatim(String)
+    }
+
+    private let summaryKind: Summary
+
+    /// 顶上那句话（中文 —— 既有测试与默认口径）。
+    public var summary: String { summary(lang: .zh) }
+
+    /// 按当前语言取句；`verbatim` 原样返回（内核原文，约束 3）。
+    public func summary(lang: Lang) -> String {
+        switch summaryKind {
+        case .nothing:
+            return lang.t(.enqueueNothing)
+        case .added(let added):
+            return lang.tf(.enqueueAdded, ["added": String(added)])
+        case .addedWithPending(let added, let pending):
+            return lang.tf(.enqueueAddedPending, ["added": String(added), "pending": String(pending)])
+        case .verbatim(let text):
+            return text
+        }
+    }
 
     /// 逐条拒绝理由（可能为空）。
     public let rejections: [Rejection]
 
     /// `added` 非空 → 切到传输列表。
     public let switchesToTransfers: Bool
+
+    public init(summary: Summary, rejections: [Rejection], switchesToTransfers: Bool) {
+        self.summaryKind = summary
+        self.rejections = rejections
+        self.switchesToTransfers = switchesToTransfers
+    }
 
     /// 内核回执 → 要说的话。
     ///
@@ -195,15 +233,18 @@ public struct EnqueueFeedback: Equatable, Sendable {
     ///    （`[Object {"path": …, "reason": …}]`），**不是结构化字段**。壳要"逐条"就得去切
     ///    一句内核随时会改的措辞 —— 而"壳不解析内核文案"（约束 2/3）与"不改 `core/`"（约束 10）
     ///    是底线；宁可整条原文照登（约束 4 的"不静默少交"已经满足：用户看得到全部信息）。
-    public static func of(_ result: EnqueueResult) -> EnqueueFeedback {
-        let summary: String
+    public static func of(_ result: EnqueueResult, lang: Lang = .zh) -> EnqueueFeedback {
+        // ⚠️ `lang` 目前不参与判决（三种计数句都由 `summaryKind` 在渲染时取句）；
+        //    留在签名里是为了与 `failure(of:lang:)` 同形，调用点不必分两种写法。
+        _ = lang
+        let summary: Summary
         if result.added.isEmpty && result.pending == 0 {
-            summary = "没有需要下载的文件"
+            summary = .nothing
         } else if result.pending > 0 {
             // 大批量是分批加入的：先让客户看到任务开始，其余的在下载的同时陆续加入。
-            summary = "已加入 \(result.added.count) 个下载任务，另有 \(result.pending) 个正在后台继续加入"
+            summary = .addedWithPending(added: result.added.count, pending: result.pending)
         } else {
-            summary = "已加入 \(result.added.count) 个下载任务"
+            summary = .added(result.added.count)
         }
         return EnqueueFeedback(summary: summary,
                                rejections: result.rejected.map { Rejection(path: $0.path, reason: $0.reason) },
@@ -216,8 +257,8 @@ public struct EnqueueFeedback: Equatable, Sendable {
     /// 原文映射走 `AppModel.message(of:)` —— 那是 `CoreError` → 用户可见文案的**唯一**实现
     /// （`DirLoadFailure.of` 用的也是它）。本文件不抄第二份，视图里也不映射：
     /// 视图只把这个值摆到屏幕上（约束 8）。
-    public static func failure(of error: Error) -> EnqueueFeedback {
-        EnqueueFeedback(summary: AppModel.message(of: error),
+    public static func failure(of error: Error, lang: Lang = .zh) -> EnqueueFeedback {
+        EnqueueFeedback(summary: .verbatim(AppModel.message(of: error, lang: lang)),
                         rejections: [],
                         switchesToTransfers: false)
     }
@@ -235,12 +276,12 @@ public struct DownloadNotice: Equatable, Sendable {
     public let code: String?
     public let feedback: EnqueueFeedback
 
-    public static func of(_ result: EnqueueResult, code: String?) -> DownloadNotice {
-        DownloadNotice(code: code, feedback: .of(result))
+    public static func of(_ result: EnqueueResult, code: String?, lang: Lang = .zh) -> DownloadNotice {
+        DownloadNotice(code: code, feedback: .of(result, lang: lang))
     }
 
-    public static func failure(of error: Error, code: String?) -> DownloadNotice {
-        DownloadNotice(code: code, feedback: .failure(of: error))
+    public static func failure(of error: Error, code: String?, lang: Lang = .zh) -> DownloadNotice {
+        DownloadNotice(code: code, feedback: .failure(of: error, lang: lang))
     }
 
     /// 这条回执属于当前这批吗。`nil == nil` 算"属于"（没有码就没有"哪一批"可比，
@@ -252,7 +293,13 @@ public struct DownloadNotice: Equatable, Sendable {
     /// 回执条顶上那句话。**不属于当前批时前面加上批次码** ——
     /// 用户必须一眼看出"这条不是我刚加载的这批的结果"。
     public func summary(currentCode: String?) -> String {
-        guard !belongsTo(to: currentCode) else { return feedback.summary }
-        return "批次 \(code ?? "—")：\(feedback.summary)"
+        summary(currentCode: currentCode, lang: .zh)
+    }
+
+    /// 按当前语言取句；跨批时带批次码（那句话同样是按语言取的）。
+    public func summary(currentCode: String?, lang: Lang) -> String {
+        guard !belongsTo(to: currentCode) else { return feedback.summary(lang: lang) }
+        return lang.tf(.downloadNoticeBatch, ["code": code ?? "—",
+                                              "summary": feedback.summary(lang: lang)])
     }
 }

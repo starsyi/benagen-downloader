@@ -11,14 +11,17 @@ import BenagenCoreKit
 /// ⚠️ 本文件**只有绑定与布局**（全局约束 8）：没有可断言的值计算，
 ///    所以它靠手工清单验收（`macos/README.md` 第 17 条）。视图不单测（规格 §10.4）。
 struct AboutView: View {
+    /// 当前界面语言（默认中文：既有调用点不变）。
+    var lang: Lang = .zh
+
     var body: some View {
         VStack(spacing: 14) {
             logoCard
-            Text("Benagen 数据下载工具")
+            Text(lang.t(.appTitle))
                 .font(.title3.weight(.semibold))
             // ⚠️ 前面**不加**"版本"两个字：`AboutInfo` 的兜底文案本身就是一句完整的话
             //    （"版本未知（…）"），加上去会变成"版本 版本未知（…）"。
-            Text(AboutInfo.version(in: .main))
+            Text(AboutInfo.version(in: .main, lang: lang))
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)      // 报障时能把版本号原样复制出来

@@ -100,6 +100,7 @@
 use std::sync::Arc;
 
 use shell_core::client::CoreClient;
+use shell_core::i18n::{t, tf, Key, Lang};
 use shell_core::lifecycle;
 use shell_core::protocol::EngineState;
 use shell_win::bootstrap;
@@ -115,18 +116,20 @@ use shell_win::session::{self, Connector, Session};
 /// ⚠️ 两处必须**逐字相同**（否则用户看到两个名字），而**没有任何东西会因此变红** ——
 ///    钉住它的就是下面 `mod tests` 里那条 `the_message_box_title_matches_the_window_title`
 ///    （它把 `tauri.conf.json` 读进来比字面量）。改标题时两处一起改。
-const WINDOW_TITLE: &str = "Benagen 数据下载工具";
+fn window_title(lang: Lang) -> &'static str {
+    t(lang, Key::UiAppTitle)
+}
 
 /// 原生消息框（规格 §7 那张表的最后一行）。
 ///
 /// ⚠️ **交付形态的子系统是 `windows`（没有控制台）**，而启动期失败时**也没有窗口**
 ///    ⇒ 这是唯一还能跟人说话的通道（W-2：失败必须看得见）。
 #[cfg(target_os = "windows")]
-fn native_message_box(text: &str) {
+fn native_message_box(title: &str, text: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
     let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
     let text = wide(text);
-    let caption = wide(WINDOW_TITLE);
+    let caption = wide(title);
     // SAFETY：两个缓冲区都以 NUL 结尾、在本调用期间一直存活；这是 MessageBoxW 的契约。
     unsafe {
         MessageBoxW(
@@ -148,8 +151,8 @@ fn native_message_box(text: &str) {
 /// ⚠️ 宿主构建**不是交付形态**（规格 §9.0：它是开发期的脚手架），所以这里"能看见"
 ///    这件事在宿主上是成立的（终端里有字）。
 #[cfg(not(target_os = "windows"))]
-fn native_message_box(text: &str) {
-    eprintln!("{text}");
+fn native_message_box(title: &str, text: &str) {
+    eprintln!("{title}\n{text}");
 }
 
 /// 关掉内核连接（**显式、幂等**，规格 §3.3 第 6 条）。
@@ -176,6 +179,9 @@ fn shutdown(session: &Arc<Session>) {
 
 /// 装配入口（规格 §3.3）：**单实例 → WebView2Loader → 会话 → 内核在哪 → 连接器 → Tauri**。
 fn main() {
+    // 启动期语言（握手落定之前）：消息框、托盘、窗口标题都用它。
+    let lang = shell_win::locale::startup_lang();
+
     // ---- ⓪ 单实例（规格 §2.2 / §7 那张表的第五行 / 待定项 D-3）---------------
     //
     // ⚠️ **必须排在所有事情之前**：第二份进程不该去释放一份 DLL、不该去建窗口、
@@ -184,7 +190,10 @@ fn main() {
     //    `single_instance.rs` 的模块头）—— 所以这一段在本地开发时**不会**拦第二个实例。
     if shell_win::single_instance::acquire() == shell_win::single_instance::Verdict::AlreadyRunning
     {
-        native_message_box(shell_win::single_instance::already_running_message());
+        native_message_box(
+            window_title(lang),
+            shell_win::single_instance::already_running_message(lang),
+        );
         std::process::exit(0);
     }
 
@@ -198,13 +207,16 @@ fn main() {
     // ⚠️ **宿主靶上这是一个 no-op**（`install()` 那一支恒返回 `Ok`）：宿主是 WKWebView，
     //    压根没有 WebView2 这回事（规格 §9.0）。**不是静默降级** —— 宿主的产物本来
     //    就不是交付形态，而交付形态那一条（`not(msvc)` 的 Windows 靶）没有开关。
-    if let Err(why) = shell_win::wv2::install() {
-        native_message_box(&format!("{WINDOW_TITLE} 起不来：\n\n{why}"));
+    if let Err(why) = shell_win::wv2::install(lang) {
+        native_message_box(
+            window_title(lang),
+            &tf(lang, Key::StartupFailed, &[("app", window_title(lang)), ("why", &why)]),
+        );
         std::process::exit(1);
     }
 
     // ---- ③ 会话 + 内核在哪（R-15 搬回来的那三条路）---------------------------
-    let session = Arc::new(Session::new());
+    let session = Arc::new(Session::new_with_lang(lang));
 
     // ⚠️ 这里**不留下那个路径**：真正要起的那个内核由连接器在**每一次尝试**里重查一遍
     //    （`retry()` 的语义就是"重新找一次"——人类伙伴的验收动作是"把内核放到壳旁边、
@@ -212,7 +224,7 @@ fn main() {
     //      · 是不是"退回了同目录那一份"（W-2 披露，写进它自己那一格，见下）；
     //      · 这一刻**有没有**可起的进程 —— 没有就**当场**落到"不可用"，让页面第一眼
     //        就能说清为什么（而不是等一次后台线程的往返）。
-    let core_found = match bootstrap::locate_core_binary() {
+    let core_found = match bootstrap::locate_core_binary(lang) {
         Ok(lookup) => {
             // ⚠️ W-2：**"退回了同目录那份内核"这件事必须说出来**，而且要住在**它自己那一格**
             //    （粘滞），不许借 `last_error`（那一格的契约是"下一个成功就清"）。
@@ -268,7 +280,7 @@ fn main() {
                 //        "退回了同目录那份内核"这回事，留着上一轮那一句就是一句已不成立的话。
                 //    ⚠️ 少了下面那一支，这一格会**跨过重试一直粘着**：② 修好之后页面上还挂着
                 //    "本机用的是手工放的那份内核" —— 与 W-2 要的"那一格的字必须是事实"相反。
-                let lookup = match bootstrap::locate_core_binary() {
+                let lookup = match bootstrap::locate_core_binary(worker.lang()) {
                     Ok(lookup) => lookup,
                     Err(why) => {
                         worker.set_fallback_notice(None);
@@ -291,7 +303,7 @@ fn main() {
                 };
                 // ⚠️ 这一发是**无上界**的（`hello` 有 5 秒上界，但起子进程没有），
                 //    而它跑在 `session::spawn_connect` 起的那条**后台线程**上（裁决 Z）。
-                let connected = bootstrap::connect(&lookup.path, &arguments)?;
+                let connected = bootstrap::connect(worker.lang(), &lookup.path, &arguments)?;
                 Ok((connected.client, connected.handshake_reply))
             });
         session.set_connector(connector);
@@ -359,12 +371,28 @@ fn main() {
         .invoke_handler(commands::invoke_handler())
         .on_window_event(window_events)
         .setup(move |app| {
-            let tray = build_tray(app.handle());
+            // 窗口起来之后按启动语言覆盖一次标题（`tauri.conf.json` 里那份保持中文，
+            // 它是构建期的常量；真正的语言由运行时决定）。
+            {
+                use tauri::Manager;
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_title(window_title(setup_session.lang()));
+                }
+            }
+            let tray = build_tray(app.handle(), lang);
+            let tick_session = Arc::clone(&setup_session);
             let on_count: Arc<dyn Fn(usize) + Send + Sync> = match tray {
-                Ok(tray) => {
+                Ok((tray, show, quit)) => {
                     setup_tray.store(true, std::sync::atomic::Ordering::Relaxed);
                     Arc::new(move |n| {
-                        let _ = tray.set_tooltip(Some(lifecycle::tray_tip(n)));
+                        use tauri::Manager;
+                        let lang = tick_session.lang();
+                        let _ = tray.set_tooltip(Some(lifecycle::tray_tip(lang, n)));
+                        let _ = show.set_text(t(lang, Key::StartupTrayShow));
+                        let _ = quit.set_text(t(lang, Key::StartupTrayQuit));
+                        if let Some(window) = tray.app_handle().get_webview_window("main") {
+                            let _ = window.set_title(window_title(lang));
+                        }
                     })
                 }
                 // 托盘装不上：不致命——关窗会走"真退出"那条（见 `close_intent`）。
@@ -380,9 +408,14 @@ fn main() {
         Ok(app) => app,
         Err(why) => {
             // 走到这里说明**窗口都没起来**（前端资源坏了、webview 初始化失败、…）。
-            native_message_box(&format!(
-                "{WINDOW_TITLE} 起不来：\n\n{why}\n\n补救：把这条原样发给我们。"
-            ));
+            native_message_box(
+                window_title(lang),
+                &tf(
+                    lang,
+                    Key::StartupFailedHelp,
+                    &[("app", window_title(lang)), ("why", &why.to_string())],
+                ),
+            );
             std::process::exit(1);
         }
     };
@@ -399,20 +432,27 @@ fn main() {
 }
 
 /// 建托盘：左键 / 「显示主窗口」把窗口叫回来；「退出」是**唯一**的真退出入口。
+type TrayParts = (
+    tauri::tray::TrayIcon,
+    tauri::menu::MenuItem<tauri::Wry>,
+    tauri::menu::MenuItem<tauri::Wry>,
+);
+
 fn build_tray(
     app: &tauri::AppHandle,
-) -> Result<tauri::tray::TrayIcon, Box<dyn std::error::Error>> {
+    lang: Lang,
+) -> Result<TrayParts, Box<dyn std::error::Error>> {
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
     use tauri::Manager;
 
-    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", t(lang, Key::StartupTrayShow), true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", t(lang, Key::StartupTrayQuit), true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
     let icon = app
         .default_window_icon()
         .cloned()
-        .ok_or("exe 里没有图标资源：任务栏图标无从显示")?;
+        .ok_or_else(|| t(lang, Key::StartupNoIcon))?;
 
     fn show_main(app: &tauri::AppHandle) {
         if let Some(w) = app.get_webview_window("main") {
@@ -425,7 +465,7 @@ fn build_tray(
 
     let tray = TrayIconBuilder::new()
         .icon(icon)
-        .tooltip(lifecycle::tray_tip(0))
+        .tooltip(lifecycle::tray_tip(lang, 0))
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -444,7 +484,7 @@ fn build_tray(
             }
         })
         .build(app)?;
-    Ok(tray)
+    Ok((tray, show, quit))
 }
 
 #[cfg(test)]
@@ -462,7 +502,8 @@ mod tests {
     //!    判据也就跟着它们走；**本文件不再持有它们**）。8 条回来了、4 条留在 git 历史里
     //!    （哪 4 条、为什么，见 `bootstrap.rs` 的文件头）。
 
-    use super::WINDOW_TITLE;
+    use super::window_title;
+    use shell_core::i18n::Lang;
 
     /// **窗口标题与消息框标题必须逐字相同。**
     ///
@@ -478,7 +519,8 @@ mod tests {
             .as_str()
             .expect("tauri.conf.json 里必须有 app.windows[0].title（窗口标题的家在那里）");
         assert_eq!(
-            title, WINDOW_TITLE,
+            title,
+            window_title(Lang::Zh),
             "两处标题对不上：窗口上显示一个名字、启动失败的消息框上显示另一个"
         );
     }

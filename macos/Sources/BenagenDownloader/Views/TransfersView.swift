@@ -72,7 +72,7 @@ struct TransfersView: View {
     private var header: some View {
         HStack(spacing: 12) {
             if let global = model.transfers?.global {
-                let summary = TransferGlobalSummary.of(global)
+                let summary = TransferGlobalSummary.of(global, lang: model.language)
                 Image(systemName: "arrow.down.circle")
                     .foregroundStyle(.secondary)
                 Text(summary.speedText)
@@ -84,7 +84,7 @@ struct TransfersView: View {
                     .monospacedDigit()
             } else {
                 // 还没有快照：不编数字，也不留一段空白（那会看着像坏了）。
-                Text("读取中…")
+                Text(model.language.t(.transfersLoading))
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
@@ -98,46 +98,46 @@ struct TransfersView: View {
             Button {
                 run(.pauseAll, gid: nil)
             } label: {
-                Label("暂停全部", systemImage: "pause.circle")
+                Label(model.language.t(.transfersPauseAll), systemImage: "pause.circle")
             }
             .buttonStyle(.borderless)
             .labelStyle(.titleAndIcon)
             .disabled(!engineAllowsActions || !batch.canPauseAll)
-            .help(engineAllowsActions ? "立刻暂停全部任务（已下载的部分保留，可随时一键开始）" : EngineGate.unavailableHelp)
+            .help(engineAllowsActions ? model.language.t(.transfersPauseAllHelp) : EngineGate.unavailableHelp(lang: model.language))
 
             Button {
                 run(.resumeAll, gid: nil)
             } label: {
-                Label("一键开始", systemImage: "play.circle")
+                Label(model.language.t(.transfersResumeAll), systemImage: "play.circle")
             }
             .buttonStyle(.borderless)
             .labelStyle(.titleAndIcon)
             .disabled(!engineAllowsActions || !batch.canResumeAll)
-            .help(engineAllowsActions ? "继续全部已暂停的任务，并把还没下完的补回队列" : EngineGate.unavailableHelp)
+            .help(engineAllowsActions ? model.language.t(.transfersResumeAllHelp) : EngineGate.unavailableHelp(lang: model.language))
 
             Button {
                 Task { await model.refreshTransfers() }
             } label: {
-                Label("刷新", systemImage: "arrow.clockwise")
+                Label(model.language.t(.commonRefresh), systemImage: "arrow.clockwise")
             }
             .buttonStyle(.borderless)
             .labelStyle(.titleAndIcon)
             .disabled(!engineAllowsActions)
-            .help(engineAllowsActions ? "立刻取一次传输列表快照" : EngineGate.unavailableHelp)
+            .help(engineAllowsActions ? model.language.t(.transfersRefreshHelp) : EngineGate.unavailableHelp(lang: model.language))
 
             // 「清空已完成」是**列表级**动作（没有 gid）：行级菜单里没有它，
             // 否则用户以为只清那一行、实际清掉一片。
             Button {
                 run(.clearFinished, gid: nil)
             } label: {
-                Label("清空已完成", systemImage: "trash")
+                Label(model.language.t(.transfersClearFinished), systemImage: "trash")
             }
             .buttonStyle(.borderless)
             .labelStyle(.titleAndIcon)
             // 没有已结束的任务时禁用（判据在 `TransferGlobalSummary.canClearFinished`）：
             // 点了界面毫无变化的话，用户分不清"清完了"还是"没生效"（约束 4）。
-            .disabled(!engineAllowsActions || !(model.transfers.map { TransferGlobalSummary.of($0.global).canClearFinished } ?? false))
-            .help(engineAllowsActions ? "移除全部已结束的任务" : EngineGate.unavailableHelp)
+            .disabled(!engineAllowsActions || !(model.transfers.map { TransferGlobalSummary.of($0.global, lang: model.language).canClearFinished } ?? false))
+            .help(engineAllowsActions ? model.language.t(.transfersClearFinishedHelp) : EngineGate.unavailableHelp(lang: model.language))
         }
         .font(.callout)
         .padding(.horizontal, 20)
@@ -155,11 +155,11 @@ struct TransfersView: View {
             centered {
                 ProgressView()
                     .controlSize(.small)
-                Text("正在读取传输列表…")
+                Text(model.language.t(.transfersLoadingList))
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-        } else if let text = TransferListEmpty.of(engine: model.engine) {
+        } else if let text = TransferListEmpty.of(engine: model.engine, lang: model.language) {
             // `engine_not_started` 落在这里：**空态文案，不是错误**（简报）。
             centered {
                 Image(systemName: "arrow.down.circle")
@@ -182,7 +182,8 @@ struct TransfersView: View {
             TransferRowView(row: row,
                             engineAllowsActions: engineAllowsActions,
                             onAction: { run($0, gid: row.gid) },
-                            onReveal: { reveal(row) })
+                            onReveal: { reveal(row) },
+                            lang: model.language)
         }
         .listStyle(.inset)
     }
@@ -211,7 +212,7 @@ struct TransfersView: View {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.borderless)
-            .help("收起这条提示")
+            .help(model.language.t(.commonDismissNotice))
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 8)

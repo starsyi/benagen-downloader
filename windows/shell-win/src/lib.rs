@@ -36,6 +36,7 @@ pub mod commands;
 /// ⚠️ 它是**唯一会往客户的下载目录里写东西**的模块（一个 8 MiB 的探针文件，写完即删），
 ///    所以单独成模块、单独被测（`a_real_write_yields_a_number` 真的写一遍）。
 pub mod diskspeed;
+pub mod locale;
 /// 内嵌内核 exe 的**释放**（规格 §3.3 第 3 步）。
 ///
 /// ⚠️ **它的调用点在 `bootstrap.rs` 的 `embedded_core()`**（`locate_core_binary` 的第 ② 条路，

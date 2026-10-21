@@ -63,6 +63,9 @@ struct SettingsView: View {
                 // ② 「诊断」紧挨在下载目录之后、编辑器之前（规格 §2.4 指定的位置）。
                 DiagnosticsSection(model: model)
 
+                // ②½ 「界面语言」（规格 W1）。**立刻生效**：不重启内核、不关设置窗。
+                LanguageSection(model: model)
+
                 // ③ 「启动时检查更新」（规格 §4）。**不重启内核**（开关状态在内核自己的
                 //    `update.json` 里，内核下一次检查时自己读）—— 与上面那个详细日志开关不同。
                 UpdateSection(model: model)
@@ -71,7 +74,7 @@ struct SettingsView: View {
                 //    编辑器的 `Stepper` / `Picker` / `TextField` 都要**非可选**的
                 //    `Binding<SettingsForm>`。
                 if let form = Binding($form) {
-                    SettingsParameterSections(form: form)
+                    SettingsParameterSections(form: form, lang: model.language)
                 } else {
                     Section { unavailable }
                 }
@@ -113,7 +116,7 @@ struct SettingsView: View {
             Image(systemName: "gearshape")
                 .font(.largeTitle)
                 .foregroundStyle(.tertiary)
-            Text("内核还没有交出参数面板")
+            Text(model.language.t(.settingsUnavailableTitle))
                 .font(.callout)
             Text(EngineStatusPresentation.text(for: model.engine, lang: model.language))
                 .font(.caption)
@@ -172,22 +175,22 @@ private struct DownloadDirectorySection: View {
 
     var body: some View {
         Section {
-            LabeledContent("下载到") {
+            LabeledContent(model.language.t(.settingsDownloadTo)) {
                 HStack(spacing: 8) {
-                    Text(DownloadDirectory.display(model.downloadDir))
+                    Text(DownloadDirectory.display(model.downloadDir, lang: model.language))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .textSelection(.enabled)
-                        .help(DownloadDirectory.display(model.downloadDir))
+                        .help(DownloadDirectory.display(model.downloadDir, lang: model.language))
                     if changing { ProgressView().controlSize(.small) }
                     Spacer(minLength: 8)
-                    Button("选择…") { choose() }
+                    Button(model.language.t(.commonChoose)) { choose() }
                         .disabled(changing)
-                        .help("挑一个文件夹，交付文件会下到这里（改完会重启内核）")
-                    Button("恢复默认") { ask(to: "") }
+                        .help(model.language.t(.settingsChooseDirectoryHelp))
+                    Button(model.language.t(.settingsRestoreDefault)) { ask(to: "") }
                         .disabled(changing || !isConfigured)
-                        .help("不再指定下载目录，由内核用它自己的默认值（改完会重启内核）")
+                        .help(model.language.t(.settingsRestoreDefaultHelp))
                 }
             }
             if let outcome {
@@ -205,7 +208,7 @@ private struct DownloadDirectorySection: View {
                     //    截断与上限的规矩只此一份，两处不可能漂移）；
                     //    只有**呈现**不同：这里字号是表单的 `.caption`，图标是"刚按完确认"
                     //    的绿色对勾（主区那条用文件夹图标），那两样留在调用点。
-                    DownloadDirChangeNotice(change: outcome, titleFont: .caption)
+                    DownloadDirChangeNotice(change: outcome, titleFont: .caption, lang: model.language)
                     Spacer(minLength: 8)
                     Button {
                         // 收起的是**模型那一份**（这一屏与 `RootView` 那行提示是同一个值，
@@ -215,11 +218,11 @@ private struct DownloadDirectorySection: View {
                         Image(systemName: "xmark")
                     }
                     .buttonStyle(.borderless)
-                    .help("收起这条提示")
+                    .help(model.language.t(.commonDismissNotice))
                 }
             }
         } footer: {
-            Text(DownloadDirectory.sectionNote)
+            Text(DownloadDirectory.sectionNote(lang: model.language))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -229,12 +232,12 @@ private struct DownloadDirectorySection: View {
                presenting: prompt) { p in
             switch p {
             case .problem:
-                Button("知道了", role: .cancel) { prompt = nil }
+                Button(model.language.t(.commonOK), role: .cancel) { prompt = nil }
             case .confirm(let target):
-                Button("取消", role: .cancel) { prompt = nil }
+                Button(model.language.t(.commonCancel), role: .cancel) { prompt = nil }
                 // ⚠️ 这颗按钮的标题把**后果**再说一遍（"重启内核"），而不是一句
                 //    空泛的「确定」—— 用户点它之前要能看出自己答应的是什么。
-                Button("更改并重启内核") { Task { await apply(target) } }
+                Button(model.language.t(.settingsChangeDirConfirmButton)) { Task { await apply(target) } }
             }
         } message: { p in
             switch p {
@@ -242,7 +245,7 @@ private struct DownloadDirectorySection: View {
                 Text(text)
             case .confirm(let target):
                 // E-6 的三条后果（逐字来自 `DownloadDirectory.confirmation`，**有单测**）。
-                Text(DownloadDirectory.confirmation(from: model.downloadDir, to: target))
+                Text(DownloadDirectory.confirmation(from: model.downloadDir, to: target, lang: model.language))
             }
         }
     }
@@ -253,15 +256,15 @@ private struct DownloadDirectorySection: View {
 
     private var alertTitle: String {
         switch prompt {
-        case .problem: return "这个文件夹不能用"
-        case .confirm: return "更改下载目录？"
+        case .problem: return model.language.t(.settingsDirProblemTitle)
+        case .confirm: return model.language.t(.settingsChangeDirTitle)
         case nil: return ""
         }
     }
 
     /// 发起一次改动（`target` 空串 = 恢复默认）：先检查、再确认。
     private func ask(to target: String) {
-        if let problem = DownloadDirectory.check(target) {
+        if let problem = DownloadDirectory.check(target, lang: model.language) {
             prompt = .problem(problem)      // §2.3：确认**之前**就中止
             return
         }
@@ -275,8 +278,8 @@ private struct DownloadDirectorySection: View {
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        panel.prompt = "选择"
-        panel.message = "交付文件会下载到这个文件夹"
+        panel.prompt = model.language.t(.commonSelect)
+        panel.message = model.language.t(.settingsPanelDirMessage)
         // 从当前目录开始找（它不在时别把它设成起始目录：面板会开在一个奇怪的地方）。
         if !model.downloadDir.isEmpty,
            FileManager.default.fileExists(atPath: model.downloadDir) {
@@ -357,11 +360,11 @@ private struct DiagnosticsSection: View {
 
     var body: some View {
         Section {
-            Toggle(DiagnosticsToggle.label,
+            Toggle(DiagnosticsToggle.label(lang: model.language),
                    isOn: Binding(get: { model.verboseLogging },
                                  set: { on in Task { await apply(on) } }))
                 .disabled(changing)
-                .help(DiagnosticsToggle.note)
+                .help(DiagnosticsToggle.note(lang: model.language))
             if changing { ProgressView().controlSize(.small) }
 
             if let outcome {
@@ -373,7 +376,7 @@ private struct DiagnosticsSection: View {
                     // ⚠️ 走**有界可滚**的那个正文块（同 `DownloadDirChangeNotice` 的标题）：
                     //    `.failed` 那一格是内核 / 系统原文，**不许截断**（约束 3），
                     //    而它的长度不受我们控制 —— 上限管的是高度，不是内容。
-                    BoundedNoticeText(text: outcome.headline, font: .caption)
+                    BoundedNoticeText(text: outcome.headline(lang: model.language), font: .caption)
                     Spacer(minLength: 8)
                     Button {
                         // 收起的是**模型那一份**（回执的唯一出口）。
@@ -382,7 +385,7 @@ private struct DiagnosticsSection: View {
                         Image(systemName: "xmark")
                     }
                     .buttonStyle(.borderless)
-                    .help("收起这条提示")
+                    .help(model.language.t(.commonDismissNotice))
                 }
             }
 
@@ -391,9 +394,9 @@ private struct DiagnosticsSection: View {
             HStack(spacing: 8) {
                 // ⚠️ `.disabled(exporting)` 留着：它今天**画不出来**（见 `exporting` 的注释），
                 //    但它是那一格状态唯一说得通的用法 —— 哪天把导出改成异步，它立刻就是对的行为。
-                Button(DiagnosticsExport.buttonLabel) { runExport() }
+                Button(DiagnosticsExport.buttonLabel(lang: model.language)) { runExport() }
                     .disabled(exporting)
-                    .help(DiagnosticsExport.buttonHelp)
+                    .help(DiagnosticsExport.buttonHelp(lang: model.language))
                 Spacer(minLength: 8)
             }
 
@@ -401,7 +404,7 @@ private struct DiagnosticsSection: View {
                 exportReceipt(export)
             }
         } footer: {
-            Text(DiagnosticsToggle.note)
+            Text(DiagnosticsToggle.note(lang: model.language))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -419,7 +422,7 @@ private struct DiagnosticsSection: View {
             Image(systemName: export.isFailure ? "exclamationmark.triangle" : "checkmark.circle")
                 .foregroundStyle(export.isFailure ? Color.red : Color.green)
             VStack(alignment: .leading, spacing: 2) {
-                BoundedNoticeText(text: export.headline, font: .caption)
+                BoundedNoticeText(text: export.headline(lang: model.language), font: .caption)
                 if let path = export.pathDetail {
                     Text(path)
                         .font(.caption)
@@ -429,7 +432,7 @@ private struct DiagnosticsSection: View {
                         .truncationMode(.middle)
                         .help(path)
                 }
-                if let note = export.privacyNote {
+                if let note = export.privacyNote(lang: model.language) {
                     Text(note)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -443,7 +446,7 @@ private struct DiagnosticsSection: View {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.borderless)
-            .help("收起这条提示")
+            .help(model.language.t(.commonDismissNotice))
         }
     }
 
@@ -466,8 +469,8 @@ private struct DiagnosticsSection: View {
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        panel.prompt = "导出到"
-        panel.message = DiagnosticsExport.panelMessage
+        panel.prompt = model.language.t(.settingsExportTo)
+        panel.message = DiagnosticsExport.panelMessage(lang: model.language)
         guard panel.runModal() == .OK, let target = panel.url else {
             // ⚠️ **取消也要说一句**（同 `pick_directory` 的口径）：什么都不显示会与"卡住了"分不开。
             exportOutcome = .cancelled
@@ -486,7 +489,7 @@ private struct DiagnosticsSection: View {
         let at = Date()
         // 说明文件要写的七格**在这里取齐**（成句与摆位置都在 `DiagnosticsExport` 里）。
         let header = DiagnosticsExport.header(
-            appVersion: AboutInfo.version(in: .main),
+            appVersion: AboutInfo.version(in: .main, lang: model.language),
             // ⚠️ 内核那份二进制的**身份**：macOS 上是**导出时现算**那个文件的 sha256
             //    （Windows 是编译期常量，见 `DiagnosticsExport` 模块头那处不对称）。
             //    找不到 ⇒ `nil` ⇒ 那一格如实写"取不到"，不编一个哈希。
@@ -495,20 +498,21 @@ private struct DiagnosticsSection: View {
             //    连不上 ⇒ `nil` ⇒ 那一格如实写"未连上"。
             protocolVersion: model.kernelProtocolVersion.map(Int.init),
             verboseLogging: model.verboseLogging,
-            os: DiagnosticsExport.osVersion(),
+            os: DiagnosticsExport.osVersion(lang: model.language),
             arch: DiagnosticsExport.arch,
-            at: at)
+            at: at,
+            lang: model.language)
         do {
             let folder = try DiagnosticsExport.export(
                 from: DiagnosticsLog.logURL.deletingLastPathComponent(),
-                to: target, header: header, now: at)
+                to: target, header: header, now: at, lang: model.language)
             exportOutcome = .done(folder: folder.path)
         } catch let failure as DiagnosticsExport.ExportFailure {
             exportOutcome = .failed(message: failure.message)
         } catch {
             // 理论上到不了（`export` 只抛 `ExportFailure`）；真到了也**不许静默**
             // （约束 4）：系统原文照登。
-            exportOutcome = .failed(message: "诊断日志没有导出：\(error.localizedDescription)")
+            exportOutcome = .failed(message: model.language.tf(.settingsExportUnexpectedFailure, ["error": error.localizedDescription]))
         }
     }
 
@@ -577,16 +581,16 @@ private struct UpdateSection: View {
 
     var body: some View {
         Section {
-            Toggle("启动时检查更新",
+            Toggle(model.language.t(.settingsCheckUpdateOnLaunch),
                    isOn: Binding(get: { model.updateStatus?.enabled ?? true },
                                  set: { on in Task { await apply(on) } }))
-                .help("默认打开。每次启动问一次官方仓库有没有新版本（只提示，不下载、不安装）")
+                .help(model.language.t(.settingsCheckUpdateOnLaunchHelp))
 
             // 「立即检测」（规格 §2）：客户"现在就想知道"的出口 —— 不受 24 小时节流限制。
             HStack(spacing: 8) {
-                Button("立即检测") { Task { await checkNow() } }
+                Button(model.language.t(.settingsCheckNow)) { Task { await checkNow() } }
                     .disabled(checking)
-                    .help("现在就去问一次官方仓库（不受 24 小时节流限制）")
+                    .help(model.language.t(.settingsCheckNowHelp))
                 if checking { ProgressView().controlSize(.small) }
                 Spacer(minLength: 8)
             }
@@ -600,7 +604,7 @@ private struct UpdateSection: View {
                     // ⚠️ 走**有界可滚**的那个正文块（同「详细日志」那条）：
                     //    `noAnswer` 那一档会把内核给的原样带出来，长度不受我们控制 ——
                     //    上限管的是高度，不是内容（约束 3：不许截断）。
-                    BoundedNoticeText(text: receipt.text, font: .caption)
+                    BoundedNoticeText(text: receipt.text(lang: model.language), font: .caption)
                     Spacer(minLength: 8)
                     Button {
                         // 收起的是**模型那一份**（回执的唯一出口）。
@@ -609,7 +613,7 @@ private struct UpdateSection: View {
                         Image(systemName: "xmark")
                     }
                     .buttonStyle(.borderless)
-                    .help("收起这条提示")
+                    .help(model.language.t(.commonDismissNotice))
                 }
             }
 
@@ -647,7 +651,7 @@ private struct UpdateSection: View {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.borderless)
-            .help("收起这条提示")
+            .help(model.language.t(.commonDismissNotice))
         }
     }
 }
@@ -672,18 +676,20 @@ private struct UpdateSection: View {
 ///    没有一处要问 `model` —— 别为了"看起来对称"把 `model` 传进来。
 private struct SettingsParameterSections: View {
     @Binding var form: SettingsForm
+    /// 七行标签与两段注释按这一档语言成句。
+    let lang: Lang
 
     var body: some View {
         Section {
-            int32Row("并行文件数（-j）", $form.parallel, in: SettingsForm.limits.parallel)
-            int32Row("单文件连接数（-x）", $form.connections, in: SettingsForm.limits.connections)
-            int32Row("分片数（-s）", $form.splits, in: SettingsForm.limits.splits)
+            int32Row(lang.t(.settingsParallelLabel), $form.parallel, in: SettingsForm.limits.parallel)
+            int32Row(lang.t(.settingsConnectionsLabel), $form.connections, in: SettingsForm.limits.connections)
+            int32Row(lang.t(.settingsSplitsLabel), $form.splits, in: SettingsForm.limits.splits)
             minSplitSizeRow
             limitMbpsRow
-            int32Row("重试次数", $form.maxTries, in: SettingsForm.limits.maxTries)
-            int32Row("重试间隔（秒）", $form.retryWait, in: SettingsForm.limits.retryWait)
+            int32Row(lang.t(.settingsMaxTriesLabel), $form.maxTries, in: SettingsForm.limits.maxTries)
+            int32Row(lang.t(.settingsRetryWaitLabel), $form.retryWait, in: SettingsForm.limits.retryWait)
         } footer: {
-            Text(SettingsForm.applyNote)
+            Text(SettingsForm.applyNote(lang: lang))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -717,11 +723,11 @@ private struct SettingsParameterSections: View {
     ///    **不在 tag 集合里**的值画成空白或第一项，客户看到一个他从没设过的数。
     private var minSplitSizeRow: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Picker("最小分片大小（-k）", selection: $form.minSplitSize) {
+            Picker(lang.t(.settingsMinSplitLabel), selection: $form.minSplitSize) {
                 // 顺序就是内核给的顺序（`minSplitSizeOptions` 不排序、不去重）。
                 ForEach(form.minSplitSizeOptions, id: \.self) { Text($0).tag($0) }
             }
-            if let note = form.minSplitSizeNote {
+            if let note = form.minSplitSizeNote(lang: lang) {
                 Text(note)
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -733,9 +739,9 @@ private struct SettingsParameterSections: View {
     /// `limit_mbps`：输入框 + 上下调节（简报指定），并写明 `0 = 不限速`。
     private var limitMbpsRow: some View {
         VStack(alignment: .leading, spacing: 4) {
-            LabeledContent("限速（MB/s）") {
+            LabeledContent(lang.t(.settingsLimitLabel)) {
                 HStack(spacing: 8) {
-                    TextField("限速", value: $form.limitMbps, format: .number)
+                    TextField(lang.t(.settingsLimitPlaceholder), value: $form.limitMbps, format: .number)
                         .textFieldStyle(.roundedBorder)     // 规格 §7.2「圆角输入框」
                         .multilineTextAlignment(.trailing)
                         .labelsHidden()
@@ -743,7 +749,7 @@ private struct SettingsParameterSections: View {
                     Stepper(value: $form.limitMbps, in: SettingsForm.limits.limitMbps) { EmptyView() }
                 }
             }
-            Text(SettingsForm.limitMbpsNote)
+            Text(SettingsForm.limitMbpsNote(lang: lang))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -773,7 +779,7 @@ private struct SettingsFooter: View {
         footer
             // 许可那一页挂在**这里**（与改之前挂在 `SettingsEditor` 的 VStack 上等价：
             // 两者都在设置窗口里，`LicenseView` 的尺寸由它自己的 `frame` 定 —— 见那个文件）。
-            .sheet(isPresented: $showingLicense) { LicenseView() }
+            .sheet(isPresented: $showingLicense) { LicenseView(lang: model.language) }
     }
 
     // MARK: - 保存条
@@ -787,9 +793,9 @@ private struct SettingsFooter: View {
     private var canSave: Bool { engineAllowsActions && hasUnsavedChanges && !saving }
 
     private var saveHelp: String {
-        if !engineAllowsActions { return EngineGate.unavailableHelp }
-        return hasUnsavedChanges ? "把七项参数下发给内核（set_settings）"
-                                 : "与内核当前参数一致：没有要保存的改动"
+        if !engineAllowsActions { return EngineGate.unavailableHelp(lang: model.language) }
+        return hasUnsavedChanges ? model.language.t(.settingsSaveHelpPending)
+                                 : model.language.t(.settingsSaveHelpUnchanged)
     }
 
     private var footer: some View {
@@ -811,7 +817,7 @@ private struct SettingsFooter: View {
                         Image(systemName: "xmark")
                     }
                     .buttonStyle(.borderless)
-                    .help("收起这条提示")
+                    .help(model.language.t(.commonDismissNotice))
                 }
             }
 
@@ -819,7 +825,7 @@ private struct SettingsFooter: View {
                 Button {
                     showingLicense = true
                 } label: {
-                    Label("开源许可…", systemImage: "doc.text")
+                    Label(model.language.t(.settingsLicenseEntry), systemImage: "doc.text")
                 }
                 .buttonStyle(.borderless)
                 // ⚠️ 与 `VerifyView` / `EngineStatusBadge` / 工具栏那颗下载按钮同款：
@@ -828,18 +834,18 @@ private struct SettingsFooter: View {
                 //    所以这里显式要求"标题与图标都要"（同款实测证据见
                 //    `EngineStatusBadge.swift:32-36`）。
                 .labelStyle(.titleAndIcon)
-                .help("查看内嵌组件（aria2）的 GPLv2 全文")
+                .help(model.language.t(.settingsLicenseHelp))
 
                 Spacer(minLength: 8)
 
                 if saving {
                     ProgressView().controlSize(.small)
                 }
-                Text(hasUnsavedChanges ? "有未保存的改动" : "与内核当前参数一致")
+                Text(hasUnsavedChanges ? model.language.t(.settingsUnsaved) : model.language.t(.settingsNoChanges))
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Button("保存") {
+                Button(model.language.t(.commonSave)) {
                     Task { await save() }
                 }
                 .buttonStyle(.borderedProminent)            // 规格 §7.2「主按钮」
@@ -870,7 +876,7 @@ private struct SettingsFooter: View {
             try await model.applySettings(form.settings)
             failure = nil
         } catch {
-            failure = SettingsSaveFailure.message(of: error)
+            failure = SettingsSaveFailure.message(of: error, lang: model.language)
         }
     }
 }

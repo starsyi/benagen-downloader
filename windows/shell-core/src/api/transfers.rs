@@ -82,7 +82,7 @@ mod tests {
     use crate::presentation::RowColor;
 
     fn no_batch() -> BatchControl {
-        BatchControl::of(&[], false, None)
+        BatchControl::of(crate::i18n::Lang::Zh, &[], false, None)
     }
 
     fn a_row(gid: &str) -> TransferRow {

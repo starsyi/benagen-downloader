@@ -118,6 +118,11 @@ pub struct Session {
 
 impl Session {
     pub fn new() -> Session {
+        Self::new_with_lang(shell_core::i18n::Lang::Zh)
+    }
+
+    /// 带启动语言建会话：握手回执到达之前，界面文案用这一门语言（系统语言）。
+    pub fn new_with_lang(lang: shell_core::i18n::Lang) -> Session {
         Session {
             auto_restart_attempted: AtomicBool::new(false),
             startup_auto_load_claimed: AtomicBool::new(false),
@@ -129,7 +134,7 @@ impl Session {
                 fallback_notice: None,
             disk: None,
                 handshake_reply: None,
-                lang: shell_core::i18n::Lang::Zh,
+                lang,
                 language_chosen: false,
                 cards: shell_core::presentation::error_card::CardBook::default(),
                 connector: None,

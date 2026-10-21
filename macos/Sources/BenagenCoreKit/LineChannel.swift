@@ -155,6 +155,9 @@ struct LineReader {
 ///
 /// 这条线程随子进程退出（写端关闭 → EOF）自行结束；`close()` 里有界地等它。
 public final class ProcessChannel: LineChannel, @unchecked Sendable {
+    /// 这三句 transport 错误会显示在引擎横幅/错误卡上，所以跟 `CoreClient.lang` 走。
+    public var language: Lang = .zh
+
     private let process: Process
     private let stdinHandle: FileHandle
     private let stdoutHandle: FileHandle
@@ -225,7 +228,9 @@ public final class ProcessChannel: LineChannel, @unchecked Sendable {
             try? stdoutPipe.fileHandleForReading.close()
             try? stderrPipe.fileHandleForReading.close()
             throw CoreError.transport(
-                "内核进程启动失败（\(executableURL.path)）：\(error.localizedDescription)")
+                language.tf(.coreStartFailed,
+                             ["path": executableURL.path,
+                              "reason": error.localizedDescription]))
         }
 
         self.process = p
@@ -271,7 +276,7 @@ public final class ProcessChannel: LineChannel, @unchecked Sendable {
             try stdinHandle.write(contentsOf: Data((s + "\n").utf8))
         } catch {
             throw CoreError.transport(
-                "向内核写入请求失败（管道已断）：\(error.localizedDescription)")
+                language.tf(.pipeWriteFailed, ["reason": error.localizedDescription]))
         }
     }
 
@@ -284,7 +289,7 @@ public final class ProcessChannel: LineChannel, @unchecked Sendable {
             // 读端被关掉（强制收尾）时这里会拿到 EBADF；子进程没了则是 EOF（走 nil 那条）。
             // 两条都变成一条**显式的** transport 错误交给上层——绝不允许静默失败。
             throw CoreError.transport(
-                "读取内核响应失败（管道已断）：\(error.localizedDescription)")
+                language.tf(.pipeReadFailed, ["reason": error.localizedDescription]))
         }
     }
 
@@ -304,7 +309,7 @@ public final class ProcessChannel: LineChannel, @unchecked Sendable {
             throw CoreError.timedOut
         } catch {
             throw CoreError.transport(
-                "读取内核响应失败（管道已断）：\(error.localizedDescription)")
+                language.tf(.pipeReadFailed, ["reason": error.localizedDescription]))
         }
     }
 

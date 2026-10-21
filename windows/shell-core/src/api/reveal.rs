@@ -104,10 +104,11 @@ pub fn no_path() -> Value {
 ///
 /// ⚠️ `variable` 由调用方给（`TransferReveal::home_variable()`：Windows 上是
 ///    `USERPROFILE`、其余平台是 `HOME`）—— **不在这里写死一个平台的名字**。
-pub fn root_unknown(variable: &str) -> Value {
-    envelope::err(&format!(
-        "定位不到这个文件：既没有配置过下载目录，也取不到 {variable} 那一级环境变量，\
-         算不出它在哪。补救：在设置里指定一个下载目录。"
+pub fn root_unknown(lang: crate::i18n::Lang, variable: &str) -> Value {
+    envelope::err(&crate::i18n::tf(
+        lang,
+        crate::i18n::Key::RevealNoDownloadDir,
+        &[("variable", variable)],
     ))
 }
 
@@ -117,10 +118,11 @@ pub fn root_unknown(variable: &str) -> Value {
 ///    句子里要**带上一件用户能自己查的事**（那个文件可能已经不在了）——
 ///    因为"在资源管理器里显示"最常失败的原因就是文件被移走/删掉了，
 ///    而系统给的那句话（`ShellExecuteW` 的返回值 / `open` 的 stderr）读起来像天书。
-pub fn failure(cause: &str) -> Value {
-    envelope::err(&format!(
-        "没能在资源管理器里显示这个文件（{cause}）。\
-         补救：先确认它还在那儿（也许已被移走或删掉），再试一次。"
+pub fn failure(lang: crate::i18n::Lang, cause: &str) -> Value {
+    envelope::err(&crate::i18n::tf(
+        lang,
+        crate::i18n::Key::RevealShellFailed,
+        &[("cause", cause)],
     ))
 }
 
@@ -235,13 +237,13 @@ mod tests {
         assert_eq!(no_path()["ok"], json!(true));
         assert_eq!(no_path()["data"]["status"], json!("no_path"));
 
-        let unknown = root_unknown("USERPROFILE");
+        let unknown = root_unknown(crate::i18n::Lang::Zh, "USERPROFILE");
         assert_eq!(unknown["ok"], json!(false));
         let message = unknown["error"]["message"].as_str().expect("失败要有一句话");
         assert!(message.contains("USERPROFILE"), "要点名缺的是哪一级变量：{message}");
         assert!(message.contains("下载目录"), "要给出可执行的补救：{message}");
 
-        let failed = failure("ShellExecuteW 返回 2");
+        let failed = failure(crate::i18n::Lang::Zh, "ShellExecuteW 返回 2");
         assert_eq!(failed["ok"], json!(false));
         let message = failed["error"]["message"].as_str().expect("失败要有一句话");
         assert!(message.contains("ShellExecuteW 返回 2"), "系统原文必须照登：{message}");

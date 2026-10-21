@@ -39,6 +39,10 @@ fn set_system_required(_on: bool) {}
 pub fn spawn(session: Arc<Session>, on_count: Arc<dyn Fn(usize) + Send + Sync>) {
     let _ = std::thread::Builder::new().name("keepalive".to_string()).spawn(move || {
         let mut tracker = lifecycle::AwakeTracker::default();
+        // 上一拍的"未落定数"。**每拍都回调**（不只是有变化时）：标题与托盘话术还跟着
+        // 界面语言走，而握手落定（语言可能从系统语言变成内核回执那一门）时必须有东西
+        // 把新语言刷上去 —— 见 `main.rs` 的 `on_count`。
+        let mut last = 0usize;
         loop {
             std::thread::sleep(lifecycle::watch_interval(WINDOW_VISIBLE.load(Ordering::Relaxed)));
             let lang = session.lang();
@@ -62,8 +66,9 @@ pub fn spawn(session: Arc<Session>, on_count: Arc<dyn Fn(usize) + Send + Sync>) 
             // 该状态要**反复设置**才稳（线程状态可能被别的调用冲掉），所以每拍都设。
             set_system_required(want);
             if let Some(n) = unfinished {
-                on_count(n);
+                last = n;
             }
+            on_count(last);
         }
     });
 }

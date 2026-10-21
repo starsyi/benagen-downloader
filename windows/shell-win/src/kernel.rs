@@ -355,7 +355,7 @@ pub fn set_settings(
     // ⚠️ 编码失败 ⇒ 回一句**可读的人话**（与 `task_action` 那条同款措辞），**绝不 panic**：
     //    panic 会让前端那条 `invoke` 永远等不到回话（静默挂住）。
     let params = SettingsForm::set_settings_params(settings)
-        .map_err(|e| CallFailure::shell(SettingsForm::encode_failure_text(&e)))?;
+        .map_err(|e| CallFailure::shell(SettingsForm::encode_failure_text(lang, &e)))?;
     let value = client
         .call("set_settings", params)
         .map_err(|e| CallFailure::of(lang, &e))?;

@@ -73,7 +73,8 @@
 //    按当下的偏好算好交进来，本模块不猜"该传什么"。全 crate 里拼那一段 argv 的地方
 //    只有两处、且是同一条路：`DownloadDirectory::core_arguments_for`（→ `client::core_arguments`）。
 use shell_core::client::CoreClient;
-use shell_core::presentation::error_text::error_text;
+use shell_core::i18n::{t, tf, Key, Lang};
+use shell_core::presentation::error_text::error_text_in;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -148,7 +149,7 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// ⚠️ 每次连接都会重查一遍（不是启动时查一次就固定）：人类伙伴的验收动作正是
 ///    "把内核放到壳旁边，然后点「重试」" —— 启动时定死的话，那条路就没有出口。
-pub fn locate_core_binary() -> Result<CoreLookup, String> {
+pub fn locate_core_binary(lang: Lang) -> Result<CoreLookup, String> {
     // ⚠️ **副作用如实记账**：这一行会**真的执行释放**（首次写十几 MB、此后核一次哈希），
     //    它发生在**主线程**上。这是有界的（一次本地文件读写，不是内核调用那种可能
     //    永不返回的东西），而且只发生在**起 Tauri 之前**（那时窗口还没建起来、
@@ -159,13 +160,14 @@ pub fn locate_core_binary() -> Result<CoreLookup, String> {
     //    （阶段 A 修订：此处原文说的是"界面线程 / 窗口还没画出第一帧"——那是 egui 时代的
     //     说法；Tauri 那一代修订：界面回来了，但那一刻**窗口还没建起来**，
     //     这一点仍然成立。**代码一字未改**，改的只是这句说明。）
-    let from_embedded = embedded_core();
+    let from_embedded = embedded_core(lang);
     choose_core(
         std::env::var_os("BENAGEN_CORE")
             .filter(|p| !p.is_empty())
             .map(PathBuf::from),
         from_embedded,
         same_dir_candidate(),
+        lang,
     )
 }
 
@@ -201,6 +203,7 @@ fn choose_core(
     from_env: Option<PathBuf>,
     from_embedded: Result<Option<PathBuf>, String>,
     same_dir_candidate: Option<PathBuf>,
+    lang: Lang,
 ) -> Result<CoreLookup, String> {
     // ① 环境变量：排障开关。
     if let Some(path) = from_env {
@@ -234,7 +237,7 @@ fn choose_core(
     }
     // 三条都断了：报 **② 那条原因**（比"哪儿都找不到"具体得多 —— 它带着补救）。
     Err(embedded_failure
-        .unwrap_or_else(|| core_not_found_message(same_dir_candidate.as_deref())))
+        .unwrap_or_else(|| core_not_found_message(lang, same_dir_candidate.as_deref())))
 }
 
 /// ③ 的落点：与壳同一个目录下的 `benagen-core.exe`。
@@ -253,12 +256,12 @@ fn same_dir_candidate() -> Option<PathBuf> {
 ///    （`build.rs` 只在 Windows 靶产出它，见 `embed.rs` 文件头）。这不是"静默降级"——
 ///    宿主的产物不是交付形态；而**交付形态那一条没有开关**。
 #[cfg(target_os = "windows")]
-fn embedded_core() -> Result<Option<PathBuf>, String> {
-    crate::embed::extract_core().map(Some)
+fn embedded_core(lang: Lang) -> Result<Option<PathBuf>, String> {
+    crate::embed::extract_core(lang).map(Some)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn embedded_core() -> Result<Option<PathBuf>, String> {
+fn embedded_core(_lang: Lang) -> Result<Option<PathBuf>, String> {
     Ok(None)
 }
 
@@ -277,17 +280,15 @@ fn embedded_core() -> Result<Option<PathBuf>, String> {
 /// ⚠️ 文案里点名了**第三个地方**（缓存目录）：走到这里说明内嵌那份没释放成功
 ///    （或者这台机器上的构建压根没有内嵌那份）。不说清"它本该在哪"，
 ///    用户就没有任何线索能对上那句话。
-fn core_not_found_message(same_dir_candidate: Option<&Path>) -> String {
+fn core_not_found_message(lang: Lang, same_dir_candidate: Option<&Path>) -> String {
     let where_looked = same_dir_candidate
         .and_then(|p| p.parent())
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "本程序所在目录".to_string());
-    format!(
-        "没找到内核：{CORE_EXE_NAME} 不在 {where_looked} 里，\
-         %LOCALAPPDATA%\\BenagenDownloader\\cache\\ 里也没有释放成功的那一份，\
-         环境变量 BENAGEN_CORE 也没有指向它。\n\
-         补救：把 benagen-core.exe 放到本程序所在目录（或设 BENAGEN_CORE 指向它），\
-         然后点「重试」。（放好之后点「重试」，那一份**一定查得到**。）"
+        .unwrap_or_else(|| t(lang, Key::StartupLookSameDir).to_string());
+    tf(
+        lang,
+        Key::StartupCoreNotFound,
+        &[("exe", CORE_EXE_NAME), ("where", &where_looked)],
     )
 }
 
@@ -318,8 +319,9 @@ mod bounded_handshake {
     use super::DEFAULT_HANDSHAKE_TIMEOUT;
     use serde_json::json;
     use shell_core::client::CoreClient;
-    use shell_core::presentation::engine_status::HANDSHAKE_TIMEOUT_MESSAGE;
-    use shell_core::presentation::error_text::error_text;
+    use shell_core::i18n::{tf, Key, Lang};
+    use shell_core::presentation::engine_status::handshake_timeout_message;
+    use shell_core::presentation::error_text::error_text_in;
     use shell_core::protocol::PROTOCOL_VERSION;
     use std::sync::mpsc;
     use std::sync::Arc;
@@ -335,11 +337,20 @@ mod bounded_handshake {
     ///
     /// ⚠️ 它吃 `&Arc<CoreClient>`（不是 `&CoreClient`）：超时的逃生口要**换到另一条线程上**
     ///    去收尾，那里得有一份**活得比本次调用久**的引用（见 [`call_with_deadline`]）。
-    pub(crate) fn handshake(client: &Arc<CoreClient>) -> Result<serde_json::Value, String> {
+    pub(crate) fn handshake(
+        lang: Lang,
+        client: &Arc<CoreClient>,
+    ) -> Result<serde_json::Value, String> {
         call_with_deadline(
+            lang,
             client,
             "hello",
-            json!({ "protocol": PROTOCOL_VERSION }),
+            json!({
+                "protocol": PROTOCOL_VERSION,
+                // 「跟随系统语言」用的就是这一格：图形壳里 `LANG` 通常是空的，
+                // 空串交给内核会按英文兜底 —— 中文 Windows 上首启就成英文了。
+                "system_locale": crate::locale::system_locale(),
+            }),
             DEFAULT_HANDSHAKE_TIMEOUT,
         )
     }
@@ -369,6 +380,7 @@ mod bounded_handshake {
     ///    界面靠它决定"该去点授权框"还是"照登内核原文"。往里拼别的东西（比如实际的
     ///    超时秒数）会让判别式失配 —— 上游对这一条有专门的叮嘱（`AppModel.swift:234-236`）。
     fn call_with_deadline(
+        lang: Lang,
         client: &Arc<CoreClient>,
         method: &str,
         params: serde_json::Value,
@@ -386,12 +398,12 @@ mod bounded_handshake {
                 // 接收端可能已经走了（超时之后我们就返回了）：`send` 失败不是错误，丢掉即可。
                 let _ = tx.send(inner.call(&method, params));
             })
-            .map_err(|cause| super::cannot_spawn_thread_message(&cause))?;
+            .map_err(|cause| super::cannot_spawn_thread_message(lang, &cause))?;
 
         match rx.recv_timeout(timeout) {
             Ok(Ok(value)) => Ok(value),
             // 内核报的错按**唯一映射**（规格 §10）变成一句话：内核原文逐字。
-            Ok(Err(error)) => Err(error_text(&error)),
+            Ok(Err(error)) => Err(error_text_in(lang, &error)),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // **逃生口**：收掉这条通道。它一收，里面那条卡住的读以 EOF 收场。
                 // 它**在另一条线程上**跑（理由见上面那段"耗时上界"）。
@@ -399,11 +411,12 @@ mod bounded_handshake {
                 let _ = std::thread::Builder::new()
                     .name("core-shutdown".to_string())
                     .spawn(move || escape.shutdown());
-                Err(HANDSHAKE_TIMEOUT_MESSAGE.to_string())
+                Err(handshake_timeout_message(lang).to_string())
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!(
-                "等内核回 `{label}` 的那条线程没送回任何东西就结束了（它 panic 了吗？）。\
-                 补救：把这条原样发给我们。"
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(tf(
+                lang,
+                Key::StartupHandshakeThreadDied,
+                &[("label", &label)],
             )),
         }
     }
@@ -418,6 +431,7 @@ mod bounded_handshake {
 
         use super::*;
         use shell_core::client::LineChannel;
+        use shell_core::presentation::engine_status::HANDSHAKE_TIMEOUT_MESSAGE;
         use shell_core::presentation::engine_status::EngineStatusPresentation;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Instant;
@@ -538,7 +552,13 @@ mod bounded_handshake {
             let client = Arc::new(CoreClient::new(Box::new(stub.clone())));
 
             let started = Instant::now();
-            let result = call_with_deadline(&client, "hello", json!({ "protocol":2 }), TIMEOUT);
+            let result = call_with_deadline(
+                shell_core::i18n::Lang::Zh,
+                &client,
+                "hello",
+                json!({ "protocol":2 }),
+                TIMEOUT,
+            );
             let took = started.elapsed();
 
             // ② 界面上那句话（**逐字**，判别式认得它）。
@@ -587,7 +607,7 @@ mod bounded_handshake {
             let client = Arc::new(CoreClient::new(Box::new(stub.clone())));
 
             let started = Instant::now();
-            let result = handshake(&client);
+            let result = handshake(shell_core::i18n::Lang::Zh, &client);
             let took = started.elapsed();
 
             assert_eq!(
@@ -638,11 +658,11 @@ mod bounded_handshake {
 ///
 /// ⚠️ **每次调用都要现算一遍 argv**（调用方负责）：`retry()` 的语义是"重新找一次内核"，
 ///    而用户可能刚在设置里改过目录 —— 把 argv 缓存下来会让那次改动对重试失效。
-pub fn connect(exe: &Path, arguments: &[String]) -> Result<Connected, String> {
+pub fn connect(lang: Lang, exe: &Path, arguments: &[String]) -> Result<Connected, String> {
     let client = Arc::new(
-        crate::spawn::spawn_core(exe, arguments).map_err(|e| error_text(&e))?,
+        crate::spawn::spawn_core(exe, arguments).map_err(|e| error_text_in(lang, &e))?,
     );
-    let reply = bounded_handshake::handshake(&client)?;
+    let reply = bounded_handshake::handshake(lang, &client)?;
     Ok(Connected {
         client,
         // 内核回执的**原文**（JSON 一行）。壳不改写内核的话（规格 §10）——
@@ -681,7 +701,7 @@ pub struct Connected {
 ///
 /// 起不了线程时返回一句**能直接显示**的话（W-2：不许静默降级成"那就同步跑吧"——
 /// 同步跑正是不变量禁止的那件事）。
-pub fn spawn_core_job<T, F>(name: &str, job: F, tx: Sender<T>) -> Result<(), String>
+pub fn spawn_core_job<T, F>(lang: Lang, name: &str, job: F, tx: Sender<T>) -> Result<(), String>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -692,7 +712,7 @@ where
             let _ = tx.send(job());
         })
         .map(|_| ())
-        .map_err(|cause| cannot_spawn_thread_message(&cause))
+        .map_err(|cause| cannot_spawn_thread_message(lang, &cause))
 }
 
 /// 「起不了后台线程」那句话。
@@ -730,11 +750,11 @@ where
 /// 先看那里；`DEFAULT_CALL_TIMEOUT` / `LONG_CALL_TIMEOUT` 任一变动都要回来读一遍。
 /// 结论从第一版起就没变过：这两档对"占住一条线程"来说都太长，
 /// 所以"绝不在调用方的线程上跑"照旧。
-fn cannot_spawn_thread_message(cause: &std::io::Error) -> String {
-    format!(
-        "起不了后台线程（{cause}）：这次内核调用没有线程可跑 —— 它绝不能在调用方的线程上跑\
-         （`CoreClient::call` 单次最长 600 秒（多数调用 150 秒），占住哪条线程那一侧就一起停摆）。\n\
-         补救：把这条原样发给我们。"
+fn cannot_spawn_thread_message(lang: Lang, cause: &std::io::Error) -> String {
+    tf(
+        lang,
+        Key::StartupCannotSpawnThread,
+        &[("cause", &cause.to_string())],
     )
 }
 
@@ -799,7 +819,7 @@ mod tests {
         let fallback = fake_core_file("fallback");
         let why = "释放内嵌内核失败：磁盘满。补救：清理空间后点「重试」".to_string();
 
-        let lookup = choose_core(None, Err(why.clone()), Some(fallback.clone()))
+        let lookup = choose_core(None, Err(why.clone()), Some(fallback.clone()), Lang::Zh)
             .expect("第二条路失败、但同目录那一份在场 ⇒ 必须成功落回它");
         assert_eq!(
             lookup.path, fallback,
@@ -829,7 +849,7 @@ mod tests {
         let _ = std::fs::remove_file(&missing);
 
         let why = "释放内嵌内核失败：杀毒软件把这次写入拦下来了".to_string();
-        let error = choose_core(None, Err(why.clone()), Some(missing))
+        let error = choose_core(None, Err(why.clone()), Some(missing), Lang::Zh)
             .expect_err("三条都断了就必须失败");
         assert_eq!(
             error, why,
@@ -849,19 +869,20 @@ mod tests {
             Some(env.clone()),
             Ok(Some(embedded.clone())),
             Some(fallback.clone()),
+            Lang::Zh,
         )
         .expect("环境变量在场时必须成功");
         assert_eq!(picked.path, env);
         assert!(picked.embedded_failure.is_none(), "环境变量赢了就不算'退回'");
 
         // ① 不在 ⇒ ② 赢（③ 在场也不看）。
-        let picked = choose_core(None, Ok(Some(embedded.clone())), Some(fallback.clone()))
+        let picked = choose_core(None, Ok(Some(embedded.clone())), Some(fallback.clone()), Lang::Zh)
             .expect("第二条在场时必须成功");
         assert_eq!(picked.path, embedded);
         assert!(picked.embedded_failure.is_none(), "第二条成功就没有失败可说");
 
         // ① ② 都不在（宿主：`Ok(None)`）⇒ ③。
-        let picked = choose_core(None, Ok(None), Some(fallback.clone()))
+        let picked = choose_core(None, Ok(None), Some(fallback.clone()), Lang::Zh)
             .expect("宿主构建上同目录那份是主路径");
         assert_eq!(picked.path, fallback);
         assert!(
@@ -881,7 +902,7 @@ mod tests {
     #[test]
     fn the_not_found_message_names_all_three_places_and_a_remedy() {
         let candidate = PathBuf::from("C:/apps/Benagen/").join(CORE_EXE_NAME);
-        let message = core_not_found_message(Some(&candidate));
+        let message = core_not_found_message(Lang::Zh, Some(&candidate));
 
         // ⚠️ 这条补救**必须真的走得通**（重要 #2 的教训）：放好内核之后点「重试」，
         //    ③ 这条路一定查得到 —— 那句话里的承诺与 `choose_core` 的行为是一对，
@@ -927,6 +948,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let caller = std::thread::current().id();
         spawn_core_job(
+            shell_core::i18n::Lang::Zh,
             "test-job",
             move || std::thread::current().id() != caller,
             tx,
@@ -941,7 +963,9 @@ mod tests {
         // ⚠️ 这里调的是生产路径用的**同一个函数**（真的把 `Builder::spawn` 弄失败只有
         //    "资源耗尽"一条路，测不出来）；判别力的边界如实记下：把生产路径里那个
         //    `.map_err(...)` 换成别的消息，这一条**不会**红 —— 它钉的是"这句话长什么样"。
-        let message = cannot_spawn_thread_message(&std::io::Error::new(
+        let message = cannot_spawn_thread_message(
+            shell_core::i18n::Lang::Zh,
+            &std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "资源暂时不可用",
         ));

@@ -447,7 +447,9 @@ private func runningModel(_ fake: FakeCore,
 
     await model.start()
 
-    #expect(fake.params("hello") == .object(["protocol": .integer(Int64(kProtocolVersion))]))
+    // 握手里必须带上系统界面语言（「跟随系统」的口径），否则中文系统首启会成英文。
+    #expect(fake.params("hello") == AppModel.helloParams)
+    #expect(AppModel.systemLocale == (Locale.preferredLanguages.first ?? ""))
     #expect(fake.callCount("hello") == 1)
 }
 
@@ -1309,7 +1311,7 @@ private func runningModel(_ fake: FakeCore,
 }
 
 @MainActor
-@Test func applySettingsSendsTheSevenWireKeys() async throws {
+@Test func applySettingsSendsTheEightWireKeys() async throws {
     // ⚠️ 这条盯的是**「类型化载荷走 requestEncoder」**这个口径：属性名是 camelCase，
     //    而内核 `set_settings` 走 `serde_json::from_value::<Settings>`（`Settings` 没有
     //    任何 rename）。发成 camelCase 的 payload **看起来完全正常（也是七个键）**，
@@ -1327,9 +1329,10 @@ private func runningModel(_ fake: FakeCore,
         Issue.record("set_settings 的 params 形状不对：\(String(describing: params))")
         return
     }
+    // 0.3.0 起多了 `language`（第八格）：它必须跟着整份回传，否则内核会把语言重置。
     #expect(Set(inner.keys) == ["parallel", "connections", "splits", "min_split_size",
-                                "limit_mbps", "max_tries", "retry_wait"],
-            "七个键一个不能少，且必须是线上键名")
+                                "limit_mbps", "max_tries", "retry_wait", "language"],
+            "八个键一个不能少，且必须是线上键名")
     #expect(inner["min_split_size"] == .string("20M"))
     #expect(model.settings?.parallel == 2, "落状态的是内核回执那一份")
     #expect(model.lastCode == "C24-8")

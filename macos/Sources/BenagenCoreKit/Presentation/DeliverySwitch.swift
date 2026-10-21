@@ -36,9 +36,12 @@ public enum DeliverySwitch: Equatable, Sendable {
     ///      否则取消之后的那次成功换码在用户眼里就是一次**没有来源的界面变化**。
     ///      这句话只陈述一个**内核给的事实**（新批次的码就是它回的 `code`），
     ///      不添加任何判断或建议。
-    public var noticeText: String {
+    public var noticeText: String { noticeText(lang: .zh) }
+
+    /// 按当前语言取句；`.failed` 是内核原文，**不翻译**（约束 3）。
+    public func noticeText(lang: Lang) -> String {
         switch self {
-        case .switched(let code): return "已换到批次 \(code)"
+        case .switched(let code): return lang.tf(.switchSwitchedNotice, ["code": code])
         case .failed(let message): return message
         }
     }

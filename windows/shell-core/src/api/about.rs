@@ -48,7 +48,7 @@ mod tests {
 
         // 兜底那一句也照发（它本身就是一句完整的话 —— 界面上前面**不加**"版本"两个字，
         // 否则会变成"版本 版本未知（…）"）。
-        let fallback = AboutInfo::version(None, None);
+        let fallback = AboutInfo::version(crate::i18n::Lang::Zh, None, None);
         let v = about(&fallback);
         assert_eq!(v["data"]["version"], json!(fallback));
         assert!(

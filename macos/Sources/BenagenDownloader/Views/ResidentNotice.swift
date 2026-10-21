@@ -318,16 +318,18 @@ struct BoundedNoticeText: View {
 struct DownloadDirChangeNotice: View {
     let change: DownloadDirChange
     var titleFont: Font = .callout.weight(.semibold)
+    /// 标题按哪一档语言成句（默认中文：既有调用点不用改也能编译）。
+    var lang: Lang = .zh
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             // ① 固定短的标题。`.failed` 那一支是内核 / 系统原文 ⇒ 用有界可滚的散文
             //    （**不许截断**：失败原文必须完整可见，约束 4 / C-7）。
             BoundedNoticeArea(maxHeight: residentNoticeTextMaxHeight, baselineFont: titleFont) {
-                Text(change.headline)
+                Text(change.headline(lang: lang))
                     .font(titleFont)
                     .textSelection(.enabled)
-                    .help(change.headline)
+                    .help(change.headline(lang: lang))
             }
             // ② 路径**单独一行**（这次的修复落点）：固定一行高，
             //    中间截断（头尾才是有辨识度的部分：哪个卷、哪一层），悬停看完整路径。

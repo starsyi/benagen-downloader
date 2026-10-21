@@ -48,8 +48,9 @@ use crate::presentation::verify_summary::{SidebarBadge, VerifySummary};
 /// ⚠️ 措辞的两半与 [`super::NO_KERNEL`] 同形：**根因**（壳算不出摘要）+
 /// **可执行的下一步**（把这条原样发回来，W-2）。
 /// 它刻意**不提**任何内核协议的名词（那属于诊断、不属于给客户的话）。
-pub const NO_VERIFY_SUMMARY: &str =
-    "内核回的校验结果里一个文件都没有，壳算不出一份摘要。补救：把这条原样发给我们。";
+pub fn no_verify_summary(lang: crate::i18n::Lang) -> &'static str {
+    crate::i18n::t(lang, crate::i18n::Key::VerifyNoSummary)
+}
 
 /// 校验状态：`data` 就是那份 `VerifySummary`（**不是**包一层 `{"summary": …}`）。
 ///
@@ -187,18 +188,20 @@ mod tests {
     #[test]
     fn the_uncomputable_summary_message_says_the_cause_and_the_next_step() {
         assert!(
-            NO_VERIFY_SUMMARY.contains("壳") && NO_VERIFY_SUMMARY.contains("摘要"),
-            "这句话没说清根因（是壳自己没算出摘要，不是内核报错）：{NO_VERIFY_SUMMARY}"
+            no_verify_summary(crate::i18n::Lang::Zh).contains("壳") && no_verify_summary(crate::i18n::Lang::Zh).contains("摘要"),
+            "这句话没说清根因（是壳自己没算出摘要，不是内核报错）：{}",
+            no_verify_summary(crate::i18n::Lang::Zh)
         );
         assert!(
-            NO_VERIFY_SUMMARY.contains("补救"),
-            "这句话没给出可执行的下一步：{NO_VERIFY_SUMMARY}"
+            no_verify_summary(crate::i18n::Lang::Zh).contains("补救"),
+            "这句话没给出可执行的下一步：{}",
+            no_verify_summary(crate::i18n::Lang::Zh)
         );
-        let v = envelope::err(NO_VERIFY_SUMMARY);
+        let v = envelope::err(no_verify_summary(crate::i18n::Lang::Zh));
         assert_eq!(v["ok"], serde_json::json!(false));
         assert_eq!(
             v["error"]["message"],
-            serde_json::json!(NO_VERIFY_SUMMARY),
+            serde_json::json!(no_verify_summary(crate::i18n::Lang::Zh)),
             "原文逐字、不加工"
         );
     }

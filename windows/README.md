@@ -1149,3 +1149,32 @@ macos/scripts/test.sh    624 passed（--disable-sandbox）
 `docs/superpowers/specs/2026-10-20-v0.3.0-i18n-errors-engines-domains-design.md` 的「真机验收」一节）：
 首次弹窗只弹一次、断网后的错误卡说人话、拔盘出慢盘提醒、挂起内核进程看自动重启三档、
 国际域名那台机器能解析出交付码。
+
+### 0.3.0 续（2026-10-21）：两端全量双语 + 「跟随系统」真的能跟
+
+客户的反馈是"找不到语言切换、中文系统首启是英文"。两件事都已修：
+
+1. **默认跟系统**：内核原来只读 `LC_ALL/LC_MESSAGES/LANG` —— 图形壳里这些变量通常是空的，
+   空串按英文兜底。现在 `hello.params` 带 **`system_locale`**（Windows 问
+   `GetUserDefaultUILanguage`，macOS 用 `Locale.preferredLanguages`），内核解析顺序变成
+   `hello.language` > 设置值 >（值为 system 时）`hello.system_locale` > 环境变量 > 英文。
+   CLI 的最后一档也改成问系统（`#[link]` + 裸 `extern "system"`，不引 crate、不加 feature）。
+   老壳不传这一格 ⇒ 退回环境变量，行为与改前逐字相同。
+2. **文案全部收进语言表**：Windows 壳的 `i18n.rs` 从 52 条 Key 增到 **189 条**；
+   `index.html` 的 91 处静态文案迁成 `data-copy*`（文案由 Rust 随 `state.copy` 下发），
+   §3.2 的 71 条类 1 白名单因此**全部删除**——前端不再持有任何中文。握手之前的启动期文案
+   （窗口标题、托盘两项、单实例提示、许可、内核释放失败）按 `locale::startup_lang()` 成句，
+   握手落定后再按内核语言覆盖一次。
+
+读数：
+
+```
+core                     596 lib + 4 cli_e2e（全 passed）
+windows/scripts/test.sh   EXIT=0；735 例（面板夹具 ok=173 fail=0）
+macos/scripts/test.sh     634 passed（--disable-sandbox）
+对位判据                   EXIT=0（五句更新回执与八类错误三句两端逐字一致）
+字体子集                   213,168 B / sha256 11accf8a…（无新增缺口的那次；后续按需重生成）
+```
+
+仍未双语化（如实记账）：`diagnostics`/`event=` 日志正文（规格 I-2：日志不翻译，便于排查）、
+`client.rs` 的 `Display`（只进日志）。

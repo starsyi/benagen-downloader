@@ -51,6 +51,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::i18n::{t, tf, Key, Lang};
+
 /// **"被释放的是什么"** —— 文件名的形状与失败话术里指名道姓的那几处，全由它派生。
 ///
 /// ⚠️ 为什么要这么多字段而不是一个 `name: &str`：**话术里试过只用一个字段**，
@@ -67,18 +69,21 @@ pub struct ReleaseSpec {
     /// 直接执行是推断、不是实测）；DLL 那份**必须**是 `.dll`（`LoadLibraryW` 同理）。
     pub suffix: &'static str,
     /// 「释放 X 失败」那句里的**完整主语短语**（"内嵌内核" / "内嵌的 WebView2Loader.dll"）。
-    pub subject: &'static str,
+    ///
+    /// ⚠️ 存的是 [`Key`] 而不是字面量：这句话是**客户可见**的，必须按界面语言成句
+    ///    （句子的唯一一份在 `i18n` 表里）。
+    pub subject: Key,
     /// 各阶段那句里指代它的**简短名词**（"内核" / "WebView2Loader.dll"）。
-    pub noun: &'static str,
+    pub noun: Key,
     /// 磁盘满那一档的补充（说清这件东西大概要多少空闲空间），会连括号一起插进那句话；
     /// `None` = 不提（两件东西的量级差 60 倍：内核十几 MB、DLL 157 KB）。
-    pub space_hint: Option<&'static str>,
+    pub space_hint: Option<Key>,
     /// 失败话术末尾那句「临时绕过」。
     ///
     /// ⚠️ `None` 的语义是**这件东西没有旁路可走**（不是"忘了填"）：WebView2Loader.dll
     ///    只能从缓存目录被装载，没有"放到程序旁边也行"这一条 —— 写一句假的旁路会让用户
     ///    照做之后拿到同一个错（W-2：补救必须真的走得通）。
-    pub escape: Option<&'static str>,
+    pub escape: Option<Key>,
 }
 
 /// **内核 exe** 的释放规格（`shell-win/src/embed.rs` 用）。
@@ -93,12 +98,10 @@ pub struct ReleaseSpec {
 pub const BENAGEN_CORE: ReleaseSpec = ReleaseSpec {
     prefix: "benagen-core",
     suffix: ".exe",
-    subject: "内嵌内核",
-    noun: "内核",
-    space_hint: Some("本程序需要大约与内嵌内核同样大的空闲空间：二十 MB 上下。"),
-    escape: Some(
-        "把 benagen-core.exe 放到本程序所在目录（或设环境变量 BENAGEN_CORE 指向它）后点「重试」。",
-    ),
+    subject: Key::EmbedSubjectCore,
+    noun: Key::EmbedNounCore,
+    space_hint: Some(Key::EmbedSpaceHintCore),
+    escape: Some(Key::EmbedEscapeCore),
 };
 
 /// 内容哈希取前多少位当文件名的一部分（与内核那边释放 aria2c 的口径一致：12 位十六进制
@@ -133,23 +136,27 @@ pub fn release_name(spec: &ReleaseSpec, sha256_hex: &str) -> String {
 pub fn cache_dir_from(
     spec: &ReleaseSpec,
     local_appdata: Option<std::ffi::OsString>,
+    lang: Lang,
 ) -> Result<PathBuf, String> {
     match local_appdata {
         Some(value) if !value.is_empty() => {
             Ok(PathBuf::from(value).join("BenagenDownloader").join("cache"))
         }
-        _ => Err(format!(
-            "取不到 %LOCALAPPDATA%，不知道该把{}释放到哪里。\n\
-             ⚠ 这里**故意**不退到 %TEMP%：本程序把{}放在 %LOCALAPPDATA% 下是有意的\
-             （规格 §7.2 对杀软风险的缓解措施），悄悄换一个地方等于把那句话作废。\n\
-             补救：{}",
-            spec.subject,
-            spec.noun,
-            spec.escape.unwrap_or(
-                "确认这台机器上的 %LOCALAPPDATA% 是设好的（本程序只能把它放在那里），\
-                 然后重新启动；若还不行，把这条原样发给我们。"
-            )
-        )),
+        _ => {
+            let remedy = spec
+                .escape
+                .map(|key| t(lang, key))
+                .unwrap_or(t(lang, Key::EmbedEscapeFallback));
+            Err(tf(
+                lang,
+                Key::EmbedNoLocalAppData,
+                &[
+                    ("subject", t(lang, spec.subject)),
+                    ("noun", t(lang, spec.noun)),
+                    ("remedy", remedy),
+                ],
+            ))
+        }
     }
 }
 
@@ -166,9 +173,10 @@ pub fn extract_into(
     bytes: &[u8],
     expected_sha256: &str,
     cache_dir: &Path,
+    lang: Lang,
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(cache_dir)
-        .map_err(|e| release_error(spec, ReleaseStage::CreateDir, cache_dir, &e))?;
+        .map_err(|e| release_error(spec, ReleaseStage::CreateDir, cache_dir, &e, lang))?;
 
     let path = cache_dir.join(release_name(spec, expected_sha256));
 
@@ -184,11 +192,11 @@ pub fn extract_into(
     let tmp = private_tmp(&path);
     if let Err(cause) = write_private(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp); // 收尾：别在缓存目录里留垃圾
-        return Err(release_error(spec, ReleaseStage::Write, &tmp, &cause));
+        return Err(release_error(spec, ReleaseStage::Write, &tmp, &cause, lang));
     }
     if let Err(cause) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(release_error(spec, ReleaseStage::Rename, &path, &cause));
+        return Err(release_error(spec, ReleaseStage::Rename, &path, &cause, lang));
     }
 
     // ③ **落地之后再核一遍**。这一条不是多余的健壮性：它是"**被杀软拦了**"唯一能
@@ -196,16 +204,20 @@ pub fn extract_into(
     //    （写盘时不 fsync：万一断电留下半截文件，上面的哈希判据下次启动就会重写它。）
     match std::fs::read(&path) {
         Ok(written) if crate::sha256::sha256_hex(&written) == expected_sha256 => Ok(path),
-        Ok(_) => Err(format!(
-            "释放出来的{}与本程序内嵌的那份**不是一个东西**：{}\n\
-             ⚠ 文件已经落盘，内容却被改动了 —— 常见原因是杀毒软件（实时防护）动了它。\n\
-             补救：把 {} 整个删掉后重试；若还在，用杀毒软件扫一次这台机器。{}",
-            spec.noun,
-            path.display(),
-            cache_dir.display(),
-            escape_suffix(spec)
-        )),
-        Err(cause) => Err(release_error(spec, ReleaseStage::Verify, &path, &cause)),
+        Ok(_) => {
+            let escape = escape_suffix(spec, lang);
+            Err(tf(
+                lang,
+                Key::EmbedMismatch,
+                &[
+                    ("noun", t(lang, spec.noun)),
+                    ("path", &path.display().to_string()),
+                    ("cache", &cache_dir.display().to_string()),
+                    ("escape", &escape),
+                ],
+            ))
+        }
+        Err(cause) => Err(release_error(spec, ReleaseStage::Verify, &path, &cause, lang)),
     }
 }
 
@@ -213,9 +225,9 @@ pub fn extract_into(
 ///
 /// ⚠️ [`ReleaseSpec::escape`] 是 `None` 时**返回空串**（不是"什么都没说"）：
 ///    那件东西**没有旁路可走**，硬凑一句假的会比不写更糟（W-2：补救必须真的走得通）。
-fn escape_suffix(spec: &ReleaseSpec) -> String {
+fn escape_suffix(spec: &ReleaseSpec, lang: Lang) -> String {
     match spec.escape {
-        Some(text) => format!("\n临时绕过：{text}"),
+        Some(key) => tf(lang, Key::EmbedEscapeSuffix, &[("text", t(lang, key))]),
         None => String::new(),
     }
 }
@@ -267,13 +279,13 @@ pub enum ReleaseStage {
 
 impl ReleaseStage {
     /// 这一步在干什么（话术里的前半句）。⚠️ 名词由 `spec` 给（见 [`ReleaseSpec::noun`]）。
-    fn what(self, spec: &ReleaseSpec) -> String {
-        let noun = spec.noun;
+    fn what(self, spec: &ReleaseSpec, lang: Lang) -> String {
+        let noun = t(lang, spec.noun);
         match self {
-            ReleaseStage::CreateDir => "建缓存目录失败".to_string(),
-            ReleaseStage::Write => format!("把{noun}写进缓存目录失败"),
-            ReleaseStage::Rename => format!("把{noun}换到最终文件名失败"),
-            ReleaseStage::Verify => format!("释放完成后再核对{noun}失败"),
+            ReleaseStage::CreateDir => t(lang, Key::EmbedStageCreateDir).to_string(),
+            ReleaseStage::Write => tf(lang, Key::EmbedStageWrite, &[("noun", noun)]),
+            ReleaseStage::Rename => tf(lang, Key::EmbedStageRename, &[("noun", noun)]),
+            ReleaseStage::Verify => tf(lang, Key::EmbedStageVerify, &[("noun", noun)]),
         }
     }
 }
@@ -292,53 +304,66 @@ impl ReleaseStage {
 ///
 /// 本机上"磁盘满""被杀软拦"两条**造不出来**（见文件头"验不到的那一半"），
 /// 但**分类函数**是纯的 ⇒ 可以用人造的错误码把每一支都断言掉（下面 `mod tests`）。
-fn release_error(spec: &ReleaseSpec, stage: ReleaseStage, path: &Path, cause: &std::io::Error) -> String {
+fn release_error(
+    spec: &ReleaseSpec,
+    stage: ReleaseStage,
+    path: &Path,
+    cause: &std::io::Error,
+    lang: Lang,
+) -> String {
     let code = cause.raw_os_error();
     let remedy = match code {
         // ERROR_HANDLE_DISK_FULL (39) / ERROR_DISK_FULL (112)
         // ⚠️ 这一档**带一个由 `spec` 给的括号补充**（两件东西的量级差 60 倍：
         //    内核十几 MB、DLL 157 KB ⇒ 同一句"二十 MB 上下"对后者是假话）。
-        Some(39) | Some(112) => match spec.space_hint {
-            Some(hint) => format!("缓存目录所在的磁盘满了：清理空间后点「重试」。（{hint}）"),
-            None => "缓存目录所在的磁盘满了：清理空间后点「重试」。".to_string(),
-        },
+        Some(39) | Some(112) => {
+            let base = t(lang, Key::EmbedDiskFull);
+            match spec.space_hint {
+                Some(hint) => tf(
+                    lang,
+                    Key::EmbedDiskFullWithHint,
+                    &[("base", base), ("hint", t(lang, hint))],
+                ),
+                None => base.to_string(),
+            }
+        }
         // ERROR_VIRUS_INFECTED (225) / ERROR_VIRUS_DELETED (226)
-        Some(225) | Some(226) => "杀毒软件把这次写入拦下来了：把本程序与缓存目录加入白名单后点「重试」。\
-             ⚠ 我们**不做任何规避杀软的动作**（那是另一个性质的事，规格 §7.2）：\
-             正确做法是让用户把这份程序加进白名单。"
-            .to_string(),
+        Some(225) | Some(226) => t(lang, Key::EmbedVirusWrite).to_string(),
         // ERROR_ACCESS_DENIED (5) / ERROR_WRITE_PROTECT (19)
-        Some(5) | Some(19) => "权限不足：确认缓存目录可写（不要用受限账户运行本程序）。\
-             若杀毒软件开启了「受控文件夹访问」之类，也会表现成这一条。"
-            .to_string(),
+        Some(5) | Some(19) => t(lang, Key::EmbedAccessDenied).to_string(),
         // ERROR_SHARING_VIOLATION (32) / ERROR_LOCK_VIOLATION (33)
-        Some(32) | Some(33) => "文件被别的进程占着（杀毒软件正在扫描？资源管理器在预览？）：\
-             等它松开、或把它关掉，然后点「重试」。"
-            .to_string(),
+        Some(32) | Some(33) => t(lang, Key::EmbedSharing).to_string(),
         // 走到这里说明错误码不在上面那张表里，或者压根不是 OS 错误。
         _ => match cause.kind() {
             // 非 Windows 宿主上跑本模块（本仓的测试）时走这一支。
-            std::io::ErrorKind::PermissionDenied => "权限不足：确认缓存目录可写。".to_string(),
+            std::io::ErrorKind::PermissionDenied => {
+                t(lang, Key::EmbedPermissionDenied).to_string()
+            }
             // ⚠️ **这一支与下面那一支只差 `stage == Verify`**，而它们的处置完全不同
             //    （"被隔离了"要加白名单，"路径没了"再试一次就行）。**不许把这两支合成
             //    一支** —— 这一条正是 2026-09-20 那次抄写丢掉的两支之一（见文件头）。
-            std::io::ErrorKind::NotFound if stage == ReleaseStage::Verify => format!(
-                "刚释放出来的{}转眼就不见了：多半是杀毒软件把它隔离了。\
-                 把本程序与缓存目录加入白名单后点「重试」。",
-                spec.noun
+            std::io::ErrorKind::NotFound if stage == ReleaseStage::Verify => tf(
+                lang,
+                Key::EmbedVerifyVanished,
+                &[("noun", t(lang, spec.noun))],
             ),
-            std::io::ErrorKind::NotFound => {
-                "路径不存在（缓存目录被删了？）：重新点一次「重试」。".to_string()
-            }
-            _ => "原因见下面那行系统原话。".to_string(),
+            std::io::ErrorKind::NotFound => t(lang, Key::EmbedPathMissing).to_string(),
+            _ => t(lang, Key::EmbedCauseBelow).to_string(),
         },
     };
-    format!(
-        "释放{}失败：{}。\n路径：{}\n系统原话：{cause}\n补救：{remedy}{}",
-        spec.subject,
-        stage.what(spec),
-        path.display(),
-        escape_suffix(spec)
+    let stage = stage.what(spec, lang);
+    let escape = escape_suffix(spec, lang);
+    tf(
+        lang,
+        Key::EmbedReleaseFailed,
+        &[
+            ("subject", t(lang, spec.subject)),
+            ("stage", &stage),
+            ("path", &path.display().to_string()),
+            ("cause", &cause.to_string()),
+            ("remedy", &remedy),
+            ("escape", &escape),
+        ],
     )
 }
 
@@ -350,6 +375,7 @@ mod tests {
     //!    （人造错误码 → 那句话长什么样、说的是不是根因），不是"真机上它一定会发生"。
 
     use super::*;
+    use crate::i18n::Lang;
     use std::io::Error;
 
     /// 一个用完就删的临时目录（不引 `tempfile`：本 workspace 的依赖纪律）。
@@ -410,7 +436,7 @@ mod tests {
         let dir = cache_dir_from(
             &BENAGEN_CORE,
             Some(std::ffi::OsString::from(r"C:\Users\x\AppData\Local")),
-        )
+                Lang::Zh)
         .expect("有 LOCALAPPDATA 时必须给出目录");
         assert_eq!(
             dir,
@@ -421,7 +447,7 @@ mod tests {
         );
 
         for missing in [None, Some(std::ffi::OsString::new())] {
-            let why = cache_dir_from(&BENAGEN_CORE, missing)
+            let why = cache_dir_from(&BENAGEN_CORE, missing, Lang::Zh)
                 .expect_err("取不到就必须失败，不许静默换地方");
             assert!(why.contains("LOCALAPPDATA"), "根因要点名那个变量：{why}");
             assert!(why.contains("%TEMP%"), "要说清为什么**不**退到别处：{why}");
@@ -436,7 +462,7 @@ mod tests {
         let bytes = b"\x4d\x5a fake but stable payload".repeat(64);
         let sha = crate::sha256::sha256_hex(&bytes);
 
-        let path = extract_into(&BENAGEN_CORE, &bytes, &sha, dir.path()).expect("释放必须成功");
+        let path = extract_into(&BENAGEN_CORE, &bytes, &sha, dir.path(), Lang::Zh).expect("释放必须成功");
         assert_eq!(path, dir.path().join(release_name(&BENAGEN_CORE, &sha)));
         assert_eq!(std::fs::read(&path).expect("文件必须在场"), bytes);
         // 临时文件不许留在原地（`rename` 之后它就不存在了）。
@@ -459,10 +485,10 @@ mod tests {
         let bytes = b"reuse-me".to_vec();
         let sha = crate::sha256::sha256_hex(&bytes);
 
-        let first = extract_into(&BENAGEN_CORE, &bytes, &sha, dir.path()).expect("第一次释放");
+        let first = extract_into(&BENAGEN_CORE, &bytes, &sha, dir.path(), Lang::Zh).expect("第一次释放");
         let mtime_before = std::fs::metadata(&first).expect("stat").modified().ok();
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let second = extract_into(&BENAGEN_CORE, &bytes, &sha, dir.path()).expect("第二次释放");
+        let second = extract_into(&BENAGEN_CORE, &bytes, &sha, dir.path(), Lang::Zh).expect("第二次释放");
 
         assert_eq!(first, second, "名字由内容派生 ⇒ 两次落到同一个路径");
         assert_eq!(
@@ -485,7 +511,7 @@ mod tests {
         let target = dir.path().join(release_name(&BENAGEN_CORE, &sha));
         std::fs::write(&target, b"i am definitely not the kernel").expect("放一个冒牌货");
 
-        let path = extract_into(&BENAGEN_CORE, &bytes, &sha, dir.path()).expect("释放必须成功");
+        let path = extract_into(&BENAGEN_CORE, &bytes, &sha, dir.path(), Lang::Zh).expect("释放必须成功");
         assert_eq!(path, target);
         assert_eq!(
             std::fs::read(&path).expect("读回"),
@@ -510,7 +536,7 @@ mod tests {
                 let bytes = bytes.clone();
                 let sha = sha.clone();
                 let dir = dir_path.clone();
-                std::thread::spawn(move || extract_into(&BENAGEN_CORE, &bytes, &sha, &dir))
+                std::thread::spawn(move || extract_into(&BENAGEN_CORE, &bytes, &sha, &dir, Lang::Zh))
             })
             .collect();
 
@@ -533,10 +559,10 @@ mod tests {
         let stage = ReleaseStage::Write;
         let path = Path::new(r"C:\Users\x\AppData\Local\BenagenDownloader\cache\benagen-core-x.exe");
 
-        let full = release_error(&BENAGEN_CORE, stage, path, &Error::from_raw_os_error(112));
-        let denied = release_error(&BENAGEN_CORE, stage, path, &Error::from_raw_os_error(5));
-        let virus = release_error(&BENAGEN_CORE, stage, path, &Error::from_raw_os_error(225));
-        let sharing = release_error(&BENAGEN_CORE, stage, path, &Error::from_raw_os_error(32));
+        let full = release_error(&BENAGEN_CORE, stage, path, &Error::from_raw_os_error(112), Lang::Zh);
+        let denied = release_error(&BENAGEN_CORE, stage, path, &Error::from_raw_os_error(5), Lang::Zh);
+        let virus = release_error(&BENAGEN_CORE, stage, path, &Error::from_raw_os_error(225), Lang::Zh);
+        let sharing = release_error(&BENAGEN_CORE, stage, path, &Error::from_raw_os_error(32), Lang::Zh);
 
         assert!(full.contains("磁盘满"), "112 = ERROR_DISK_FULL：{full}");
         assert!(denied.contains("权限"), "5 = ERROR_ACCESS_DENIED：{denied}");
@@ -564,11 +590,11 @@ mod tests {
             ReleaseStage::Verify,
             path,
             &Error::new(std::io::ErrorKind::NotFound, "gone"),
-        );
+                Lang::Zh);
         assert!(vanished.contains("杀毒软件"), "Verify 阶段的不见了多半是隔离：{vanished}");
 
         // 兜底那一支也要出现在话里（不许吞掉系统原文）。
-        let other = release_error(&BENAGEN_CORE, stage, path, &Error::from_raw_os_error(1234));
+        let other = release_error(&BENAGEN_CORE, stage, path, &Error::from_raw_os_error(1234), Lang::Zh);
         assert!(other.contains("1234"), "认不出的错误码也要把原文带出来：{other}");
     }
 
@@ -598,7 +624,7 @@ mod tests {
                 ReleaseStage::Write,
                 path,
                 &Error::from_raw_os_error(code),
-            );
+                Lang::Zh);
             assert!(
                 why.contains("占着"),
                 "{code} = ERROR_SHARING/ERROR_LOCK_VIOLATION 必须走「文件被别的进程占着」那一档，\
@@ -613,7 +639,7 @@ mod tests {
             ReleaseStage::Write,
             path,
             &Error::from_raw_os_error(1234),
-        );
+                Lang::Zh);
         assert!(
             !fallback.contains("占着"),
             "认不出的错误码不该被说成「被占着」：{fallback}"
@@ -621,8 +647,8 @@ mod tests {
 
         // ③ `NotFound` 在 **Verify 阶段**是「刚释放出来就被隔离了」，在别的阶段只是「路径没了」。
         let gone = Error::new(std::io::ErrorKind::NotFound, "gone");
-        let quarantined = release_error(&BENAGEN_CORE, ReleaseStage::Verify, path, &gone);
-        let missing = release_error(&BENAGEN_CORE, ReleaseStage::Write, path, &gone);
+        let quarantined = release_error(&BENAGEN_CORE, ReleaseStage::Verify, path, &gone, Lang::Zh);
+        let missing = release_error(&BENAGEN_CORE, ReleaseStage::Write, path, &gone, Lang::Zh);
         assert!(
             quarantined.contains("杀毒软件"),
             "Verify + NotFound = 落地之后被隔离（那是这一档的根因）：{quarantined}"

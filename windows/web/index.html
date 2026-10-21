@@ -14,19 +14,22 @@
     分住在 `.html` / `.css` / `.js` 三个文件里，各自能被单独读完。
 
   ===========================================================================
-  🔴 这里的中文为什么不算"JS 拼界面文案"（规格 §3.2）
+  🔴 这里的静态文案从哪来（规格 §3.2）
   ===========================================================================
-  §3.2 管的是 **JS**：`js/` 下那些文件里不许出现任何面向用户的字面量。而本文件是
-  **结构**，它的中文是**结构文案** —— 与数据无关、在任何状态下都一样的那一类
-  （导航项名、按钮名、分组名、标题句）。它们住在 HTML 里、由浏览器直接渲染，
-  JS **一个字都不碰**。
+  0.3.0 双语化之后，**本文件里没有一个面向用户的中文字面量**。每个要显示字的
+  位置只留一个标记，句子由壳侧按 `state.lang` 成句、随 `/api/state` 的 `copy`
+  下发（Rust 的 `i18n::UI`，见 `shell-core/src/api/state.rs`）：
 
-  为什么不由 Rust 给：`shell-core/src/presentation/` 里**没有**这些字的模块 ——
-  macOS 侧的它们同样住在视图文件里（`Sidebar.swift:20-26` 的 `SidebarSection.title`、
-  `EmptyState.swift` 的几句字面量、`RootView.swift` 的「设置」）。
-  把它们搬进 `presentation/` 是**另一件事**（它要先在 macOS 侧也搬，否则两份真相），
-  **不在任务 9 的范围里**。⇒ 本任务**记账，不越权**：
-  报告里逐条列出"哪些字还没有 Rust 的家"，以及它们各自的 macOS 出处。
+    · `data-copy="Key"`            → 写 `textContent`
+    · `data-copy-title="Key"`      → 写 `title`
+    · `data-copy-aria-label="Key"` → 写 `aria-label`
+    · `data-copy-placeholder="Key"`→ 写 `placeholder`
+
+  填字的是 `js/dom.js:applyCopy()`，由 `app.js` 在每一拍 `state` 到达时调用
+  （模板内容也先填一遍，屏克隆出来才不是空的）。JS 只按标记写回，**不拼串**。
+
+  ⚠️ 所以这个文件里剩下的中文**只在注释里**（$3.2 的扫描器会剥掉注释）。
+     字体子集与 §3.2 的判据都只看真正会渲染的字。
 
   ⚠️ 反过来说：**凡是与数据有关的一个字都不许写在这里** ——
      交付码、文件数、大小、有效期、状态、错误原文、计数、按钮的动态标题，
@@ -56,7 +59,7 @@
 <meta name="color-scheme" content="light">
 <!-- ⚠️ 窗口标题的权威在 `shell-win/tauri.conf.json` 的 `app.windows[0].title`
      （WebView 里这一行看不见）。它在这里只是为了"直接打开这一页时不至于没有标题"。 -->
-<title>Benagen 数据下载工具</title>
+<title data-copy="UiAppTitle"></title>
 <link rel="stylesheet" href="./app.css">
 <!-- 原生 ES 模块（规格 §6.1：没有构建步骤、没有打包器）。
      `type="module"` 天然是 defer 的 ⇒ 脚本跑起来时下面这些挂载点都已经在了。 -->
@@ -93,7 +96,7 @@
         <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true">
           <path d="M1.9 4.2h4.2l1.3 1.7h6.7v6.4H1.9z"/>
         </svg>
-        <span class="nav-label">文件</span>
+        <span class="nav-label" data-copy="UiNavFiles"></span>
         <span class="nav-badge" id="badge-files" hidden></span>
       </button>
       <button class="nav-item" id="nav-transfers" type="button" aria-current="false">
@@ -103,7 +106,7 @@
         <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <circle cx="8" cy="8" r="6"/><path d="M8 4.7v6M5.5 8.2 8 10.7l2.5-2.5"/>
         </svg>
-        <span class="nav-label">传输列表</span>
+        <span class="nav-label" data-copy="UiNavTransfers"></span>
         <span class="nav-badge" id="badge-transfers" hidden></span>
       </button>
       <button class="nav-item" id="nav-verify" type="button" aria-current="false">
@@ -118,7 +121,7 @@
           <path d="M8 1.6 6.12 3.47 3.47 3.47 3.47 6.12 1.6 8 3.47 9.88 3.47 12.53 6.12 12.53 8 14.4 9.88 12.53 12.53 12.53 12.53 9.88 14.4 8 12.53 6.12 12.53 3.47 9.88 3.47z"/>
           <path d="M5.8 8.05 7.2 9.5 10.1 6.5"/>
         </svg>
-        <span class="nav-label">校验结果</span>
+        <span class="nav-label" data-copy="UiNavVerify"></span>
         <span class="nav-badge" id="badge-verify" hidden></span>
       </button>
     </nav>
@@ -126,13 +129,13 @@
     <!-- 底部常驻批次摘要。四格数据全部来自 `state().load.summary`（`DeliverySummary`）；
          **没有生效批次时整块不渲染**（`hidden`，由 `shell.setBatchSummary(null)` 挂上）。 -->
     <div class="batch-summary" id="batch-summary" hidden>
-      <div class="batch-summary__title">批次摘要</div>
+      <div class="batch-summary__title" data-copy="UiBatchSummary"></div>
       <div class="batch-summary__head">
         <span class="batch-summary__code" id="summary-code"></span>
         <span class="batch-summary__expired" id="summary-expired" hidden></span>
       </div>
       <div class="batch-summary__meta">
-        <span id="summary-files"></span><span>·</span><span id="summary-size"></span>
+        <span id="summary-files"></span><span data-copy="UiDot"></span><span id="summary-size"></span>
       </div>
       <div class="batch-summary__validity" id="summary-validity"></div>
     </div>
@@ -170,7 +173,7 @@
           <rect x="2.2" y="8.8" width="5" height="5" rx="1"/>
           <path d="M9 9h2.2v2.2H9zM12.8 12.8h1v1h-1z"/>
         </svg>
-        <span id="tb-code-static">交付码</span>
+        <span id="tb-code-static" data-copy="UiCodeLabel"></span>
         <span id="tb-code-value" hidden></span>
       </button>
 
@@ -180,7 +183,7 @@
           <circle cx="8" cy="8" r="2.4"/>
           <path d="M8 1.6v2.1M8 12.3v2.1M1.6 8h2.1M12.3 8h2.1M3.5 3.5l1.5 1.5M11 11l1.5 1.5M12.5 3.5 11 5M5 11l-1.5 1.5"/>
         </svg>
-        <span>设置</span>
+        <span data-copy="UiSettings"></span>
       </button>
 
       <span class="tb-spacer"></span>
@@ -231,9 +234,9 @@
       <span class="update-bar__text selectable" id="restart-bar-text"></span>
     </div>
     <div class="update-bar" id="update-bar" hidden>
-      <span class="update-bar__text selectable">有新版本 <span id="update-bar-latest"></span>（当前 <span id="update-bar-current"></span>）</span>
-      <button class="notice__action" id="update-bar-go" type="button">去下载</button>
-      <button class="notice__dismiss" id="update-bar-dismiss" type="button" aria-label="收起"></button>
+      <span class="update-bar__text selectable"><span data-copy="UiUpdateNewVersion"></span> <span id="update-bar-latest"></span><span data-copy="UiUpdateCurrentOpen"></span> <span id="update-bar-current"></span><span data-copy="UiUpdateCurrentClose"></span></span>
+      <button class="notice__action" id="update-bar-go" type="button" data-copy="UiUpdateGo"></button>
+      <button class="notice__dismiss" id="update-bar-dismiss" type="button" aria-label="" data-copy-aria-label="UiDismiss"></button>
     </div>
 
     <!-- 屏宿主：任务 10/11/12 的东西挂在这里面（接口契约见 `js/screens/registry.js`）。 -->
@@ -244,8 +247,8 @@
 <!-- ===========================================================================
      `<template>`：**运行时才出现的那部分结构的家**
      ===========================================================================
-     里面是"结构 + 结构文案"，没有数据、没有逻辑。JS 只**克隆与摆放**它们
-     （`js/dom.js:template()`），所以那些字不算"JS 拼出来的界面文案"（§3.2）。
+     里面是"结构 + `data-copy` 标记"，没有数据、没有逻辑。JS 只**克隆与摆放**它们
+     （`js/dom.js:template()`）；字由 `applyCopy()` 从 Rust 下发的 `copy` 写回。
 
      ⚠️ 为什么不做成"JS 里写 `h('button', {text: '重试'})`"：那一句就是一次
         JS 生成界面字符串，而它**不会有任何东西变红**。这正是 §3.2 那条纪律
@@ -254,14 +257,14 @@
 
 <!-- 常驻提示行那颗「重试」。**它取代了 ×**：出错现场不给"关掉它"这个选项。 -->
 <template id="tpl-notice-retry">
-  <button class="notice__retry" type="button">重试</button>
+  <button class="notice__retry" type="button" data-copy="UiRetry"></button>
 </template>
 
 <!-- 常驻提示行那颗「收起」（只有"你刚才那个动作的结果"那类回执才带它）。
      ⚠️ 图标由 JS 补（`dom.js` 的 `ICONS` 是图形唯一的家），这里只留按钮与它的
      无障碍名字 —— 一颗只有 × 的按钮对读屏来说是空的。 -->
 <template id="tpl-notice-dismiss">
-  <button class="notice__dismiss" type="button" aria-label="收起"></button>
+  <button class="notice__dismiss" type="button" aria-label="" data-copy-aria-label="UiDismiss"></button>
 </template>
 
 <!-- 空态屏（`.idle` / `.loading` / `.failed` 三种加载态都落在这里）。
@@ -297,14 +300,14 @@
            `width`/`height` 属性是**给布局用的**（图没到位之前先占住 58×58，
            否则标题会跳一下）—— 尺寸的权威仍是 `empty.css` 的 `.empty__mark`。 -->
       <img class="empty__mark" src="./img/benagen-mark.png" alt="" width="58" height="58">
-      <h1 class="empty__title">输入交付码开始下载</h1>
-      <p class="empty__subtitle">交付码在交付邮件或交付页链接里（整条链接也可以直接粘进来）</p>
+      <h1 class="empty__title" data-copy="UiEmptyTitle"></h1>
+      <p class="empty__subtitle" data-copy="UiEmptyHint"></p>
     </div>
 
     <div class="empty__card">
-      <input class="empty__field" id="empty-code" type="text" placeholder="交付码"
+      <input class="empty__field" id="empty-code" type="text" placeholder="" data-copy-placeholder="UiCodeLabel"
              autocomplete="off" autocapitalize="off" spellcheck="false">
-      <button class="empty__submit" id="empty-submit" type="button">加载</button>
+      <button class="empty__submit" id="empty-submit" type="button" data-copy="UiLoad"></button>
 
       <!-- 🔴 「高级：自定义下载地址」**默认收起**（简报明文）。用原生 `<details>` ——
            它天生自带键盘可达与无障碍语义，而手写一个折叠要多写五行 JS，
@@ -314,12 +317,12 @@
               它会禁用上面那颗「加载」，所以必须在**收起分组也看得见**的地方 ——
               用户完全可能填完地址之后把「高级」收起来再点加载）。 -->
       <details class="empty__advanced" id="empty-advanced">
-        <summary>高级：自定义下载地址</summary>
+        <summary data-copy="UiAdvancedBaseUrl"></summary>
         <div class="empty__advanced-body">
           <input class="empty__field" id="empty-base-url" type="text"
                  placeholder="http://download.benagen.com"
                  autocomplete="off" autocapitalize="off" spellcheck="false">
-          <p class="empty__note">留空即用默认交付服务器</p>
+          <p class="empty__note" data-copy="UiBaseUrlHint"></p>
         </div>
       </details>
     </div>
@@ -344,7 +347,7 @@
         <span class="empty__failure-icon" id="empty-failure-icon"></span>
         <span class="selectable" id="empty-failure-text"></span>
       </div>
-      <button class="empty__retry" id="empty-retry" type="button" hidden>重试</button>
+      <button class="empty__retry" id="empty-retry" type="button" hidden data-copy="UiRetry"></button>
     </div>
   </section>
 </template>
@@ -354,16 +357,11 @@
      ===========================================================================
      本块由任务 10（文件页）添加，与任务 11/12 各自那一块**相邻但不相交**。
 
-     🔴 这里为什么有中文（规格 §3.2 的第一类例外：**结构文案**）：
+     🔴 文案从哪来（规格 §3.2）：
         下面这些字**与数据无关、任何状态下都一样**（列名、按钮名、状态句），
-        它们住在 HTML 里、由浏览器直接渲染，`js/screens/files.js` **一个字都不碰** ——
-        它只把这些节点克隆出来、按 `hidden` 亮一格（同 `tpl-screen-empty` 的做法）。
-        它们**不该由 Rust 给**：`shell-core/src/presentation/` 里没有这些字的模块，
-        而 macOS 侧它们同样住在视图文件里（`FileBrowser.swift:284-290` 的四列、
-        `:119` 的「下载本目录」、`:126-132` 的重读按钮、`:284` 与 `SelectionBar.swift:66,69`
-        的底栏按钮、`:249-250` 的右键菜单）。
-        ⇒ 把它们搬进 `presentation/` 是**另一件事**（要先在 macOS 侧也搬，
-          否则两份真相），不在任务 10 的范围里。
+        现在全部走 `data-copy*` 标记，句子由 `/api/state` 的 `copy`（Rust
+        `i18n::UI`）按语言给；`js/screens/files.js` 只克隆节点、按 `hidden`
+        亮一格，**一个字都不碰**。
 
      ⚠️ **凡是与数据有关的一个字都不许写在这里**：文件名、大小、时间、状态标签、
         项数、合计、批次号、错误原文 —— 全部由 `BrowserRow` / `Breadcrumb` /
@@ -390,11 +388,11 @@
         <svg class="files__crumb-btn-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <circle cx="8" cy="8" r="6"/><path d="M8 4.7v6M5.5 8.2 8 10.7l2.5-2.5"/>
         </svg>
-        <span class="files__crumb-btn-label">下载本目录</span>
+        <span class="files__crumb-btn-label" data-copy="UiDownloadThisFolder"></span>
       </button>
       <button class="files__crumb-btn" id="files-reload" type="button"
-              title="重新读取这一层"
-              aria-label="重新读取这一层">
+              title="" data-copy-title="UiReloadFolder"
+              aria-label="" data-copy-aria-label="UiReloadFolder">
         <svg class="files__crumb-btn-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.75"/><path d="M13.4 1.9v3.2h-3.2"/>
         </svg>
@@ -410,8 +408,8 @@
       <span class="files__failure-text selectable" id="files-failure-text"></span>
       <span class="files__spacer"></span>
       <button class="files__failure-dismiss" id="files-failure-dismiss" type="button"
-              title="收起这条提示"
-              aria-label="收起这条提示">
+              title="" data-copy-title="UiDismissNotice"
+              aria-label="" data-copy-aria-label="UiDismissNotice">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
           <path d="M4 4l8 8M12 4l-8 8"/>
         </svg>
@@ -419,20 +417,20 @@
     </div>
 
     <div class="files__head" id="files-head">
-      <span class="files__col-name">名称</span>
-      <span class="files__col-size">大小</span>
-      <span class="files__col-time">时间</span>
-      <span class="files__col-state">状态</span>
+      <span class="files__col-name" data-copy="UiColName"></span>
+      <span class="files__col-size" data-copy="UiColSize"></span>
+      <span class="files__col-time" data-copy="UiColTime"></span>
+      <span class="files__col-state" data-copy="UiColState"></span>
     </div>
 
     <div class="files__rows" id="files-rows"></div>
 
     <div class="files__status" id="files-status" hidden>
       <span class="files__status-spinner" id="files-status-spinner" hidden></span>
-      <span class="files__status-text" id="files-status-loading" hidden>正在读取目录…</span>
-      <span class="files__status-text" id="files-status-failed" hidden>这一层没能读出来</span>
-      <span class="files__status-text" id="files-status-empty" hidden>这个目录是空的</span>
-      <button class="files__status-retry" id="files-status-retry" type="button" hidden>重试</button>
+      <span class="files__status-text" id="files-status-loading" hidden data-copy="UiDirLoading"></span>
+      <span class="files__status-text" id="files-status-failed" hidden data-copy="UiDirLoadFailed"></span>
+      <span class="files__status-text" id="files-status-empty" hidden data-copy="UiDirEmpty"></span>
+      <button class="files__status-retry" id="files-status-retry" type="button" hidden data-copy="UiRetry"></button>
     </div>
 
     <div class="files__notice" id="files-notice" hidden>
@@ -442,13 +440,13 @@
 
     <div class="files__bar">
       <span class="files__bar-hint" id="files-bar-hint"></span>
-      <span class="files__bar-sep" id="files-bar-hint-sep" hidden>·</span>
+      <span class="files__bar-sep" id="files-bar-hint-sep" hidden data-copy="UiDot"></span>
       <span class="files__bar-count" id="files-bar-count"></span>
-      <span class="files__bar-sep">·</span>
+      <span class="files__bar-sep" data-copy="UiDot"></span>
       <span class="files__bar-size" id="files-bar-size"></span>
       <span class="files__spacer"></span>
-      <button class="files__bar-btn" id="files-bar-select-all" type="button">全选</button>
-      <button class="files__bar-btn" id="files-bar-select-none" type="button">全不选</button>
+      <button class="files__bar-btn" id="files-bar-select-all" type="button" data-copy="UiSelectAll"></button>
+      <button class="files__bar-btn" id="files-bar-select-none" type="button" data-copy="UiSelectNone"></button>
       <button class="files__bar-btn is-primary" id="files-bar-download" type="button"></button>
     </div>
   </section>
@@ -458,10 +456,10 @@
      里面三句是结构文案，JS 只克隆与摆放。 -->
 <template id="tpl-screen-files-menu">
   <div class="files__menu" id="files-menu" hidden>
-    <button class="files__menu-item" id="files-menu-download" type="button">下载选中项</button>
+    <button class="files__menu-item" id="files-menu-download" type="button" data-copy="UiDownloadSelected"></button>
     <span class="files__menu-sep"></span>
-    <button class="files__menu-item" id="files-menu-select-level" type="button">全选本层</button>
-    <button class="files__menu-item" id="files-menu-select-none" type="button">全不选</button>
+    <button class="files__menu-item" id="files-menu-select-level" type="button" data-copy="UiSelectAllHere"></button>
+    <button class="files__menu-item" id="files-menu-select-none" type="button" data-copy="UiSelectNone"></button>
   </div>
 </template>
 <!-- ===========================================================================
@@ -500,7 +498,7 @@
          `total_bytes` 为 0 时**百分比那一格是 Rust 给的占位符**，JS 不编数字。 -->
     <div class="verify__header">
       <div class="verify__progress">
-        <span class="verify__progress-title">总进度</span>
+        <span class="verify__progress-title" data-copy="UiTotalProgress"></span>
         <!-- 🔴 **值域是 0…1**（不是 0…100），与传输列表那一屏的进度条逐字同款
              （`index.html` 的 `transfers-row` 模板）：`aria-valuenow` 直接是 Rust 给的
              那个**原始比例**，`aria-valuetext` 是 Rust 的 `percent_text`
@@ -518,7 +516,7 @@
         <span class="verify__meta" id="verify-speed"></span>
         <!-- 树还没到、或还不是这一批的：**说「—」**，不留空白、不编一个 0%
              （口径同 `PercentFormat` 的占位符）。这四个字是 macOS 视图里的同一个字面量。 -->
-        <span class="verify__placeholder" id="verify-progress-empty" hidden>—</span>
+        <span class="verify__placeholder" id="verify-progress-empty" hidden data-copy="UiNoValue"></span>
         <span class="verify__spacer"></span>
         <!-- 刷新（`VerifyView.swift:76-93` 那颗按钮）。它做的事与 macOS 逐字同款：
              **两条请求一起重取**（校验结果 + 总进度）—— 只刷一半会留下一个"看起来刷新了、
@@ -539,7 +537,7 @@
             <path d="M13.3 8a5.3 5.3 0 1 1-1.55-3.75"/>
             <path d="M13.3 2.7v2.7h-2.7"/>
           </svg>
-          <span>刷新</span>
+          <span data-copy="UiRefresh"></span>
         </button>
       </div>
 
@@ -552,7 +550,7 @@
       </div>
       <!-- 还没有拿到第一份校验结果（本屏刚挂上、第一拍还没回来）：说这一句，不画六个 0
            （那会读成"全部通过"，而这句话谁都没说过）。 -->
-      <div class="verify__headline-empty" id="verify-headline-empty">还没有校验结果</div>
+      <div class="verify__headline-empty" id="verify-headline-empty" data-copy="UiNoVerifyYet"></div>
     </div>
 
     <!-- ---- 本屏自己的失败条 ------------------------------------------------
@@ -648,20 +646,20 @@
            先停手、换一个存储目录、再一键开始（换目录时内核会把旧目录里已下载的文件搬过来）。
            可用性来自载荷里的 `batch.can_pause_all` / `batch.can_resume_all`（Rust 判的，
            JS 不重算）；搬运进行中两颗都灰着，进度话在下面那一行。 -->
-      <button class="transfers__batch" id="transfers-pause-all" type="button">暂停全部</button>
-      <button class="transfers__batch" id="transfers-resume-all" type="button">一键开始</button>
+      <button class="transfers__batch" id="transfers-pause-all" type="button" data-copy="UiPauseAll"></button>
+      <button class="transfers__batch" id="transfers-resume-all" type="button" data-copy="UiResumeAll"></button>
       <button class="transfers__refresh" id="transfers-refresh" type="button">
         <svg class="transfers__refresh-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M13.3 8a5.3 5.3 0 1 1-1.55-3.75"/>
           <path d="M13.3 2.7v2.7h-2.7"/>
         </svg>
-        <span>刷新</span>
+        <span data-copy="UiRefresh"></span>
       </button>
       <!-- 「清空已完成」是**列表级**动作（没有 gid）：行级菜单里没有它，
            否则用户以为只清那一行、实际清掉一片（`TransferRow::actions` 的注释）。
            可用性来自 `TransferGlobalSummary.can_clear_finished`（Rust 判的），
            JS 不重算。 -->
-      <button class="transfers__clear" id="transfers-clear" type="button">清空已完成</button>
+      <button class="transfers__clear" id="transfers-clear" type="button" data-copy="UiClearCompleted"></button>
     </div>
 
     <!-- ---- 搬运进度 / 搬运结果（换下载目录之后）-----------------------------------
@@ -698,7 +696,7 @@
             正是约束 4 明禁的静默挂死；那时原因与出口都在主区顶部那条常驻横幅上。 -->
     <div class="transfers__loading" id="transfers-loading" hidden>
       <span class="transfers__spinner" aria-hidden="true"></span>
-      <span class="transfers__loading-text">正在读取传输列表…</span>
+      <span class="transfers__loading-text" data-copy="UiTransfersLoading"></span>
     </div>
 
     <!-- ---- 空态 ------------------------------------------------------------
@@ -740,7 +738,7 @@
              理由与"这为什么不算 §3.2 的拼串"与 `verify.js:pathRow` **逐条相同**
              （**一个字符都没被改写**、切点是结构性的、全文在 `title` 与选中复制里都在）。 -->
         <span class="transfers__title"><span class="transfers__title-head"></span><span class="transfers__title-tail"></span></span>
-        <span class="transfers__badge" hidden>已暂停</span>
+        <span class="transfers__badge" hidden data-copy="UiPaused"></span>
       </div>
       <div class="transfers__progress-line">
         <div class="transfers__bar" role="progressbar" aria-valuemin="0" aria-valuemax="1">
@@ -753,7 +751,7 @@
     </div>
     <span class="transfers__speed"></span>
     <span class="transfers__state"></span>
-    <button class="transfers__menu-btn" type="button" aria-label="这一行的操作"></button>
+    <button class="transfers__menu-btn" type="button" aria-label="" data-copy-aria-label="UiRowActions"></button>
   </div>
 </template>
 
@@ -765,13 +763,13 @@
      ⚠️ `data-kind` 区分两类：`kernel` 那五项要发 `task_action`（值是线上字面量），
         `shell` 那一项走 `reveal`（**协议里没有这个名字**，见上面那段）。 -->
 <template id="tpl-screen-transfers-menu">
-  <button class="transfers__menu-item" type="button" data-kind="kernel" data-action="pause">暂停</button>
-  <button class="transfers__menu-item" type="button" data-kind="kernel" data-action="unpause">继续</button>
-  <button class="transfers__menu-item" type="button" data-kind="kernel" data-action="retry">重试</button>
+  <button class="transfers__menu-item" type="button" data-kind="kernel" data-action="pause" data-copy="UiPause"></button>
+  <button class="transfers__menu-item" type="button" data-kind="kernel" data-action="unpause" data-copy="UiResume"></button>
+  <button class="transfers__menu-item" type="button" data-kind="kernel" data-action="retry" data-copy="UiRetry"></button>
   <span class="transfers__menu-sep"></span>
-  <button class="transfers__menu-item" type="button" data-kind="shell" data-action="reveal">在资源管理器中显示</button>
+  <button class="transfers__menu-item" type="button" data-kind="shell" data-action="reveal" data-copy="UiReveal"></button>
   <span class="transfers__menu-sep"></span>
-  <button class="transfers__menu-item is-destructive" type="button" data-kind="kernel" data-action="remove">移除</button>
+  <button class="transfers__menu-item is-destructive" type="button" data-kind="kernel" data-action="remove" data-copy="UiRemove"></button>
 </template>
 
 <!-- ===========================================================================
@@ -815,10 +813,10 @@
      --------------------------------------------------------------------------- -->
 <template id="tpl-panel-switchcode">
   <div class="panel panel--switch" id="sc-root">
-    <p class="panel__title">加载另一个交付码</p>
-    <p class="panel__note">换码会把当前的下载任务从引擎里摘掉（含等待中的）；已经下载到磁盘的文件不会被删除。</p>
+    <p class="panel__title" data-copy="UiSwitchCodeTitle"></p>
+    <p class="panel__note" data-copy="UiSwitchCodeWarning"></p>
 
-    <input class="panel__input" id="sc-code" type="text" placeholder="交付码"
+    <input class="panel__input" id="sc-code" type="text" placeholder="" data-copy-placeholder="UiCodeLabel"
            autocomplete="off" autocapitalize="off" spellcheck="false">
 
     <!-- 失败原文**留在面板里**（约束 4：不得静默失效）。可选中复制（约束 3）：
@@ -834,7 +832,7 @@
     <!-- 历史批次。**空列表时整段不渲染**（`BatchHistoryRow::rows` 的判据：
          列表为空时不显示这一段，不要给空盒子）—— 由 `sc-history` 的 hidden 切换。 -->
     <div class="panel__history" id="sc-history" hidden>
-      <p class="panel__subtitle">历史批次</p>
+      <p class="panel__subtitle" data-copy="UiHistoryTitle"></p>
       <div class="panel__history-list" id="sc-history-rows"></div>
       <!-- 历史写盘失败那行（主区另有一条常驻提示，两处读的是同一个字段 ——
            macOS 的最终审查重要 1）。那句承诺是"重启应用后仍在"，而写盘失败时
@@ -849,7 +847,7 @@
              模板，本文件不另写一个字）。 -->
         <span class="panel__dismiss" id="sc-history-failure-dismiss"></span>
       </div>
-      <p class="panel__hint">点一行即可切换到那一批；备注写在这里，重启应用后仍在。</p>
+      <p class="panel__hint" data-copy="UiHistoryHint"></p>
     </div>
 
     <div class="panel__foot">
@@ -857,8 +855,8 @@
       <!-- ⚠️ 「取消」**有意不禁用**（macOS 同款）：面板关不关得掉，不该由一次网络请求
            决定。代价是那次换码的结果会失去面板这个落点 —— 所以结果**同时**落在
            `state().load` 上，由主区呈现（成功：文件页换成了新那一批；失败：原文）。 -->
-      <button class="panel__btn" id="sc-cancel" type="button">取消</button>
-      <button class="panel__btn is-primary" id="sc-load" type="button">加载</button>
+      <button class="panel__btn" id="sc-cancel" type="button" data-copy="UiCancel"></button>
+      <button class="panel__btn is-primary" id="sc-load" type="button" data-copy="UiLoad"></button>
     </div>
   </div>
 </template>
@@ -875,7 +873,7 @@
       <span class="sc__code selectable"><span class="mid__head" data-part="code-head"></span><span class="mid__tail" data-part="code-tail"></span></span>
       <span class="sc__time" data-part="time"></span>
     </div>
-    <input class="sc__note" type="text" placeholder="备注" autocomplete="off" spellcheck="false">
+    <input class="sc__note" type="text" placeholder="" data-copy-placeholder="UiNotePlaceholder" autocomplete="off" spellcheck="false">
   </div>
 </template>
 
@@ -905,8 +903,8 @@
 <template id="tpl-window-settings">
   <div class="win win--settings" id="set-root">
     <div class="win__head">
-      <h2 class="win__title">设置</h2>
-      <button class="win__close" id="set-close" type="button" aria-label="关闭">
+      <h2 class="win__title" data-copy="UiSettings"></h2>
+      <button class="win__close" id="set-close" type="button" aria-label="" data-copy-aria-label="UiClose">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
           <path d="M4 4l8 8M12 4l-8 8"/>
         </svg>
@@ -916,7 +914,7 @@
     <div class="win__body">
       <section class="set__section">
         <div class="set__row">
-          <span class="set__label">下载到</span>
+          <span class="set__label" data-copy="UiDownloadTo"></span>
           <!-- 只读显示值：未配置时是 Rust 给的那句"默认（…，由内核决定）"，
                而**不是**一个空行（空行在界面上与"这一行坏了"分不开）。
                ⚠️ 里面那两格是**中间截断**用的（路径可能很长，而这一行不许长高）：
@@ -925,7 +923,7 @@
           <span class="set__value selectable" id="set-dir-display"><span class="mid__head" data-part="head"></span><span class="mid__tail" data-part="tail"></span></span>
         </div>
         <div class="set__row">
-          <input class="set__control" id="set-dir-input" type="text" placeholder="文件夹路径"
+          <input class="set__control" id="set-dir-input" type="text" placeholder="" data-copy-placeholder="UiFolderPlaceholder"
                  autocomplete="off" autocapitalize="off" spellcheck="false">
           <!-- 「选择…」= 弹一次**系统的**「选择文件夹」（`pick_directory`）。
                对位 `SettingsView.swift:230` 那颗 `NSOpenPanel` 的入口。
@@ -933,9 +931,9 @@
                   填进输入框 + 检查 → 确认 → 写偏好 → 重启内核），不是"只填一格、再让用户
                   自己去点「应用」"—— 那会与 macOS 的行为分叉，而两处说的本来是同一件事。
                   手工粘路径那条路一个字都没变。 -->
-          <button class="set__btn" id="set-dir-choose" type="button">选择…</button>
-          <button class="set__btn" id="set-dir-apply" type="button">应用</button>
-          <button class="set__btn" id="set-dir-reset" type="button">恢复默认</button>
+          <button class="set__btn" id="set-dir-choose" type="button" data-copy="UiChoose"></button>
+          <button class="set__btn" id="set-dir-apply" type="button" data-copy="UiApply"></button>
+          <button class="set__btn" id="set-dir-reset" type="button" data-copy="UiRestoreDefault"></button>
         </div>
         <!-- 那一段脚注（"没有设置过时壳不指定下载目录……网络盘会让界面变慢"）：
              逐字来自 `DownloadDirectory::SECTION_NOTE`。 -->
@@ -977,7 +975,7 @@
              ⚠️ 回执那几格（标题 / 路径 / 隐私提醒）**全部来自载荷**（`api::diagnostics`）
                  —— 本文件里没有一个字是这次动作的文案，JS 也不许造（§3.2）。 -->
         <div class="set__row">
-          <button class="set__btn" id="set-export" type="button">导出诊断日志…</button>
+          <button class="set__btn" id="set-export" type="button" data-copy="UiExportDiagnostics"></button>
         </div>
         <div class="set__receipt" id="set-export-receipt" hidden>
           <span class="dlg__receipt-icon" id="set-export-receipt-icon"></span>
@@ -998,7 +996,7 @@
       <section class="set__section">
         <label class="set__check" id="set-update-check">
           <input type="checkbox" id="set-update" checked>
-          <span class="set__check-label" id="set-update-label">启动时检查更新</span>
+          <span class="set__check-label" id="set-update-label" data-copy="UiCheckUpdatesOnStart"></span>
         </label>
         <!-- 「立即检测」（规格 §2）：**不受 24 小时节流**的一次手动检查。
              ⚠️ 内核对这一条**早就备好了**（`op_check_update_now`），缺的只是这颗按钮与
@@ -1012,7 +1010,7 @@
              这颗按钮说"现在查一次"（开关关着时点了会得到一句"没有去查" + 补救，
              而不是"已经是最新的"—— 那一档由内核与判决那一层说了算）。 -->
         <div class="set__row">
-          <button class="set__btn" id="set-update-now" type="button">立即检测</button>
+          <button class="set__btn" id="set-update-now" type="button" data-copy="UiCheckNow"></button>
         </div>
         <div class="set__receipt" id="set-update-receipt" hidden>
           <span class="dlg__receipt-icon" id="set-update-receipt-icon"></span>
@@ -1038,7 +1036,7 @@
         <!-- 内核还没交出参数时的形态：**不画一张空表**（空表会让客户以为参数全没了，
              而真实原因是"还没问到"）。下面那一格是**原文逐字**（内核还没起来那句）。 -->
         <div class="set__unavailable" id="set-unavailable" hidden>
-          <p class="set__unavailable-title">内核还没交出参数</p>
+          <p class="set__unavailable-title" data-copy="UiKernelParamsPending"></p>
           <p class="set__unavailable-text selectable" id="set-unavailable-text"></p>
         </div>
       </section>
@@ -1064,18 +1062,18 @@
         <svg class="set__link-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
           <circle cx="8" cy="8" r="6"/><path d="M8 7.2v3.6M8 5.1v.01"/>
         </svg>
-        <span>关于</span>
+        <span data-copy="UiAbout"></span>
       </button>
       <button class="set__link" id="set-license" type="button">
         <svg class="set__link-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M3.4 1.9h6l3.2 3.2v9H3.4z"/><path d="M9.4 1.9v3.2h3.2"/>
         </svg>
-        <span>开源许可…</span>
+        <span data-copy="UiLicenses"></span>
       </button>
       <span class="set__spacer"></span>
       <!-- 横幅：**两格**（有改动 / 与内核一致）由 JS 按比较结果**挑选**，不造句。 -->
       <span class="set__banner" id="set-banner"></span>
-      <button class="panel__btn is-primary" id="set-save" type="button">保存</button>
+      <button class="panel__btn is-primary" id="set-save" type="button" data-copy="UiSave"></button>
     </div>
   </div>
 </template>
@@ -1093,23 +1091,23 @@
      --------------------------------------------------------------------------- -->
 <template id="tpl-dialog-problem">
   <div class="dlg dlg--alert">
-    <p class="dlg__title">这个文件夹不能用</p>
+    <p class="dlg__title" data-copy="UiFolderUnusable"></p>
     <p class="dlg__body selectable" id="dlg-problem-message"></p>
     <div class="dlg__foot">
-      <button class="panel__btn is-primary" id="dlg-problem-ok" type="button">知道了</button>
+      <button class="panel__btn is-primary" id="dlg-problem-ok" type="button" data-copy="UiGotIt"></button>
     </div>
   </div>
 </template>
 
 <template id="tpl-dialog-confirm">
   <div class="dlg dlg--alert">
-    <p class="dlg__title">更改下载目录？</p>
+    <p class="dlg__title" data-copy="UiChangeDirTitle"></p>
     <p class="dlg__body selectable" id="dlg-confirm-message"></p>
     <div class="dlg__foot">
-      <button class="panel__btn" id="dlg-confirm-cancel" type="button">取消</button>
+      <button class="panel__btn" id="dlg-confirm-cancel" type="button" data-copy="UiCancel"></button>
       <!-- ⚠️ 这颗按钮的标题把**后果**再说一遍（「更改并重启内核」），不是一句空泛的
            「确定」—— 用户点它之前要能看出自己答应的是什么（macOS 同款）。 -->
-      <button class="panel__btn is-primary" id="dlg-confirm-accept" type="button">更改并重启内核</button>
+      <button class="panel__btn is-primary" id="dlg-confirm-accept" type="button" data-copy="UiChangeAndRestart"></button>
     </div>
   </div>
 </template>
@@ -1130,8 +1128,8 @@
 <template id="tpl-dialog-about">
   <div class="dlg dlg--about">
     <div class="win__head">
-      <h2 class="win__title">关于</h2>
-      <button class="win__close" id="about-close" type="button" aria-label="关闭">
+      <h2 class="win__title" data-copy="UiAbout"></h2>
+      <button class="win__close" id="about-close" type="button" aria-label="" data-copy-aria-label="UiClose">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
           <path d="M4 4l8 8M12 4l-8 8"/>
         </svg>
@@ -1139,7 +1137,7 @@
     </div>
     <!-- 全称 logo（`logoCard`）。`alt=""`：装饰性资产，macOS 那一边也不给读屏念它。 -->
     <img class="dlg__logo" src="./img/benagen-full-logo.png" alt="">
-    <p class="dlg__app">Benagen 数据下载工具</p>
+    <p class="dlg__app" data-copy="UiAppTitle"></p>
     <!-- 版本号可选中复制：报障时被问到的第一个问题就是"你用的是哪个版本"。 -->
     <p class="dlg__version selectable" id="about-version"></p>
     <div class="dlg__failure" id="about-failure" hidden>
@@ -1167,8 +1165,8 @@
 <template id="tpl-dialog-license">
   <div class="dlg dlg--license">
     <div class="win__head">
-      <h2 class="win__title">开源许可</h2>
-      <button class="win__close" id="license-close" type="button" aria-label="关闭">
+      <h2 class="win__title" data-copy="UiLicenseTitle"></h2>
+      <button class="win__close" id="license-close" type="button" aria-label="" data-copy-aria-label="UiClose">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
           <path d="M4 4l8 8M12 4l-8 8"/>
         </svg>
@@ -1177,7 +1175,7 @@
     <!-- 条目（两份）由 JS 按载荷生成 —— 条数由 Rust 的 LICENSES 表决定，不是这里的结构。 -->
     <div class="dlg__tabs" id="license-list"></div>
     <p class="dlg__why selectable" id="license-why"></p>
-    <p class="dlg__sha"><span class="dlg__sha-label">全文 sha256</span>
+    <p class="dlg__sha"><span class="dlg__sha-label" data-copy="UiLicenseFullSha"></span>
       <span class="selectable" id="license-sha"></span></p>
     <div class="dlg__license-body" id="license-body"></div>
     <div class="dlg__failure" id="license-failure" hidden>

@@ -14,6 +14,7 @@
 
 use serde::Serialize;
 
+use crate::i18n::{t, tf, Key, Lang};
 use crate::presentation::format::ByteFormat;
 use crate::presentation::transfer_row::TransferRow;
 use crate::protocol::{MigrateStatus, TaskAction};
@@ -32,6 +33,7 @@ pub struct BatchControl {
 
 impl BatchControl {
     pub fn of(
+        lang: Lang,
         rows: &[TransferRow],
         resume_pending: bool,
         migrate: Option<&MigrateStatus>,
@@ -42,20 +44,22 @@ impl BatchControl {
             can_pause_all: !running && offers(TaskAction::Pause),
             can_resume_all: !running && (offers(TaskAction::Unpause) || resume_pending),
             migrate_running: running,
-            migrate_text: migrate.filter(|m| m.running).map(running_text),
-            migrate_note: migrate.filter(|m| m.finished && !m.running).and_then(finished_note),
+            migrate_text: migrate.filter(|m| m.running).map(|m| running_text(lang, m)),
+            migrate_note: migrate
+                .filter(|m| m.finished && !m.running)
+                .and_then(|m| finished_note(lang, m)),
         }
     }
 
     /// 壳这一侧记下的搬运失败（内核没有 `MigrateStatus` 可以说）。并进 `migrate_note`，
     /// 与已有的结束话用空格并排（规则同 [`finished_note`]）。
-    pub fn with_migrate_failure(mut self, failure: Option<&MigrateFailure>) -> Self {
+    pub fn with_migrate_failure(mut self, lang: Lang, failure: Option<&MigrateFailure>) -> Self {
         let Some(failure) = failure else {
             return self;
         };
         let sentence = match failure {
-            MigrateFailure::Refused(reason) => migrate_refused_note(reason),
-            MigrateFailure::ProgressLost => PROGRESS_LOST_NOTE.to_string(),
+            MigrateFailure::Refused(reason) => migrate_refused_note(lang, reason),
+            MigrateFailure::ProgressLost => t(lang, Key::MigrateProgressLost).to_string(),
         };
         self.migrate_note = Some(match self.migrate_note.take() {
             Some(note) => format!("{note} {sentence}"),
@@ -77,21 +81,24 @@ pub enum MigrateFailure {
 /// 搬运没能完成的那句话（与 [`finished_note`] 的失败句同一个后果描述）。
 ///
 /// `reason` 是内核原文或壳给的那一句原因；这里只拼句式，不加工它。
-pub fn migrate_refused_note(reason: &str) -> String {
-    format!("旧目录里已下载的文件没能搬到新目录，会从头下载（旧文件仍在原目录）。原因：{reason}")
+pub fn migrate_refused_note(lang: Lang, reason: &str) -> String {
+    tf(lang, Key::MigrateRefused, &[("reason", reason)])
 }
 
-/// 取不到搬运进度的那句话（与 [`migrate_refused_note`] 并列，两者都经 [`BatchControl::with_migrate_failure`] 出口）。
-pub const PROGRESS_LOST_NOTE: &str = "没能取到搬运进度，旧文件可能没有搬完。";
-
-
-fn running_text(m: &MigrateStatus) -> String {
-    format!(
-        "正在搬运已下载的文件：{}/{} 个（{} / {}）",
-        m.files_done,
-        m.files_total,
-        ByteFormat::text(m.bytes_done as i64),
-        ByteFormat::text(m.bytes_total as i64),
+fn running_text(lang: Lang, m: &MigrateStatus) -> String {
+    let done = m.files_done.to_string();
+    let total = m.files_total.to_string();
+    let done_bytes = ByteFormat::text(m.bytes_done as i64);
+    let total_bytes = ByteFormat::text(m.bytes_total as i64);
+    tf(
+        lang,
+        Key::MigrateRunning,
+        &[
+            ("done", &done),
+            ("total", &total),
+            ("done_bytes", &done_bytes),
+            ("total_bytes", &total_bytes),
+        ],
     )
 }
 
@@ -100,21 +107,18 @@ fn running_text(m: &MigrateStatus) -> String {
 ///
 /// ⚠️ 失败那句点明**后果**（会从头下载）与**文件还在哪**（旧目录）：客户拿到这句话唯一
 /// 要做的决定就是「要不要自己去旧目录处理」，所以两样都得在话里。
-fn finished_note(m: &MigrateStatus) -> Option<String> {
+fn finished_note(lang: Lang, m: &MigrateStatus) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(first) = m.errors.first() {
-        parts.push(format!(
-            "有 {} 个文件没能搬到新目录，会从头下载（旧文件仍在原目录）。第一个：{}：{}",
-            m.errors.len(),
-            first.path,
-            first.reason
+        let n = m.errors.len().to_string();
+        parts.push(tf(
+            lang,
+            Key::MigrateErrors,
+            &[("n", &n), ("path", &first.path), ("reason", &first.reason)],
         ));
     }
     if !m.skipped.is_empty() {
-        parts.push(format!(
-            "有 {} 个文件在新目录里已经存在，没有覆盖。",
-            m.skipped.len()
-        ));
+        parts.push(tf(lang, Key::MigrateSkipped, &[("n", &m.skipped.len().to_string())]));
     }
     if parts.is_empty() {
         None
@@ -126,6 +130,7 @@ fn finished_note(m: &MigrateStatus) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::{t, Key, Lang};
     use crate::presentation::RowColor;
     use crate::protocol::MigrateProblem;
     use std::collections::BTreeSet;
@@ -166,15 +171,15 @@ mod tests {
     #[test]
     fn availability_follows_what_the_rows_offer() {
         let active = [row(&[TaskAction::Pause, TaskAction::Remove])];
-        let c = BatchControl::of(&active, false, None);
+        let c = BatchControl::of(Lang::Zh, &active, false, None);
         assert!(c.can_pause_all && !c.can_resume_all, "{c:?}");
 
         let paused = [row(&[TaskAction::Unpause, TaskAction::Remove])];
-        let c = BatchControl::of(&paused, false, None);
+        let c = BatchControl::of(Lang::Zh, &paused, false, None);
         assert!(!c.can_pause_all && c.can_resume_all, "{c:?}");
 
         let done = [row(&[TaskAction::Retry, TaskAction::Remove])];
-        let c = BatchControl::of(&done, false, None);
+        let c = BatchControl::of(Lang::Zh, &done, false, None);
         assert!(!c.can_pause_all && !c.can_resume_all, "已完成的行两个都不给: {c:?}");
     }
 
@@ -182,9 +187,9 @@ mod tests {
     /// 判别力：去掉 `|| resume_pending` ⇒ 红。
     #[test]
     fn resume_is_offered_on_an_empty_list_when_a_hand_over_is_pending() {
-        let c = BatchControl::of(&[], true, None);
+        let c = BatchControl::of(Lang::Zh, &[], true, None);
         assert!(c.can_resume_all && !c.can_pause_all, "{c:?}");
-        let c = BatchControl::of(&[], false, None);
+        let c = BatchControl::of(Lang::Zh, &[], false, None);
         assert!(!c.can_resume_all, "{c:?}");
     }
 
@@ -193,7 +198,7 @@ mod tests {
     fn nothing_is_offered_while_files_are_being_moved() {
         let rows = [row(&[TaskAction::Pause]), row(&[TaskAction::Unpause])];
         let m = status(true, false);
-        let c = BatchControl::of(&rows, true, Some(&m));
+        let c = BatchControl::of(Lang::Zh, &rows, true, Some(&m));
         assert!(!c.can_pause_all && !c.can_resume_all && c.migrate_running, "{c:?}");
         let text = c.migrate_text.expect("进行中必须有进度话");
         assert!(text.contains("2/5"), "{text}");
@@ -203,7 +208,7 @@ mod tests {
     #[test]
     fn a_clean_finish_says_nothing() {
         let m = status(false, true);
-        let c = BatchControl::of(&[], true, Some(&m));
+        let c = BatchControl::of(Lang::Zh, &[], true, Some(&m));
         assert!(c.migrate_text.is_none() && c.migrate_note.is_none(), "{c:?}");
         assert!(c.can_resume_all, "搬完了就能开始");
     }
@@ -220,7 +225,7 @@ mod tests {
             path: "c.fq".to_string(),
             reason: "x".to_string(),
         }];
-        let note = BatchControl::of(&[], false, Some(&m)).migrate_note.expect("应当有话说");
+        let note = BatchControl::of(Lang::Zh, &[], false, Some(&m)).migrate_note.expect("应当有话说");
         assert!(note.contains("从头下载") && note.contains("旧文件仍在原目录"), "{note}");
         assert!(note.contains("a/b.fq") && note.contains("磁盘已满"), "{note}");
         assert!(note.contains("没有覆盖"), "{note}");
@@ -231,12 +236,12 @@ mod tests {
     #[test]
     fn a_migrate_the_shell_could_not_run_is_said_out_loud() {
         let refused = MigrateFailure::Refused("旧目录已经不存在".to_string());
-        let c = BatchControl::of(&[], true, None).with_migrate_failure(Some(&refused));
+        let c = BatchControl::of(Lang::Zh, &[], true, None).with_migrate_failure(Lang::Zh, Some(&refused));
         let note = c.migrate_note.expect("搬运没能开始必须有话说");
         assert!(note.contains("从头下载") && note.contains("旧文件仍在原目录"), "{note}");
         assert!(note.ends_with("原因：旧目录已经不存在"), "{note}");
 
-        let quiet = BatchControl::of(&[], true, None).with_migrate_failure(None);
+        let quiet = BatchControl::of(Lang::Zh, &[], true, None).with_migrate_failure(Lang::Zh, None);
         assert!(quiet.migrate_note.is_none(), "没有失败就不许凭空说话");
     }
 
@@ -245,22 +250,28 @@ mod tests {
     #[test]
     fn losing_the_progress_says_so_verbatim_and_sits_beside_the_finished_note() {
         let lost = MigrateFailure::ProgressLost;
-        let alone = BatchControl::of(&[], true, None).with_migrate_failure(Some(&lost));
-        assert_eq!(alone.migrate_note.as_deref(), Some("没能取到搬运进度，旧文件可能没有搬完。"));
+        let alone = BatchControl::of(Lang::Zh, &[], true, None).with_migrate_failure(Lang::Zh, Some(&lost));
+        assert_eq!(
+            alone.migrate_note.as_deref(),
+            Some(t(Lang::Zh, Key::MigrateProgressLost))
+        );
 
         let mut m = status(false, true);
         m.errors = vec![MigrateProblem {
             path: "a.fq".to_string(),
             reason: "磁盘已满".to_string(),
         }];
-        let both = BatchControl::of(&[], true, Some(&m)).with_migrate_failure(Some(&lost));
+        let both = BatchControl::of(Lang::Zh, &[], true, Some(&m)).with_migrate_failure(Lang::Zh, Some(&lost));
         let note = both.migrate_note.expect("两句都要在");
-        assert!(note.contains("从头下载") && note.ends_with("没能取到搬运进度，旧文件可能没有搬完。"), "{note}");
+        assert!(
+            note.contains("从头下载") && note.ends_with(t(Lang::Zh, Key::MigrateProgressLost)),
+            "{note}"
+        );
     }
 
     #[test]
     fn serializes_with_stable_keys() {
-        let v = serde_json::to_value(BatchControl::of(&[], false, None)).unwrap();
+        let v = serde_json::to_value(BatchControl::of(Lang::Zh, &[], false, None)).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(

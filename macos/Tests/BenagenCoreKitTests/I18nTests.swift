@@ -49,8 +49,13 @@ private func hasCJK(_ s: String) -> Bool {
     }
 }
 
+/// 「选项名不翻译」的那两条 —— 「中文」与「English」各自永远以自己的语言显示
+/// （客户在英文界面里也要一眼认出中文那一项；Windows 侧的 `language_labels` 同一条规矩）。
+/// 除此之外的每个键都必须中英不同、英文里不许有汉字。
+private let properNounKeys: Set<Key> = [.languageChinese, .languageEnglish]
+
 @Test func theEnglishTableHasNoCJK() {
-    for key in Key.allCases {
+    for key in Key.allCases where !properNounKeys.contains(key) {
         #expect(!hasCJK(Lang.en.t(key)), "英文列混进汉字：\(key) => \(Lang.en.t(key))")
     }
 }
@@ -93,7 +98,7 @@ private func hasCJK(_ s: String) -> Bool {
 
 @Test func everyKeyDiffersBetweenLanguages() {
     // 判别力：若有人把英文分支 return 成中文（或反过来），逐条非空断言仍可能全绿。
-    for key in Key.allCases where key != .engineUnavailablePrefix {
+    for key in Key.allCases where key != .engineUnavailablePrefix && !properNounKeys.contains(key) {
         #expect(Lang.zh.t(key) != Lang.en.t(key), "中英两列相同：\(key)")
     }
 }

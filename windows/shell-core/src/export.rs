@@ -25,10 +25,17 @@
 use std::time::SystemTime;
 
 /// 导出目录的名字前缀。**它也是跨端契约的一部分**（两端生成的目录同名同形）。
-pub const DIR_PREFIX: &str = "诊断日志-";
+pub fn dir_prefix(lang: crate::i18n::Lang) -> &'static str {
+    crate::i18n::t(lang, crate::i18n::Key::ExportDirPrefix)
+}
 
-/// 清单文件的名字（导出文件夹里**唯一**那份不是日志的文件）。
-pub const HEADER_FILE_NAME: &str = "说明.txt";
+/// 说明文件的名字（跟着界面语言走：客户在资源管理器里看到的就是这一份）。
+pub fn header_file_name(lang: crate::i18n::Lang) -> &'static str {
+    crate::i18n::t(lang, crate::i18n::Key::ExportHeaderFileName)
+}
+
+/// 内核自己的那份日志名（内核给的，**不翻译**）。
+pub const KERNEL_LOG_NAME: &str = "diag-kernel.log";
 
 /// **内核**那份日志的名字。
 ///
@@ -36,7 +43,6 @@ pub const HEADER_FILE_NAME: &str = "说明.txt";
 ///    **照抄**的：它的家是 `core/src/paths.rs` 的 `diagnostics_log()`。
 ///    壳那份的名字**不在这里抄** —— 它取自 [`crate::diagnostics::FILE_NAME`]
 ///    （见 [`all_log_names`] 的注释：抄第二遍的后果是改名之后**静默什么也不拷**）。
-pub const KERNEL_LOG_NAME: &str = "diag-kernel.log";
 
 /// 导出文件夹里**可能有**的全部日志名，顺序固定：**内核在前、代次由新到旧**。
 ///
@@ -110,47 +116,27 @@ pub struct Header {
 /// 三段（规格 §2.6 / §2.7）：**风险**（在第一屏）、**有什么**（字段表）、**没有什么**
 /// ——最后那段说的是"这份导出**不**做什么"（不打包、不加锁、不过滤），
 /// 它们各自都是一种**显式的接受**，写在纸上比默认发生强。
-pub fn header_text(header: &Header) -> String {
+pub fn header_text(lang: crate::i18n::Lang, header: &Header) -> String {
+    use crate::i18n::{t, tf, Key};
     // ⚠️ **这是一份给人看的纯文本**（他在记事本里打开它）⇒ 正文里**不用**
     //    Markdown 的强调记号（`**` 在那里只是噪音）。分节与缩进是它唯一的排版。
     let mut out = String::new();
-    out.push_str("诊断日志导出说明\n");
-    out.push_str("================\n");
-    out.push_str("这份文件是这次导出的清单：它说的不是「日志里有什么内容」，\n");
-    out.push_str("而是「这个文件夹里有哪些文件、每一份覆盖了哪一段时间」。\n\n");
-
+    out.push_str(t(lang, Key::ExportHeaderTitle));
     // ---- 第一屏：风险（规格 §2.7 的第 1 处明说）--------------------------------
-    out.push_str("⚠️ 风险先说：这份日志会离开你的机器，里面可能有下载地址片段\n");
-    out.push_str("（下载引擎的原始报错会原样带上它）。我们没有做自动过滤 —— 要可靠地\n");
-    out.push_str("抹掉它，得先能识别它，而我们识别不了任意第三方文案；做一个不可靠的\n");
-    out.push_str("过滤器比不做更糟（它会让人以为已经安全了）。\n");
-    out.push_str("发送之前，你可以自己打开看一眼。\n\n");
-    // ⚠️ **这一段在 2026-10-06 之前是一句绝对句，而它是假的**（终审实测）：交付码与
-    //    客户目录名从**内核原文**（那条 404 的 URL、preflight 那句）进得来。
-    //    ⇒ 现在分两句：**按构造抹掉的**（那两个串，壳自己知道）与**抹不掉的**
-    //    （第三方文案里以别的写法出现的片段）。**两端逐字相同**（规格 §2.6 的契约）。
-    // ⚠️⚠️ **"抹不掉的"是两条，不是一条**（修复轮 2 订正）：除了第三方写法那一条，
-    //    还有**内核自己那条默认下载目录** —— **没配置下载目录**（默认状态）时壳推下去的
-    //    是空串（`redact` 跳过它）、也不传 `--download-dir`，内核于是回落到**它自己**的
-    //    默认路径（`core/src/paths.rs` → `C:\Users\<用户名>\Downloads\Benagen` /
-    //    `~/Downloads/Benagen`）。那个串**壳不知道**（macOS 的 `kernelDefaultDisplayPath`
-    //    明说了它只是显示用的），而它出现在内核 `preflight` 的失败文案里时**是逐字落的**
-    //    （`core/src/main.rs`：`目标目录不可写（{dir}）`）⇒ 壳抹不掉它。
-    //    **行为是对的**（猜一条客户机上的路径去抹，比不抹更糟）；错的是把话说满。
-    out.push_str("本来就不记的：交付码本身、文件路径本身、rpc-secret、客户的目录名。\n");
-    out.push_str("（其中交付码与下载目录在写进日志之前会被按字面抹成 [已隐去]；但没配置\n");
-    out.push_str("下载目录时，内核会用它自己的默认路径——那一条壳不知道，抹不掉。抹不\n");
-    out.push_str("掉的还有第三方文案里以别的写法出现的那一份——见上。）\n\n");
+    out.push_str(t(lang, Key::ExportRisk));
+    // ⚠️ 那一段在 2026-10-06 之前是一句绝对句，而它是假的：交付码与客户目录名从
+    //    内核原文进得来。现在分两句：**按构造抹掉的**（那两个串，壳自己知道）与
+    //    **抹不掉的**（第三方文案里以别的写法出现的片段，以及内核自己的默认目录）。
+    out.push_str(t(lang, Key::ExportRedaction));
 
     // ---- 有什么（规格 §2.6 那张表，逐行点名）-----------------------------------
-    out.push_str("这里面有什么\n");
-    out.push_str("------------\n");
+    out.push_str(t(lang, Key::ExportWhatHeading));
     out.push_str(&format!("app_version: {}\n", header.app_version));
     out.push_str(&format!("core_sha256: {}\n", header.core_sha256));
     match header.protocol_version {
         Some(version) => out.push_str(&format!("protocol_version: {version}\n")),
         // ⚠️ 连不上内核**不是失败**：这一格如实写"未连上"（编一个版本号比不写更坏）。
-        None => out.push_str("protocol_version: 未连上\n"),
+        None => out.push_str(t(lang, Key::ExportProtocolOffline)),
     }
     out.push_str(&format!("log_level: {}\n", header.log_level));
     out.push_str(&format!("os: {}\n", header.os));
@@ -159,19 +145,16 @@ pub fn header_text(header: &Header) -> String {
     out.push('\n');
 
     // ---- 每份文件（名字 / 字节数 / sha256 / 覆盖范围）--------------------------
-    out.push_str("日志文件（每份：名字 / 字节数 / sha256 / 覆盖时间范围）\n");
-    out.push_str("----------------------------------------------------\n");
+    out.push_str(t(lang, Key::ExportFilesHeading));
     let present: Vec<String> = header.files.iter().map(|f| f.name.clone()).collect();
     let absent: Vec<String> = all_log_names()
         .into_iter()
         .filter(|name| !present.iter().any(|have| have == name))
         .collect();
     if header.files.is_empty() {
-        // ⚠️ 括号里那句**指路要指对**（修复轮 1 订正）：原来写的是"见下面「没有什么」"，
-        //    而那一节讲的是"没有压缩包 / 没有加锁 / 没有过滤"——**回答不了**这里的
-        //    "为什么一份都没有"。答案就在**紧下面那六行**（每一行都写着「尚未产生」），
+        // ⚠️ 括号里那句**指路要指对**：答案就在**紧下面那六行**（每一行都写着「尚未产生」），
         //    以及上面那两格（`log_level` 与 `exported_at`）。
-        out.push_str("没有任何日志文件（下面每一行都写着「尚未产生」）。\n");
+        out.push_str(t(lang, Key::ExportNoFiles));
     }
     for file in &header.files {
         out.push_str(&format!(
@@ -179,40 +162,29 @@ pub fn header_text(header: &Header) -> String {
             file.name,
             file.bytes,
             file.sha256,
-            coverage(file)
+            coverage(lang, file)
         ));
     }
     for name in &absent {
-        out.push_str(&format!("{name}  尚未产生（这一份日志还没有生成过）\n"));
+        out.push_str(&tf(lang, Key::ExportAbsentLine, &[("name", name)]));
     }
     out.push('\n');
 
     // ---- 没有什么 --------------------------------------------------------------
-    out.push_str("没有什么（都是显式的选择，不是漏做）\n");
-    out.push_str("--------------------------------------\n");
-    out.push_str("· 没有压缩包：导出就是一个文件夹，本文件是它的清单；\n");
-    out.push_str("· 没有加锁、也没有做快照：导出时日志可能仍在被写 ⇒\n");
-    out.push_str("  某一份的最后一行可能是写到一半的（代价远大于收益，规格 §4）；\n");
-    out.push_str("· 没有敏感信息自动过滤（理由见第一屏那段）。注意「把交付码与下载目录按字面\n");
-    out.push_str("  抹成 [已隐去]」不是过滤：抹的是壳自己知道的那两个串本身，不是去识别\n");
-    out.push_str("  任意文案里像不像它。\n\n");
+    out.push_str(t(lang, Key::ExportNothingHeading));
+    out.push_str(t(lang, Key::ExportNothingBullets));
 
     // ---- 怎么读 ----------------------------------------------------------------
-    out.push_str("怎么读\n");
-    out.push_str("------\n");
-    out.push_str("每份日志一行一条记录，形状是：ts=<unix 秒> event=<事件名> 键=值 …\n");
-    out.push_str("那个时间是 UTC 的 unix 秒（macOS `date -r <ts>`、Linux `date -d @<ts>`）。\n");
-    out.push_str("「覆盖范围」那一格取的是这份日志的头尾两行：一眼就能看出它有没有\n");
-    out.push_str("覆盖到出问题的那一段时间。没覆盖到的那一刻只有等下一次现场 ——\n");
-    out.push_str("所以请在复现之前把详细日志打开，导出之后可以再关掉。\n");
+    out.push_str(t(lang, Key::ExportHowToHeading));
+    out.push_str(t(lang, Key::ExportHowToLines));
     out
 }
 
 /// 一份文件的"覆盖时间范围"那一格：头尾两个 `ts=`，**读不到就写"未知"**。
-fn coverage(file: &FileFact) -> String {
+fn coverage(lang: crate::i18n::Lang, file: &FileFact) -> String {
     match (file.first_ts, file.last_ts) {
         (Some(first), Some(last)) => format!("{first} → {last}"),
-        _ => "未知".to_string(),
+        _ => crate::i18n::t(lang, crate::i18n::Key::ExportUnknown).to_string(),
     }
 }
 
@@ -220,9 +192,12 @@ fn coverage(file: &FileFact) -> String {
 ///
 /// 判别力：写成固定名字 ⇒ 客户导第二次时**把第一次的现场覆盖掉了**，
 /// 而两次的时间点不同、恰好是最需要对比的时候。
-pub fn subdirectory_name(at: SystemTime) -> String {
+pub fn subdirectory_name(lang: crate::i18n::Lang, at: SystemTime) -> String {
     let (year, month, day, hour, minute, second) = utc_parts(unix_seconds(at));
-    format!("{DIR_PREFIX}{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
+    format!(
+        "{}{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}",
+        dir_prefix(lang)
+    )
 }
 
 /// 导出时刻那一格（`2025-10-06 09:23:11 UTC`）。
@@ -248,10 +223,11 @@ pub fn utc_stamp(at: SystemTime) -> String {
 /// ⚠️ 它们住在这里（而不是在 `shell-win/src/export.rs` 里就地 `format!` 一句）：
 ///    那是**面向用户的话**，本仓的纪律是"能写出断言的都归 `shell-core`"，
 ///    而且三档各有断言（`each_failure_names_the_step_that_actually_failed`）。
-pub fn folder_failure_text(folder: &str, cause: &str) -> String {
-    format!(
-        "诊断日志没有导出：建不了文件夹 {folder}（系统原话：{cause}）。\
-         补救：换一个能写的文件夹再试一次（比如桌面），或检查那个位置是不是一个文件、磁盘是不是满了。"
+pub fn folder_failure_text(lang: crate::i18n::Lang, folder: &str, cause: &str) -> String {
+    crate::i18n::tf(
+        lang,
+        crate::i18n::Key::ExportFolderFailed,
+        &[("folder", folder), ("cause", cause)],
     )
 }
 
@@ -259,18 +235,20 @@ pub fn folder_failure_text(folder: &str, cause: &str) -> String {
 ///
 /// 补救说的是这一档真正能做的事：某个文件被别的程序独占（**客户正用记事本开着日志**
 /// 是真机上最常见的形状）时，关掉它再试一次就有用 —— 而"换个文件夹"没用。
-pub fn copy_failure_text(file: &str, cause: &str) -> String {
-    format!(
-        "诊断日志没有导出：拷不进 {file}（系统原话：{cause}）。\
-         补救：确认那一份文件还在、且没有被别的程序独占（比如你正用记事本打开着它），然后重试一次。"
+pub fn copy_failure_text(lang: crate::i18n::Lang, file: &str, cause: &str) -> String {
+    crate::i18n::tf(
+        lang,
+        crate::i18n::Key::ExportCopyFailed,
+        &[("file", file), ("cause", cause)],
     )
 }
 
 /// **说明文件写不进去**那句话（第三档：日志都拷好了、清单写不下去）。
-pub fn header_failure_text(file: &str, cause: &str) -> String {
-    format!(
-        "诊断日志没有导出：说明文件写不进去（{file}；系统原话：{cause}）。\
-         补救：检查目标磁盘是不是满了、那个文件夹是不是只读，然后重试一次。"
+pub fn header_failure_text(lang: crate::i18n::Lang, file: &str, cause: &str) -> String {
+    crate::i18n::tf(
+        lang,
+        crate::i18n::Key::ExportHeaderFailed,
+        &[("file", file), ("cause", cause)],
     )
 }
 
@@ -374,7 +352,7 @@ mod tests {
     /// 无法判断"这份日志为什么只有这么几行"（是没问题，还是级别没开？）。
     #[test]
     fn the_header_names_every_field_the_spec_asks_for() {
-        let text = header_text(&a_header());
+        let text = header_text(crate::i18n::Lang::Zh, &a_header());
         for needle in [
             "0.2.0",                      // 应用版本
             &"aa".repeat(32),             // 内嵌内核的 sha256
@@ -445,7 +423,7 @@ mod tests {
     ///     ⚠️ 它也是"必须写明是 UTC"这一条的守卫：`… UTC` 与 `… +08:00` 长度不同。
     #[test]
     fn the_header_prints_the_moment_verbatim_with_its_clock() {
-        let text = header_text(&a_header());
+        let text = header_text(crate::i18n::Lang::Zh, &a_header());
         assert!(text.contains("exported_at: 2026-10-06 14:03:11 UTC"), "{text}");
 
         // 生产那一侧产得出的形状（`commands::diagnostics_export` 用的就是它）。
@@ -473,7 +451,7 @@ mod tests {
     ///    "六代一个不漏地点名"。
     #[test]
     fn a_header_with_no_files_says_so_instead_of_being_empty() {
-        let text = header_text(&Header {
+        let text = header_text(crate::i18n::Lang::Zh, &Header {
             files: Vec::new(),
             ..a_header()
         });
@@ -496,7 +474,7 @@ mod tests {
     /// 而编一个范围比写"未知"坏得多）。
     #[test]
     fn a_missing_coverage_range_is_stated_not_invented() {
-        let text = header_text(&Header {
+        let text = header_text(crate::i18n::Lang::Zh, &Header {
             files: vec![FileFact {
                 first_ts: None,
                 last_ts: None,
@@ -510,7 +488,7 @@ mod tests {
     /// **连不上内核时也要能生成**（协议版本那一格如实写"未连上"，不是失败）。
     #[test]
     fn a_missing_protocol_version_is_stated_not_invented() {
-        let text = header_text(&Header {
+        let text = header_text(crate::i18n::Lang::Zh, &Header {
             protocol_version: None,
             ..a_header()
         });
@@ -589,7 +567,7 @@ mod tests {
     /// ⚠️ **没产生的那几代要逐个点名**（"这份日志为什么只有这么几行"的一半答案）。
     #[test]
     fn a_generation_that_was_never_written_is_named() {
-        let text = header_text(&a_header()); // 只有主文件那一份
+        let text = header_text(crate::i18n::Lang::Zh, &a_header()); // 只有主文件那一份
         for missing in ["diag-kernel.log.2", "diag-shell.log"] {
             assert!(
                 text.contains(missing),
@@ -604,8 +582,8 @@ mod tests {
     /// **把第一次的现场覆盖掉了**，而两次的时间点不同、恰好是最需要对比的时候。
     #[test]
     fn the_subdirectory_carries_a_timestamp_and_is_not_a_fixed_name() {
-        let a = subdirectory_name(SystemTime::UNIX_EPOCH + Duration::from_secs(1_759_742_591));
-        let b = subdirectory_name(SystemTime::UNIX_EPOCH + Duration::from_secs(1_759_742_592));
+        let a = subdirectory_name(crate::i18n::Lang::Zh, SystemTime::UNIX_EPOCH + Duration::from_secs(1_759_742_591));
+        let b = subdirectory_name(crate::i18n::Lang::Zh, SystemTime::UNIX_EPOCH + Duration::from_secs(1_759_742_592));
         assert_ne!(a, b, "不同时刻必须是不同的目录名");
         assert!(a.starts_with("诊断日志-"));
         assert_eq!(a.len(), "诊断日志-".len() + 15, "YYYYMMDD-HHMMSS：{a}");
@@ -629,7 +607,7 @@ mod tests {
         ];
         for (ts, want) in cases {
             assert_eq!(
-                subdirectory_name(SystemTime::UNIX_EPOCH + Duration::from_secs(ts)),
+                subdirectory_name(crate::i18n::Lang::Zh, SystemTime::UNIX_EPOCH + Duration::from_secs(ts)),
                 want,
                 "unix {ts} 的日子算错了"
             );
@@ -642,7 +620,7 @@ mod tests {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_759_742_591);
         assert_eq!(utc_stamp(at), "2025-10-06 09:23:11 UTC");
         // 与目录名说的是**同一个时刻**（两处各算一遍历法就会漂）。
-        assert!(subdirectory_name(at).ends_with("20251006-092311"));
+        assert!(subdirectory_name(crate::i18n::Lang::Zh, at).ends_with("20251006-092311"));
     }
 
     /// 日历那一格用的是 **UTC**，而且**明写了 UTC**（不假装是本机时间）。
@@ -662,7 +640,7 @@ mod tests {
     /// **不知道去看哪个位置**（他刚选的那个目标文件夹？还是日志目录？）【W-2】。
     #[test]
     fn an_unwritable_target_names_the_folder_and_the_cause() {
-        let text = folder_failure_text("D:\\导出\\诊断日志-20260101-000000", "拒绝访问 (os error 5)");
+        let text = folder_failure_text(crate::i18n::Lang::Zh, "D:\\导出\\诊断日志-20260101-000000", "拒绝访问 (os error 5)");
         assert!(text.contains("诊断日志-20260101-000000"), "要点名是哪个文件夹：{text}");
         assert!(text.contains("拒绝访问"), "系统原话必须照登：{text}");
         assert!(text.contains("补救"), "要给出下一步能做的事：{text}");
@@ -682,9 +660,9 @@ mod tests {
         let header = format!("{folder}\\说明.txt");
         let cause = "拒绝访问 (os error 5)";
 
-        let mkdir_failed = folder_failure_text(folder, cause);
-        let copy_failed = copy_failure_text(&log, cause);
-        let header_failed = header_failure_text(&header, "磁盘空间不足");
+        let mkdir_failed = folder_failure_text(crate::i18n::Lang::Zh, folder, cause);
+        let copy_failed = copy_failure_text(crate::i18n::Lang::Zh, &log, cause);
+        let header_failed = header_failure_text(crate::i18n::Lang::Zh, &header, "磁盘空间不足");
 
         // ① 建目录那一档：点名那个**文件夹**（而且不该提到还没拷的文件）。
         assert!(mkdir_failed.contains("建不了文件夹"), "{mkdir_failed}");

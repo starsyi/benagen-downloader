@@ -50,12 +50,17 @@ const TAIL_BYTES: u64 = 8 * 1024;
 ///
 /// ⚠️ **目标目录不可写 ⇒ 一句人话**（哪个目录、为什么），**绝不静默成功**：
 ///    界面上说"导出成功"、而客户发回来的文件夹是空的，比报错坏得多。
-pub fn export_to(target: &str, header: &Header, at: SystemTime) -> Result<String, String> {
+pub fn export_to(
+    lang: shell_core::i18n::Lang,
+    target: &str,
+    header: &Header,
+    at: SystemTime,
+) -> Result<String, String> {
     // 日志目录与内核同源（`storage::dir()` 的判据见它的模块头）——
     // 壳**不给**内核传 `--settings`，两边是各自从 `%APPDATA%` 推出的同一个目录，
     // 这条同源由 `windows/scripts/check_shared_paths.sh` 守着。
     let log_dir = shell_core::storage::dir()?;
-    export_from(&log_dir, target, header, at)
+    export_from(lang, &log_dir, target, header, at)
 }
 
 /// [`export_to`] 的**命令体**：日志目录与**时刻**都是**参数**（于是它能在临时目录上被真跑一遍）。
@@ -71,16 +76,17 @@ pub fn export_to(target: &str, header: &Header, at: SystemTime) -> Result<String
 ///    ⇒ 与 `core/src/diagnostics.rs` 那条"不为一行日志加一个日期库"同一条分工：
 ///    **读时钟的那一处只有一个**（`commands::diagnostics_export`），其余全是纯函数。
 pub fn export_from(
+    lang: shell_core::i18n::Lang,
     log_dir: &Path,
     target: &str,
     header: &Header,
     at: SystemTime,
 ) -> Result<String, String> {
-    let folder = Path::new(target).join(export::subdirectory_name(at));
+    let folder = Path::new(target).join(export::subdirectory_name(lang, at));
     let folder_text = folder.to_string_lossy().to_string();
     // 🔴 **不许 `let _ =`**：建不出来就往上报（回执要说"这次没成"）。
     std::fs::create_dir_all(&folder)
-        .map_err(|cause| export::folder_failure_text(&folder_text, &cause.to_string()))?;
+        .map_err(|cause| export::folder_failure_text(lang, &folder_text, &cause.to_string()))?;
 
     // 只拷**存在的**那些：详细日志刚打开时后几代还没有（不存在不算失败）。
     let existing = file_names(log_dir);
@@ -88,19 +94,19 @@ pub fn export_from(
     for name in export::files_to_copy(&existing) {
         let to = folder.join(&name);
         std::fs::copy(log_dir.join(&name), &to)
-            .map_err(|cause| export::copy_failure_text(&to.to_string_lossy(), &cause.to_string()))?;
+            .map_err(|cause| export::copy_failure_text(lang, &to.to_string_lossy(), &cause.to_string()))?;
         // ⚠️ 事实从**落进导出文件夹的那一份**上量（模块头那段：源文件还在长）。
         facts.push(measure(&to, name));
     }
 
     // 说明文件最后写：它要说的是"这个文件夹里**已经**有什么"。
-    let text = export::header_text(&Header {
+    let text = export::header_text(lang, &Header {
         files: facts,
         ..header.clone()
     });
-    let header_path = folder.join(export::HEADER_FILE_NAME);
+    let header_path = folder.join(export::header_file_name(shell_core::i18n::Lang::Zh));
     std::fs::write(&header_path, text)
-        .map_err(|cause| export::header_failure_text(&header_path.to_string_lossy(), &cause.to_string()))?;
+        .map_err(|cause| export::header_failure_text(lang, &header_path.to_string_lossy(), &cause.to_string()))?;
     Ok(folder_text)
 }
 
@@ -332,7 +338,7 @@ mod tests {
         let f = std::env::temp_dir().join(format!("benagen-export-not-a-dir-{}", std::process::id()));
         std::fs::write(&f, b"x").expect("建文件失败");
 
-        let err = export_from(&logs, &f.to_string_lossy(), &a_minimal_header(), a_test_instant()).expect_err("必须回错误");
+        let err = export_from(shell_core::i18n::Lang::Zh, &logs, &f.to_string_lossy(), &a_minimal_header(), a_test_instant()).expect_err("必须回错误");
         assert!(
             err.contains("建不了文件夹"),
             "要说清是**哪一步**、哪个位置（这一档是建目录）：{err}"
@@ -352,9 +358,9 @@ mod tests {
         let logs = a_temp_dir("no-logs");
         let target = a_temp_dir("no-logs-target");
 
-        let folder = export_from(&logs, &target.to_string_lossy(), &a_minimal_header(), a_test_instant())
+        let folder = export_from(shell_core::i18n::Lang::Zh, &logs, &target.to_string_lossy(), &a_minimal_header(), a_test_instant())
             .expect("没有日志不是失败");
-        let text = std::fs::read_to_string(Path::new(&folder).join(export::HEADER_FILE_NAME))
+        let text = std::fs::read_to_string(Path::new(&folder).join(export::header_file_name(shell_core::i18n::Lang::Zh)))
             .expect("说明文件必须生成");
         assert!(text.contains("尚未产生"), "要如实写「为什么一份都没有」：{text}");
         let _ = std::fs::remove_dir_all(&logs);
@@ -377,7 +383,7 @@ mod tests {
         std::fs::write(logs.join(shell_core::diagnostics::FILE_NAME), body).expect("写日志失败");
         let want_sha = shell_core::sha256::sha256_hex(body.as_bytes());
 
-        let folder = export_from(&logs, &target.to_string_lossy(), &a_minimal_header(), a_test_instant())
+        let folder = export_from(shell_core::i18n::Lang::Zh, &logs, &target.to_string_lossy(), &a_minimal_header(), a_test_instant())
             .expect("这一步必须成");
         let copied = Path::new(&folder).join(shell_core::diagnostics::FILE_NAME);
         assert_eq!(
@@ -385,7 +391,7 @@ mod tests {
             body,
             "拷进去的字节必须与源文件一样"
         );
-        let text = std::fs::read_to_string(Path::new(&folder).join(export::HEADER_FILE_NAME))
+        let text = std::fs::read_to_string(Path::new(&folder).join(export::header_file_name(shell_core::i18n::Lang::Zh)))
             .expect("说明文件必须生成");
         assert!(text.contains(&want_sha), "sha256 必须是**落盘那一份**的：\n{text}");
         assert!(text.contains(&body.len().to_string()), "字节数要在：\n{text}");
@@ -396,7 +402,7 @@ mod tests {
         // 导出到的是**目标文件夹里一个带时间戳的子目录**（不是把文件摊在目标里）。
         assert!(folder.starts_with(&target.to_string_lossy().to_string()));
         assert!(
-            Path::new(&folder).file_name().unwrap().to_string_lossy().starts_with(export::DIR_PREFIX)
+            Path::new(&folder).file_name().unwrap().to_string_lossy().starts_with(export::dir_prefix(shell_core::i18n::Lang::Zh))
         );
         // 🔴 **同一个时刻喂出来的两格必须说同一件事**（2026-10-06 终审 ④b）：文件夹名与
         //    说明文件里那格 `exported_at` 都来自传进来的 `at` —— `a_minimal_header()`
@@ -406,7 +412,7 @@ mod tests {
         //    看起来完全正常（两个都是"合理的时间"，谁也看不出它们对不上）。
         assert_eq!(
             Path::new(&folder).file_name().unwrap().to_string_lossy(),
-            export::subdirectory_name(a_test_instant()),
+            export::subdirectory_name(shell_core::i18n::Lang::Zh, a_test_instant()),
             "文件夹名必须由传进来的 `at` 决定（不是这个函数自己读的时钟）"
         );
         assert!(

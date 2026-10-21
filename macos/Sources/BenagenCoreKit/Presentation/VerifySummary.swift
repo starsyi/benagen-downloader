@@ -51,14 +51,17 @@ extension VerifyClass {
     ///   - `size_mismatch` = "大小不符"；
     ///   - `unverifiable` = "清单与 HEAD 都没给出 crc64"；
     ///   - `unreadable` = "能 stat 到但读不了（权限/IO 错误）"。
-    public var label: String {
+    public var label: String { label(lang: .zh) }
+
+    /// 同上，按当前语言取句（视图用这一支）。
+    public func label(lang: Lang) -> String {
         switch self {
-        case .ok: return "校验通过"
-        case .bad: return "内容不符"
-        case .missing: return "文件缺失"
-        case .sizeMismatch: return "大小不符"
-        case .unverifiable: return "无法校验"
-        case .unreadable: return "无法读取"
+        case .ok: return lang.t(.verifyClassOK)
+        case .bad: return lang.t(.verifyClassBad)
+        case .missing: return lang.t(.verifyClassMissing)
+        case .sizeMismatch: return lang.t(.verifyClassSizeMismatch)
+        case .unverifiable: return lang.t(.verifyClassUnverifiable)
+        case .unreadable: return lang.t(.verifyClassUnreadable)
         }
     }
 
@@ -101,9 +104,12 @@ extension VerifyClass {
     ///    没有一个"原文"可以把这件事讲给客户听。
     ///    **每一类都渲染**这条规则的一个实例：这一行永远在（因为这一类永远在），
     ///    `VerifyClassRow` 里 `note` 非 nil 就等于视图会画它。
-    public var note: String? {
+    public var note: String? { note(lang: .zh) }
+
+    /// 同上，按当前语言取句。
+    public func note(lang: Lang) -> String? {
         switch self {
-        case .unverifiable: return "这些文件没有可比的校验值，不是失败"
+        case .unverifiable: return lang.t(.verifyUnverifiableNote)
         case .ok, .bad, .missing, .sizeMismatch, .unreadable: return nil
         }
     }
@@ -129,7 +135,10 @@ public struct VerifyClassRow: Equatable, Sendable, Identifiable {
     ///
     /// ⚠️ 它存在的全部理由是约束 4 那一句"计数为 0 的类**显示 0，不得隐藏**"：
     ///    只靠"路径列表为空所以画不出东西"来表达 0，在界面上就是"这一类不见了"。
-    public var countText: String { "\(count) 项" }
+    public var countText: String { countText(lang: .zh) }
+
+    /// 同上，按当前语言取句。
+    public func countText(lang: Lang) -> String { lang.tf(.countItems, ["count": String(count)]) }
 
     /// 这一类算不算失败（口径在 `VerifyClass.isFailure`）。
     public var isFailure: Bool { kind.isFailure }
@@ -168,12 +177,15 @@ public enum VerifyVerdict: Equatable, Sendable {
     ///    钉住它的是 `aKernelJudgementOfNotAllGoodIsNeverDropped`。
     case kernelSaysNotAllGood
 
-    public var text: String {
+    public var text: String { text(lang: .zh) }
+
+    /// 同上，按当前语言取句（视图用这一支）。
+    public func text(lang: Lang) -> String {
         switch self {
-        case .notVerified: return "尚未校验"
-        case .allGood: return "全部通过"
-        case .failed(let n): return "\(n) 项未通过"
-        case .kernelSaysNotAllGood: return "内核判定未全部通过（六类里没有失败项）"
+        case .notVerified: return lang.t(.verifyNotVerified)
+        case .allGood: return lang.t(.verifyAllGood)
+        case .failed(let n): return lang.tf(.verifyFailedCount, ["count": String(n)])
+        case .kernelSaysNotAllGood: return lang.t(.verifyKernelNotAllGood)
         }
     }
 
@@ -222,29 +234,37 @@ public struct VerifySummary: Equatable, Sendable {
     public let verdict: VerifyVerdict
 
     /// 顶部总结的正文（视图直接渲染它）。
-    public var headline: String { verdict.text }
+    public var headline: String { headline(lang: .zh) }
+
+    /// 同上，按当前语言取句（视图用这一支）。
+    public func headline(lang: Lang) -> String { verdict.text(lang: lang) }
     /// 顶部总结的颜色（枚举，视图映射成 `Color`）。
     public var headlineColor: RowColor { verdict.color }
     /// 顶部总结的图标。
     public var headlineIcon: String { verdict.iconName }
     /// 「已校验 N 项」—— 让"这份结果覆盖了多少"看得见（同 `ByteFormat` 的"缺值也要说出来"）。
-    public var classifiedText: String { "已校验 \(classifiedCount) 项" }
+    public var classifiedText: String { classifiedText(lang: .zh) }
+
+    /// 同上，按当前语言取句。
+    public func classifiedText(lang: Lang) -> String {
+        lang.tf(.verifyClassifiedCount, ["count": String(classifiedCount)])
+    }
 
     /// `verify_status` 的结果 → 界面值；**`nil`（还没取过）→ `nil`**。
     ///
     /// ⚠️ `nil` 不能渲染成"六类全 0 + 全部通过"：那是**替内核宣布一句它没说过的话**
     ///    （还没问过它）。视图对 `nil` 走的是"还没有校验结果，点刷新"那一支，
     ///    钉住它的是 `noResultAtAllIsNotAnAllClear`。
-    public static func of(_ status: VerifyStatus?) -> VerifySummary? {
+    public static func of(_ status: VerifyStatus?, lang: Lang = .zh) -> VerifySummary? {
         guard let status else { return nil }
 
         let rows = VerifyClass.allCases.map { kind in
             VerifyClassRow(kind: kind,
-                           label: kind.label,
+                           label: kind.label(lang: lang),
                            color: kind.color,
                            iconName: kind.iconName,
                            paths: status.paths(kind),
-                           note: kind.note)
+                           note: kind.note(lang: lang))
         }
         let failed = rows.reduce(0) { $0 + ($1.isFailure ? $1.count : 0) }
         let classified = rows.reduce(0) { $0 + $1.count }

@@ -37,6 +37,9 @@ public struct TransferRow: Equatable, Sendable, Identifiable {
     public let speedText: String
     /// 「状态」那一列的文字。五档**两两不同**（约束 4）。
     public let stateLabel: String
+
+    /// 领域状态（`stateLabel` 是它的中文呈现；存下来是为了换语言时能重新成句）。
+    public let state: TaskState
     /// 「状态」那一列的颜色（枚举，不是 SwiftUI 的 `Color`）。
     public let stateColor: RowColor
     /// 行首那颗状态图标（SF Symbol 名，同 `BrowserRow.iconName` 的形态）。
@@ -69,6 +72,12 @@ public struct TransferRow: Equatable, Sendable, Identifiable {
     ///    所以"能显示"与"算得出路径"不会分叉。
     public var canRevealInFinder: Bool { manifestPath != nil }
 
+    /// 行标题的当前语言版本（`path == nil` 时那句「（未知路径）」要跟着语言走）。
+    public func title(lang: Lang) -> String { manifestPath ?? Self.unknownPath(lang: lang) }
+
+    /// 状态标签的当前语言版本（视图用这一支）。
+    public func stateLabel(lang: Lang) -> String { Self.label(state, lang: lang) }
+
     /// `transfer_list` 的一条 → 一行。
     public init(_ item: TransferItem) {
         let path = TransferReveal.manifestPath(item.path)
@@ -80,6 +89,7 @@ public struct TransferRow: Equatable, Sendable, Identifiable {
         self.progressFraction = Self.fraction(completed: item.completed, total: item.total)
         self.speedText = SpeedFormat.text(item.speed)
         self.stateLabel = Self.label(item.state)
+        self.state = item.state
         self.stateColor = Self.color(item.state)
         self.stateIconName = Self.iconName(item.state)
         self.showsPausedBadge = item.rawStatus == Self.pausedRawStatus
@@ -95,7 +105,9 @@ public struct TransferRow: Equatable, Sendable, Identifiable {
     ///
     /// 这一句是**壳自己写的**（同 `AppModel.busyReason` 的性质）：内核发的是一个 `null`，
     /// 没有可登的原文，而把 `null` 渲染成空白或字面量 "nil" 都是约束 4 说的静默失效。
-    static let unknownPath = "（未知路径）"
+    static var unknownPath: String { unknownPath(lang: .zh) }
+
+    static func unknownPath(lang: Lang) -> String { lang.t(.transferUnknownPath) }
 
     /// aria2 里"已暂停"的原始状态串（`core/src/engine/status.rs` 的透传值）。
     static let pausedRawStatus = "paused"
@@ -110,13 +122,13 @@ public struct TransferRow: Equatable, Sendable, Identifiable {
     }
 
     /// `TaskState` 五档 → 界面标签。**任何一档都不许是空白**（约束 4）。
-    static func label(_ state: TaskState) -> String {
+    static func label(_ state: TaskState, lang: Lang = .zh) -> String {
         switch state {
-        case .waiting: return "等待中"
-        case .active: return "下载中"
-        case .complete: return "已完成"
-        case .error: return "失败"
-        case .removed: return "已移除"
+        case .waiting: return lang.t(.transferWaiting)
+        case .active: return lang.t(.transferActive)
+        case .complete: return lang.t(.transferComplete)
+        case .error: return lang.t(.transferError)
+        case .removed: return lang.t(.transferRemoved)
         }
     }
 
@@ -196,11 +208,12 @@ public struct TransferGlobalSummary: Equatable, Sendable {
 
     /// ⚠️ 三个数**一个都不能省**（约束 4）：只显示"活动"的话，一个"排队等着的"
     /// 和一个"已经失败的"在界面上就分不出来了。
-    public static func of(_ global: GlobalStat) -> TransferGlobalSummary {
+    public static func of(_ global: GlobalStat, lang: Lang = .zh) -> TransferGlobalSummary {
         TransferGlobalSummary(
             speedText: SpeedFormat.text(global.downloadSpeed),
-            activityText: "活动 \(global.numActive) · 等待 \(global.numWaiting)"
-                + " · 已停止 \(global.numStopped)",
+            activityText: lang.tf(.transfersActivity, ["active": String(global.numActive),
+                                                       "waiting": String(global.numWaiting),
+                                                       "stopped": String(global.numStopped)]),
             // 没有已结束的任务时**禁用**那颗按钮：点了之后界面毫无变化的话，
             // 用户分不清"清完了"还是"没生效"（约束 4）。
             canClearFinished: global.numStopped > 0)
@@ -258,7 +271,7 @@ public struct EngineBanner: Equatable, Sendable {
     /// 要不要显示那颗**真的会生效**的「重试」按钮（`AppModel.retryEngine()`）。
     public let showsRetry: Bool
 
-    public static func of(engine: AppModel.EngineState, lastError: String?) -> EngineBanner? {
+    public static func of(engine: AppModel.EngineState, lastError: String?, lang: Lang = .zh) -> EngineBanner? {
         if case .unavailable(let why) = engine {
             // ⚠️ 覆盖 `.unavailable` 的**每一个**理由，不只是 `engine_disconnected` /
             //    `engine_start_failed`：任务 4b 的握手超时与重启失败都落在这里，
@@ -269,7 +282,7 @@ public struct EngineBanner: Equatable, Sendable {
                 // 超时是**壳探测到的**状况（内核一个字都没回，没有原文可登），
                 // 所以只有这一支补一句"该去点什么"；内核自己给的失败原因不套壳的话。
                 hint: EngineStatusPresentation.isHandshakeTimeout(why)
-                    ? EngineStatusPresentation.handshakeTimeoutTooltip
+                    ? EngineStatusPresentation.handshakeTimeoutTooltip(lang: lang)
                     : nil,
                 showsRetry: true)
         }
@@ -288,18 +301,22 @@ public struct EngineBanner: Equatable, Sendable {
 ///    所以给的是空态文案，没有红色、没有惊叹号。
 public enum TransferListEmpty {
     /// 引擎尚未启动（内核的 `engine_not_started`）。**逐字**（简报）。
-    public static let engineNotStarted = "下载引擎尚未启动（还没有添加过任务）"
+    public static var engineNotStarted: String { engineNotStarted(lang: .zh) }
+
+    public static func engineNotStarted(lang: Lang) -> String { lang.t(.transferListEngineNotStarted) }
     /// 引擎在跑、但确实没有任务。
-    public static let nothingInFlight = "没有正在传输的任务"
+    public static var nothingInFlight: String { nothingInFlight(lang: .zh) }
+
+    public static func nothingInFlight(lang: Lang) -> String { lang.t(.transferListEmpty) }
 
     /// `nil` = 这里不说话。
     ///
     /// ⚠️ 引擎不可用时返回 `nil`：顶部横幅（常驻、带「重试」）已经在说同一句话，
     ///    两处重复同一句原文只会让真正要看的那条变淡。
-    public static func of(engine: AppModel.EngineState) -> String? {
+    public static func of(engine: AppModel.EngineState, lang: Lang = .zh) -> String? {
         switch engine {
-        case .notStarted: return engineNotStarted
-        case .running, .unknown: return nothingInFlight
+        case .notStarted: return engineNotStarted(lang: lang)
+        case .running, .unknown: return nothingInFlight(lang: lang)
         case .unavailable: return nil
         }
     }
@@ -335,7 +352,10 @@ public enum EngineGate {
     /// 它是**壳自己写的**（同 `AppModel.busyReason` / `DirLoadFailure.notice` 的性质）：
     /// 它描述的是**界面动作**（"去点那颗按钮"），内核不知道也没有对应的话可说。
     /// 约束 3 管的是"内核说了什么"，不是"壳对自己的界面元素怎么指路"。
-    public static let unavailableHelp = "引擎不可用，请先点顶部的「重试」"
+    public static var unavailableHelp: String { unavailableHelp(lang: .zh) }
+
+    /// 同一句话的**当前语言**版本。
+    public static func unavailableHelp(lang: Lang) -> String { lang.t(.engineGateUnavailableHelp) }
 }
 
 /// 轮询节拍。**规格 §5.3 定稿 200 ms**（拉、不推）。

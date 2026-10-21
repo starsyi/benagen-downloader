@@ -98,7 +98,7 @@ public struct DirLoadFailure: Equatable, Sendable {
     public var didFallBack: Bool { notice != nil }
 
     /// 退回上一层时那句提示。
-    private static let fallbackNotice = "已返回上一层"
+    private static func fallbackNotice(lang: Lang) -> String { lang.t(.breadcrumbBackNotice) }
 
     /// 直接构造。给"不是 `CoreError` 的失败"用（视图侧那条通用 `catch`）——
     /// `listDir` 正常只抛 `CoreError`，但那条出口不能因此被编译器吞掉。
@@ -108,8 +108,8 @@ public struct DirLoadFailure: Equatable, Sendable {
         self.notice = notice
     }
 
-    public static func of(_ error: CoreError, currentPath: String) -> DirLoadFailure {
-        let message = AppModel.message(of: error)
+    public static func of(_ error: CoreError, currentPath: String, lang: Lang = .zh) -> DirLoadFailure {
+        let message = AppModel.message(of: error, lang: lang)
 
         // 只认**结构化错误码** `path_not_found`，不看 `message` 的措辞（契约 §5.1）。
         if case .rpc(let code, _) = error, ErrorCode(rawValue: code) == .pathNotFound {
@@ -118,7 +118,7 @@ public struct DirLoadFailure: Equatable, Sendable {
             // 少了这条守卫，这里会拼出一个 "/" 或空路径，让下一次 `list_dir` 换一个新错误回来，
             // 用户看到的是"错误在变、位置不变"。
             if parent != currentPath {
-                return DirLoadFailure(message: message, path: parent, notice: fallbackNotice)
+                return DirLoadFailure(message: message, path: parent, notice: fallbackNotice(lang: lang))
             }
         }
 

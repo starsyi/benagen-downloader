@@ -25,36 +25,43 @@ public struct BatchControl: Equatable, Sendable {
     public static func of(rows: [TransferRow],
                           resumePending: Bool,
                           migrate: MigrateStatus?,
-                          migrateFailure: String? = nil) -> BatchControl {
+                          migrateFailure: String? = nil,
+                          lang: Lang = .zh) -> BatchControl {
         let running = migrate?.running ?? false
         func offers(_ a: TaskAction) -> Bool { rows.contains { $0.availableActions.contains(a) } }
         return BatchControl(
             canPauseAll: !running && offers(.pause),
             canResumeAll: !running && (offers(.unpause) || resumePending),
             migrateRunning: running,
-            migrateText: migrate.flatMap { $0.running ? runningText($0) : nil },
-            migrateNote: note(migrate: migrate, failure: migrateFailure))
+            migrateText: migrate.flatMap { $0.running ? runningText($0, lang: lang) : nil },
+            migrateNote: note(migrate: migrate, failure: migrateFailure, lang: lang))
     }
 
     /// 搬运没能开始（`migrate_start` 被拒或传输断了）。原文照登（约束 3），后果与旧文件位置照说（约束 4）。
     ///
     /// ⚠️ 与 Windows 侧逐字同文案：两边任何一方改了措辞都要一起改。
-    public static func migrateStartFailedNote(reason: String) -> String {
-        "旧目录里已下载的文件没能搬到新目录，会从头下载（旧文件仍在原目录）。原因：\(reason)"
+    public static func migrateStartFailedNote(reason: String, lang: Lang = .zh) -> String {
+        lang.tf(.batchMigrateStartFailed, ["reason": reason])
     }
 
     /// 搬运进度再也取不到（连续失败到上界，或内核重启后任务已不在）。
     /// 不说「搬运完成」也不说「没有搬运」——我们只知道自己不知道。
-    public static let migrateProgressLostNote = "没能取到搬运进度，旧文件可能没有搬完。"
+    public static var migrateProgressLostNote: String { migrateProgressLostNote(lang: .zh) }
 
-    private static func runningText(_ m: MigrateStatus) -> String {
-        "正在搬运已下载的文件：\(m.filesDone)/\(m.filesTotal) 个"
-            + "（\(ByteFormat.text(m.bytesDone)) / \(ByteFormat.text(m.bytesTotal))）"
+    public static func migrateProgressLostNote(lang: Lang) -> String {
+        lang.t(.batchMigrateProgressLost)
     }
 
-    private static func note(migrate: MigrateStatus?, failure: String?) -> String? {
+    private static func runningText(_ m: MigrateStatus, lang: Lang) -> String {
+        lang.tf(.batchMigrateRunning, ["done": String(m.filesDone),
+                                       "total": String(m.filesTotal),
+                                       "doneBytes": ByteFormat.text(m.bytesDone),
+                                       "totalBytes": ByteFormat.text(m.bytesTotal)])
+    }
+
+    private static func note(migrate: MigrateStatus?, failure: String?, lang: Lang) -> String? {
         var parts: [String] = []
-        if let m = migrate, m.finished, !m.running, let text = finishedNote(m) { parts.append(text) }
+        if let m = migrate, m.finished, !m.running, let text = finishedNote(m, lang: lang) { parts.append(text) }
         if let failure { parts.append(failure) }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
@@ -64,14 +71,15 @@ public struct BatchControl: Equatable, Sendable {
     ///
     /// ⚠️ 失败那句点明**后果**（会从头下载）与**文件还在哪**（旧目录）：客户拿到这句话唯一
     /// 要做的决定就是「要不要自己去旧目录处理」，所以两样都得在话里。
-    private static func finishedNote(_ m: MigrateStatus) -> String? {
+    private static func finishedNote(_ m: MigrateStatus, lang: Lang) -> String? {
         var parts: [String] = []
         if let first = m.errors.first {
-            parts.append("有 \(m.errors.count) 个文件没能搬到新目录，会从头下载（旧文件仍在原目录）。"
-                + "第一个：\(first.path)：\(first.reason)")
+            parts.append(lang.tf(.batchMigrateErrors, ["count": String(m.errors.count),
+                                                       "path": first.path,
+                                                       "reason": first.reason]))
         }
         if !m.skipped.isEmpty {
-            parts.append("有 \(m.skipped.count) 个文件在新目录里已经存在，没有覆盖。")
+            parts.append(lang.tf(.batchMigrateSkipped, ["count": String(m.skipped.count)]))
         }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
     }

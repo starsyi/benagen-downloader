@@ -17,11 +17,14 @@ import BenagenCoreKit
 public enum SidebarSection: String, CaseIterable, Hashable {
     case files, transfers, verify
 
-    var title: String {
+    var title: String { title(lang: .zh) }
+
+    /// 同上，按当前语言取句（视图用这一支）。
+    func title(lang: Lang) -> String {
         switch self {
-        case .files: return "文件"
-        case .transfers: return "传输列表"
-        case .verify: return "校验结果"
+        case .files: return lang.t(.sidebarFiles)
+        case .transfers: return lang.t(.sidebarTransfers)
+        case .verify: return lang.t(.sidebarVerify)
         }
     }
 
@@ -48,7 +51,7 @@ struct Sidebar: View {
     var body: some View {
         List(selection: selectionBinding) {
             ForEach(SidebarSection.allCases, id: \.self) { section in
-                Label(section.title, systemImage: section.systemImage)
+                Label(section.title(lang: model.language), systemImage: section.systemImage)
                     .badge(unfinishedCount(for: section))
                     .tag(section)
             }
@@ -92,11 +95,11 @@ struct Sidebar: View {
     ///    `·` 都只是一段静态文本（与 `SidebarSection.title` 同类）。
     @ViewBuilder private var batchSummary: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("批次摘要")
+            Text(model.language.t(.sidebarBatchSummary))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
 
-            if let summary = DeliverySummary.of(model.loadState) {
+            if let summary = DeliverySummary.of(model.loadState, lang: model.language) {
                 HStack(spacing: 4) {
                     Text(summary.code)
                         .font(.caption2.weight(.semibold))
@@ -119,7 +122,7 @@ struct Sidebar: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             } else {
-                Text("尚未加载交付批次")
+                Text(model.language.t(.sidebarNoBatch))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }

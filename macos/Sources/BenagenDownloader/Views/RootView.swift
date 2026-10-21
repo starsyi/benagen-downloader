@@ -105,7 +105,7 @@ struct RootView: View {
             //    同时出现时只是把主区往下推一点（各自高度固定，没有 ZStack 的覆盖风险）。
             //    顺序也保证"谁能救场"（重试）永远在"发生了什么"（回执）之上。
             VStack(spacing: 0) {
-                if let banner = EngineBanner.of(engine: model.engine, lastError: model.lastError) {
+                if let banner = EngineBanner.of(engine: model.engine, lastError: model.lastError, lang: model.language) {
                     engineBannerBar(banner)
                 }
                 // 自动重启进度（T7）：`restart_progress` 的四档句子之一。
@@ -171,11 +171,11 @@ struct RootView: View {
                     //    `Label` 渲染成只有图标，文字会掉进 `.help` 浮层里（本仓库栽过三次，
                     //    同款证据见 `EngineStatusBadge.swift:32-36`）。而"看得见当前交付码"
                     //    恰恰是这颗按钮存在的全部意义。
-                    Label(loadedCode ?? "交付码", systemImage: "qrcode")
+                    Label(model.language.t(.deliveryCode), systemImage: "qrcode")
                 }
                 .labelStyle(.titleAndIcon)
                 .disabled(!hasLoadedManifest)
-                .help("换一个交付码（当前：\(loadedCode ?? "—")）")
+                .help(model.language.tf(.rootSwitchCodeHelp, ["code": loadedCode ?? "—"]))
             }
             ToolbarItem {
                 // 任务 10：设置入口。与菜单里那条「设置…」（`CommandGroup(replacing: .appSettings)`）
@@ -183,13 +183,13 @@ struct RootView: View {
                 // 规格 §7.1 把「设置」列在工具栏上，而设置窗口是客户唯一能改内核参数的地方
                 // —— 只藏在菜单里，很多客户一辈子找不到它。
                 SettingsEntry {
-                    Label("设置", systemImage: "gearshape")
+                    Label(model.language.t(.rootSettings), systemImage: "gearshape")
                 }
                 // ⚠️ 这一行不是装饰：macOS 的统一工具栏默认把 `Label` 渲染成**只有图标**，
                 //    于是「设置」这两个字会掉进 `.help` 浮层里（同款实测证据见
                 //    `EngineStatusBadge.swift:32-36`；工具栏那颗下载按钮也显式写了这一行）。
                 .labelStyle(.titleAndIcon)
-                .help("打开设置（⌘,）")
+                .help(model.language.t(.rootOpenSettingsHelp))
             }
             ToolbarItem {
                 // 约束 4 的落点：内核没起来时，工具栏上那句原因就是客户唯一的线索。
@@ -323,6 +323,17 @@ struct RootView: View {
         // 换码面板（任务 2）。**换批之后的复位不用新写**：上面那条
         // `onChange(of: loadedCode)` 已经会调 `manifest.display(code:)` 并清掉
         // `browserPath` / `browserSelection`（阶段 B 建的那条线）。
+        // 首启语言窗（规格 W1）：判据是**内核说"没选过"**（`language_chosen == false`），
+        // 不是"值是 system"。选完 `languageChosen` 变 true，这张 sheet 自己收起。
+        // ⚠️ `.interactiveDismissDisabled()`：不许点 Esc / 滑走 —— 那会让判据永远为真，
+        //    下一次窗口刷新又弹一遍（"只弹一次"是规格 W1 的判据）。
+        .sheet(isPresented: Binding(
+            get: { !model.languageChosen },
+            set: { _ in }
+        )) {
+            LanguageSheet(model: model)
+                .interactiveDismissDisabled()
+        }
         .sheet(isPresented: $showingSwitch) {
             SwitchDeliverySheet(model: model)
         }
@@ -568,11 +579,11 @@ struct RootView: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "arrow.down.circle")
                 .foregroundStyle(Color.accentColor)
-            BoundedNoticeText(text: notice.text, font: .callout.weight(.semibold))
+            BoundedNoticeText(text: notice.text(lang: model.language), font: .callout.weight(.semibold))
             Spacer(minLength: 8)
             if let url = notice.url {
-                Button("去下载") { NSWorkspace.shared.open(url) }
-                    .help("在系统默认浏览器里打开官方下载页")
+                Button(model.language.t(.rootGoDownload)) { NSWorkspace.shared.open(url) }
+                    .help(model.language.t(.rootGoDownloadHelp))
             }
             Button {
                 model.dismissUpdateNotice()
@@ -580,7 +591,7 @@ struct RootView: View {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.borderless)
-            .help("收起这条提示")
+            .help(model.language.t(.commonDismissNotice))
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 8)
@@ -601,7 +612,7 @@ struct RootView: View {
                                                 : "arrow.triangle.2.circlepath")
                 .foregroundStyle(outcome.isFailure ? Color.red : Color.secondary)
             // 失败那一支是**内核原文**（长度不受壳控制）⇒ 高度必须有界、但**不截断**。
-            BoundedNoticeText(text: outcome.noticeText, font: .callout.weight(.semibold))
+            BoundedNoticeText(text: outcome.noticeText(lang: model.language), font: .callout.weight(.semibold))
             Spacer(minLength: 8)
             Button {
                 model.dismissSwitchOutcome()
@@ -609,7 +620,7 @@ struct RootView: View {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.borderless)
-            .help("收起这条提示")
+            .help(model.language.t(.commonDismissNotice))
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 8)
@@ -643,7 +654,7 @@ struct RootView: View {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.borderless)
-            .help("收起这条提示")
+            .help(model.language.t(.commonDismissNotice))
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 8)
@@ -681,7 +692,7 @@ struct RootView: View {
             Image(systemName: change.isFailure ? "exclamationmark.triangle.fill"
                                                : "folder.badge.gearshape")
                 .foregroundStyle(change.isFailure ? Color.red : Color.secondary)
-            DownloadDirChangeNotice(change: change)
+            DownloadDirChangeNotice(change: change, lang: model.language)
             Spacer(minLength: 8)
             Button {
                 model.dismissDownloadDirChange()
@@ -689,7 +700,7 @@ struct RootView: View {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.borderless)
-            .help("收起这条提示")
+            .help(model.language.t(.commonDismissNotice))
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 8)
@@ -722,7 +733,7 @@ struct RootView: View {
         Button {
             download(browserSelection)
         } label: {
-            Label(DownloadTargets.buttonTitle(for: browserSelection), systemImage: "arrow.down.circle")
+            Label(DownloadTargets.buttonTitle(for: browserSelection, lang: model.language), systemImage: "arrow.down.circle")
         }
         // ⚠️ **这一行不是装饰**：macOS 的统一工具栏默认把 `Label` 渲染成**只有图标**，
         //    于是「下载选中」/「全部下载」这句话会掉进 `.help` 浮层里 ——
@@ -735,7 +746,7 @@ struct RootView: View {
         //    所以每一处都得自己写。
         .labelStyle(.titleAndIcon)
         .disabled(!hasLoadedManifest)
-        .help(DownloadTargets.helpText)
+        .help(DownloadTargets.helpText(lang: model.language))
     }
 
     /// **下载动作的唯一实现**：工具栏那颗按钮与文件浏览器底部那颗按钮都走它。
@@ -763,7 +774,7 @@ struct RootView: View {
             do {
                 let result = try await model.enqueue(
                     paths: DownloadTargets.paths(for: selection, allPaths: allPaths))
-                let notice = DownloadNotice.of(result, code: code)
+                let notice = DownloadNotice.of(result, code: code, lang: model.language)
                 downloadNotice = notice
                 if notice.feedback.switchesToTransfers { section = .transfers }
             } catch {
@@ -772,7 +783,7 @@ struct RootView: View {
                 // **不切视图**（简报）—— 切走了那句话就没人看见了。
                 // 原文的映射在 `EnqueueFeedback.failure(of:)` 里（内部走 `AppModel.message(of:)`，
                 // 那是 `CoreError` → 用户可见文案的唯一实现）—— 视图这一层不映射、不编文案。
-                downloadNotice = DownloadNotice.failure(of: error, code: code)
+                downloadNotice = DownloadNotice.failure(of: error, code: code, lang: model.language)
             }
         }
     }
@@ -784,7 +795,7 @@ struct RootView: View {
     /// ⚠️ 顶上那句由 `summary(currentCode:)` 算：**不属于当前批时带批次码**（见 `DownloadNotice`）。
     private func downloadFeedbackBar(_ notice: DownloadNotice) -> some View {
         let f = notice.feedback
-        let title = notice.summary(currentCode: loadedCode)
+        let title = notice.summary(currentCode: loadedCode, lang: model.language)
         return VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Image(systemName: f.rejections.isEmpty ? "arrow.down.circle" : "exclamationmark.triangle")
@@ -800,7 +811,7 @@ struct RootView: View {
                     Image(systemName: "xmark")
                 }
                 .buttonStyle(.borderless)
-                .help("收起这条提示")
+                .help(model.language.t(.commonDismissNotice))
             }
             // 🔴 **这一串的行数由内核决定，不是壳能控制的**（第 2 轮补的那一处）：
             //    内核回几条拒绝理由 = 有几个文件没加进下载列表

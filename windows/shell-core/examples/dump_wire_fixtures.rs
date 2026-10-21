@@ -615,7 +615,7 @@ fn a_history() -> History {
 fn rows(json: &str, parent: &str) -> Vec<BrowserRow> {
     let result: ListDirResult =
         serde_json::from_str(json).expect("这是内核会发的线上 JSON，必须解得出");
-    BrowserRow::rows(&result.entries, parent)
+    BrowserRow::rows(shell_core::i18n::Lang::Zh, &result.entries, parent)
 }
 
 fn tree() -> TreeResult {
@@ -784,12 +784,12 @@ fn main() {
         .map(|i| TransferRow::new(shell_core::i18n::Lang::Zh, i))
         .collect();
     // 「暂停全部 / 一键开始」那两颗按钮：判据在 `BatchControl::of`，夹具从它倒出来。
-    let batch_rows = BatchControl::of(&transfer_rows, false, None);
-    let batch_rows_next = BatchControl::of(&transfer_rows_next, false, None);
-    let batch_rows_after = BatchControl::of(&transfer_rows_after, false, None);
-    let batch_none = BatchControl::of(&[], false, None);
+    let batch_rows = BatchControl::of(shell_core::i18n::Lang::Zh, &transfer_rows, false, None);
+    let batch_rows_next = BatchControl::of(shell_core::i18n::Lang::Zh, &transfer_rows_next, false, None);
+    let batch_rows_after = BatchControl::of(shell_core::i18n::Lang::Zh, &transfer_rows_after, false, None);
+    let batch_none = BatchControl::of(shell_core::i18n::Lang::Zh, &[], false, None);
     // 换完目录、引擎是空的、队列还没补回来：列表一行都没有，「一键开始」靠壳记着。
-    let batch_handover = BatchControl::of(&[], true, None);
+    let batch_handover = BatchControl::of(shell_core::i18n::Lang::Zh, &[], true, None);
     // 搬运进行中 / 搬完但有失败。
     let migrating = shell_core::protocol::MigrateStatus {
         running: true,
@@ -809,8 +809,8 @@ fn main() {
         }],
         ..Default::default()
     };
-    let batch_migrating = BatchControl::of(&transfer_rows, true, Some(&migrating));
-    let batch_migrated_errors = BatchControl::of(&[], true, Some(&migrated_with_errors));
+    let batch_migrating = BatchControl::of(shell_core::i18n::Lang::Zh, &transfer_rows, true, Some(&migrating));
+    let batch_migrated_errors = BatchControl::of(shell_core::i18n::Lang::Zh, &[], true, Some(&migrated_with_errors));
     let transfer_global = TransferGlobalSummary::of(shell_core::i18n::Lang::Zh, &TRANSFER_GLOBAL);
     let transfer_global_next = TransferGlobalSummary::of(shell_core::i18n::Lang::Zh, &TRANSFER_GLOBAL_NEXT);
     // 空态那句话由 `TransferListEmpty::of` 给：引擎在跑 ⇒ 「没有正在传输的任务」；
@@ -854,7 +854,7 @@ fn main() {
         "treeWhole": api::tree::whole(
             &Breadcrumb::new(""),
             progress.as_ref(),
-            &SelectionSummary::of(&selected, &sizes),
+            &SelectionSummary::of(shell_core::i18n::Lang::Zh, &selected, &sizes),
             &tree.default_selected,
             &action,
         ),
@@ -865,9 +865,9 @@ fn main() {
         // `tree("01.RawData")` 的失败支：面包屑跟着**退到的那一层**走。
         "treeLevelFailure": api::tree::level_failure(&Breadcrumb::new(&failure.path), &failure),
         // `enqueue`：部分成功（`added` 与 `rejected` 两边都有落点）。
-        "enqueuePartial": api::enqueue::enqueue(&EnqueueFeedback::of(&enqueued(ENQUEUE_PARTIAL_WIRE))),
+        "enqueuePartial": api::enqueue::enqueue(&EnqueueFeedback::of(shell_core::i18n::Lang::Zh, &enqueued(ENQUEUE_PARTIAL_WIRE))),
         // `enqueue`：一件都没加（`{"added":[],"rejected":[]}` 那条真实回执）。
-        "enqueueNothing": api::enqueue::enqueue(&EnqueueFeedback::of(&enqueued(ENQUEUE_NOTHING_WIRE))),
+        "enqueueNothing": api::enqueue::enqueue(&EnqueueFeedback::of(shell_core::i18n::Lang::Zh, &enqueued(ENQUEUE_NOTHING_WIRE))),
 
         // ---- 传输列表（任务 11）---------------------------------------------
         // 快照：六行 + 全局摘要。⚠️ `empty_text` **照样在场**（命令层恒发它，
@@ -940,6 +940,7 @@ fn main() {
         "preferencesCheckOk": api::preferences::plan(
             None,
             DownloadDirectory::confirmation(
+            shell_core::i18n::Lang::Zh,
                 &preferences().download_dir,
                 "/Volumes/Data/交付_新盘",
             ),
@@ -948,11 +949,11 @@ fn main() {
         // ⚠️ `/nope` 是一个**保证不存在**的绝对路径（下面有断言守着：
         //    它一旦在这台机器上存在，生成器**当场红**，而不是悄悄写出一份会漂的夹具）。
         "preferencesCheckBad": api::preferences::plan(
-            DownloadDirectory::check("/nope"),
-            DownloadDirectory::confirmation(&preferences().download_dir, "/nope"),
+            DownloadDirectory::check(shell_core::i18n::Lang::Zh, "/nope"),
+            DownloadDirectory::confirmation(shell_core::i18n::Lang::Zh, &preferences().download_dir, "/nope"),
         ),
         // `preferences_set` 的三支回执（成功 / 没动 / 失败）。
-        // ⚠️ 失败那一句用 `api::preferences::restart_timed_out()`（**壳自己的那一句**，
+        // ⚠️ 失败那一句用 `api::preferences::restart_timed_out(shell_core::i18n::Lang::Zh)`（**壳自己的那一句**，
         //    不是在这里编的）：编一句到夹具里 = 夹具与真载荷各说各话，
         //    而夹具正是前端那套验收的**唯一**期望值来源。
         "preferencesSetChanged": api::preferences::change(shell_core::i18n::Lang::Zh, &DownloadDirChange::Changed {
@@ -962,7 +963,7 @@ fn main() {
             dir: preferences().download_dir,
         }),
         "preferencesSetFailed": api::preferences::change(shell_core::i18n::Lang::Zh, &DownloadDirChange::Failed {
-            message: api::preferences::restart_timed_out().to_string(),
+            message: api::preferences::restart_timed_out(shell_core::i18n::Lang::Zh).to_string(),
         }),
         // `verbose_logging_set` 的两支回执（任务 3）：**形状与 `preferences_set` 逐格相同**，
         // 但话不一样（那三句把主词写死成了"下载目录"）—— 见 `VerboseLoggingChange` 的文档。
@@ -974,7 +975,7 @@ fn main() {
         "verboseLoggingSetFailed": api::preferences::verbose_change(
             shell_core::i18n::Lang::Zh,
             &VerboseLoggingChange::Failed {
-                message: api::preferences::verbose_restart_timed_out().to_string(),
+                message: api::preferences::verbose_restart_timed_out(shell_core::i18n::Lang::Zh).to_string(),
             },
         ),
         // `diagnostics_export` 的三支回执（任务 4）：成功（带那句隐私提醒）/ 取消 /
@@ -986,10 +987,12 @@ fn main() {
         //    "会被压缩的那一段"，**用户最需要看的文件夹名刚好被省略号吃掉**。
         //    夹具用 POSIX 形状的话，本机**永远看不见**这个缺陷（判据会照着假形状绿）。
         "diagnosticsExportDone": api::diagnostics::export_done(
+            shell_core::i18n::Lang::Zh,
             "D:\\导出\\诊断日志-20260101-000000",
         ),
-        "diagnosticsExportCancelled": api::diagnostics::export_cancelled(),
+        "diagnosticsExportCancelled": api::diagnostics::export_cancelled(shell_core::i18n::Lang::Zh),
         "diagnosticsExportFailed": api::diagnostics::export_failed(&shell_core::export::folder_failure_text(
+            shell_core::i18n::Lang::Zh,
             "/Volumes/Data/只读/诊断日志-20260101-000000",
             "Permission denied (os error 13)",
         )),
@@ -1002,22 +1005,22 @@ fn main() {
         //       都**不许**落到那句上 —— 那正是这一波加 `last_check_ok` 的全部理由。
         "updateCheckNewer": api::update::checked(&UpdateCheck::of(&update_status(
             UPDATE_STATUS_NEWER_WIRE,
-        ))),
+        )), shell_core::i18n::Lang::Zh),
         "updateCheckUpToDate": api::update::checked(&UpdateCheck::of(&update_status(
             UPDATE_STATUS_UP_TO_DATE_WIRE,
-        ))),
+        )), shell_core::i18n::Lang::Zh),
         "updateCheckUnreachable": api::update::checked(&UpdateCheck::of(&update_status(
             UPDATE_STATUS_UNREACHABLE_WIRE,
-        ))),
+        )), shell_core::i18n::Lang::Zh),
         "updateCheckDisabled": api::update::checked(&UpdateCheck::of(&update_status(
             UPDATE_STATUS_DISABLED_WIRE,
-        ))),
+        )), shell_core::i18n::Lang::Zh),
         "updateCheckNoAnswer": api::update::checked(&UpdateCheck::of(&update_status(
             UPDATE_STATUS_NO_ANSWER_WIRE,
-        ))),
+        )), shell_core::i18n::Lang::Zh),
         // `about`：正常那一档（短版本优先）+ 两个来源都空的那一档（兜底文案必须非空）。
-        "about": api::about::about(&AboutInfo::version(Some("0.1.0"), Some("1"))),
-        "aboutFallback": api::about::about(&AboutInfo::version(None, None)),
+        "about": api::about::about(&AboutInfo::version(shell_core::i18n::Lang::Zh, Some("0.1.0"), Some("1"))),
+        "aboutFallback": api::about::about(&AboutInfo::version(shell_core::i18n::Lang::Zh, None, None)),
         // R-5：**对位对照的用例表**（判据由 Rust 现算，前端那一侧回放同一份用例）。
         "mirrorCases": {
             "noteDrafts": note_draft_cases(),

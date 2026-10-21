@@ -217,7 +217,7 @@ pub fn load(app: tauri::State<'_, Shell>, code: String, base_url: Option<String>
         None => {
             // ⚠️ 这句话的家在 `shell_core::api`（**命令层一个字都不自己写**，R-13）。
             app.session
-                .set_load(LoadState::Failed(api::NO_KERNEL.to_string()));
+                .set_load(LoadState::Failed(api::no_kernel(lang).to_string()));
             api::envelope::ok(serde_json::json!({ "status": "no_kernel" }))
         }
     }
@@ -260,11 +260,11 @@ pub fn tree(
     path: Option<String>,
     selection: Option<Vec<String>>,
 ) -> Value {
-    let Some(client) = app.session.client() else {
-        return api::envelope::err(api::NO_KERNEL);
-    };
-    // 状态列那几个词要按界面语言成句（规格 W1）。
+    // 状态列那几个词要按界面语言成句（规格 W1）；"没有内核"那句也一样。
     let lang = app.session.lang();
+    let Some(client) = app.session.client() else {
+        return api::envelope::err(api::no_kernel(lang));
+    };
     match path {
         Some(path) => match kernel::list_dir(lang, &client, &path) {
             Ok(result) => {
@@ -273,7 +273,7 @@ pub fn tree(
                 //    `path` 就是请求里那一条**清单原文**（约束 3：不 trim、不加工）。
                 api::tree::level(lang,
                     &Breadcrumb::new(&path),
-                    &BrowserRow::rows(&result.entries, &path),
+                    &BrowserRow::rows(lang, &result.entries, &path),
                 )
             }
             // ⚠️ **读不到某一层仍然是 `ok` 信封**（那是界面上的一个状态，不是整屏错误）——
@@ -363,7 +363,7 @@ fn whole_tree(
     api::tree::whole(
         &Breadcrumb::new(""),
         progress.as_ref(),
-        &SelectionSummary::of(&selected, &sizes),
+        &SelectionSummary::of(lang, &selected, &sizes),
         &tree.default_selected,
         &action,
     )
@@ -434,7 +434,7 @@ fn enqueue_with(session: &Arc<Session>, paths: Vec<String>) -> Value {
     // 失败文案要按界面语言成句（规格 W1）。
     let lang = session.lang();
     let Some(client) = session.client() else {
-        return api::envelope::err(api::NO_KERNEL);
+        return api::envelope::err(api::no_kernel(lang));
     };
     // ⚠️ 锁的纪律：`client()` 与 `view()` 都是"读一次就放锁"，两次临界区都在这一行之内，
     //    之后的 `kernel::enqueue` 手里没有会话锁（见文件头那条）。
@@ -487,7 +487,7 @@ fn enqueue_with(session: &Arc<Session>, paths: Vec<String>) -> Value {
                     path: format!("未提交 {} 个", rest + orphaned),
                     reason: why.text().to_string(),
                 });
-                return api::enqueue::enqueue(&EnqueueFeedback::of(&merged));
+                return api::enqueue::enqueue(&EnqueueFeedback::of(lang, &merged));
             }
         }
     }
@@ -504,7 +504,7 @@ fn enqueue_with(session: &Arc<Session>, paths: Vec<String>) -> Value {
     if let Ok(preferences) = load_preferences() {
         note_disk_speed(session, Some(&preferences.download_dir), false);
     }
-    api::enqueue::enqueue(&EnqueueFeedback::of(&merged))
+    api::enqueue::enqueue(&EnqueueFeedback::of(lang, &merged))
 }
 
 /// 单条路径超过单次请求上限、没有发送时的那句话（与 macOS `AppModel` 逐字相同）。
@@ -554,13 +554,17 @@ fn kernel_paths(batch: &LoadState, selection: &[String]) -> Vec<String> {
 }
 
 /// 「暂停全部 / 一键开始」两颗按钮的状态（判据在 `BatchControl::of`，本层只喂它输入）。
-fn batch_control(rows: &[TransferRow]) -> shell_core::presentation::batch_control::BatchControl {
+fn batch_control(
+    lang: shell_core::i18n::Lang,
+    rows: &[TransferRow],
+) -> shell_core::presentation::batch_control::BatchControl {
     shell_core::presentation::batch_control::BatchControl::of(
+        lang,
         rows,
         batch::resume_pending(),
         batch::migrate().as_ref(),
     )
-    .with_migrate_failure(batch::migrate_failure().as_ref())
+    .with_migrate_failure(lang, batch::migrate_failure().as_ref())
 }
 
 /// 传输列表（规格 §3.4 第六行，对齐第二代 `GET /api/transfers`）。
@@ -575,8 +579,9 @@ pub fn transfers(app: tauri::State<'_, Shell>) -> Value {
 /// `transfers` 的**命令体**（[`transfers`] 的唯一实现，单测直接调它 —— Tauri 的
 /// `State` 只有运行时造得出来，同 [`enqueue_with`] 的拆法）。
 fn transfers_with(session: &Arc<Session>) -> Value {
+    let lang = session.lang();
     let Some(client) = session.client() else {
-        return api::envelope::err(api::NO_KERNEL);
+        return api::envelope::err(api::no_kernel(lang));
     };
     // ⚠️ 空列表那句话要用到引擎态 ⇒ 先取一份快照（锁只在这一行里）。
     let engine = session.view().engine;
@@ -601,7 +606,7 @@ fn transfers_with(session: &Arc<Session>) -> Value {
                 &rows,
                 Some(&TransferGlobalSummary::of(lang, &result.global)),
                 TransferListEmpty::of(lang, &engine),
-                &batch_control(&rows),
+                &batch_control(lang, &rows),
             )
         }
         // ⚠️ 内核亲口说的**正常态**（还没添加过任务 / 这一批没了）⇒ 发 `global: null` 的
@@ -619,7 +624,7 @@ fn transfers_with(session: &Arc<Session>) -> Value {
             if flip_not_started {
                 session.note_engine_not_started();
             }
-            api::transfers::transfers(&[], None, TransferListEmpty::of(lang, &engine), &batch_control(&[]))
+            api::transfers::transfers(&[], None, TransferListEmpty::of(lang, &engine), &batch_control(lang, &[]))
         }
         // 🔴 **内核亲口说"这一批没了"**（`no_delivery`）：除了发空快照，还要**作废当前批次**
         //    （清掉 `load_request` —— 对齐 macOS 的 `resetToEmptyState()`）。
@@ -630,7 +635,7 @@ fn transfers_with(session: &Arc<Session>) -> Value {
         //    （正常态、不显示那句话），我们照办 —— 界面上的表现就是**空态**，不是红横幅。
         TransferPoll::NoDelivery => {
             session.reset_to_empty_state();
-            api::transfers::transfers(&[], None, TransferListEmpty::of(lang, &engine), &batch_control(&[]))
+            api::transfers::transfers(&[], None, TransferListEmpty::of(lang, &engine), &batch_control(lang, &[]))
         }
         TransferPoll::Failed(why) => {
             note_failure(session, &why);
@@ -646,7 +651,7 @@ fn transfers_with(session: &Arc<Session>) -> Value {
 pub fn verify(app: tauri::State<'_, Shell>) -> Value {
     let lang = app.session.lang();
     let Some(client) = app.session.client() else {
-        return api::envelope::err(api::NO_KERNEL);
+        return api::envelope::err(api::no_kernel(lang));
     };
     match kernel::verify_status(lang, &client) {
         Ok(status) => {
@@ -659,7 +664,7 @@ pub fn verify(app: tauri::State<'_, Shell>) -> Value {
             //    `api::verify::NO_VERIFY_SUMMARY` 的文档里 —— 别把它搬回这里。
             match VerifySummary::of(app.session.lang(), Some(&status)) {
                 Some(summary) => api::verify::verify(&summary),
-                None => api::envelope::err(api::verify::NO_VERIFY_SUMMARY),
+                None => api::envelope::err(api::verify::no_verify_summary(lang)),
             }
         }
         Err(why) => {
@@ -692,7 +697,7 @@ pub fn verify(app: tauri::State<'_, Shell>) -> Value {
 pub fn update_status(app: tauri::State<'_, Shell>) -> Value {
     let lang = app.session.lang();
     let Some(client) = app.session.client() else {
-        return api::envelope::err(api::NO_KERNEL);
+        return api::envelope::err(api::no_kernel(lang));
     };
     match kernel::update_status(lang, &client) {
         Ok(kernel_value) => {
@@ -718,7 +723,7 @@ pub fn update_status(app: tauri::State<'_, Shell>) -> Value {
 pub fn update_set_enabled(app: tauri::State<'_, Shell>, enabled: bool) -> Value {
     let lang = app.session.lang();
     let Some(client) = app.session.client() else {
-        return api::envelope::err(api::NO_KERNEL);
+        return api::envelope::err(api::no_kernel(lang));
     };
     match kernel::update_set_enabled(lang, &client, enabled) {
         Ok(kernel_value) => {
@@ -800,13 +805,13 @@ pub fn restart_progress(app: tauri::State<'_, Shell>) -> Value {
 pub fn update_check_now(app: tauri::State<'_, Shell>) -> Value {
     let lang = app.session.lang();
     let Some(client) = app.session.client() else {
-        return api::envelope::err(api::NO_KERNEL);
+        return api::envelope::err(api::no_kernel(lang));
     };
     match kernel::update_check_now(lang, &client) {
         Ok(kernel_value) => {
             app.session.set_last_error(None);
             let check = UpdateCheck::of(&kernel_value);
-            api::update::checked(&check)
+            api::update::checked(&check, lang)
         }
         Err(why) => {
             note_failure(&app.session, &why);
@@ -834,13 +839,14 @@ pub fn update_check_now(app: tauri::State<'_, Shell>) -> Value {
 ///    也不该翻引擎那一格）。失败只走**回执那一格**（`is_failure` 由信封形状决定）。
 /// ⚠️ 实参是**内核给的那条 URL 原文**（`update_status().url`），本层不拼、不改写。
 #[tauri::command]
-pub fn open_update_url(url: String) -> Value {
+pub fn open_update_url(app: tauri::State<'_, Shell>, url: String) -> Value {
+    let lang = app.session.lang();
     match openurl::open(&url) {
         openurl::Outcome::Opened => api::update::opened(),
         // 不在白名单里 ⇒ 壳自己的锁拦下的（R15）：拒绝、什么都不打开。
-        openurl::Outcome::Refused => api::update::refused(),
+        openurl::Outcome::Refused => api::update::refused(lang),
         // 在白名单里、但系统那一半没能打开（原样带上原因 + 补救）。
-        openurl::Outcome::Failed(why) => api::update::open_failed(&why),
+        openurl::Outcome::Failed(why) => api::update::open_failed(lang, &why),
     }
 }
 
@@ -884,7 +890,7 @@ pub fn task_action(
 ) -> Value {
     let lang = app.session.lang();
     let Some(client) = app.session.client() else {
-        return api::envelope::err(api::NO_KERNEL);
+        return api::envelope::err(api::no_kernel(lang));
     };
     match kernel::task_action(lang, &client, action, gid) {
         Ok(()) => {
@@ -922,15 +928,15 @@ pub fn task_action(
 ///    弄成别的样子。失败**只走失败信封**，由界面决定摆在哪（macOS 摆在传输页那条
 ///    失败栏里；我们这一侧的前端还没做，任务 11/12 定）。
 #[tauri::command]
-pub fn reveal(path: Option<String>) -> Value {
-    // ⚠️ 本命令**不收 `State<'_, Shell>`**：它一次都不碰 `Session`（上面那段文档说了
+pub fn reveal(app: tauri::State<'_, Shell>, path: Option<String>) -> Value {
+    // ⚠️ 本命令**只借 `Session` 取界面语言**：除语言外一次都不碰它（上面那段文档说了
     //    为什么 —— 这件事不经过内核）。要数据就去偏好文件里读，要环境就问进程。
-    //    收一个用不到的参数只会让下一个人以为"这里迟早要用它"。
+    let lang = app.session.lang();
     // 下载目录是偏好里那一份（**空串 = 未配置** ⇒ 落盘根是内核默认值）。
     let download_dir = match load_preferences() {
         Ok(preferences) => preferences.download_dir,
         // 读到偏好的**存放根**都取不到（`%APPDATA%` 缺失）⇒ 那句话说清了根因与补救。
-        Err(why) => return api::reveal::failure(&why),
+        Err(why) => return api::reveal::failure(lang, &why),
     };
     match reveal::reveal(
         path.as_deref(),
@@ -945,9 +951,9 @@ pub fn reveal(path: Option<String>) -> Value {
         // 算不出文件在哪 ⇒ **要说出来**（W-2）：用户点了那一项、什么都没发生，
         // 唯一的解释就在这句话里。变量名按**本靶**取（Windows 是 USERPROFILE）。
         shell_core::api::reveal::Outcome::RootUnknown => {
-            api::reveal::root_unknown(TransferReveal::home_variable())
+            api::reveal::root_unknown(lang, TransferReveal::home_variable())
         }
-        shell_core::api::reveal::Outcome::Failed(why) => api::reveal::failure(&why),
+        shell_core::api::reveal::Outcome::Failed(why) => api::reveal::failure(lang, &why),
     }
 }
 
@@ -964,7 +970,7 @@ pub fn reveal(path: Option<String>) -> Value {
 pub fn settings_get(app: tauri::State<'_, Shell>) -> Value {
     let lang = app.session.lang();
     let Some(client) = app.session.client() else {
-        return api::envelope::err(api::NO_KERNEL);
+        return api::envelope::err(api::no_kernel(lang));
     };
     // ⚠️ 锁的纪律：`view()` 与 `client()` 都是"读一次就放锁"（`-k` 的候选集合要从
     //    这一格里取，而它是一份 `String` 的克隆 —— 与内核无关）。
@@ -998,7 +1004,7 @@ pub fn settings_get(app: tauri::State<'_, Shell>) -> Value {
 pub fn settings_set(app: tauri::State<'_, Shell>, settings: Settings) -> Value {
     let lang = app.session.lang();
     let Some(client) = app.session.client() else {
-        return api::envelope::err(api::NO_KERNEL);
+        return api::envelope::err(api::no_kernel(lang));
     };
     let handshake = app.session.view().handshake_reply;
     match kernel::set_settings(lang, &client, &settings) {
@@ -1052,15 +1058,16 @@ pub fn preferences_get(app: tauri::State<'_, Shell>) -> Value {
 /// ⚠️ 它**没有任何副作用**（不写盘、不碰内核）：`check` 会在候选目录里建一个探针文件
 ///    再立刻删掉（那是它的判据，见 `probe_writable`），除此之外什么都不改。
 #[tauri::command]
-pub fn preferences_check(path: String) -> Value {
+pub fn preferences_check(app: tauri::State<'_, Shell>, path: String) -> Value {
+    let lang = app.session.lang();
     // 确认文案要说清"从哪改到哪" ⇒ 得先知道**现在**用的是哪个目录。
     let current = match load_preferences() {
         Ok(preferences) => preferences.download_dir,
         Err(why) => return api::envelope::err(&why),
     };
     api::preferences::plan(
-        DownloadDirectory::check(&path),
-        DownloadDirectory::confirmation(&current, &path),
+        DownloadDirectory::check(lang, &path),
+        DownloadDirectory::confirmation(lang, &current, &path),
     )
 }
 
@@ -1093,8 +1100,11 @@ pub fn preferences_check(path: String) -> Value {
 ///    而 `invoke_handler::<R>` 把 `R` 传进来（写死 `tauri::Wry` 的话这一条只在
 ///    真交付形态下编得过，宿主上的单测直接编不过）。
 #[tauri::command]
-pub fn pick_directory<R: tauri::Runtime>(window: tauri::WebviewWindow<R>) -> Value {
-    api::envelope::ok(match pickdir::pick_folder(owner_hwnd(&window)) {
+pub fn pick_directory<R: tauri::Runtime>(
+    app: tauri::State<'_, Shell>,
+    window: tauri::WebviewWindow<R>,
+) -> Value {
+    api::envelope::ok(match pickdir::pick_folder(app.session.lang(), owner_hwnd(&window)) {
         Some(path) => Value::String(path),
         None => Value::Null,
     })
@@ -1144,9 +1154,10 @@ pub fn diagnostics_export<R: tauri::Runtime>(
     app: tauri::State<'_, Shell>,
     window: tauri::WebviewWindow<R>,
 ) -> Value {
+    let lang = app.session.lang();
     // ① 选目标文件夹。取消 ⇒ 一句"没有导出"（**不是**错误信封，见函数文档）。
-    let Some(target) = pickdir::pick_folder(owner_hwnd(&window)) else {
-        return api::diagnostics::export_cancelled();
+    let Some(target) = pickdir::pick_folder(lang, owner_hwnd(&window)) else {
+        return api::diagnostics::export_cancelled(lang);
     };
     // ②③④ 的**事实**在这一段里取齐：说明文件要写的那七格（规格 §2.6 那张表）。
     //    ⚠️ 这些是**取数据**（规格 §5.3 的第一步），成句与摆位置在 `shell_core` 里。
@@ -1161,6 +1172,7 @@ pub fn diagnostics_export<R: tauri::Runtime>(
         // 与 `about()` 同一个来源（`option_env!` 是编译那一刻的环境，`build.rs` 的
         // `rerun-if-env-changed` 盯的是同一个名字 —— 两处同源）。
         app_version: AboutInfo::version(
+            app.session.view().lang,
             option_env!("BENAGEN_VERSION"),
             Some(env!("CARGO_PKG_VERSION")),
         ),
@@ -1189,8 +1201,8 @@ pub fn diagnostics_export<R: tauri::Runtime>(
         // `shell-win/src/export.rs`），这里一个字都不编。
         files: Vec::new(),
     };
-    match crate::export::export_to(&target, &header, at) {
-        Ok(folder) => api::diagnostics::export_done(&folder),
+    match crate::export::export_to(lang, &target, &header, at) {
+        Ok(folder) => api::diagnostics::export_done(lang, &folder),
         // 那句话是 `shell_core::export` 里**按失败的那一步**拼好的
         // （`folder_failure_text` / `copy_failure_text` / `header_failure_text` 三档，
         // 各自点名自己的那个位置、带上系统原话与下一步 —— 修复轮 1 拆的，
@@ -1277,9 +1289,9 @@ pub fn preferences_set(app: tauri::State<'_, Shell>, dir: String) -> Value {
     if let Err(cause) = updated.save(&path) {
         let cause = cause.to_string();
         let message = if paused {
-            api::preferences::save_failed_after_pause(&cause)
+            api::preferences::save_failed_after_pause(lang, &cause)
         } else {
-            api::preferences::save_failed(&cause)
+            api::preferences::save_failed(lang, &cause)
         };
         return api::preferences::change(lang, &DownloadDirChange::Failed { message });
     }
@@ -1289,7 +1301,7 @@ pub fn preferences_set(app: tauri::State<'_, Shell>, dir: String) -> Value {
     // ⚠️ 这是**用户的显式动作** ⇒ 复位自动重启预算（对齐 macOS `AppModel.swift:1244`）：
     //    否则"自动重启已经用掉预算"会让改目录变成一件按下去没有回音的事。
     app.session.reset_auto_restart();
-    match restart_kernel(&app.session, ChangedSetting::DownloadDir.restart_timeout_message()) {
+    match restart_kernel(&app.session, ChangedSetting::DownloadDir.restart_timeout_message(shell_core::i18n::Lang::Zh)) {
         Ok(()) => {
             // 新盘要重新量一次（旧盘那句不许粘在新盘上）。
             note_disk_speed(&app.session, Some(&updated.download_dir), true);
@@ -1337,15 +1349,16 @@ pub fn verbose_logging_set(app: tauri::State<'_, Shell>, on: bool) -> Value {
         Ok(path) => path,
         Err(why) => return api::envelope::err(&why),
     };
+    let lang = app.session.lang();
     let current = Preferences::load(&path);
     let updated = current.setting_verbose_logging(on);
 
     if updated.verbose_logging == current.verbose_logging {
-        return api::preferences::verbose_change(app.session.lang(), &VerboseLoggingChange::Unchanged { on });
+        return api::preferences::verbose_change(lang, &VerboseLoggingChange::Unchanged { on });
     }
     if let Err(cause) = updated.save(&path) {
-        return api::preferences::verbose_change(app.session.lang(), &VerboseLoggingChange::Failed {
-            message: api::preferences::verbose_save_failed(&cause.to_string()),
+        return api::preferences::verbose_change(lang, &VerboseLoggingChange::Failed {
+            message: api::preferences::verbose_save_failed(lang, &cause.to_string()),
         });
     }
     // 🔴 **先落壳自己这一格，再重启内核**（顺序承重）：反过来的话，内核重启那一段
@@ -1357,9 +1370,9 @@ pub fn verbose_logging_set(app: tauri::State<'_, Shell>, on: bool) -> Value {
     app.session.reset_auto_restart();
     match restart_kernel(
         &app.session,
-        ChangedSetting::VerboseLogging.restart_timeout_message(),
+        ChangedSetting::VerboseLogging.restart_timeout_message(shell_core::i18n::Lang::Zh),
     ) {
-        Ok(()) => api::preferences::verbose_change(app.session.lang(), &VerboseLoggingChange::Changed { on }),
+        Ok(()) => api::preferences::verbose_change(lang, &VerboseLoggingChange::Changed { on }),
         // 内核起不来的**原因原文**照登（与 `preferences_set` 同一条）。
         Err(why) => api::preferences::verbose_change(app.session.lang(), &VerboseLoggingChange::Failed { message: why }),
     }
@@ -1402,14 +1415,18 @@ pub fn history_get() -> Value {
 /// ⚠️ 成功时回的是**写完之后的那份历史**（与 `history_get` 同一个载荷形状）：
 ///    前端不必再发一条命令去刷新（少一次往返，也少一个"界面与盘上不一致"的窗口）。
 #[tauri::command]
-pub fn history_put(entry: shell_core::api::history::HistoryWrite) -> Value {
+pub fn history_put(
+    app: tauri::State<'_, Shell>,
+    entry: shell_core::api::history::HistoryWrite,
+) -> Value {
+    let lang = app.session.lang();
     let path = match history_path() {
         Ok(path) => path,
         Err(why) => return api::envelope::err(&why),
     };
     match write_history_entry(&path, &entry) {
         Ok(updated) => api::history::payload(&updated),
-        Err(cause) => api::envelope::err(&api::history::write_failed(&cause)),
+        Err(cause) => api::envelope::err(&api::history::write_failed(lang, &cause)),
     }
 }
 
@@ -1516,8 +1533,8 @@ fn remembered_code_in(
 ///
 /// ⚠️ **它不碰会话、不发内核请求**：许可全文是**编译期**编进这个 exe 的常量。
 #[tauri::command]
-pub fn license() -> Value {
-    api::envelope::ok(crate::licenses::wire())
+pub fn license(app: tauri::State<'_, Shell>) -> Value {
+    api::envelope::ok(crate::licenses::wire(app.session.lang()))
 }
 
 /// 关于窗口（规格 §3.4 第十六行）：今天的全部内容就是**版本号**。
@@ -1531,8 +1548,9 @@ pub fn license() -> Value {
 ///    那种用法照样生效），而 `build.rs` 的 `rerun-if-env-changed` 盯的是同一个名字
 ///    —— 两处同源。未设时回落 `CARGO_PKG_VERSION`（本 crate 的 `Cargo.toml` 版本）。
 #[tauri::command]
-pub fn about() -> Value {
+pub fn about(app: tauri::State<'_, Shell>) -> Value {
     api::about::about(&AboutInfo::version(
+        app.session.view().lang,
         option_env!("BENAGEN_VERSION"),
         Some(env!("CARGO_PKG_VERSION")),
     ))
@@ -1575,10 +1593,10 @@ impl ChangedSetting {
     ///
     /// ⚠️ 两个取值**必须**各回各的那一句（`api::preferences` 的两条同构常量）：
     ///    这一格的判据在 `mod tests` 的 `each_setting_gets_its_own_restart_timeout_message`。
-    pub fn restart_timeout_message(self) -> &'static str {
+    pub fn restart_timeout_message(self, lang: shell_core::i18n::Lang) -> &'static str {
         match self {
-            ChangedSetting::DownloadDir => api::preferences::restart_timed_out(),
-            ChangedSetting::VerboseLogging => api::preferences::verbose_restart_timed_out(),
+            ChangedSetting::DownloadDir => api::preferences::restart_timed_out(lang),
+            ChangedSetting::VerboseLogging => api::preferences::verbose_restart_timed_out(lang),
         }
     }
 }
@@ -1997,13 +2015,13 @@ mod tests {
     ///     把两个臂对调会是**恒真**的（`f() == f()` 那种写法）。
     #[test]
     fn each_setting_gets_its_own_restart_timeout_message() {
-        let dir = ChangedSetting::DownloadDir.restart_timeout_message();
-        let verbose = ChangedSetting::VerboseLogging.restart_timeout_message();
+        let dir = ChangedSetting::DownloadDir.restart_timeout_message(shell_core::i18n::Lang::Zh);
+        let verbose = ChangedSetting::VerboseLogging.restart_timeout_message(shell_core::i18n::Lang::Zh);
 
-        assert_eq!(dir, api::preferences::restart_timed_out(), "下载目录那一格用错句子了");
+        assert_eq!(dir, api::preferences::restart_timed_out(shell_core::i18n::Lang::Zh), "下载目录那一格用错句子了");
         assert_eq!(
             verbose,
-            api::preferences::verbose_restart_timed_out(),
+            api::preferences::verbose_restart_timed_out(shell_core::i18n::Lang::Zh),
             "详细日志那一格用错句子了"
         );
 

@@ -80,18 +80,20 @@ struct FileBrowser: View {
             Divider()
             SelectionBar(
                 summary: SelectionSummary.of(selected: selection,
-                                             sizes: SelectionSummary.sizeIndex(model.tree?.flat ?? [])),
+                                             sizes: SelectionSummary.sizeIndex(model.tree?.flat ?? []),
+                                             lang: model.language),
                 // 文案由 `DownloadTargets` 算：**没有勾选时是「全部下载」**（发 `paths: []`）。
-                title: DownloadTargets.buttonTitle(for: selection),
+                title: DownloadTargets.buttonTitle(for: selection, lang: model.language),
                 // 一项都没勾时**明说**会发生什么（不勾 = 下全部待下载）。不让用户猜 ——
                 // 一颗写着「全部下载」的按钮旁边没有这句话，谁都想不到"不勾也是下全部"。
-                hint: selection.isEmpty ? DownloadTargets.emptySelectionHint : nil,
+                hint: selection.isEmpty ? DownloadTargets.emptySelectionHint(lang: model.language) : nil,
                 // ⚠️ 底栏这颗「全选」勾的是**整批的全部文件**（`get_tree` 的 `flat`），
                 //    不是"这一层" —— 那正是"覆盖整批 ⇒ `paths: []`"（约束 C-3）的入口。
                 //    「全选本层」（含目录）是 ⌘A 与右键菜单那条，走 `BrowserSelection.all(in:)`。
                 onSelectAll: { selection = BrowserSelection.allFiles(in: model.tree?.flat ?? []) },
                 onClearSelection: { selection = [] },
-                onDownload: { onDownload(selection) })
+                onDownload: { onDownload(selection) },
+                lang: model.language)
         }
         // ⌘A 全选当前层（简报）。见 `selectAllShortcut` 里为什么不靠 `List` 自带的行为。
         .background(selectAllShortcut)
@@ -120,11 +122,11 @@ struct FileBrowser: View {
                 Button {
                     onDownload([currentPath])
                 } label: {
-                    Label("下载本目录", systemImage: "arrow.down.circle")
+                    Label(model.language.t(.fileDownloadHere), systemImage: "arrow.down.circle")
                 }
                 .labelStyle(.titleAndIcon)   // 同一个坑：不写就只剩图标
                 .buttonStyle(.borderless)
-                .help("把当前这个目录（连同子目录）加进下载")
+                .help(model.language.t(.fileDownloadHereHelp))
             }
 
             Button {
@@ -133,7 +135,7 @@ struct FileBrowser: View {
                 Image(systemName: "arrow.clockwise")
             }
             .buttonStyle(.borderless)
-            .help("重新读取这一层")
+            .help(model.language.t(.fileReloadLevel))
         }
         .font(.callout)
         .padding(.horizontal, 20)
@@ -153,7 +155,7 @@ struct FileBrowser: View {
                 .foregroundStyle(path == currentPath ? .primary : .secondary)
         }
         .buttonStyle(.plain)
-        .help(path.isEmpty ? "回到批次根目录" : path)
+        .help(path.isEmpty ? model.language.t(.fileBackToRoot) : path)
     }
 
     private var breadcrumb: Breadcrumb { Breadcrumb(path: currentPath) }
@@ -183,7 +185,7 @@ struct FileBrowser: View {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.borderless)
-            .help("收起这条提示")
+            .help(model.language.t(.commonDismissNotice))
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 8)
@@ -198,7 +200,7 @@ struct FileBrowser: View {
             centered {
                 ProgressView()
                     .controlSize(.small)
-                Text("正在读取目录…")
+                Text(model.language.t(.fileLoading))
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -206,10 +208,10 @@ struct FileBrowser: View {
             // 加载失败也要有**可读的呈现**（约束 4）。原文已经在上面那条提示里，
             // 这里给一颗「重试」——否则用户面对的是一个没有出口的页面。
             centered {
-                Label("这一层没能读出来", systemImage: "exclamationmark.triangle")
+                Label(model.language.t(.fileLoadFailed), systemImage: "exclamationmark.triangle")
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                Button("重试") { Task { await load(path: currentPath) } }
+                Button(model.language.t(.retry)) { Task { await load(path: currentPath) } }
                     .buttonStyle(.borderless)
             }
         case .loaded where rows.isEmpty:
@@ -217,7 +219,7 @@ struct FileBrowser: View {
                 Image(systemName: "folder")
                     .font(.largeTitle)
                     .foregroundStyle(.tertiary)
-                Text("这个目录是空的")
+                Text(model.language.t(.fileEmpty))
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -248,10 +250,10 @@ struct FileBrowser: View {
             .contextMenu(forSelectionType: String.self) { items in
                 // 空集 = 右键落在没有行的空白处：那就按**当前勾选面**来，不让用户对着
                 // 一个空集发请求（那会变成 `paths: []` = 下全部 —— 与他的意图正好相反）。
-                Button("下载选中项") { onDownload(items.isEmpty ? selection : items) }
+                Button(model.language.t(.fileDownloadSelected)) { onDownload(items.isEmpty ? selection : items) }
                 Divider()
-                Button("全选本层") { selection = BrowserSelection.all(in: rows) }
-                Button("全不选") { selection = [] }
+                Button(model.language.t(.fileSelectAllLevel)) { selection = BrowserSelection.all(in: rows) }
+                Button(model.language.t(.deselectAll)) { selection = [] }
             } primaryAction: { items in
                 // 双击的**语义**在 `BrowserPrimaryAction`（纯函数，有单测）——
                 // 这里只剩把结果分派出去（约束 8：视图不做判断）。
@@ -293,13 +295,13 @@ struct FileBrowser: View {
     ///    窗口下界就是照四列的宽度估的（四列约 820px + 侧边栏 + 内边距）。
     private var columnHeader: some View {
         HStack(spacing: 8) {
-            Text("名称")
+            Text(model.language.t(.fileColumnName))
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Text("大小")
+            Text(model.language.t(.fileColumnSize))
                 .frame(width: 96, alignment: .trailing)
-            Text("时间")
+            Text(model.language.t(.fileColumnTime))
                 .frame(width: 120, alignment: .leading)
-            Text("状态")
+            Text(model.language.t(.fileColumnStatus))
                 .frame(width: 72, alignment: .leading)
         }
         .font(.caption.weight(.semibold))
@@ -324,7 +326,7 @@ struct FileBrowser: View {
                     .foregroundStyle(selection.contains(row.path) ? Color.accentColor : Color.secondary)
             }
             .buttonStyle(.borderless)
-            .help(selection.contains(row.path) ? "取消勾选这一项" : "勾选这一项")
+            .help(selection.contains(row.path) ? model.language.t(.fileDeselectItem) : model.language.t(.fileSelectItem))
             Image(systemName: row.iconName)
                 .foregroundStyle(row.kind == .dir ? Color.accentColor : Color.secondary)
                 .frame(width: 16)
@@ -346,7 +348,7 @@ struct FileBrowser: View {
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
                 .frame(width: 120, alignment: .leading)
-            Text(row.state.label)
+            Text(row.state.label(lang: model.language))
                 .font(.caption)
                 .foregroundStyle(tint(row.state.color))
                 .frame(width: 72, alignment: .leading)
@@ -392,7 +394,7 @@ struct FileBrowser: View {
     /// ⚠️ 用 `frame(0×0) + opacity(0)` 而**不是** `.hidden()`：`hidden()` 会把按钮从命令
     ///    系统里摘掉，快捷键跟着失效。它是不可见、不可聚焦的（`accessibilityHidden`）。
     private var selectAllShortcut: some View {
-        Button("全选当前层") {
+        Button(model.language.t(.fileSelectAllCurrentLevel)) {
             selection = BrowserSelection.all(in: rows)
         }
         .keyboardShortcut("a", modifiers: .command)
@@ -404,7 +406,7 @@ struct FileBrowser: View {
 
     // MARK: - 取值
 
-    private var rows: [BrowserRow] { BrowserRow.rows(entries, parent: currentPath) }
+    private var rows: [BrowserRow] { BrowserRow.rows(entries, parent: currentPath, lang: model.language) }
 
     private var code: String? {
         if case .loaded(let info) = model.loadState { return info.code }
@@ -482,7 +484,7 @@ struct FileBrowser: View {
             entries = result.entries
             phase = .loaded
         } catch let e as CoreError {
-            let f = DirLoadFailure.of(e, currentPath: path)
+            let f = DirLoadFailure.of(e, currentPath: path, lang: model.language)
             failure = f
             phase = .failed
             if f.didFallBack {

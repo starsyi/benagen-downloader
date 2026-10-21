@@ -19,6 +19,15 @@ import Foundation
 public final class CoreClient: CoreCalling, @unchecked Sendable {
     private let channel: LineChannel
 
+    /// 壳自己写的诊断文案（通道/协议错误）该用哪种语言。
+    ///
+    /// 由 `AppModel` 在握手落定语言、以及客户改语言之后写入；改的时候同步
+    /// 传给底下的 `ProcessChannel`（它也会自己写两句 transport 错误）。
+    /// 深层的错误在**生成那一刻**取句，所以切换语言之后新产生的错误立刻换语言。
+    public var lang: Lang = .zh {
+        didSet { (channel as? ProcessChannel)?.language = lang }
+    }
+
     /// **串行**队列（`DispatchQueue` 默认就是 `.serial`）：约束 15 的那条"单飞"语义
     /// 全靠它。`callSync` 与 `callAsync` 走的是同一条，所以两者之间也是互斥的。
     private let queue: DispatchQueue
@@ -304,13 +313,13 @@ public final class CoreClient: CoreCalling, @unchecked Sendable {
     /// [`performCall`] 的本体：**只做事、不记账**（计时与详细档那一行在上面那一层）。
     private func performCallInner(_ method: String, _ params: JSONValue) throws -> JSONValue {
         guard !requestsClosed else {
-            throw CoreError.transport("内核连接已关闭（shutdown 已调用）")
+            throw CoreError.transport(lang.t(.coreChannelShutdown))
         }
         stateLock.lock()
         let dead = channelDead
         stateLock.unlock()
         if dead {
-            throw CoreError.transport("内核连接已判死（读超时后未能重新对齐）")
+            throw CoreError.transport(lang.t(.coreChannelDead))
         }
 
         let id = nextId
@@ -330,7 +339,7 @@ public final class CoreClient: CoreCalling, @unchecked Sendable {
                 return try drainUntilMatch(id: id, deadline: timeout)
             }
             guard let line else {
-                throw CoreError.transport("内核进程已退出（管道结束）")
+                throw CoreError.transport(lang.t(.corePipeClosed))
             }
             let env = try decodeEnvelope(line)
 
@@ -345,13 +354,14 @@ public final class CoreClient: CoreCalling, @unchecked Sendable {
             // 把一条无关的 result 当成自己的（界面显示另一个请求的数据）比吵一句糟得多。
             guard env.id == id else {
                 throw CoreError.malformedResponse(
-                    "内核回的响应 id 是 \(env.id)，而当前在等 \(id)（请求-响应失步）")
+                    lang.tf(.coreResponseMismatch,
+                            ["got": String(env.id), "want": String(id)]))
             }
             // ⚠️ `ok:false` 与"缺 result"两条守卫**只此一份**（在 `RawEnvelope.unwrapResult`），
             // 不在这里重新内联——复制粘贴的文案会静默分叉（见那段注释）。
             // 也**不**用 `unwrap`：那会为了要一个 `JSONValue` 来回编码一趟，而
             // `.integer` / `.number` 是分开的两个 case，二次编解码会丢这个区分。
-            return try env.unwrapResult()
+            return try env.unwrapResult(lang: lang)
         }
     }
 
@@ -381,7 +391,7 @@ public final class CoreClient: CoreCalling, @unchecked Sendable {
             }
             guard let line else {
                 markChannelDead()
-                throw CoreError.transport("内核进程已退出（管道结束）")
+                throw CoreError.transport(lang.t(.corePipeClosed))
             }
             // 排空途中：解不开的行、id==0 告警、别人的应答 —— 一律丢掉，接着找自己那条。
             guard let env = try? decodeEnvelope(line) else { continue }
@@ -390,7 +400,7 @@ public final class CoreClient: CoreCalling, @unchecked Sendable {
                 continue
             }
             if env.id == id {
-                return try env.unwrapResult()
+                return try env.unwrapResult(lang: lang)
             }
             // id 不对：丢弃，继续排空
         }
@@ -466,7 +476,8 @@ public final class CoreClient: CoreCalling, @unchecked Sendable {
             return try CoreJSON.decoder.decode(RawEnvelope.self, from: Data(line.utf8))
         } catch {
             // 截断到 200 字符：这一行可能是几 MB 的垃圾，而它会显示在界面上
-            throw CoreError.malformedResponse("内核发来的一行不是合法 JSON：\(line.prefix(200))")
+            throw CoreError.malformedResponse(
+                lang.tf(.coreLineNotJSON, ["line": String(line.prefix(200))]))
         }
     }
 

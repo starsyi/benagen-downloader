@@ -133,7 +133,10 @@ public struct AppPreferences: Equatable, Sendable {
 ///    （全局约束 8），而视图那一层不单测。
 public enum DiagnosticsToggle {
     /// 勾选框的标签（规格 §2.4 逐字：「勾选「详细日志」」）。
-    public static let label = "详细日志"
+    public static var label: String { label(lang: .zh) }
+
+    /// 同一句话的**当前语言**版本。
+    public static func label(lang: Lang) -> String { lang.t(.diagnosticsTitle) }
 
     /// 标签下面那句说明。**三件事缺一不可**：
     ///   * 它**是什么用的**（排查问题）—— 否则用户会以为这是个"性能档"；
@@ -145,8 +148,10 @@ public enum DiagnosticsToggle {
     ///    但**不许**为了"少一句话"就把它省掉：这是本面板上第二处会让内核重启的控件。
     /// ⚠️ 与 Windows 那份的 `DiagnosticsToggle::NOTE` **逐字同源**（两端给客户看的是
     ///    同一句话）。
-    public static let note = "打开后日志会详细很多（用于排查问题），排查完请关掉。"
-        + "改动会立刻重启内核（正在跑的任务会停）。"
+    public static var note: String { note(lang: .zh) }
+
+    /// 同一句话的**当前语言**版本。
+    public static func note(lang: Lang) -> String { lang.t(.diagnosticsNote) }
 }
 
 /// 一次「改详细日志」的结果。
@@ -178,10 +183,6 @@ public enum VerboseLoggingChange: Equatable, Sendable {
     /// ⚠️ 它不含任何**长度不受控**的东西（没有路径、没有批次号）——
     ///    与 `DownloadDirChange.headline` 同一条纪律：这条回执会画在常驻那一行上，
     ///    高度不许由外部文本决定（那是一次真实布局事故的根因）。
-    private static let changedOn = "详细日志已打开（内核已按详细档重启）"
-    private static let changedOff = "详细日志已关闭（内核已按普通档重启）"
-    /// 没改动那一支的固定全文（与 `DownloadDirChange` 的那一句逐字同构）。
-    private static let unchangedText = "详细日志没有变化，没有重启内核"
 
     /// **这条回执的第一行**：固定短的标题，任何情况下都不含外部文本。
     ///
@@ -189,11 +190,17 @@ public enum VerboseLoggingChange: Equatable, Sendable {
     ///    不加工、不截断成"标题"—— 与 `DownloadDirChange.headline` 逐字同一条。
     ///    它同样是**外部文本**，高度由**视图**那边统一封顶
     ///    （`Views/ResidentNotice.swift` 的 `BoundedNoticeText`），**全文始终都在**。
-    public var headline: String {
+    public var headline: String { headline(lang: .zh) }
+
+    /// 同一句话的**当前语言**版本。
+    public func headline(lang: Lang) -> String {
         switch self {
-        case .changed(let on): return on ? Self.changedOn : Self.changedOff
-        case .unchanged: return Self.unchangedText
-        case .failed(let message): return message
+        case .changed(let on):
+            return on ? lang.t(.verboseLoggingOn) : lang.t(.verboseLoggingOff)
+        case .unchanged:
+            return lang.t(.verboseLoggingUnchanged)
+        case .failed(let message):
+            return message
         }
     }
 

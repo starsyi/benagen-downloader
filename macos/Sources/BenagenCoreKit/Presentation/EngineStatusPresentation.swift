@@ -31,9 +31,12 @@ public enum EngineStatusPresentation {
     ///
     /// 内容分两层：**是什么**（可能卡在系统授权对话框上）+ **怎么办**（看一眼屏幕、点「允许」、
     /// 回来点「重试」）。没有第二层的那句话，用户能做的就只剩"再等等"。
-    public static let handshakeTimeoutTooltip =
-        "内核可能正卡在系统授权对话框上（例如\"想访问下载文件夹\"）。"
-        + "请查看屏幕上是否有该对话框并点「允许」，然后点「重试」。"
+    public static var handshakeTimeoutTooltip: String { handshakeTimeoutTooltip(lang: .zh) }
+
+    /// 同上，按当前语言取句（视图用这一支）。
+    public static func handshakeTimeoutTooltip(lang: Lang) -> String {
+        lang.t(.engineHandshakeTooltip)
+    }
 
     /// 这一条 `reason` 是不是"握手超时"（而不是内核给的失败原因）？
     ///

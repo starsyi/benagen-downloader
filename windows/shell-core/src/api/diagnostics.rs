@@ -26,19 +26,23 @@ use crate::api::envelope;
 ///
 /// ⚠️ 措辞按字体子集的覆盖判据挑过字（`test.sh` 第 0.5 步：每一个非 ASCII 字都必须在
 ///    内嵌子集里，否则判据变红）。
-pub const PRIVACY_NOTE: &str = "这份日志可能包含下载地址片段，发送前你可以自己打开看一眼。";
+
 
 /// **导出成功**：回执（标题 + 那个文件夹）+ 上面那句提醒。
 ///
 /// ⚠️ `folder` 只出现在 `path_detail` 那一格（**标题里一个字都不许有路径** ——
 ///    那是一次真实布局事故的修法，见 `api::preferences::receipt` 的文档）。
-pub fn export_done(folder: &str) -> Value {
+pub fn export_done(lang: crate::i18n::Lang, folder: &str) -> Value {
     envelope::ok(json!({
-        "headline": "诊断日志已导出",
+        "headline": crate::i18n::t(lang, crate::i18n::Key::DiagExportDone),
         "path_detail": folder,
-        "notice_text": format!("诊断日志已导出到 {folder}"),
+        "notice_text": crate::i18n::tf(
+            lang,
+            crate::i18n::Key::DiagExportDoneTo,
+            &[("folder", folder)],
+        ),
         "is_failure": false,
-        "privacy_note": PRIVACY_NOTE,
+        "privacy_note": crate::i18n::t(lang, crate::i18n::Key::DiagExportPrivacy),
     }))
 }
 
@@ -47,11 +51,11 @@ pub fn export_done(folder: &str) -> Value {
 /// ⚠️ 与 `pick_directory` 那条同一条口径（取消一个对话框什么都不该发生）——
 ///    差别只在这里**要说一句**：用户点的是「导出」，界面一动不动会与"卡住了"分不开
 ///    （约束 4 明禁的静默失效）。所以回执在，只是它是"没有导出"，不是错误。
-pub fn export_cancelled() -> Value {
+pub fn export_cancelled(lang: crate::i18n::Lang) -> Value {
     envelope::ok(json!({
-        "headline": "没有导出（你取消了选择文件夹）",
+        "headline": crate::i18n::t(lang, crate::i18n::Key::DiagExportCancelled),
         "path_detail": Value::Null,
-        "notice_text": "没有导出（你取消了选择文件夹）",
+        "notice_text": crate::i18n::t(lang, crate::i18n::Key::DiagExportCancelled),
         "is_failure": false,
         "privacy_note": Value::Null,
     }))
@@ -92,8 +96,8 @@ mod tests {
             k.sort();
             k
         };
-        let done = keys(&export_done("D:\\导出\\诊断日志-20260101-000000"));
-        assert_eq!(keys(&export_cancelled()), done);
+        let done = keys(&export_done(crate::i18n::Lang::Zh, "D:\\导出\\诊断日志-20260101-000000"));
+        assert_eq!(keys(&export_cancelled(crate::i18n::Lang::Zh)), done);
         assert_eq!(keys(&export_failed("导出没有完成")), done);
         assert_eq!(done.len(), 5, "四格沿用改设置那两条的形状 + 一格隐私提醒");
     }
@@ -105,12 +109,12 @@ mod tests {
     /// §2.7 拒绝做自动过滤之后，唯一还剩下的那道防线）。
     #[test]
     fn a_successful_export_carries_the_privacy_note() {
-        let v = export_done("D:\\导出\\诊断日志-20260101-000000");
-        assert_eq!(v["data"]["privacy_note"], json!(PRIVACY_NOTE));
-        assert!(PRIVACY_NOTE.contains("下载地址"), "那句话要把风险说清：{PRIVACY_NOTE}");
-        assert!(PRIVACY_NOTE.contains("自己打开看一眼"), "要给出用户能做的事：{PRIVACY_NOTE}");
+        let v = export_done(crate::i18n::Lang::Zh, "D:\\导出\\诊断日志-20260101-000000");
+        assert_eq!(v["data"]["privacy_note"], json!(crate::i18n::t(crate::i18n::Lang::Zh, crate::i18n::Key::DiagExportPrivacy)));
+        assert!(crate::i18n::t(crate::i18n::Lang::Zh, crate::i18n::Key::DiagExportPrivacy).contains("下载地址"), "那句话要把风险说清");
+        assert!(crate::i18n::t(crate::i18n::Lang::Zh, crate::i18n::Key::DiagExportPrivacy).contains("自己打开看一眼"), "要给出用户能做的事");
         // ⚠️ 标题里**不许有路径**（布局事故的修法）——路径在 `path_detail` 那一格。
-        assert_eq!(v["data"]["headline"], json!("诊断日志已导出"));
+        assert_eq!(v["data"]["headline"], json!(crate::i18n::t(crate::i18n::Lang::Zh, crate::i18n::Key::DiagExportDone)));
         assert!(
             !v["data"]["headline"].as_str().unwrap_or_default().contains('\\'),
             "标题里混进了路径：{v}"
@@ -125,7 +129,7 @@ mod tests {
     /// 而把回执整个去掉 ⇒ 用户点了「导出」之后界面一动不动（与"卡住了"分不开）。
     #[test]
     fn cancelling_is_not_a_failure_but_it_still_says_something() {
-        let v = export_cancelled();
+        let v = export_cancelled(crate::i18n::Lang::Zh);
         assert_eq!(v["ok"], json!(true), "取消走的是**成功**信封（它不是错误）：{v}");
         assert_eq!(v["data"]["is_failure"], json!(false));
         assert_eq!(v["data"]["path_detail"], Value::Null, "没有文件夹可说");
@@ -139,7 +143,7 @@ mod tests {
     /// **失败那一档照登原文**（不加工、不换一句更客气的话），并且 `is_failure` 翻面。
     #[test]
     fn a_failed_export_reports_the_reason_verbatim() {
-        let why = crate::export::folder_failure_text("D:\\只读\\诊断日志-20260101-000000", "拒绝访问 (os error 5)");
+        let why = crate::export::folder_failure_text(crate::i18n::Lang::Zh, "D:\\只读\\诊断日志-20260101-000000", "拒绝访问 (os error 5)");
         let v = export_failed(&why);
         assert_eq!(v["data"]["headline"], json!(why), "原文逐字，不加工");
         assert_eq!(v["data"]["notice_text"], json!(why));

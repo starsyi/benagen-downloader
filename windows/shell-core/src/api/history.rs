@@ -132,8 +132,8 @@ pub fn apply(history: &History, write: &HistoryWrite, at_unix_seconds: i64) -> H
 ///    才发现历史里什么都没有（那些码是他手动敲进去的）。对齐 macOS 的
 ///    `historyWriteFailure`（那边落在一条常驻提示行上；我们这一侧落在失败信封里，
 ///    由界面决定摆在哪 —— 但**不许**吞掉它）。
-pub fn write_failed(cause: &str) -> String {
-    format!("历史记录写入失败：{cause}")
+pub fn write_failed(lang: crate::i18n::Lang, cause: &str) -> String {
+    crate::i18n::tf(lang, crate::i18n::Key::HistorySaveFailed, &[("cause", cause)])
 }
 
 // ---------------------------------------------------------------------------
@@ -366,11 +366,11 @@ mod tests {
         // ⚠️ 期望值是**字面量**（macOS 的原文逐字）：这句文案被 R-39 钉住过 ——
         //    它**不许**因为字体子集缺字而换词（换词是让字体决定文案）。
         assert_eq!(
-            write_failed("Permission denied (os error 13)"),
+            write_failed(crate::i18n::Lang::Zh, "Permission denied (os error 13)"),
             "历史记录写入失败：Permission denied (os error 13)",
             "这句话逐字来自 macOS 的 AppModel.swift:839（R-39）"
         );
-        assert!(write_failed("x").contains("失败"), "要说清是写失败这一步：{}", write_failed("x"));
+        assert!(write_failed(crate::i18n::Lang::Zh, "x").contains("失败"), "要说清是写失败这一步：{}", write_failed(crate::i18n::Lang::Zh, "x"));
     }
 
     /// ⚠️ **桥是双向恒等的**（同一份历史过一遍两个方向、字段一格不差）。

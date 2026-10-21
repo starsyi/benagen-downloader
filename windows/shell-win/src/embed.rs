@@ -75,16 +75,18 @@ pub const CORE_SHA256: &str = env!("BENAGEN_CORE_SHA256");
 /// 失败时返回一句**能直接显示给用户的话**（W-2：磁盘满 / 权限不足 / 被杀软拦截
 /// 三档分开说，规格 §10 要求可执行的补救）。
 #[cfg(target_os = "windows")]
-pub fn extract_core() -> Result<PathBuf, String> {
+pub fn extract_core(lang: shell_core::i18n::Lang) -> Result<PathBuf, String> {
     let cache_dir = shell_core::embedded_core::cache_dir_from(
         &shell_core::embedded_core::BENAGEN_CORE,
         std::env::var_os("LOCALAPPDATA"),
+        lang,
     )?;
     shell_core::embedded_core::extract_into(
         &shell_core::embedded_core::BENAGEN_CORE,
         CORE_BIN,
         CORE_SHA256,
         &cache_dir,
+        lang,
     )
 }
 

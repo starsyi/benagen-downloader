@@ -27,6 +27,12 @@ import Foundation
 /// `AppModel.applySettings(_:)`，而落状态的是**内核回执**那一份。
 public struct SettingsForm: Equatable, Sendable {
 
+    /// 语言三档的**线上词**（与内核 `i18n::Lang` 的 serde 名逐字相同）。
+    ///
+    /// 顺序就是界面上的顺序：跟随系统在前（默认），然后中文、English。
+    public static let languageChoices: [String] = ["system", "zh", "en"]
+
+
     // MARK: - 七个可编辑字段（顺序与内核 `core/src/settings.rs:32-47` 一致）
 
     /// `-j`，1–64。
@@ -44,6 +50,9 @@ public struct SettingsForm: Equatable, Sendable {
     public var maxTries: Int32
     /// `--retry-wait`，0–60 秒。
     public var retryWait: Int32
+    /// 界面语言（`"system"` / `"zh"` / `"en"`）。**不是数字参数**，但同属这一份设置：
+    /// 内核的 `set_settings` 整份替换，漏回这一格就等于把语言重置成"跟随系统"。
+    public var language: String
 
     /// 内核 `hello` 给的 `-k` 取值集合（**壳不生成它**，契约 §2.3）。
     public let choices: [String]
@@ -57,6 +66,7 @@ public struct SettingsForm: Equatable, Sendable {
         self.limitMbps = settings.limitMbps
         self.maxTries = settings.maxTries
         self.retryWait = settings.retryWait
+        self.language = settings.language
         self.choices = choices
     }
 
@@ -73,7 +83,8 @@ public struct SettingsForm: Equatable, Sendable {
                  minSplitSize: minSplitSize,
                  limitMbps: limitMbps,
                  maxTries: maxTries,
-                 retryWait: retryWait)
+                 retryWait: retryWait,
+                 language: language)
     }
 
     // MARK: - `-k` 的枚举面
@@ -98,10 +109,13 @@ public struct SettingsForm: Equatable, Sendable {
     ///    而一个手改进 `settings.json` 的 `999M` 会被内核回 `invalid_params`
     ///    —— 谁是合法值由内核判（壳不比内核更松、也不更严），这句话只负责
     ///    让客户知道"这个值不在内核给的清单里"。
-    public var minSplitSizeNote: String? {
+    public var minSplitSizeNote: String? { minSplitSizeNote(lang: .zh) }
+
+    /// 同一句话的**当前语言**版本。
+    public func minSplitSizeNote(lang: Lang) -> String? {
         choices.contains(minSplitSize)
             ? nil
-            : "当前值「\(minSplitSize)」不在内核给出的取值集合里。保存会按这个原值下发，由内核校验。"
+            : lang.tf(.settingsMinSplitNote, ["value": minSplitSize])
     }
 
     // MARK: - 发给内核的载荷
@@ -200,7 +214,10 @@ public struct SettingsForm: Equatable, Sendable {
     ///    "限速 0"很自然会读成"限速到 0 = 不让下载"，正好反了。内核侧同一个语义
     ///    （`Settings::global_options` 在不限速时**显式下发 `"0"`**，见
     ///    `core/src/settings.rs` 的那段实测）也说明 `0` 不是"缺省/未设"。
-    public static let limitMbpsNote = "0 = 不限速（不限制总下载速度）"
+    public static var limitMbpsNote: String { limitMbpsNote(lang: .zh) }
+
+    /// 同一句话的**当前语言**版本。
+    public static func limitMbpsNote(lang: Lang) -> String { lang.t(.settingsLimitNote) }
 
     /// 参数面板底下那句"改动什么时候生效"。
     ///
@@ -209,9 +226,10 @@ public struct SettingsForm: Equatable, Sendable {
     ///    经 `changeGlobalOption` **立即**下发；其余各项是 `per_task_options`，
     ///    在**添加任务**时随 `addUri` 交出去。不说清楚，客户改完 `-s` 会以为
     ///    正在传的那些任务变了（它们没变）。
-    public static let applyNote =
-        "改动会写盘保存（重开应用仍是这一份）。并行数与限速对已启动的引擎即时生效；"
-        + "其余各项在添加新任务时生效，已在传输的任务不受影响。"
+    public static var applyNote: String { applyNote(lang: .zh) }
+
+    /// 同一段说明的**当前语言**版本。
+    public static func applyNote(lang: Lang) -> String { lang.t(.settingsApplyNote) }
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +252,11 @@ public struct SettingsForm: Equatable, Sendable {
 ///     "保存失败"会把客户引到错误的方向（他会以为参数没存上，再改一遍）。
 public enum SettingsSaveFailure {
     public static func message(of error: Error) -> String {
-        AppModel.message(of: error)
+        message(of: error, lang: .zh)
+    }
+
+    /// 同一句话的**当前语言**版本（错误类别的措辞由 `AppModel.message` 取）。
+    public static func message(of error: Error, lang: Lang) -> String {
+        AppModel.message(of: error, lang: lang)
     }
 }

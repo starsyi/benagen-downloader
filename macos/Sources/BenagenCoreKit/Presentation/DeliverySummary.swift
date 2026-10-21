@@ -34,19 +34,19 @@ public struct DeliverySummary: Equatable, Sendable {
     private static let noValue = "—"
 
     /// 内核清单 → 摘要。
-    public static func of(_ info: DeliveryInfo) -> DeliverySummary {
+    public static func of(_ info: DeliveryInfo, lang: Lang = .zh) -> DeliverySummary {
         DeliverySummary(
             code: info.code.isEmpty ? noValue : info.code,
-            filesText: "\(info.totalFiles) 个文件",
+            filesText: lang.tf(.deliveryFilesCount, ["count": String(info.totalFiles)]),
             sizeText: ByteFormat.text(info.totalBytes),
             // ⚠️ 空串直接给占位符，**不进** `TimestampPresentation`：那里对空串的行为是
             //    "原样返回"，两者结果相同，但这一层的语义是"这个字段根本没有值"。
-            validityText: "有效期至 " + (info.expiresAt.isEmpty
-                                         ? noValue
-                                         : TimestampPresentation.text(info.expiresAt)),
+            validityText: lang.tf(.deliveryValidUntil, ["time": info.expiresAt.isEmpty
+                                                          ? noValue
+                                                          : TimestampPresentation.text(info.expiresAt)]),
             // 过期与否**只看内核给的 `expired`**：那是内核按同一份 `expires_at` 算出来的，
             // 壳再自己比一次时间就是重实现内核逻辑（约束 1），两边还会因为时钟差打架。
-            expiredBadgeText: info.expired ? "已过期" : nil)
+            expiredBadgeText: info.expired ? lang.t(.deliveryExpired) : nil)
     }
 
     /// `loadState` → 摘要。**只有 `.loaded` 有摘要**，其余（未加载 / 加载中 / 失败）是 `nil`。
@@ -54,9 +54,9 @@ public struct DeliverySummary: Equatable, Sendable {
     /// ⚠️ `.failed` 也是 `nil`：刷新失败时内核清单还留着（`loadDeliveryFailureKeepsTheOldManifest`），
     ///    但界面已经退回空态页（`RootView` 的分支），此时侧边栏再挂一个批次号，
     ///    就是在说"这批还在"而主区正说着"没有生效的批次"。
-    public static func of(_ state: AppModel.LoadState) -> DeliverySummary? {
+    public static func of(_ state: AppModel.LoadState, lang: Lang = .zh) -> DeliverySummary? {
         guard case .loaded(let info) = state else { return nil }
-        return of(info)
+        return of(info, lang: lang)
     }
 }
 
@@ -137,8 +137,12 @@ public enum DeliveryCodeEntry {
     ///    `switchDelivery` 那条路传的是 `nil`（面板没有这个字段），所以在那边不起作用。
     ///
     /// 🔴 同 [`tooLongHint`]：**壳自己写的用户可见文案**（内核收不到这条请求，没有原文可登）。
-    public static let baseURLTooLongHint =
-        "自定义下载地址过长（超过 \(maximumText)），请确认粘贴的内容确实是交付页的地址。"
+    public static var baseURLTooLongHint: String { baseURLTooLongHint(lang: .zh) }
+
+    /// 同上，按当前语言取句（视图用这一支）。
+    public static func baseURLTooLongHint(lang: Lang) -> String {
+        lang.tf(.deliveryBaseURLTooLong, ["limit": maximumText])
+    }
 
     /// 输入框里那一串过长时，界面上要说的话。
     ///
@@ -151,7 +155,12 @@ public enum DeliveryCodeEntry {
     ///    "请求超限的后果"（会一直等下去），是给"绕过视图的调用点"兜底的；
     ///    这里是输入框旁边的一句**即时提示**，在用户还没点之前就该出现。
     ///    两句都从 [`maximumText`] 派生（上界本身只有 [`maximumBytes`] 一份），改一处不会打架。
-    public static let tooLongHint = "交付码过长（超过 \(maximumText)），请只粘贴交付码本身或交付页链接。"
+    public static var tooLongHint: String { tooLongHint(lang: .zh) }
+
+    /// 同上，按当前语言取句（视图用这一支）。
+    public static func tooLongHint(lang: Lang) -> String {
+        lang.tf(.deliveryCodeTooLong, ["limit": maximumText])
+    }
 }
 
 // ---------------------------------------------------------------------------

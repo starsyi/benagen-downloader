@@ -106,7 +106,17 @@ public struct UpdateStatus: Equatable, Decodable, Sendable {
 ///      ② [`of`] 自己**只让"三段纯数字"的版本号进得来**（见下面 R21 那一段），
 ///         于是进到这条文案里的版本号在正常情形下很短。
 public struct UpdateNotice: Equatable {
-    public let text: String
+    /// 内核给的版本号原文；文案按当前语言**现场拼**（切换语言后提示条立刻跟着变）。
+    private let latest: String
+    private let current: String
+
+    /// 中文文案（既有调用点与既有测试读这一支）。
+    public var text: String { text(lang: .zh) }
+
+    /// 按当前语言取句（视图用这一支）。
+    public func text(lang: Lang) -> String {
+        lang.tf(.updateNoticeNewer, ["latest": latest, "current": current])
+    }
     /// 「去下载」要打开的链接。**`nil` = 不画那颗按钮**（链接缺失，或不在官方发布路径下）。
     public let url: URL?
 
@@ -137,7 +147,8 @@ public struct UpdateNotice: Equatable {
         guard isThreeSegmentVersion(latest) else { return nil }
 
         return UpdateNotice(
-            text: "有新版本 \(latest)（当前 \(st.current)）",
+            latest: latest,
+            current: st.current,
             // 🔴 链接要过**前缀白名单**（R15）：不在官方发布路径下就当作**没有链接**
             //    （提示照常出现，只是不画「去下载」）。见 `allowedReleaseURL`。
             url: st.url.flatMap(allowedReleaseURL(_:)))

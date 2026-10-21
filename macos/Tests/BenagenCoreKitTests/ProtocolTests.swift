@@ -296,11 +296,12 @@ private let GET_STATE_OK = #"{"id":7,"ok":true,"result":{"code":"R.pnhIQhki1xxKW
     // ① 键名**逐字**：不是数个数——camelCase 编出来同样是 7 个键，数个数零判别力。
     let obj = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
     #expect(Set(obj.keys) == ["parallel", "connections", "splits",
-                              "min_split_size", "limit_mbps", "max_tries", "retry_wait"])
+                              "min_split_size", "limit_mbps", "max_tries", "retry_wait",
+                              "language"])
 
     // ② 更强的：与真内核 `{"id":2,"method":"get_settings"}` 抓下来的 `settings` 子对象**逐字相同**
     #expect(String(decoding: body, as: UTF8.self)
-            == #"{"connections":16,"limit_mbps":0,"max_tries":3,"min_split_size":"20M","parallel":8,"retry_wait":1,"splits":16}"#)
+            == #"{"connections":16,"language":"system","limit_mbps":0,"max_tries":3,"min_split_size":"20M","parallel":8,"retry_wait":1,"splits":16}"#)
 
     // ③ 编解码两个口径互相对称（转出去能转回来）
     #expect(try CoreJSON.decoder.decode(Settings.self, from: body) == s)

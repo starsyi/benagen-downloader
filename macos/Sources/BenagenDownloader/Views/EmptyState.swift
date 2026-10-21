@@ -67,9 +67,9 @@ struct EmptyState: View {
     private var header: some View {
         VStack(spacing: 6) {
             mark
-            Text("输入交付码开始下载")
+            Text(model.language.t(.emptyTitle))
                 .font(.title2.weight(.semibold))
-            Text("交付码在交付邮件或交付页链接里（整条链接也可以直接粘进来）")
+            Text(model.language.t(.emptySubtitle))
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -112,7 +112,7 @@ struct EmptyState: View {
 
     private var entryCard: some View {
         VStack(spacing: 12) {
-            TextField("交付码", text: $code)
+            TextField(model.language.t(.deliveryCode), text: $code)
                 .textFieldStyle(.roundedBorder)
                 .font(.body)
                 .disabled(isBusy)
@@ -121,14 +121,14 @@ struct EmptyState: View {
             // 过长时**立刻**说清楚为什么（不是只把按钮变灰）：约束 4 要求用户看得见
             // "为什么按不动"，而文案是 `DeliveryCodeEntry.tooLongHint`（壳写的，理由在那边）。
             if codeTooLong {
-                Label(DeliveryCodeEntry.tooLongHint, systemImage: "exclamationmark.triangle")
+                Label(DeliveryCodeEntry.tooLongHint(lang: model.language), systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            Button("加载", action: load)
+            Button(model.language.t(.commonLoad), action: load)
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
                 // `codeTooLong` / `baseURLTooLong`：超过 2 KiB 的串**不许发**（约束 C-3 ——
@@ -137,7 +137,7 @@ struct EmptyState: View {
                 .disabled(isBusy || codeToLoad.isEmpty || codeTooLong || baseURLTooLong)
 
             // 对应 `load_delivery` 的 `base_url`；默认收起，普通客户永远用不到。
-            DisclosureGroup("高级：自定义下载地址", isExpanded: $showAdvanced) {
+            DisclosureGroup(model.language.t(.emptyAdvanced), isExpanded: $showAdvanced) {
                 VStack(alignment: .leading, spacing: 4) {
                     TextField("http://download.benagen.com", text: $baseURL)
                         .textFieldStyle(.roundedBorder)
@@ -145,7 +145,7 @@ struct EmptyState: View {
                         .disabled(isBusy)
                     // 过长时的说明**不在这里**：它会禁用「加载」那颗按钮，所以必须摆在
                     // 收起这个分组也看得见的地方（见 `entryCard` 里那一句与它的注释）。
-                    Text("留空即用默认交付服务器")
+                    Text(model.language.t(.emptyBaseURLNote))
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 }
@@ -157,7 +157,7 @@ struct EmptyState: View {
             //    「加载」，而"按钮灰着、界面上什么都不说"正是约束 4 要防的形态 ——
             //    用户完全可能填完地址之后把「高级」收起来再点加载。
             if baseURLTooLong {
-                Label(DeliveryCodeEntry.baseURLTooLongHint,
+                Label(DeliveryCodeEntry.baseURLTooLongHint(lang: model.language),
                       systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -214,7 +214,7 @@ struct EmptyState: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                Button("重试", action: load)
+                Button(model.language.t(.retry), action: load)
                     .buttonStyle(.borderless)
                     // 同「加载」：过长的码/地址不许发（「重试」要重试的那两个值同样可能过长
                     // —— 它们是从输入框或**壳的历史**里来的，见 `codeToLoad` 与 `baseURLToLoad`）。

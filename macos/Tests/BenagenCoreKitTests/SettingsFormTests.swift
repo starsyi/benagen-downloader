@@ -108,7 +108,7 @@ import Foundation
     #expect(f.splits == 5, "-s 这一格拿的必须是内核的 splits")
 }
 
-@Test func setSettingsAlwaysSendsAllSevenKeys() {
+@Test func setSettingsAlwaysSendsAllEightKeys() {
     // ⚠️ 内核的 set_settings 没有 serde default：少一个键整个请求就 invalid_params
     // ⚠️ 断的是**键名**，不是键的个数——`core/src/settings.rs:32-47` 的字段名逐字是
     //    snake_case，而 `Settings` 的属性名是 camelCase。按 `Settings` 的 Codable
@@ -121,7 +121,7 @@ import Foundation
     }
     #expect(Set(obj.keys) == [
         "parallel", "connections", "splits", "min_split_size",
-        "limit_mbps", "max_tries", "retry_wait",
+        "limit_mbps", "max_tries", "retry_wait", "language",
     ])
 }
 
@@ -138,7 +138,7 @@ import Foundation
     #expect(Set(top.keys) == ["settings"])
     #expect(inner == (try bodyObject(f.requestBody)))
     #expect(Set(inner.keys) == ["parallel", "connections", "splits", "min_split_size",
-                               "limit_mbps", "max_tries", "retry_wait"])
+                               "limit_mbps", "max_tries", "retry_wait", "language"])
 }
 
 @Test func theBodyIsDerivedFromTheSettingsTypeNotASecondCopyOfTheWireFormat() throws {

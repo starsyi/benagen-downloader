@@ -170,10 +170,10 @@ const _: () = assert!(
 ///    本壳有**三份**许可，所以那句话必须**跟着条目走**，不能写成一条全局的常量 ——
 ///    否则 OFL 那一页会写着 aria2 的话（一句**看起来对、实际错**的说明）。
 pub struct License {
-    /// 界面上的条目名（选择器里那一行）。
-    pub name: &'static str,
+    /// 界面上的条目名（选择器里那一行）—— 句子在 `i18n` 表里，这里只存键。
+    pub name: shell_core::i18n::Key,
     /// 一句话说明：这份许可是**随哪个内嵌组件**来的。
-    pub why: &'static str,
+    pub why: shell_core::i18n::Key,
     /// 全文（**逐字**，只做排版，不截断、不重排）。
     pub text: &'static str,
     /// 全文的 sha256（**登记值**，见上面那一段）。
@@ -192,22 +192,20 @@ pub struct License {
 ///    （"内嵌的可再分发资产必须随附许可全文"）。
 pub const LICENSES: [License; 3] = [
     License {
-        name: "GNU 通用公共许可协议 第 2 版（GPLv2）",
-        why: "本程序内嵌 aria2（GPLv2 许可）作为下载引擎，因此随附下列许可全文。",
+        name: shell_core::i18n::Key::LicenseGplName,
+        why: shell_core::i18n::Key::LicenseGplWhy,
         text: GPLV2,
         sha256: GPLV2_SHA256,
     },
     License {
-        name: "SIL 开放字体许可 1.1（OFL-1.1）",
-        why: "本程序内嵌 Noto Sans SC 的一个子集（SIL OFL 1.1 许可）作为界面字体，\
-              因此随附下列许可全文。",
+        name: shell_core::i18n::Key::LicenseOflName,
+        why: shell_core::i18n::Key::LicenseOflWhy,
         text: OFL_1_1,
         sha256: OFL_1_1_SHA256,
     },
     License {
-        name: "WebView2 SDK 许可（3-Clause BSD）",
-        why: "本程序随交付物再分发 Microsoft 的 WebView2Loader.dll（WebView2 SDK，\
-              3-Clause BSD 许可），因此随附下列许可全文。",
+        name: shell_core::i18n::Key::LicenseWebView2Name,
+        why: shell_core::i18n::Key::LicenseWebView2Why,
         text: WEBVIEW2_SDK,
         sha256: WEBVIEW2_SDK_SHA256,
     },
@@ -226,13 +224,13 @@ pub const LICENSES: [License; 3] = [
 ///
 /// ⚠️ `sha256` 也发出去：界面把它显示出来（可选中复制），用户能拿它去跟官方发布件核对
 ///    （见那三个登记值的文档）。
-pub fn wire() -> serde_json::Value {
+pub fn wire(lang: shell_core::i18n::Lang) -> serde_json::Value {
     let entries: Vec<serde_json::Value> = LICENSES
         .iter()
         .map(|license| {
             serde_json::json!({
-                "name": license.name,
-                "why": license.why,
+                "name": shell_core::i18n::t(lang, license.name),
+                "why": shell_core::i18n::t(lang, license.why),
                 "text": license.text,
                 "sha256": license.sha256,
             })
@@ -351,23 +349,23 @@ mod tests {
             assert!(
                 license.text.len() >= FLOOR_OF_THE_SHORTEST,
                 "{} 的全文只有 {} 字节 —— 那不像一份全文（连三份里较短那份的下限都没到）",
-                license.name,
+                shell_core::i18n::t(shell_core::i18n::Lang::Zh, license.name),
                 license.text.len()
             );
             assert!(
                 !license.sha256.is_empty(),
                 "{} 没有登记 sha256 —— 构建脚本第 5a 步靠它判'编进去的是不是全文'",
-                license.name
+                shell_core::i18n::t(shell_core::i18n::Lang::Zh, license.name)
             );
             assert!(
                 license.text.contains('\n'),
                 "{} 的全文连换行都没有？",
-                license.name
+                shell_core::i18n::t(shell_core::i18n::Lang::Zh, license.name)
             );
             assert!(
-                !license.why.is_empty() && license.why.contains('许'),
+                shell_core::i18n::t(shell_core::i18n::Lang::Zh, license.why).contains('许'),
                 "{} 缺一句'为什么会在这里'（OFL 那一页写 aria2 的话就是这种错的样子）",
-                license.name
+                shell_core::i18n::t(shell_core::i18n::Lang::Zh, license.name)
             );
         }
     }
@@ -482,7 +480,8 @@ mod tests {
     ///   * 只发两份 ⇒ 第一条断言红。
     #[test]
     fn the_wire_payload_carries_all_three_full_texts() {
-        let v = wire();
+        use shell_core::i18n::Lang;
+        let v = wire(Lang::Zh);
         let entries = v["licenses"].as_array().expect("licenses 必须是数组");
         assert_eq!(entries.len(), LICENSES.len(), "三份许可一份都不能少");
         assert_eq!(
@@ -504,15 +503,21 @@ mod tests {
                 ["name", "why", "text", "sha256"].into_iter().collect(),
                 "四格一个不多一个不少：{entry}"
             );
-            assert_eq!(entry["name"], serde_json::json!(license.name));
-            assert_eq!(entry["why"], serde_json::json!(license.why));
+            assert_eq!(
+                entry["name"],
+                serde_json::json!(shell_core::i18n::t(Lang::Zh, license.name))
+            );
+            assert_eq!(
+                entry["why"],
+                serde_json::json!(shell_core::i18n::t(Lang::Zh, license.why))
+            );
             assert_eq!(entry["sha256"], serde_json::json!(license.sha256));
             // ⚠️ **全文**（不是摘要、不是空串）：长度与内嵌的那一份逐字相同。
             assert_eq!(entry["text"], serde_json::json!(license.text));
             assert!(
                 entry["text"].as_str().unwrap_or_default().len() >= FLOOR_OF_THE_SHORTEST,
                 "{} 的全文短得不像全文：{}",
-                license.name,
+                shell_core::i18n::t(Lang::Zh, license.name),
                 entry["text"].as_str().unwrap_or_default().len()
             );
         }
@@ -528,8 +533,19 @@ mod tests {
             }
         }
         for license in LICENSES {
-            assert!(!license.name.trim().is_empty());
-            assert!(!license.why.trim().is_empty());
+            for lang in [shell_core::i18n::Lang::Zh, shell_core::i18n::Lang::En] {
+                let name = shell_core::i18n::t(lang, license.name);
+                let why = shell_core::i18n::t(lang, license.why);
+                assert!(!name.trim().is_empty());
+                assert!(!why.trim().is_empty());
+                if lang == shell_core::i18n::Lang::En {
+                    assert!(
+                        !name.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+                            && !why.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                        "英文许可文案里不许有汉字：{name} / {why}"
+                    );
+                }
+            }
         }
     }
 }
