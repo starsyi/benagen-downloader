@@ -432,7 +432,8 @@ public final class AppModel: ObservableObject {
                 historyStore: BatchHistoryStore? = nil,
                 preferencesStore: AppPreferencesStore? = nil,
                 downloadDir: String = "",
-                verboseLogging: Bool = false) {
+                verboseLogging: Bool = false,
+                language: String = "") {
         self.client = client
         self.historyStore = historyStore
         self.preferencesStore = preferencesStore
@@ -442,9 +443,11 @@ public final class AppModel: ObservableObject {
         self.handshakeTimeout = handshakeTimeout
         // 与传给第一个内核的那份**同一个来源**（生产里由 `live()` 从盘上读一次、两处都用它）
         // —— 所以"内存里的值"与"第一个内核拿到的 argv"不可能分叉。
-        let preferences = AppPreferences(downloadDir: downloadDir, verboseLogging: verboseLogging)
+        let preferences = AppPreferences(downloadDir: downloadDir, verboseLogging: verboseLogging,
+                                        language: language)
         self.downloadDir = preferences.downloadDir
         self.verboseLogging = preferences.verboseLogging
+        self.language = preferences.languageChoice ?? .zh
     }
 
     /// 测试接缝（带重启工厂）。
@@ -454,15 +457,18 @@ public final class AppModel: ObservableObject {
                 historyStore: BatchHistoryStore? = nil,
                 preferencesStore: AppPreferencesStore? = nil,
                 downloadDir: String = "",
-                verboseLogging: Bool = false) {
+                verboseLogging: Bool = false,
+                language: String = "") {
         self.client = client
         self.historyStore = historyStore
         self.preferencesStore = preferencesStore
         self.makeClient = makeClient
         self.handshakeTimeout = handshakeTimeout
-        let preferences = AppPreferences(downloadDir: downloadDir, verboseLogging: verboseLogging)
+        let preferences = AppPreferences(downloadDir: downloadDir, verboseLogging: verboseLogging,
+                                        language: language)
         self.downloadDir = preferences.downloadDir
         self.verboseLogging = preferences.verboseLogging
+        self.language = preferences.languageChoice ?? .zh
     }
 
     /// 「内核压根没起来」的形态（`live()` 找不到二进制时用它）：没有客户端，
@@ -473,15 +479,18 @@ public final class AppModel: ObservableObject {
          historyStore: BatchHistoryStore? = nil,
          preferencesStore: AppPreferencesStore? = nil,
          downloadDir: String = "",
-         verboseLogging: Bool = false) {
+         verboseLogging: Bool = false,
+         language: String = "") {
         self.client = nil
         self.historyStore = historyStore
         self.preferencesStore = preferencesStore
         self.makeClient = makeClient
         self.handshakeTimeout = handshakeTimeout
-        let preferences = AppPreferences(downloadDir: downloadDir, verboseLogging: verboseLogging)
+        let preferences = AppPreferences(downloadDir: downloadDir, verboseLogging: verboseLogging,
+                                        language: language)
         self.downloadDir = preferences.downloadDir
         self.verboseLogging = preferences.verboseLogging
+        self.language = preferences.languageChoice ?? .zh
         self.engine = engine
     }
 
@@ -532,14 +541,16 @@ public final class AppModel: ObservableObject {
                             historyStore: historyStore,
                             preferencesStore: preferencesStore,
                             downloadDir: preferences.downloadDir,
-                            verboseLogging: preferences.verboseLogging)
+                            verboseLogging: preferences.verboseLogging,
+                            language: preferences.language)
         } catch {
             return AppModel(engine: .unavailable(Self.message(of: error)),
                             makeClient: make,
                             historyStore: historyStore,
                             preferencesStore: preferencesStore,
                             downloadDir: preferences.downloadDir,
-                            verboseLogging: preferences.verboseLogging)
+                            verboseLogging: preferences.verboseLogging,
+                            language: preferences.language)
         }
     }
 
@@ -2089,6 +2100,18 @@ public final class AppModel: ObservableObject {
         // `zh`/`en` —— 问一次 `hello`（内核每次都按设置重新解析并回填 `k.language`），
         // 这样"设置里点 English"与"首启窗点 English"走的是同一条路。
         await refreshLanguage()
+        // 顺手记进壳自己的偏好：**启动期那几百毫秒**（窗口标题、握手前的菜单）
+        // 没有内核可问 —— 不记它，中文系统上选了英文的客户每次启动都会先看到中文。
+        // 失败只写诊断（语言在本次会话里已经生效，不值得为它回一句红条）。
+        if let store = preferencesStore {
+            do {
+                try store.save(store.load().settingLanguage(echoed.settings.language),
+                               lang: language)
+            } catch {
+                DiagnosticsLog.log("preferences_language_save_failed",
+                                   [("why", "\(error)")])
+            }
+        }
     }
 
     /// 只读地问一次 `hello`，把内核解析后的语言与"选过没有"落到本对象。

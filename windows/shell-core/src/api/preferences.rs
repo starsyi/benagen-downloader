@@ -556,3 +556,56 @@ mod tests {
                 "它不许长到让用户以为界面挂了：{RESTART_DEADLINE:?}");
     }
 }
+
+#[cfg(test)]
+mod english_payload_tests {
+    use super::*;
+
+    fn has_cjk(s: &str) -> bool {
+        s.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
+    }
+
+    #[test]
+    fn the_settings_payload_is_english_when_asked() {
+        use crate::protocol::{Settings, SettingsResult};
+        let current = SettingsResult {
+            settings: Settings {
+                parallel: 5,
+                connections: 8,
+                splits: 8,
+                min_split_size: "20M".to_string(),
+                limit_mbps: 0,
+                max_tries: 1,
+                retry_wait: 1,
+                language: "en".to_string(),
+            },
+            last_code: String::new(),
+        };
+        let text =
+            crate::api::settings::payload_for(&current, None, crate::i18n::Lang::En).to_string();
+        // 语言选项名**不翻译**（`中文` 就是 `中文`），其余都是英文。
+        let text = text.replace("中文", "");
+        assert!(!has_cjk(&text), "英文界面下设置载荷还有汉字：{text}");
+    }
+
+    #[test]
+    fn the_tree_payload_is_english_when_asked() {
+        use crate::presentation::download_targets::DownloadTargets;
+        let lang = crate::i18n::Lang::En;
+        let action = crate::api::tree::DownloadAction {
+            button_title: DownloadTargets::button_title(lang, &Default::default()),
+            empty_selection_hint: Some(DownloadTargets::empty_selection_hint(lang).to_string()),
+            blocked_reason: None,
+        };
+        let text = action.button_title.clone() + &action.empty_selection_hint.clone().unwrap_or_default();
+        assert!(!has_cjk(&text), "英文界面下文件树底栏还有汉字：{text}");
+    }
+
+    #[test]
+    fn the_preferences_payload_is_english_when_asked() {
+        let prefs = Preferences::new("");
+        let value = current(crate::i18n::Lang::En, &prefs);
+        let text = value.to_string();
+        assert!(!has_cjk(&text), "英文界面下这段载荷还有汉字：{text}");
+    }
+}

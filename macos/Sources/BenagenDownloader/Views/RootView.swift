@@ -152,6 +152,10 @@ struct RootView: View {
                 mainArea
             }
         }
+        // 窗口标题跟着界面语言走（`CFBundleDisplayName` 是打包时写死的中文名，
+        // 不随语言变；`.navigationTitle` 才是运行时可换的那一个）。英文界面下
+        // 标题栏仍然是「Benagen 数据下载工具」的话，客户看到的是"翻译只做了一半"。
+        .navigationTitle(model.language.t(.appTitle))
         .toolbar {
             ToolbarItem {
                 downloadButton

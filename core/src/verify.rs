@@ -155,6 +155,11 @@ pub fn check(dir: &Path, files: &[File]) -> (CheckResult, Vec<(String, Entry)>) 
             res.bad.push(f.path.clone());
             continue;
         }
+        // ⚠️ Windows 建不出来的名字（`:`、`*`、`?`、保留设备名…）在这里**仍然算 missing**：
+        // 盘上确实没有这些文件，六类契约里也**没有**"名字不合法"这一桶（新增第七桶会
+        // 同时改两壳的映射表与夹具，规格里那六条是契约）。真正的提醒发生在**开工之前**
+        // ——`op_enqueue` 用 `crate::names` 直接拒绝并点名是哪个字符（现场：40 个
+        // `SW_vs_SG.gsea.go.GO:0002181.pdf`），客户不会走到"下完了才发现缺文件"。
         let full = dir.join(&f.path);
         // 用 `symlink_metadata`（= Go 的 `os.Lstat`）而不是 `metadata`（= `os.Stat`）：
         // 要看得出"这个位置**本身**是什么"，而不是它指向什么——符号链接在本内核里

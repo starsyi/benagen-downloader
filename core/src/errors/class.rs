@@ -11,7 +11,7 @@
 
 use crate::i18n::Lang;
 
-/// 客户能理解的八类病灶。
+/// 客户能理解的九类病灶（0.3.1 增「文件名建不出来」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Class {
     /// 连不上服务器（连接失败/超时/被重置）。
@@ -30,6 +30,8 @@ pub enum Class {
     EngineCrashed,
     /// 落盘内容与清单的 CRC64/大小不符。
     VerifyMismatch,
+    /// 清单里的文件名在 Windows 上建不出来（冒号、通配符、保留设备名…）。
+    NameInvalid,
 }
 
 /// 判定时的**旁证**：同一个码，旁证不同就是不同的类。
@@ -54,6 +56,8 @@ pub enum Cause {
     Crashed,
     /// 引擎在但不回话（重启预算用尽）。
     Unresponsive,
+    /// 清单里有 Windows 建不出来的文件名。
+    BadName,
 }
 
 impl Class {
@@ -68,6 +72,7 @@ impl Class {
             Class::EngineUnresponsive => "engine_unresponsive",
             Class::EngineCrashed => "engine_crashed",
             Class::VerifyMismatch => "verify_mismatch",
+            Class::NameInvalid => "name_invalid",
         }
     }
 
@@ -82,6 +87,7 @@ impl Class {
             Class::DiskFull => 50,
             Class::DiskSlow => 40,
             Class::VerifyMismatch => 30,
+            Class::NameInvalid => 58,
             Class::NetworkUnreachable => 20,
             Class::DnsFailed => 19,
             Class::ServerRefused => 18,
@@ -107,6 +113,8 @@ impl Class {
             (Class::EngineCrashed, Lang::En) => {
                 "The download engine failed to start or has exited"
             }
+            (Class::NameInvalid, Lang::Zh) => "有文件名在 Windows 上建不出来",
+            (Class::NameInvalid, Lang::En) => "Some file names cannot be created on Windows",
             (Class::VerifyMismatch, Lang::Zh) => "文件校验没有通过",
             (Class::VerifyMismatch, Lang::En) => "A file failed verification",
             // `Lang::System` 永远不该走到这里（内核握手时就落定了具体语言）；
@@ -158,6 +166,12 @@ impl Class {
             (Class::EngineCrashed, Lang::En) => {
                 "The engine process could not start, or it exited midway."
             }
+            (Class::NameInvalid, Lang::Zh) => {
+                "清单里有名字带了 Windows 不允许的字符（例如冒号），系统建不出这些文件——文件本身是好的，换到 macOS / Linux 就能下。"
+            }
+            (Class::NameInvalid, Lang::En) => {
+                "The list contains names with characters Windows does not allow (for example a colon), so these files cannot be created. The files are fine; a macOS or Linux client can download them."
+            }
             (Class::VerifyMismatch, Lang::Zh) => {
                 "落盘的内容和清单里的 CRC64 / 大小对不上，这份文件不完整。"
             }
@@ -185,6 +199,8 @@ impl Class {
             (Class::EngineUnresponsive, Lang::En) => "Restart the engine",
             (Class::EngineCrashed, Lang::Zh) => "重启引擎",
             (Class::EngineCrashed, Lang::En) => "Restart the engine",
+            (Class::NameInvalid, Lang::Zh) => "联系交付方改名",
+            (Class::NameInvalid, Lang::En) => "Ask the sender to rename them",
             (Class::VerifyMismatch, Lang::Zh) => "重新下载该文件",
             (Class::VerifyMismatch, Lang::En) => "Download that file again",
             (_, Lang::System) => self.action(Lang::En),
@@ -202,6 +218,7 @@ pub const ALL: &[Class] = &[
     Class::EngineUnresponsive,
     Class::EngineCrashed,
     Class::VerifyMismatch,
+    Class::NameInvalid,
 ];
 
 /// **唯一**的分类判据。
@@ -224,9 +241,11 @@ pub fn class_of(code: &str, cause: Option<Cause>) -> Option<Class> {
             Cause::Verify => Class::VerifyMismatch,
             Cause::Crashed => Class::EngineCrashed,
             Cause::Unresponsive => Class::EngineUnresponsive,
+            Cause::BadName => Class::NameInvalid,
         });
     }
     match code {
+        kcodes::INVALID_FILENAME => Some(Class::NameInvalid),
         kcodes::PREFLIGHT_FAILED => Some(Class::DiskFull),
         kcodes::ENGINE_START_FAILED => Some(Class::EngineCrashed),
         kcodes::ENGINE_DISCONNECTED => Some(Class::EngineUnresponsive),
@@ -273,7 +292,9 @@ mod tests {
         }
     }
 
-    /// 判据：**线上字符串是八个稳定的单词**——壳按它做分支，改名等于改协议。
+    /// 判据：**线上字符串是九个稳定的单词**——壳按它做分支，改名等于改协议。
+    /// 第九个（`name_invalid`）是 0.3.1 现场补的：老壳不认识它，会退回"只显示原文"
+    /// 的兜底路径（`Class::of_wire` 返回 None），不会崩也不会误分类。
     #[test]
     fn the_wire_words_are_exactly_the_spec() {
         let words: Vec<&str> = ALL.iter().map(|c| c.wire()).collect();
@@ -288,6 +309,7 @@ mod tests {
                 "engine_unresponsive",
                 "engine_crashed",
                 "verify_mismatch",
+                "name_invalid",
             ]
         );
     }

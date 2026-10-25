@@ -1012,12 +1012,40 @@ pub fn settings_set(app: tauri::State<'_, Shell>, settings: Settings) -> Value {
             app.session.set_last_error(None);
             // 客户这次明确选过语言了（首启询问从此不再出现）。
             app.session.note_language_chosen(&echoed.settings.language);
+            // 顺手把这一格抄进壳自己的偏好：**启动期那几句话在握手之前**
+            // （第二实例提示框、托盘、起不来时的 MessageBoxW），那时只能问这份文件。
+            remember_language(&echoed.settings.language);
             api::settings::payload_for(&echoed, handshake.as_deref(), app.session.lang())
         }
         Err(why) => {
             note_failure(&app.session, &why);
             api::failure(&why)
         }
+    }
+}
+
+/// 把用户选的界面语言记进壳自己的 `preferences.json`（**尽力而为**）。
+///
+/// 为什么要记：启动期（握手之前）的第二实例提示框、托盘菜单、起不来的消息框都是
+/// 壳自己说的，那一刻没有内核可问。不记这一格的表现是：中文系统上选了英文的客户，
+/// 关掉再双击一次会看到一个中文的「已经在运行了」框（0.3.0 真机反馈）。
+///
+/// ⚠️ 失败**只记诊断日志、不改回执**：内核已经收下这次设置了，语言在本次会话里
+///    已经生效；这一格只影响**下次启动的头几百毫秒**。为它回一句红条，是拿
+///    "下次启动可能还是系统语言"去换"用户以为保存失败"。
+/// ⚠️ 读-改-写**保留另外两格**（`setting_language` 负责），别整份覆盖成只有语言。
+fn remember_language(value: &str) {
+    let Ok(path) = preferences_path() else { return };
+    let current = Preferences::load(&path);
+    let updated = current.setting_language(value);
+    if updated.language == current.language {
+        return;
+    }
+    if let Err(cause) = updated.save(&path) {
+        shell_core::diagnostics::log(
+            "preferences_language_save_failed",
+            &[("why", cause.to_string())],
+        );
     }
 }
 

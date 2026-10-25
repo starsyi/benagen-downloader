@@ -25,10 +25,12 @@ pub enum ClassKind {
     EngineUnresponsive,
     EngineCrashed,
     VerifyMismatch,
+    /// 清单里的文件名在 Windows 上建不出来（冒号/通配符/保留设备名）。
+    NameInvalid,
 }
 
 impl ClassKind {
-    pub const ALL: [ClassKind; 8] = [
+    pub const ALL: [ClassKind; 9] = [
         ClassKind::NetworkUnreachable,
         ClassKind::DnsFailed,
         ClassKind::ServerRefused,
@@ -37,6 +39,7 @@ impl ClassKind {
         ClassKind::EngineUnresponsive,
         ClassKind::EngineCrashed,
         ClassKind::VerifyMismatch,
+        ClassKind::NameInvalid,
     ];
 
     /// 线上词（与 `core/src/errors/class.rs` 的 `Class::wire` 逐字相同）。
@@ -50,6 +53,7 @@ impl ClassKind {
             ClassKind::EngineUnresponsive => "engine_unresponsive",
             ClassKind::EngineCrashed => "engine_crashed",
             ClassKind::VerifyMismatch => "verify_mismatch",
+            ClassKind::NameInvalid => "name_invalid",
         }
     }
 
@@ -69,6 +73,7 @@ impl ClassKind {
             ClassKind::EngineUnresponsive => 20,
             ClassKind::EngineCrashed => 19,
             ClassKind::VerifyMismatch => 18,
+            ClassKind::NameInvalid => 28,
         }
     }
 
@@ -89,6 +94,8 @@ impl ClassKind {
             (EngineUnresponsive, _) => "The download engine stopped answering",
             (EngineCrashed, crate::i18n::Lang::Zh) => "下载引擎启动失败或已退出",
             (EngineCrashed, _) => "The download engine failed to start or exited",
+            (NameInvalid, crate::i18n::Lang::Zh) => "有文件名在 Windows 上建不出来",
+            (NameInvalid, _) => "Some file names cannot be created on Windows",
             (VerifyMismatch, crate::i18n::Lang::Zh) => "文件校验没有通过",
             (VerifyMismatch, _) => "File verification failed",
         }
@@ -111,6 +118,8 @@ impl ClassKind {
             (EngineUnresponsive, _) => "The engine did not answer several times in a row and the automatic restart budget is used up.",
             (EngineCrashed, crate::i18n::Lang::Zh) => "下载引擎没能起来，或者起来之后退出了。",
             (EngineCrashed, _) => "The engine could not start, or it exited after starting.",
+            (NameInvalid, crate::i18n::Lang::Zh) => "清单里有名字带了 Windows 不允许的字符（例如冒号），系统建不出这些文件——文件本身是好的。",
+            (NameInvalid, _) => "The list has names with characters Windows does not allow (for example a colon), so these files cannot be created. The files themselves are fine.",
             (VerifyMismatch, crate::i18n::Lang::Zh) => "下载完的内容与清单里的校验值对不上。",
             (VerifyMismatch, _) => "The downloaded content does not match the checksum in the file list.",
         }
@@ -129,6 +138,8 @@ impl ClassKind {
             (DiskFull, _) => "Pick another folder, or free up space.",
             (EngineUnresponsive | EngineCrashed, crate::i18n::Lang::Zh) => "重启客户端；仍然失败就导出诊断日志。",
             (EngineUnresponsive | EngineCrashed, _) => "Restart the app; if it still fails, export diagnostics.",
+            (NameInvalid, crate::i18n::Lang::Zh) => "联系交付方改名，或改用 macOS / Linux 客户端。",
+            (NameInvalid, _) => "Ask the sender to rename them, or use the macOS / Linux client.",
             (VerifyMismatch, crate::i18n::Lang::Zh) => "重新下载这个文件。",
             (VerifyMismatch, _) => "Download this file again.",
         }
@@ -280,6 +291,7 @@ mod tests {
                 "engine_unresponsive",
                 "engine_crashed",
                 "verify_mismatch",
+                "name_invalid",
             ]
         );
         assert_eq!(ClassKind::of_wire("nope"), None);
@@ -291,7 +303,7 @@ mod tests {
         let mut seen: Vec<u8> = ClassKind::ALL.iter().map(|k| k.severity()).collect();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), 8, "八类严重度必须两两不同");
+        assert_eq!(seen.len(), 9, "九类严重度必须两两不同");
         assert!(ck("network_unreachable").severity() > ck("verify_mismatch").severity());
     }
 

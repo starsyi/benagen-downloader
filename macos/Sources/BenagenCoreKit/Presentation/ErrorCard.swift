@@ -18,7 +18,7 @@ import Foundation
 // 英文表里有汉字会被 `ErrorCardTests.noCJKInTheEnglishCards` 抓住。
 // ---------------------------------------------------------------------------
 
-/// 八类病灶（线上词见 `rawValue`，与 `core/src/errors/class.rs::Class::wire` 逐字相同）。
+/// 九类病灶（线上词见 `rawValue`，与 `core/src/errors/class.rs::Class::wire` 逐字相同）。
 public enum ErrorClass: String, CaseIterable, Equatable, Sendable {
     case networkUnreachable = "network_unreachable"
     case dnsFailed = "dns_failed"
@@ -28,6 +28,7 @@ public enum ErrorClass: String, CaseIterable, Equatable, Sendable {
     case engineUnresponsive = "engine_unresponsive"
     case engineCrashed = "engine_crashed"
     case verifyMismatch = "verify_mismatch"
+    case nameInvalid = "name_invalid"
 
     /// 线上词（`rawValue` 的别名，读起来与内核那侧同名）。
     public var wire: String { rawValue }
@@ -52,6 +53,7 @@ public enum ErrorClass: String, CaseIterable, Equatable, Sendable {
         case .engineUnresponsive: return 20
         case .engineCrashed: return 19
         case .verifyMismatch: return 18
+        case .nameInvalid: return 28
         }
     }
 
@@ -72,6 +74,8 @@ public enum ErrorClass: String, CaseIterable, Equatable, Sendable {
         case (.engineUnresponsive, .en): return "The download engine stopped answering"
         case (.engineCrashed, .zh): return "下载引擎启动失败或已退出"
         case (.engineCrashed, .en): return "The download engine failed to start or exited"
+        case (.nameInvalid, .zh): return "有文件名在 Windows 上建不出来"
+        case (.nameInvalid, .en): return "Some file names cannot be created on Windows"
         case (.verifyMismatch, .zh): return "文件校验没有通过"
         case (.verifyMismatch, .en): return "File verification failed"
         }
@@ -108,6 +112,10 @@ public enum ErrorClass: String, CaseIterable, Equatable, Sendable {
             return "下载引擎没能起来，或者起来之后退出了。"
         case (.engineCrashed, .en):
             return "The engine could not start, or it exited after starting."
+        case (.nameInvalid, .zh):
+            return "清单里有名字带了 Windows 不允许的字符（例如冒号），系统建不出这些文件——文件本身是好的。"
+        case (.nameInvalid, .en):
+            return "The list has names with characters Windows does not allow (for example a colon), so these files cannot be created. The files themselves are fine."
         case (.verifyMismatch, .zh):
             return "下载完的内容与清单里的校验值对不上。"
         case (.verifyMismatch, .en):
@@ -132,6 +140,8 @@ public enum ErrorClass: String, CaseIterable, Equatable, Sendable {
             return "重启客户端；仍然失败就导出诊断日志。"
         case (.engineUnresponsive, .en), (.engineCrashed, .en):
             return "Restart the app; if it still fails, export diagnostics."
+        case (.nameInvalid, .zh): return "联系交付方改名，或改用 macOS / Linux 客户端。"
+        case (.nameInvalid, .en): return "Ask the sender to rename them, or use the macOS / Linux client."
         case (.verifyMismatch, .zh): return "重新下载这个文件。"
         case (.verifyMismatch, .en): return "Download this file again."
         }

@@ -43,6 +43,8 @@ pub enum MsgKey {
     CliVerifyFailed,
     /// 清单 404——最常见的失败，值得一句能照做的提示。
     DeliveryNotFound,
+    /// 清单里有 Windows 建不出来的文件名（冒号、通配符、保留设备名…）。
+    InvalidFilename,
 
     // ── CLI（T8）───────────────────────────────────────────────────────────
     // 帮助与用法错误发生在**内核起来之前**，所以它们的语言由 `args::pick_lang`
@@ -168,6 +170,7 @@ fn zh(key: MsgKey) -> &'static str {
         MsgKey::CliIncomplete => "有 {failed} 个文件没能下完：",
         MsgKey::CliVerifyFailed => "校验没通过 —— {counts}",
         MsgKey::DeliveryNotFound => "清单不存在（404）——请确认交付码是否正确：{url}",
+        MsgKey::InvalidFilename => "这批数据里有 {count} 个文件名在 Windows 上建不出来（{reason}，示例：{example}）。文件本身没问题，是名字里带了 Windows 不允许的东西。请联系交付方改名，或改用 macOS / Linux 客户端下载。",
 
         // ── CLI（T8）───────────────────────────────────────────────────────
         // ⚠️ 下面这些中文是 0.2.9 里**逐字存在**的原句：只许搬进这张表，
@@ -293,6 +296,7 @@ fn en(key: MsgKey) -> &'static str {
         MsgKey::CliIncomplete => "{failed} file(s) could not be finished:",
         MsgKey::CliVerifyFailed => "Verification failed - {counts}",
         MsgKey::DeliveryNotFound => "The file list was not found (404) - please check the delivery code: {url}",
+        MsgKey::InvalidFilename => "This batch has {count} file name(s) that Windows cannot create ({reason}, for example: {example}). The files themselves are fine - the names just contain characters Windows does not allow. Ask the sender to rename them, or download with the macOS / Linux client.",
 
         // ── CLI (T8)─────────────────────────────────────────────────────────
         MsgKey::CliHelp => r#"benagen-dl - download a delivery batch in full
@@ -429,6 +433,7 @@ pub const ALL: &[MsgKey] = &[
     MsgKey::CliIncomplete,
     MsgKey::CliVerifyFailed,
     MsgKey::DeliveryNotFound,
+    MsgKey::InvalidFilename,
     MsgKey::CliHelp,
     MsgKey::CliUsageSnippet,
     MsgKey::CliErrOnlyOneCode,

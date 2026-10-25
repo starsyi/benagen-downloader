@@ -540,6 +540,8 @@ function applyRoute(route, loadState) {
  *    闸门本身就是这一格报出来的（`state().allows_requests`），
  *    它自己再被闸门挡住就永远解不开了（规格 §3.5 的闸门明文把 `state`/`retry` 排除在外）。
  */
+let paintedLang = null;
+
 async function tickState() {
   let state;
   try {
@@ -563,6 +565,15 @@ async function tickState() {
   applyCopy(document, state.copy);
   applyCopyToTemplates(state.copy);
   if (typeof state.lang === "string") {
+    // 语言变了 ⇒ 整页重载一次。为什么不是"就地重画"：译文装在**上一次载荷**里
+    // （文件树的底栏按钮、换码历史的行、几处一次性的回执），重画本地缓存只会把
+    // 旧语言再贴一遍 —— 那份"英文界面里夹着中文"的现场就是这么来的。
+    // 重载后 `paintedLang` 从同一个值重新起算，不会自己转圈。
+    if (paintedLang !== null && paintedLang !== state.lang) {
+      location.reload();
+      return;
+    }
+    paintedLang = state.lang;
     document.documentElement.lang = state.lang === "en" ? "en" : "zh-CN";
   }
   // 首启语言询问（规格 W1）：判据是 `language_chosen === false`（**设置文件里有没有

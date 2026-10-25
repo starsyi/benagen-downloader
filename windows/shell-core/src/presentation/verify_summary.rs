@@ -978,8 +978,6 @@ mod tests {
     }
 
     /// 上游 `noResultAtAllIsNotAnAllClear`。
-    #[test]
-
     /// 判据（规格 W2）：**同一份回执、两种语言**，六类行与顶部总结都换话，
     /// 而且英文里一个汉字都没有。
     ///

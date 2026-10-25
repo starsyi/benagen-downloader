@@ -29,7 +29,8 @@ public struct AppPreferences: Equatable, Sendable {
     public static let version = 1
 
     /// 没有配置过任何东西（= 一切走默认）。
-    public static let empty = AppPreferences(downloadDir: "", verboseLogging: false)
+    public static let empty = AppPreferences(downloadDir: "", verboseLogging: false,
+                                            language: "")
 
     /// 用户选的下载目录。**空串 = 未配置**（E-5：不传 `--download-dir`）。
     public let downloadDir: String
@@ -43,14 +44,33 @@ public struct AppPreferences: Equatable, Sendable {
     ///    内核的缺省就是 normal，多拼一对 `--log-level normal` 只多一处会漂的东西）。
     public let verboseLogging: Bool
 
+    /// 用户选过的**界面语言**（`system` / `zh` / `en`；空串 = 从没选过）。
+    ///
+    /// 为什么壳要自己存一份：启动期那几句话发生在握手之前（窗口标题、首启前的菜单、
+    /// 起不来时的系统提示），那一刻没有内核可问。不存它，中文系统上选了英文的客户
+    /// 关掉再开一次时，前几百毫秒仍是中文（Windows 侧同一格的由来写在
+    /// `windows/shell-core/src/storage/preferences.rs` 的 `language` 字段上）。
+    public let language: String
+
     /// ⚠️ `downloadDir` 有默认值（"什么都没配"是一个**真实存在的状态**，E-5），
     ///    而 `verboseLogging` **没有**：这一格是 2026-10-06 新加的，给它一个默认值就会让
     ///    `AppPreferences(downloadDir: path)` 这种写法**静默地**把详细日志关掉 ——
     ///    这正是本功能修掉的那个 bug（`settingDownloadDir` 的旧写法）的同一形状。
     ///    **少传一个实参应该是编译错误**（与 `CoreClient.coreArguments` / `live` 同一条）。
-    public init(downloadDir: String = "", verboseLogging: Bool) {
+    public init(downloadDir: String = "", verboseLogging: Bool, language: String = "") {
         self.downloadDir = Self.normalized(downloadDir)
         self.verboseLogging = verboseLogging
+        self.language = language.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 启动期那一门语言：选过 `zh`/`en` 就照它，其余（没选过 / `system` / 手改坏）⇒ `nil`
+    /// （调用方退回系统语言）。
+    public var languageChoice: Lang? {
+        switch language {
+        case "zh": return .zh
+        case "en": return .en
+        default: return nil
+        }
     }
 
     /// 配过下载目录没有。**它是"要不要传 `--download-dir`"的唯一判据**。
@@ -61,12 +81,18 @@ public struct AppPreferences: Equatable, Sendable {
     /// ⚠️ 必须**带上另一格**：写成 `AppPreferences(downloadDir: path)` 的结局是
     ///    用户改一次下载目录，详细日志就被**静默关掉**（盘上也是）。
     public func settingDownloadDir(_ path: String) -> AppPreferences {
-        AppPreferences(downloadDir: path, verboseLogging: verboseLogging)
+        AppPreferences(downloadDir: path, verboseLogging: verboseLogging, language: language)
     }
 
     /// 改详细日志那一格（返回新值）。同 [`settingDownloadDir`]：**另一格原样带着走**。
     public func settingVerboseLogging(_ on: Bool) -> AppPreferences {
-        AppPreferences(downloadDir: downloadDir, verboseLogging: on)
+        AppPreferences(downloadDir: downloadDir, verboseLogging: on, language: language)
+    }
+
+    /// 记下用户选的界面语言（`applySettings` 成功后抄内核回执那一格）。
+    /// **另外两格原样带着走**（同上）。
+    public func settingLanguage(_ value: String) -> AppPreferences {
+        AppPreferences(downloadDir: downloadDir, verboseLogging: verboseLogging, language: value)
     }
 
     // MARK: - 磁盘形状
@@ -86,7 +112,9 @@ public struct AppPreferences: Equatable, Sendable {
                               // ⚠️ **缺字段 = 关**：老客户那份文件里没有这一格。
                               //    写成 `?? true` 的表现是"从没开过详细日志的人，
                               //    升级之后日志突然开始详细记录"，而没有任何东西会红。
-                              verboseLogging: root["verbose_logging"] as? Bool ?? false)
+                              verboseLogging: root["verbose_logging"] as? Bool ?? false,
+                              // 缺字段 = 没选过（老文件）⇒ 启动期跟系统走。
+                              language: root["language"] as? String ?? "")
     }
 
     /// 同上（给测试与调用方一个不用自己转 `Data` 的入口）。
@@ -102,7 +130,8 @@ public struct AppPreferences: Equatable, Sendable {
     public func serialized() throws -> Data {
         try JSONSerialization.data(withJSONObject: ["version": Self.version,
                                                     "download_dir": downloadDir,
-                                                    "verbose_logging": verboseLogging],
+                                                    "verbose_logging": verboseLogging,
+                                                    "language": language],
                                    options: [.prettyPrinted, .sortedKeys,
                                              .withoutEscapingSlashes])
     }

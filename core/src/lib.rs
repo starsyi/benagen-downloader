@@ -19,6 +19,7 @@ pub mod intent;
 pub mod kernel;
 pub mod legtrim;
 pub mod migrate;
+pub mod names;
 pub mod paths;
 pub mod planner;
 pub mod procstat;
@@ -61,4 +62,6 @@ pub mod kcodes {
     pub const ENGINE_RPC_FAILED: &str = "engine_rpc_failed";
     /// `list_dir` 的路径不在清单里。
     pub const PATH_NOT_FOUND: &str = "path_not_found";
+    /// 清单里有 Windows 建不出来的文件名（冒号、通配符、保留设备名…）。**引擎没有被启动。**
+    pub const INVALID_FILENAME: &str = "invalid_filename";
 }

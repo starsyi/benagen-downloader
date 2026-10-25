@@ -59,7 +59,36 @@ extern "system" {
 /// ⚠️ 这是唯一一处把「系统 locale」翻成 `Lang` 的地方：`main` / `bootstrap` /
 ///    `single_instance` 只调它，不各自判字符串（各处自己判 = 同一个真相多个来源）。
 pub fn startup_lang() -> shell_core::i18n::Lang {
-    lang_for_locale(&system_locale())
+    startup_lang_with(saved_language().as_deref(), &system_locale())
+}
+
+/// **纯函数**那一半：用户选过的那一格压过系统语言。
+///
+/// 为什么需要它：启动期那几句话（第二实例提示框、托盘、起不来时的 `MessageBoxW`）
+/// 发生在**握手之前**，那时问不到内核的 `settings.language` —— 只有壳自己的
+/// `preferences.json` 里记着。少了这一档，中文系统上选了英文的客户会突然看到一个
+/// 中文的「已经在运行了」框（0.3.0 真机反馈）。
+///
+/// 口径：`zh` / `en` 照它；其余（没选过、`system`、手改坏的）⇒ 系统语言。
+pub fn startup_lang_with(
+    saved: Option<&str>,
+    system_locale: &str,
+) -> shell_core::i18n::Lang {
+    match saved {
+        Some("zh") => shell_core::i18n::Lang::Zh,
+        Some("en") => shell_core::i18n::Lang::En,
+        _ => lang_for_locale(system_locale),
+    }
+}
+
+/// 壳自己记着的那个选择（读不到任何东西 ⇒ `None`，绝不 panic —— 启动期没有第二道闸）。
+fn saved_language() -> Option<String> {
+    let path = shell_core::storage::dir()
+        .ok()?
+        .join(shell_core::storage::preferences::FILE_NAME);
+    shell_core::storage::preferences::Preferences::load(&path)
+        .language_choice()
+        .map(str::to_string)
 }
 
 /// locale 串 → 界面语言。**主语言是中文 ⇒ `Zh`，其余 ⇒ `En`**（与
@@ -109,5 +138,21 @@ mod tests {
         // 非 Windows 上读环境变量；这台测试机可能什么都没有 —— 那就必须是 `en-US`
         // （**绝不允许空串**：空串交给内核会走"环境变量兜底"那条路，等于白交）。
         assert!(!system_locale().trim().is_empty());
+    }
+
+    /// 启动期：**用户选过的那一格压过系统语言**（真机反馈：选了英文的机器上，
+    /// 第二实例提示框还是中文 —— 那个框发生在握手之前）。
+    #[test]
+    fn the_saved_choice_beats_the_system_locale_at_startup() {
+        use shell_core::i18n::Lang;
+        assert_eq!(startup_lang_with(Some("en"), "zh-CN"), Lang::En);
+        assert_eq!(startup_lang_with(Some("zh"), "en-US"), Lang::Zh);
+        assert_eq!(startup_lang_with(None, "zh-CN"), Lang::Zh);
+        assert_eq!(startup_lang_with(Some("system"), "zh-CN"), Lang::Zh);
+        assert_eq!(
+            startup_lang_with(Some("fr"), "en-US"),
+            Lang::En,
+            "不认识的值不许当成中文，也不许 panic"
+        );
     }
 }

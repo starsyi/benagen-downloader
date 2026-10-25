@@ -3063,6 +3063,30 @@ fn free_bytes(dir: &Path) -> Result<u64, String> {
 ///     界面「全部下载」在整批都完整时走的就是这条——它不是错误。
 ///   - `paths` **非空**（客户点名了具体文件/目录）⇒ `resolve_targets` 的报错**全部原样保留**，
 ///     点名一个不存在的路径仍然回 `invalid_params`（"不存在的路径"必须有声音，D-7）。
+/// 「这批文件名在 Windows 上建不出来」那一份错误体（纯函数，便于在非 Windows 上测）。
+///
+/// 为什么单独抽出来：拒绝分支本身挂在 `cfg!(windows)` 后面，在 macOS/Linux 上跑不到；
+/// 而**措辞**（数了几个、点出哪个字符、给出哪一条示例、带哪个 class）是客户唯一看到的东西，
+/// 必须有判别力用例钉住。
+fn invalid_filename_error(lang: crate::i18n::Lang, scan: &crate::names::Scan) -> ErrorBody {
+    let (_seg, reason) = scan.first.clone().expect("count>0 必有 first");
+    let count = scan.count.to_string();
+    let reason = reason.describe();
+    let example = scan.examples.first().cloned().unwrap_or_default();
+    let msg = crate::i18n::text::tf(
+        lang,
+        crate::i18n::text::MsgKey::InvalidFilename,
+        &[
+            ("count", count.as_str()),
+            ("reason", reason.as_str()),
+            ("example", example.as_str()),
+        ],
+    );
+    let mut body = ErrorBody::new(kcodes::INVALID_FILENAME, msg);
+    body.class = Some(crate::errors::Class::NameInvalid.wire().to_string());
+    body
+}
+
 pub fn op_enqueue(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, ErrorBody> {
     // 纯参数解析（连锁都不用取）
     let raw: Vec<String> = params
@@ -3148,6 +3172,17 @@ pub fn op_enqueue(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, 
                 ("ms", t0.elapsed().as_millis().to_string()),
             ],
         );
+
+        // ①½ 名字能不能在这台机器上建出来（Windows）：
+        // `:`、`*`、`?`、`"`、`<`、`>`、`|`、`\\` 与保留设备名会让 aria2 一律建不出文件，
+        // 而它的失败在传输列表里只是"这一条没动"，客户看到的是"已完成 / 校验通过 / 少 40 个文件"。
+        // **开工前拒绝**，比下完 100 GB 再说便宜得多；句子在 i18n 表里，示例逐字带出来。
+        if cfg!(windows) {
+            let scan = crate::names::scan(targets.iter().map(|f| f.path.as_str()));
+            if !scan.is_clean() {
+                return Err(invalid_filename_error(k.language, &scan));
+            }
+        }
 
         // ② 起引擎（仍在锁内：起引擎的网络 I/O 是既有的另一处，见 `ensure_engine`）。
         let t1 = std::time::Instant::now();
@@ -4251,6 +4286,32 @@ pub fn write_line(out: &mut impl Write, r: &Response) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 拒绝那一条错误体：数对了几个、点出了哪个字符、带上了哪条示例、class 是不是九类里那个。
+    ///
+    /// 判别力：把 `count` 换成常量、或丢掉 `example`、或 class 写成 `disk_full`，
+    /// 这条都会红——它是客户唯一看到的措辞。
+    #[test]
+    fn the_invalid_filename_error_names_the_count_the_char_and_an_example() {
+        let scan = crate::names::scan([
+            "d/SW_vs_SG.gsea.go.GO:0002181.pdf",
+            "d/ok.bin",
+            "d/other*name.bin",
+        ]);
+        for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
+            let body = invalid_filename_error(lang, &scan);
+            assert_eq!(body.code, "invalid_filename");
+            assert_eq!(body.class.as_deref(), Some("name_invalid"));
+            assert!(body.message.contains('2'), "数出来的个数必须进句子: {}", body.message);
+            assert!(
+                body.message.contains("SW_vs_SG.gsea.go.GO:0002181.pdf"),
+                "示例要逐字带出来: {}",
+                body.message
+            );
+            assert!(body.message.contains('`'), "要点出具体字符: {}", body.message);
+        }
+    }
+
 
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;

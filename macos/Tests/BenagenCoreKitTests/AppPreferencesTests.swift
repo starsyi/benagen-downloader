@@ -163,3 +163,30 @@ import Foundation
     #expect(VerboseLoggingChange.failed(message: "x").isFailure)
     #expect(!VerboseLoggingChange.changed(on: true).isFailure)
 }
+
+/// 界面语言那一格：**壳自己记一份**，供启动期（握手之前）那几百毫秒用。
+///
+/// 判别力：把 `parse` 里的 `language` 读成 `nil`（或忘掉 `serialized` 里那一键）
+/// ⇒ 本条红 —— 表现是"选了英文，下次启动的头几百毫秒仍是中文"。
+@Test func theLanguageChoiceSurvivesThePreferenceFile() {
+    #expect(AppPreferences.parse("{}").languageChoice == nil)
+
+    let saved = AppPreferences(downloadDir: "/abs/path", verboseLogging: true).settingLanguage("en")
+    #expect(saved.languageChoice == .en)
+    let text = String(decoding: try! saved.serialized(), as: UTF8.self)
+    #expect(text.contains("\"language\" : \"en\""))
+    let back = AppPreferences.parse(text)
+    #expect(back.languageChoice == .en)
+    #expect(back.downloadDir == "/abs/path")
+    #expect(back.verboseLogging)
+
+    // 没选过 / 选了 system / 手改坏了 ⇒ 都退回系统语言（nil），不许当成中文。
+    #expect(AppPreferences.parse("{}").settingLanguage("system").languageChoice == nil)
+    #expect(AppPreferences.parse("{}").settingLanguage("fr").languageChoice == nil)
+
+    // 改语言**不许**把另外两格冲掉。
+    let kept = AppPreferences(downloadDir: "/d", verboseLogging: true).settingLanguage("zh")
+    #expect(kept.downloadDir == "/d")
+    #expect(kept.verboseLogging)
+    #expect(kept.languageChoice == .zh)
+}

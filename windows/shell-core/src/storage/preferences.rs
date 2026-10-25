@@ -42,6 +42,17 @@ pub struct Preferences {
     ///    —— 要规范化就用构造函数或 [`Preferences::setting_download_dir`]。
     pub download_dir: String,
 
+    /// 用户选过的**界面语言**（`system` / `zh` / `en`；空串 = 从没选过）。
+    ///
+    /// 为什么壳要自己存一份：**启动期那几句话发生在握手之前** —— 第二实例提示框、
+    /// 托盘菜单、起不来时的 `MessageBoxW`。那一刻还没有内核，问不到 `settings.language`
+    /// ⇒ 只有壳自己记着，这些框才会是用户选的那门语言（否则中文系统上永远中文，
+    /// 而客户选的英文界面里突然弹出一个中文框）。
+    ///
+    /// ⚠️ 与内核 `settings.json` 的那一格**不是**两份真相：写它的唯一时机是
+    ///    `set_settings` 成功之后（把内核回执里那一格抄过来），读它的唯一时机是启动期。
+    pub language: String,
+
     /// **详细诊断日志**（规格 §2.4）。开着的时候壳给内核多拼一对
     /// `--log-level verbose`，壳自己那一份也用 [`crate::diagnostics::Level::Verbose`]。
     ///
@@ -63,7 +74,7 @@ impl Preferences {
     ///    而不是一个"默认打开"的东西（诊断日志开着的时候单文件能长到 4 MiB，
     ///    那是客户报障时才需要的一档）。
     pub fn empty() -> Preferences {
-        Preferences { download_dir: String::new(), verbose_logging: false }
+        Preferences { download_dir: String::new(), verbose_logging: false, language: String::new() }
     }
 
     /// 造一份偏好（**过一遍规范化**）。对齐 `AppPreferences.init(downloadDir:)`。
@@ -71,7 +82,11 @@ impl Preferences {
     /// ⚠️ **只造"下载目录"那一格**：详细日志起手是关着的，要开用
     ///    [`Self::setting_verbose_logging`]。
     pub fn new(download_dir: &str) -> Preferences {
-        Preferences { download_dir: normalized(download_dir), verbose_logging: false }
+        Preferences {
+            download_dir: normalized(download_dir),
+            verbose_logging: false,
+            language: String::new(),
+        }
     }
 
     /// 配过下载目录没有。**它是"要不要传 `--download-dir`"的唯一判据**
@@ -91,6 +106,7 @@ impl Preferences {
         Preferences {
             download_dir: normalized(path),
             verbose_logging: self.verbose_logging,
+            language: self.language.clone(),
         }
     }
 
@@ -101,6 +117,29 @@ impl Preferences {
         Preferences {
             download_dir: self.download_dir.clone(),
             verbose_logging: on,
+            language: self.language.clone(),
+        }
+    }
+
+    /// 记下用户选的界面语言（`set_settings` 成功后抄内核回执的那一格）。
+    ///
+    /// ⚠️ 另外几格**原样带过去**（同 [`Self::setting_download_dir`] 的纪律：
+    ///    这几件事互不覆盖）。
+    pub fn setting_language(&self, value: &str) -> Preferences {
+        Preferences {
+            download_dir: self.download_dir.clone(),
+            verbose_logging: self.verbose_logging,
+            language: normalized(value),
+        }
+    }
+
+    /// 启动期那一门语言：用户选过 `zh`/`en` 就照它，其余（没选过 / `system`）⇒ `None`
+    /// （调用方退回系统语言）。**不认识的值也回 `None`**：手改坏了不该让界面起不来。
+    pub fn language_choice(&self) -> Option<&str> {
+        match self.language.as_str() {
+            "zh" => Some("zh"),
+            "en" => Some("en"),
+            _ => None,
         }
     }
 
@@ -152,11 +191,13 @@ impl Serialize for Preferences {
             //    写一份"能省就省"的形状会让"老文件"与"这份偏好根本没配过"在盘上
             //    长得一样，而它们要区分开（后者是 E-1 那条"整份当未配置"）。
             verbose_logging: bool,
+            language: &'a str,
         }
         Raw {
             version: Preferences::VERSION,
             download_dir: &self.download_dir,
             verbose_logging: self.verbose_logging,
+            language: &self.language,
         }
         .serialize(serializer)
     }
@@ -192,6 +233,9 @@ impl<'de> Deserialize<'de> for Preferences {
             ///    见本函数上面那段文档）。如实记在这里，免得下一个人以为两处一样严。
             #[serde(default)]
             verbose_logging: bool,
+            /// 老文件里没有这一格 ⇒ 空串（= 没选过 ⇒ 启动期跟系统走）。
+            #[serde(default)]
+            language: String,
         }
         let raw = Raw::deserialize(deserializer)?;
         if raw.version != Self::VERSION {
@@ -202,7 +246,8 @@ impl<'de> Deserialize<'de> for Preferences {
             )));
         }
         Ok(Preferences::new(raw.download_dir.as_str().unwrap_or(""))
-            .setting_verbose_logging(raw.verbose_logging))
+            .setting_verbose_logging(raw.verbose_logging)
+            .setting_language(&raw.language))
     }
 }
 
@@ -218,11 +263,16 @@ mod tests {
     ///    `an_old_preferences_file_without_the_new_field_reads_as_off` 钉的事）：
     ///    写一份"省着写"的形状会让"老文件"与"这份偏好根本没配过"在盘上长得一样。
     #[test]
-    fn the_disk_shape_is_version_plus_download_dir_and_verbose_logging() {
+    fn the_disk_shape_is_version_plus_download_dir_verbose_logging_and_language() {
         let v = serde_json::to_value(Preferences::new("/abs/path")).expect("一定能序列化");
         assert_eq!(
             v,
-            serde_json::json!({"version": 1, "download_dir": "/abs/path", "verbose_logging": false})
+            serde_json::json!({
+                "version": 1,
+                "download_dir": "/abs/path",
+                "verbose_logging": false,
+                "language": "",
+            })
         );
         // 开着的时候那一格要真的跟着走（否则上面那条可以靠"永远写 false"变绿）。
         let on = Preferences::new("/abs/path").setting_verbose_logging(true);
@@ -436,3 +486,27 @@ mod tests {
         assert_eq!(Preferences::load(&path).download_dir, "/a", "失败的写把旧配置改掉了");
     }
 }
+
+    /// 语言那一格：**没选过 = 空串**，选过就照抄；不认识的值回 `None`（不当成错误）。
+    #[test]
+    fn the_language_choice_reads_only_the_two_wire_words() {
+        assert_eq!(Preferences::empty().language_choice(), None);
+        assert_eq!(Preferences::empty().setting_language("system").language_choice(), None);
+        assert_eq!(Preferences::empty().setting_language("zh").language_choice(), Some("zh"));
+        assert_eq!(Preferences::empty().setting_language("en").language_choice(), Some("en"));
+        assert_eq!(
+            Preferences::empty().setting_language("fr").language_choice(),
+            None,
+            "手改坏了不该让启动期跟着乱走"
+        );
+    }
+
+    /// 改语言**不许**把另外两格冲掉（同 `setting_download_dir` 的纪律）。
+    #[test]
+    fn setting_the_language_keeps_the_other_two_fields() {
+        let before = Preferences::new("/abs/path").setting_verbose_logging(true);
+        let after = before.setting_language("en");
+        assert_eq!(after.download_dir, "/abs/path");
+        assert!(after.verbose_logging);
+        assert_eq!(after.language, "en");
+    }
