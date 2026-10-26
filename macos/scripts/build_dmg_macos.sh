@@ -68,6 +68,10 @@ BIN_NAME="BenagenDownloader"
 FIXER_NAME="已损坏修复.command"
 FIXER_SRC="$REPO/macos/Resources/$FIXER_NAME"
 
+# 安装说明：盘里最可靠的入口（纯文本不受 Gatekeeper 管）。与修复脚本同属入库资产。
+NOTE_NAME="安装说明.txt"
+NOTE_SRC="$REPO/macos/Resources/$NOTE_NAME"
+
 if [ ! -d "$APP" ]; then
   echo "错误：找不到 $APP" >&2
   echo "先跑：bash macos/scripts/build_app_macos.sh（或 ... build_app_macos.sh x86_64）" >&2
@@ -95,6 +99,11 @@ fi
 if [ ! -x "$FIXER_SRC" ]; then
   echo "错误：$FIXER_SRC 没有可执行位 —— 装进盘里客户双击也不会有任何反应。" >&2
   echo "      修：chmod +x \"$FIXER_SRC\"" >&2
+  exit 2
+fi
+
+if [ ! -f "$NOTE_SRC" ]; then
+  echo "错误：找不到 $NOTE_SRC —— 安装说明是入库资产，不该缺失。" >&2
   exit 2
 fi
 
@@ -219,6 +228,16 @@ ln -s /Applications "$STAGE/Applications"
 #    客户双击它毫无反应 —— 而文件本身明明在盘里。
 cp "$FIXER_SRC" "$STAGE/$FIXER_NAME"
 chmod +x "$STAGE/$FIXER_NAME"
+# 修复脚本本身也要盖章。客户是从浏览器/网盘把它下下来的，落盘时就带上了隔离属性；
+# 没签名的 .command 双击会被 Gatekeeper 判成「已损坏，无法打开」—— 那正是它要修的症状，
+# 于是「唯一的现成办法」自己先启动不了。ad-hoc 签一下，提示就降成「无法验证开发者」，
+# 右键→打开能过（盘里的《安装说明.txt》写了这一步）。
+codesign --force --sign - "$STAGE/$FIXER_NAME" >/dev/null 2>&1 \
+  || { echo "错误：给 $FIXER_NAME 盖 ad-hoc 签名失败。" >&2; exit 1; }
+
+# 安装说明：纯文本，永远不会被 Gatekeeper 拦，是客户在这个盘里最可靠的入口。
+cp "$NOTE_SRC" "$STAGE/$NOTE_NAME" \
+  || { echo "错误：装不进 $NOTE_NAME。" >&2; exit 1; }
 
 echo "==> 压缩为 DMG（UDZO）"
 rm -f "$OUT"
@@ -260,6 +279,16 @@ fi
 if [ ! -x "$MOUNT_POINT/$FIXER_NAME" ]; then
   echo "错误：卷里的 $FIXER_NAME 没有可执行位 —— 客户双击它不会有任何反应。" >&2
   echo "      这张盘不能交付：文件明明在盘里，客户却双击不出任何东西。" >&2
+  exit 1
+fi
+# 判的是**从盘里读回来的**那一份有没有签名：没签名的 .command 双击会被判「已损坏」，
+# 而它正是客户遇到「已损坏」时唯一能自查的办法（见《安装说明.txt》第 3 步）。
+if ! codesign --verify "$MOUNT_POINT/$FIXER_NAME" >/dev/null 2>&1; then
+  echo "错误：卷里的 $FIXER_NAME 没有有效签名 —— 客户双击它会被 Gatekeeper 拦下。" >&2
+  exit 1
+fi
+if [ ! -f "$MOUNT_POINT/$NOTE_NAME" ]; then
+  echo "错误：卷里没有 $NOTE_NAME —— 客户找不到安装步骤。" >&2
   exit 1
 fi
 

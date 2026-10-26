@@ -1,0 +1,32 @@
+Benagen 数据下载工具 —— macOS 安装说明
+=====================================
+
+第 1 步  把 BenagenDownloader 拖进右边的「Applications（应用程序）」文件夹。
+
+第 2 步  打开「访达 → 应用程序」，找到 BenagenDownloader，**右键点它 → 选「打开」**
+        （或按住 Control 点它 → 打开），在弹窗里再点一次「打开」。
+
+        为什么要右键：这个应用没有 Apple 付费证书，直接双击会被系统拦一次；
+        右键「打开」等于告诉系统「这个我认了」，点过一次以后就不用再点了。
+
+第 3 步（只有出现「已损坏，无法打开」或「无法验证开发者」时才需要）
+        双击本盘里的「已损坏修复.command」。它会自动清除系统给文件加的隔离标记、
+        装进 /Applications 并启动。
+
+        如果连这个 .command 双击也被拦：
+        ① 在它上面右键 → 打开 → 再点「打开」；
+        ② 还是不行就用「终端」：打开「终端」，把下面一行整段粘贴进去回车 ——
+
+           xattr -dr com.apple.quarantine /Applications/BenagenDownloader.app && open /Applications/BenagenDownloader.app
+
+常见问题
+--------
+Q: 提示「已损坏」是不是下载坏了？
+A: 不是。文件通常是完整的，只是系统没认出签名者。按第 2/3 步处理即可。
+
+Q: 每次打开都要右键吗？
+A: 不用。成功打开过一次之后，以后双击即可。
+
+Q: Linux / Windows 用哪个？
+A: Windows 用 BenagenDownloader-0.3.0-Windows-x86_64.exe；Linux / 服务器用
+   benagen-dl-0.3.0-linux-x86_64（命令行，先 chmod +x）。
