@@ -1178,3 +1178,29 @@ macos/scripts/test.sh     634 passed（--disable-sandbox）
 
 仍未双语化（如实记账）：`diagnostics`/`event=` 日志正文（规格 I-2：日志不翻译，便于排查）、
 `client.rs` 的 `Display`（只进日志）。
+
+### 0.3.0 现场修复（2026-10-26）：十万级文件的批次读不进来 —— 壳的读上限从 64 MiB 提到 256 MiB
+
+现场（0.2.8，Windows）：交付码 `6NQKpTSJGLMk.Nt7iSIf`，**91,973 个文件 / 163.7 GB**。
+客户打开后只看到一行顶层目录、「引擎未启动」，**底栏没有下载按钮**；顶上一条红字：
+
+> 内核发来的一行超过了壳自己设的读上限 67108864 字节……
+
+根因：`get_tree` 一次把**整棵树**（每个文件带 `path`/`name`/`size`/`crc64`/`source_mtime`/`state`）
+**和**整份 `flat`（每个文件再一遍 `path`/`name`/`size`/`state`）都发回来，字节数 ∝ 文件数。
+用 9.2 万个文件、路径约 90 字节的合成清单在本机实测（`core/target/debug/benagen-core` 喂两条请求）：
+
+```
+load_delivery   33,027,043 B
+get_tree        60,986,625 B   ← 64 MiB 只差一口气；真实清单路径更长就整行被丢
+```
+
+壳侧那道护栏（`MAX_RESPONSE_LINE_BYTES`）**按实测定**：取实测最坏值（约 61 MB）的 4 倍 ——
+256 MiB。守住"发疯的内核不能无限吃内存"这条底线，同时让十万级文件的批次读得进来。
+`the_line_limits_are_pinned` 这条用例同步改成 256 MiB，注释里记了这次的理由（实测，不是比例）。
+
+⚠️ 这不是终点：`get_tree` 把树和 `flat` 各发一遍本身就是浪费（同一批文件的两份拷贝），
+真正的解法是**内核分批给子树 / 让界面按需取**——那是一次跨端（Windows + macOS）的协议改动，
+已在候选清单里；本次先把客户的批次解开。
+
+读数：`windows/scripts/test.sh` EXIT=0，740 例（`the_line_limits_are_pinned` 仍钉着这个数）。
