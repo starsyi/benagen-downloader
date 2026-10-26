@@ -2,9 +2,9 @@ import Testing
 @testable import BenagenCoreKit
 
 // ---------------------------------------------------------------------------
-// 八类错误卡（T7 / 规格 W2；样板 `windows/shell-core/src/presentation/error_card.rs`）。
+// 九类错误卡（T7 / 规格 W2；样板 `windows/shell-core/src/presentation/error_card.rs`）。
 //
-// 重点不是"有八条"，而是**每一条在两种语言下都真的有三句话、英文里没有汉字、
+// 重点不是"有九条"，而是**每一条在两种语言下都真的有三句话、英文里没有汉字、
 // 严重度两两不同、引擎类排在最后、次数只进标题**。
 // ---------------------------------------------------------------------------
 
@@ -14,11 +14,15 @@ private func hasCJK(_ s: String) -> Bool {
 
 // MARK: - 线上词
 
-@Test func allEightWireWordsAreTheOnesTheCoreSends() {
+@Test func allNineWireWordsAreTheOnesTheCoreSends() {
+    // 第九类 `name_invalid` 是 209e0236 加的（Windows 建不出来的文件名）；
+    // 词表里少了它，内核发来这类错误时卡片会整类消失，所以这里按逐字集合钉死。
     #expect(Set(ErrorClass.allCases.map(\.wire)) == Set([
         "network_unreachable", "dns_failed", "server_refused", "disk_slow",
         "disk_full", "engine_unresponsive", "engine_crashed", "verify_mismatch",
+        "name_invalid",
     ]))
+    #expect(ErrorClass.ofWire("name_invalid") == .nameInvalid)
 }
 
 @Test func unknownWireWordsMapToNil() {
@@ -57,13 +61,20 @@ private func hasCJK(_ s: String) -> Bool {
     #expect(ErrorClass.dnsFailed.title(.zh) == "域名解析失败")
     #expect(ErrorClass.diskFull.explain(.zh) == "目标磁盘放不下这次的数据，或者没有写权限。")
     #expect(ErrorClass.verifyMismatch.action(.zh) == "重新下载这个文件。")
+    // 第九类（209e0236）：Windows 建不出来的文件名。
+    #expect(ErrorClass.nameInvalid.title(.zh) == "有文件名在 Windows 上建不出来")
+    #expect(ErrorClass.nameInvalid.explain(.zh)
+            == "清单里有名字带了 Windows 不允许的字符（例如冒号），系统建不出这些文件——文件本身是好的。")
+    #expect(ErrorClass.nameInvalid.action(.zh) == "联系交付方改名，或改用 macOS / Linux 客户端。")
 }
 
 @Test func titlesExplainsAndActionsAreAllDistinct() {
     // 判别力：复制粘贴时漏改一条 switch 分支，逐条等值断言可能只有一条红；这条抓"映射塌陷"。
-    #expect(Set(ErrorClass.allCases.map { $0.title(.zh) }).count == 8)
-    #expect(Set(ErrorClass.allCases.map { $0.explain(.zh) }).count == 8)
-    #expect(Set(ErrorClass.allCases.map { $0.title(.en) }).count == 8)
+    // 九类的标题/解释必须两两不同（`name_invalid` 那三句也是独立的，不许和别的类撞车）。
+    #expect(ErrorClass.allCases.count == 9)
+    #expect(Set(ErrorClass.allCases.map { $0.title(.zh) }).count == 9)
+    #expect(Set(ErrorClass.allCases.map { $0.explain(.zh) }).count == 9)
+    #expect(Set(ErrorClass.allCases.map { $0.title(.en) }).count == 9)
 }
 
 // MARK: - 严重度
@@ -89,8 +100,10 @@ private func hasCJK(_ s: String) -> Bool {
 }
 
 @Test func theSeverityOrderMatchesTheCore() {
-    // 与内核 `Class::severity` 同序：60/59/50/40/30/20/19/18。
-    #expect(ErrorClass.allCases.map(\.severity) == [60, 59, 50, 40, 30, 20, 19, 18])
+    // 与内核 `Class::severity` 同序：60/59/50/40/30/20/19/18/28。
+    // `name_invalid` 声明在最后，severity 28 落在 disk_full(30) 与 engine_unresponsive(20) 之间；
+    // 顺序必须逐格对齐 `windows/shell-core/src/presentation/error_card.rs::ClassKind::ALL`。
+    #expect(ErrorClass.allCases.map(\.severity) == [60, 59, 50, 40, 30, 20, 19, 18, 28])
 }
 
 // MARK: - 次数只在标题里
