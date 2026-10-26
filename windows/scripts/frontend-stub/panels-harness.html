@@ -79,6 +79,12 @@ let FIX = null;
 let CODE = "";
 let ACTION_TITLE = "";
 let SELECTED = [];
+/**
+ * 无 `path` 的 `tree()` 那一支回的载荷（`null` = 用夹具里那一份 `treeWhole`）。
+ * ⚠️ 只有「大批次」那一组断言会把它换成 `treeWholeBig`（92k 文件、内核只回数不回树），
+ *    用完**必须**放回 `null` —— 后面 ⑤g0 还在等 `ACTION_TITLE` 那一句。
+ */
+let treeWholePayload = null;
 let HISTORY_ROWS = [];
 
 async function loadFixtures() {
@@ -197,7 +203,7 @@ async function invoke(cmd, args) {
   if (cmd === "delivery_progress") return resolvePayload;
   if (cmd === "tree") {
     const path = args && typeof args.path === "string" ? args.path : null;
-    if (path === null) return FIX.treeWhole;
+    if (path === null) return treeWholePayload || FIX.treeWhole;
     return FIX.treeLevelRoot;
   }
   if (cmd === "enqueue") return FIX.enqueuePartial;
@@ -380,6 +386,43 @@ async function runAll() {
     calls("enqueue").length === enqBefore + 1
       && JSON.stringify(firstEnqueue.args.paths) === JSON.stringify(SELECTED),
     JSON.stringify(firstEnqueue && firstEnqueue.args));
+
+  // =========================================================================
+  // ①j 🔴 **大批次**（91,973 文件 / 163.7 GB）：内核只回数、不回树
+  // =========================================================================
+  // 起因：`get_tree` 一条回执实测 61 MB（树 33 MB + flat + 92k 条 `default_selected`），
+  // 超过壳的读上限时整行被丢 ⇒ 界面**没有下载按钮**。现在壳改问 `summary_only`
+  // （只回三数 + 默认面计数）与 `selection_summary`，回执**形状不变** ⇒ 这一屏一个字都不用改。
+  // 判别力：这三条守的是"概要面的载荷到了屏上，底栏/按钮/下载动作仍然对"；
+  // 把壳里那支改回整棵树 ⇒ 它们照旧绿（前端只读这四格），所以它们**不**替壳的
+  // 判别力作保 —— 那一半在 `commands.rs` 的 `only_a_batch_over_thirty_thousand_files_skips_the_tree`。
+  {
+    const BIG = FIX.treeWholeBig;
+    treeWholePayload = BIG;
+    // 勾选面清空 ⇒ 补那一拍刷新（`loadWhole(false)`，不播种）：正是用户改勾选之后走的那条路。
+    click(q("#files-bar-select-none"));
+    await sleep(900);
+    check("①j 大批次：底栏的项数与合计逐字是载荷里那两句",
+      txt("#files-bar-count") === BIG.data.selection.count_text
+        && txt("#files-bar-size") === BIG.data.selection.size_text,
+      `「${txt("#files-bar-count")}」/「${txt("#files-bar-size")}」`);
+    check("①k 大批次：按钮仍可按下、文案逐字是载荷里那一句（`blocked_reason` 为空）",
+      txt("#tb-download-title") === BIG.data.action.button_title
+        && q("#tb-download").disabled === false
+        && BIG.data.action.blocked_reason === null,
+      `disabled=${q("#tb-download").disabled} 文案「${txt("#tb-download-title")}」`);
+    // 🔴 一项都没勾 ⇒ 发的是**空数组**（内核按清单现算全部）：
+    //    「没加载完也要能下全」在界面这一侧的落点。判别力：把它改成发"当前层那几行" ⇒ 红。
+    const beforeBig = calls("enqueue").length;
+    click(q("#files-bar-download"));
+    await sleep(900);
+    const lastBig = calls("enqueue").pop();
+    check("①l 大批次：一项都没勾 ⇒ enqueue 收到**空数组**（= 内核按清单现算全部待下载）",
+      calls("enqueue").length === beforeBig + 1
+        && Array.isArray(lastBig.args.paths) && lastBig.args.paths.length === 0,
+      JSON.stringify(lastBig && lastBig.args));
+    treeWholePayload = null;
+  }
 
   // =========================================================================
   // ①½ 屏幕骨架的静态文案：**逐字来自 `state.copy`**（任务：i18n 双语化）

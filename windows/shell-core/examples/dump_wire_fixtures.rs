@@ -61,8 +61,8 @@ use shell_core::presentation::transfer_row::{
 use shell_core::presentation::update_check::UpdateCheck;
 use shell_core::presentation::verify_summary::ProgressSummary;
 use shell_core::protocol::{
-    DeliveryInfo, EngineState, EnqueueResult, GlobalStat, ListDirResult,
-    LoadState, Settings, SettingsResult, TransferItem, TreeResult, TreeNode,
+    DeliveryInfo, EngineState, EnqueueResult, GlobalStat, ListDirResult, LoadState, Progress,
+    SelectionSummaryReply, Settings, SettingsResult, TransferItem, TreeResult,
 };
 use shell_core::session_view::SessionView;
 use shell_core::storage::history::{History, HistoryEntry};
@@ -639,7 +639,8 @@ fn a_view() -> SessionView {
             expired: false,
             total_files: 128,
             total_bytes: 443_033_255_936,
-            tree: TreeNode::Empty,
+            // 壳**总是**带 `tree: false` 加载（大批次那条 61 MB 的回执就出在这里）⇒ 没有树。
+            tree: None,
         }),
         last_error: None,
         fallback_notice: None,
@@ -755,6 +756,48 @@ fn main() {
         blocked_reason: None,
     };
 
+    // ---- 大批次那一支：`get_tree {"summary_only": true}` + `selection_summary` ----
+    //
+    // 现场：**91,973 个文件 / 163.7 GB**。一条 `get_tree` 的整条回执实测 60,986,625 B
+    // （树 33 MB + flat + 9.2 万条默认勾选），超过壳的读上限就整行被丢 ⇒ 界面没有
+    // 下载按钮。底栏只用下面这几个数 ⇒ 大批次改问概要（`commands.rs:summary_tree`），
+    // 而回执的形状与 `treeWhole` **逐字相同**。
+    let big_progress = Progress {
+        total_bytes: 175_718_338_816,
+        done_bytes: 42_949_672_960,
+        speed: 12_582_912,
+        percent: 24,
+    };
+    let big_code = Some(CODE);
+    let big_line = ProgressSummary::of_progress(Some(&big_progress), big_code, big_code);
+    // `selection_summary` 省略 `paths` 时内核按**默认面**现算出来的那几个数。
+    let big_counts = SelectionSummaryReply {
+        count: 91_973,
+        bytes: 175_718_338_816,
+        pending_count: 91_970,
+        pending_bytes: 175_600_000_000,
+        all_selected: true,
+    };
+    // "没报勾选面" ⇒ 底栏说「全部下载」，旁边那句"明说"在场（与 `treeWhole` 同一套逻辑）。
+    let big_all_action = api::tree::DownloadAction {
+        button_title: DownloadTargets::button_title(shell_core::i18n::Lang::Zh, &BTreeSet::new()),
+        empty_selection_hint: Some(
+            DownloadTargets::empty_selection_hint(shell_core::i18n::Lang::Zh).to_string(),
+        ),
+        blocked_reason: None,
+    };
+    // "用户勾了两项" ⇒ 按钮变「下载选中」，两条路径原样回声。
+    let big_ticked: Vec<String> = ["01.RawData/reads.fq.gz", "01.RawData/QC 图.png"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let big_ticked_set: BTreeSet<String> = big_ticked.iter().cloned().collect();
+    let big_ticked_action = api::tree::DownloadAction {
+        button_title: DownloadTargets::button_title(shell_core::i18n::Lang::Zh, &big_ticked_set),
+        empty_selection_hint: None,
+        blocked_reason: None,
+    };
+
     // ---- 读不到某一层 --------------------------------------------------------
     // `DirLoadFailure::of` 只认**结构化错误码**，所以这里从一个真的 `ClientError` 造。
     let failure = shell_core::presentation::breadcrumb::DirLoadFailure::of(shell_core::i18n::Lang::Zh, 
@@ -857,6 +900,27 @@ fn main() {
             &SelectionSummary::of(shell_core::i18n::Lang::Zh, &selected, &sizes),
             &tree.default_selected,
             &action,
+        ),
+        // 大批次（> 30,000 文件）那一条路：**只有数，没有树**。形状与 `treeWhole`
+        // 逐字相同，唯一的差别是 `selected` 是空数组 —— 整批路径不在壳里。
+        "treeWholeBig": api::tree::whole(
+            &Breadcrumb::new(""),
+            big_line.as_ref(),
+            &SelectionSummary::from_numbers(
+                shell_core::i18n::Lang::Zh,
+                big_counts.count,
+                big_counts.bytes,
+            ),
+            &[],
+            &big_all_action,
+        ),
+        // 同一批 + 用户勾了两项（前端报上来的那个面）。
+        "treeWholeBigTicked": api::tree::whole(
+            &Breadcrumb::new(""),
+            big_line.as_ref(),
+            &SelectionSummary::from_numbers(shell_core::i18n::Lang::Zh, 2, 2048),
+            &big_ticked,
+            &big_ticked_action,
         ),
         // `tree("")`：根那一层。
         "treeLevelRoot": api::tree::level(shell_core::i18n::Lang::Zh, &root_bc, &root_rows),
@@ -1047,6 +1111,23 @@ fn main() {
         fixtures["treeWhole"]["data"]["action"]["button_title"],
         json!("下载选中"),
         "底栏那颗按钮的文案不在夹具里：{fixtures}"
+    );
+
+    // 大批次那一份：**树不在、数字在**（夹具退化时当场红）。
+    assert_eq!(
+        fixtures["treeWholeBig"]["data"]["selection"]["count_text"],
+        json!("已选 91973 项"),
+        "大批次的底栏数字不在夹具里：{fixtures}"
+    );
+    assert_eq!(
+        fixtures["treeWholeBig"]["data"]["selected"],
+        json!([]),
+        "大批次的回执不该带上整批路径（9.2 万条，那正是要省掉的那 61 MB）：{fixtures}"
+    );
+    assert_eq!(
+        fixtures["treeWholeBigTicked"]["data"]["action"]["button_title"],
+        json!("下载选中"),
+        "勾了面就按那个面说：{fixtures}"
     );
 
     // ---- 传输列表那几份也要先自检（同上：夹具**退化**时当场红）---------------

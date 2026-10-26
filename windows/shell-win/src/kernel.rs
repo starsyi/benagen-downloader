@@ -51,20 +51,26 @@ use shell_core::presentation::settings_form::SettingsForm;
 use shell_core::presentation::transfer_row::TransferActionFailure;
 use shell_core::protocol::codes;
 use shell_core::protocol::{
-    DeliveryInfo, DownloadDirResult, EnqueueResult, ListDirResult, MigrateStatus, Settings,
-    SettingsResult, TaskAction, TransferListResult, TreeResult, VerifyStatus,
+    DeliveryInfo, DownloadDirResult, EnqueueResult, ListDirResult, MigrateStatus,
+    SelectionSummaryReply, Settings, SettingsResult, TaskAction, TransferListResult,
+    TreeResult, TreeSummary, VerifyStatus,
 };
 
 /// 一次 `load_delivery`。
 ///
 /// 规则与上游一致：`base_url` **空串不带这个键**；内核报错走 `error_text`（唯一映射）。
+///
+/// ⚠️ **`"tree": false` 是承重的**：9.2 万文件那一批的整棵树实测 33 MB（`get_tree`
+///    整条回执 61 MB），而加载完到点下载之间壳**根本用不上那棵树**。不发它，
+///    内核就**整个不发 `tree` 键** ⇒ [`DeliveryInfo::tree`] 是 `None`，用到整批路径的
+///    那一处（`commands::kernel_paths`）按 `None` 退化。**默认仍是给**（`tree` 默认 true）。
 pub fn load_delivery(
     lang: shell_core::i18n::Lang,
     client: &CoreClient,
     code: &str,
     base_url: &str,
 ) -> Result<DeliveryInfo, CallFailure> {
-    let mut params = serde_json::json!({ "code": code });
+    let mut params = serde_json::json!({ "code": code, "tree": false });
     if !base_url.is_empty() {
         params["base_url"] = serde_json::json!(base_url);
     }
@@ -82,6 +88,40 @@ pub fn get_tree(
         .map_err(|e| CallFailure::of(lang, &e))?;
     serde_json::from_value(value)
         .map_err(|e| CallFailure::shell(shell_cannot_decode("get_tree", "TreeResult", &e)))
+}
+
+/// 只要**总进度与默认面的规模**（`{"summary_only": true}`）—— 不拉树、不拉 `flat`、
+/// 不拉那串 9.2 万条的默认勾选。
+///
+/// 大批次（`commands::BIG_BATCH_FILES` 以上）专用；小批次仍走 [`get_tree`] 整棵树。
+pub fn get_tree_summary(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient,
+) -> Result<TreeSummary, CallFailure> {
+    let value = client
+        .call("get_tree", serde_json::json!({ "summary_only": true }))
+        .map_err(|e| CallFailure::of(lang, &e))?;
+    serde_json::from_value(value)
+        .map_err(|e| CallFailure::shell(shell_cannot_decode("get_tree", "TreeSummary", &e)))
+}
+
+/// 勾选面的**数与字节**（`selection_summary`）。`paths == None` ⇒ 内核按**默认面**算
+/// （「没加载完也要能下全」那一支就靠它：默认面由内核的清单决定，不由壳枚举）。
+pub fn selection_summary(
+    lang: shell_core::i18n::Lang,
+    client: &CoreClient,
+    paths: Option<&[String]>,
+) -> Result<SelectionSummaryReply, CallFailure> {
+    let mut params = serde_json::json!({});
+    if let Some(paths) = paths {
+        params["paths"] = serde_json::json!(paths);
+    }
+    let value = client
+        .call("selection_summary", params)
+        .map_err(|e| CallFailure::of(lang, &e))?;
+    serde_json::from_value(value).map_err(|e| {
+        CallFailure::shell(shell_cannot_decode("selection_summary", "SelectionSummaryReply", &e))
+    })
 }
 
 /// 读一层目录。`path` 是清单**原文**（约束 3：不 trim、不折叠 `//`、不动非 ASCII）。
@@ -558,9 +598,9 @@ mod tests {
     /// `load_delivery` 的 method 与参数形状（`base_url` 空串时**不带那个键**）。
     ///
     /// ⚠️ **回执必须是合法的 `DeliveryInfo`**（本计划第五版改的，第三版那个夹具少了五个键）：
-    ///    `protocol.rs` 的 `DeliveryInfo` **没有任何 `serde(default)`**，每个字段都得给；
-    ///    `tree` 的合法空树是 `{}`（⇒ `TreeNode::Empty`）。夹具**只是让 `.unwrap()` 不 panic**，
-    ///    这条用例验的始终是**发出去的请求**（下面那三行断言）。
+    ///    `protocol.rs` 的 `DeliveryInfo` 只有 `tree` 一个 `#[serde(default)]`（大批次时内核
+    ///    整个不发它），其余字段都得给；`tree` 的合法空树是 `{}`（⇒ `TreeNode::Empty`）。
+    ///    夹具**只是让 `.unwrap()` 不 panic**，这条用例验的始终是**发出去的请求**。
     #[test]
     fn load_delivery_omits_base_url_when_it_is_empty() {
         let ch = Scripted::new(&[&ok_reply(1, r#"{"code":"R.x","page_url":"","base_url":"","created_at":"","expires_at":"","expired":false,"total_files":0,"total_bytes":0,"tree":{}}"#)]);
@@ -570,6 +610,10 @@ mod tests {
         assert!(sent.contains(r#""method":"load_delivery""#));
         assert!(sent.contains(r#""code":"R.x""#));
         assert!(!sent.contains("base_url"), "空串时**不许**带这个键");
+        // 大批次那一条：整棵树不拉（9.2 万文件时它是 33 MB，而壳这一路用不上）。
+        // 判别力：把这句删掉，`DeliveryInfo::tree` 就会退回 `Some`，而 `tree` 的
+        // `#[serde(default)]` 那一条会变成"永远走不到的分支"。
+        assert!(sent.contains(r#""tree":false"#), "加载时**不许**要整棵树：{sent}");
     }
 
     /// 有 `base_url` 时要带上。
@@ -578,7 +622,60 @@ mod tests {
         let ch = Scripted::new(&[&ok_reply(1, r#"{"code":"R.x","page_url":"","base_url":"http://u/","created_at":"","expires_at":"","expired":false,"total_files":0,"total_bytes":0,"tree":{}}"#)]);
         let client = CoreClient::new(Box::new(ch.clone()));
         expect_ok(load_delivery(shell_core::i18n::Lang::Zh, &client, "R.x", "http://u/"), "load_delivery");
-        assert!(ch.last_request().contains(r#""base_url":"http://u/""#));
+        let sent = ch.last_request();
+        assert!(sent.contains(r#""base_url":"http://u/""#));
+        assert!(sent.contains(r#""tree":false"#), "`tree: false` 与 `base_url` 可以同时在场：{sent}");
+    }
+
+    /// 大批次那条路：`get_tree` 只要数（`{"summary_only": true}`）。
+    ///
+    /// 判别力：把 `summary_only` 删掉，内核就回整棵树 —— 9.2 万文件时那是 **61 MB**
+    /// 一条回执，壳的读上限一满整行就被丢，界面没有下载按钮（现场那个现象）。
+    #[test]
+    fn a_big_batch_asks_the_tree_for_numbers_only() {
+        let ch = Scripted::new(&[&ok_reply(
+            1,
+            r#"{"progress":{"total_bytes":8,"done_bytes":2,"speed":0,"percent":25},"default_count":3,"default_bytes":6,"total_files":91973}"#,
+        )]);
+        let client = CoreClient::new(Box::new(ch.clone()));
+        let t = expect_ok(
+            get_tree_summary(shell_core::i18n::Lang::Zh, &client),
+            "get_tree summary_only",
+        );
+        let sent = ch.last_request();
+        assert!(sent.contains(r#""method":"get_tree""#));
+        assert!(sent.contains(r#""summary_only":true"#), "判别力就在这里：{sent}");
+        assert_eq!(t.total_files, 91_973, "文件总数照旧要给（壳靠它判大小）");
+        assert_eq!(t.default_count, 3);
+        assert_eq!(t.progress.total_bytes, 8);
+    }
+
+    /// `selection_summary`：**没勾选面就整个不发 `paths`** —— 省略 = 内核按默认面算。
+    #[test]
+    fn the_default_selection_summary_does_not_ship_paths() {
+        let reply = r#"{"count":3,"bytes":6,"pending_count":2,"pending_bytes":4,"all_selected":true}"#;
+        let ch = Scripted::new(&[&ok_reply(1, reply), &ok_reply(2, reply)]);
+        let client = CoreClient::new(Box::new(ch.clone()));
+
+        let s = expect_ok(
+            selection_summary(shell_core::i18n::Lang::Zh, &client, None),
+            "默认面的勾选摘要",
+        );
+        let sent = ch.last_request();
+        assert!(sent.contains(r#""method":"selection_summary""#));
+        assert!(!sent.contains("paths"), "省略 paths 才是默认面：{sent}");
+        assert_eq!(s.count, 3);
+        assert_eq!(s.pending_count, 2);
+
+        let picked = vec!["a".to_string(), "b".to_string()];
+        expect_ok(
+            selection_summary(shell_core::i18n::Lang::Zh, &client, Some(&picked)),
+            "给了勾选面",
+        );
+        assert!(
+            ch.last_request().contains(r#""paths":["a","b"]"#),
+            "给了勾选面就要逐字发过去"
+        );
     }
 
     /// 内核报错 ⇒ **原文照登**（约束 3），且走的是 `error_text` 那**唯一**一份映射。

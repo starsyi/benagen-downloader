@@ -29,7 +29,7 @@ use super::format::{ByteFormat, PercentFormat, SpeedFormat};
 use super::transfer_row::TransferRow;
 use super::RowColor;
 use crate::client::ClientError;
-use crate::protocol::{TransferListResult, TreeResult, VerifyClass, VerifyStatus};
+use crate::protocol::{Progress, TransferListResult, TreeResult, VerifyClass, VerifyStatus};
 
 // ---------------------------------------------------------------------------
 // 一类校验结果
@@ -567,29 +567,49 @@ impl ProgressSummary {
         tree_code: Option<&str>,
         code: Option<&str>,
     ) -> Option<ProgressSummary> {
+        Self::of_progress(tree.map(|t| &t.progress), tree_code, code)
+    }
+
+    /// 与 [`of`](Self::of) **同一道闸**（树必须属于这一批），只是进的是那三个数。
+    ///
+    /// `get_tree {"summary_only": true}` 的回执里没有树、没有 `flat`、也没有那串默认
+    /// 勾选 —— 只有 `progress` 那三个数。它落的还是这里，闸与整棵树那条路一模一样。
+    pub fn of_progress(
+        progress: Option<&Progress>,
+        tree_code: Option<&str>,
+        code: Option<&str>,
+    ) -> Option<ProgressSummary> {
         // 上游是 `guard let code, let tree, treeCode == code else { return nil }`：
         // 三道闸顺序无关，缺一即 `None`（`tree_code == None` 与 `code == None` 都拦得住）。
         let code = code?;
-        let tree = tree?;
+        let progress = progress?;
         if tree_code != Some(code) {
             return None;
         }
+        Some(Self::from_progress(progress))
+    }
 
-        let p = &tree.progress;
-        Some(ProgressSummary {
+    /// **只有数**的时候（概要回执照样算得出这一行）：百分比 / 字节 / 速度 / 完成比例。
+    ///
+    /// ⚠️ 为什么要这条入口：9.2 万文件那一批的 `get_tree` 整条回执实测 **61 MB**
+    ///    （树 33 MB + `flat` + 9.2 万条默认勾选），而底栏这一行只用这三个数。
+    ///    大批次于是改问 `summary_only`，**但口径不许分家** —— 百分比仍走
+    ///    [`PercentFormat`]、速度仍走 [`SpeedFormat`]、分数仍走 [`TransferRow::fraction`]。
+    pub fn from_progress(progress: &Progress) -> ProgressSummary {
+        ProgressSummary {
             // 百分比与传输列表**共用** `PercentFormat`（同一个实现、同一条"总量为 0 说 —"的
             // 口径），不用内核那份 `percent` 字段：两者本来就同源（契约 §1.6），
             // 而自己再算一份就是这条口径的第二个实现。
-            percent_text: PercentFormat::text(p.done_bytes, p.total_bytes),
+            percent_text: PercentFormat::text(progress.done_bytes, progress.total_bytes),
             bytes_text: format!(
                 "{} / {}",
-                ByteFormat::text(p.done_bytes),
-                ByteFormat::text(p.total_bytes)
+                ByteFormat::text(progress.done_bytes),
+                ByteFormat::text(progress.total_bytes)
             ),
-            speed_text: SpeedFormat::text(p.speed),
+            speed_text: SpeedFormat::text(progress.speed),
             // 分数与传输列表**共用** `TransferRow::fraction`（同一份夹取/防 NaN 的实现）。
-            fraction: TransferRow::fraction(p.done_bytes, p.total_bytes),
-        })
+            fraction: TransferRow::fraction(progress.done_bytes, progress.total_bytes),
+        }
     }
 }
 
@@ -1326,6 +1346,64 @@ mod tests {
         assert!(ProgressSummary::of(Some(&tree), Some("B"), None).is_none());
         assert!(ProgressSummary::of(None, Some("B"), Some("B")).is_none());
         assert!(ProgressSummary::of(Some(&tree), Some("B"), Some("B")).is_some());
+
+        // 概要那条路（`summary_only` 的回执没有树，`tree_code` 由命令层给）**同一道闸**。
+        let p = &tree.progress;
+        assert!(ProgressSummary::of_progress(Some(p), Some("A"), Some("B")).is_none());
+        assert!(ProgressSummary::of_progress(Some(p), None, Some("B")).is_none());
+        assert!(ProgressSummary::of_progress(Some(p), Some("B"), None).is_none());
+        assert!(ProgressSummary::of_progress(None, Some("B"), Some("B")).is_none());
+        assert!(ProgressSummary::of_progress(Some(p), Some("B"), Some("B")).is_some());
+    }
+
+    /// 概要回执只有三个数：算出来的一行**与整棵树那条路逐字相同**。
+    ///
+    /// 判别力：把 `from_progress` 里的 `PercentFormat`/`SpeedFormat` 换成自己写的
+    /// 百分比/速度（`"25 %"`、`"12MB/s"`），这条立刻红 —— 那正是"两处显示同一个数，
+    /// 算法却分家"要防的事。数字按 9.2 万文件那一批的量级取（160 GB / 40 GB / 12 MB/s）。
+    #[test]
+    fn a_summary_only_receipt_computes_the_same_line_as_the_whole_tree() {
+        let gib = 1024 * 1024 * 1024;
+        let tree = TreeFx {
+            total_bytes: 160 * gib,
+            done_bytes: 40 * gib,
+            speed: 12 * 1024 * 1024,
+            percent: 25,
+        }
+        .build();
+        let whole = ProgressSummary::of(Some(&tree), Some("C91k"), Some("C91k")).expect("整棵树那条路");
+        let slim = ProgressSummary::of_progress(Some(&tree.progress), Some("C91k"), Some("C91k"))
+            .expect("概要那条路");
+
+        assert_eq!(slim, whole, "两条入口必须是同一行");
+        assert_eq!(slim.percent_text, "25%");
+        assert_eq!(slim.bytes_text, "40.0 GB / 160.0 GB");
+        assert_eq!(slim.speed_text, "12.0 MB/s");
+        assert_eq!(slim.fraction, 0.25);
+    }
+
+    /// 这一行**不分语言**（百分比/字节/速度没有中文），英文界面上一个汉字都不该有。
+    ///
+    /// 判别力：谁将来把 `from_progress` 改成带中文单位的硬编码（"12 MB/秒"），
+    /// 这条立刻红 —— 而真机上的表现是英文客户看到半句中文。
+    #[test]
+    fn the_same_summary_only_line_stays_language_free_in_english() {
+        let progress = Progress {
+            total_bytes: 4096,
+            done_bytes: 1024,
+            speed: 2048,
+            percent: 25,
+        };
+        let p = ProgressSummary::from_progress(&progress);
+        assert_eq!(p.percent_text, "25%");
+        assert_eq!(p.bytes_text, "1.0 KB / 4.0 KB");
+        assert_eq!(p.speed_text, "2.0 KB/s");
+        for text in [&p.percent_text, &p.bytes_text, &p.speed_text] {
+            assert!(
+                !text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "概要那一行不许有汉字：{text}"
+            );
+        }
     }
 
     /// 上游 `aBatchWithNothingToDownloadDoesNotClaimZeroPercent`。

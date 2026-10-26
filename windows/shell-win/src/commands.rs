@@ -238,7 +238,7 @@ pub fn retry(app: tauri::State<'_, Shell>) -> Value {
 ///
 /// ⚠️ **两条分支发的是两件不同的东西**（不是笔误，判据在 `api::tree` 的文件头）：
 ///   * 给了 `path` ⇒ 那一层的行（`list_dir` ⇒ `BrowserRow`）；读不到就是 [`api::tree::level_failure`]；
-///   * 没给 `path` ⇒ 整棵树的**总进度 + 勾选摘要**（`get_tree`）。
+///   * 没给 `path` ⇒ 整棵树的**总进度 + 勾选摘要**（`get_tree`；大批次只要数，见下）。
 ///
 /// ## 🔴 `selection`：**前端当前那一刻的勾选面**（任务 17 加的，只有无 `path` 那一支用它）
 ///
@@ -250,10 +250,15 @@ pub fn retry(app: tauri::State<'_, Shell>) -> Value {
 /// ⚠️ **首帧/播种那一拍不传它**（`None`）⇒ 落回 `default_selected`，也就是"勾选面**将要**
 ///    被播种成什么" —— 那正是那一刻唯一说得通的那个面（前端此刻手上还没有自己的面）。
 ///
-/// ## ⚠️ 它**不改变**这条命令问内核的方式
+/// ## ⚠️ 它**怎么**问内核：按批次大小分两条路（2026-10-26）
 ///
-/// 仍然是那一次 `get_tree`（`selection` 只参与**回执怎么算**，不参与请求怎么发）——
-/// 于是它既不额外增加一次内核往返，也不给这一支添一条新的失败路径。
+/// * **小批次**（≤ [`BIG_BATCH_FILES`]）⇒ 那一次 `get_tree`（整棵树）。`selection` 只参与
+///   **回执怎么算**，不参与请求怎么发，行为与以前逐字相同；
+/// * **大批次** ⇒ 两次**只要数**的调用（`summary_only` + `selection_summary`），拼出
+///   **同一个形状**的回执。理由不是性能而是"能不能用"：9.2 万文件那一批的一条
+///   `get_tree` 回执实测 61 MB，壳一旦丢掉整行，界面连下载按钮都出不来。
+///   ⚠️ 这一支会多一次内核往返（两个都是小回执），也**多一条失败路径** ——
+///   两次调用失败都落到 `note_failure` + `api::failure`，与原来那一条同样处理。
 #[tauri::command(async)]
 pub fn tree(
     app: tauri::State<'_, Shell>,
@@ -280,18 +285,108 @@ pub fn tree(
             //    判据在 `api::tree::level_failure` 的文档里。面包屑跟着**退到的那一层**走。
             Err(why) => api::tree::level_failure(&Breadcrumb::new(&why.path), &why),
         },
-        None => match kernel::get_tree(lang, &client) {
-            Ok(result) => {
-                app.session.set_last_error(None);
-                // ⚠️ 那一层 `path` 的分支**不看** `selection`（"这一层有哪些行"与勾选面无关）。
-                whole_tree(&app.session, &result, selection.as_deref())
+        None => {
+            // 大批次**不拉整棵树**：9.2 万文件那一批的一条 `get_tree` 回执实测
+            // 60,986,625 B（树 33 MB + `flat` + 9.2 万条默认勾选），而底栏只用下面
+            // 那三格数字。小批次仍走整棵树，行为逐字不变。
+            if is_big_batch(&app.session.view().load) {
+                return summary_tree(&app.session, &client, selection.as_deref());
             }
-            Err(why) => {
-                note_failure(&app.session, &why);
-                api::failure(&why)
+            match kernel::get_tree(lang, &client) {
+                Ok(result) => {
+                    app.session.set_last_error(None);
+                    // ⚠️ 那一层 `path` 的分支**不看** `selection`（"这一层有哪些行"与勾选面无关）。
+                    whole_tree(&app.session, &result, selection.as_deref())
+                }
+                Err(why) => {
+                    note_failure(&app.session, &why);
+                    api::failure(&why)
+                }
             }
-        },
+        }
     }
+}
+
+/// 这一批大到「整棵树别拉了」的门槛（清单里的**文件数**）。
+///
+/// 现场那一批是 **91,973 个文件 / 163.7 GB**。三万是分水岭：三万以下那棵树还是
+/// 几 MB 级（一次往返就够，前端也还需要 `flat` 里的路径），三十万才是那条 61 MB 的回执。
+const BIG_BATCH_FILES: i64 = 30_000;
+
+/// 要不要走「只要数」那条路。判据取 `load_delivery` 给的 `total_files`（它总是给，
+/// 与 `tree` 在不在无关）；还没加载完（`Loading` / `Idle`）时**不判**大批次 ——
+/// 那条路上前端还不会问整棵树（加载页没有下载按钮）。
+fn is_big_batch(load: &LoadState) -> bool {
+    matches!(load, LoadState::Loaded(info) if info.total_files > BIG_BATCH_FILES)
+}
+
+/// 大批次那一支要发的界面值：**只问数，不拉树**。
+///
+/// 两次内核调用（`get_tree {"summary_only": true}` + `selection_summary`）拼出的回执
+/// 与 [`whole_tree`] **同一个形状**（进度三格 + 勾选摘要 + 下载按钮），前端一个字都不用改。
+///
+/// ⚠️ 勾选面怎么来（这是「没加载完也要能下全」那条保证的落点）：
+///   - 前端**没给**勾选面 ⇒ `selection_summary` **省略 `paths`**，内核按**默认面**
+///     （清单里待下载/失败的那些）现算 —— 壳不必先把 9.2 万条路径拉回来再数一遍；
+///   - 前端**给了** ⇒ 逐字交给内核（它只认清单里存在的那些）。
+fn summary_tree(
+    session: &Arc<Session>,
+    client: &shell_core::client::CoreClient,
+    selection: Option<&[String]>,
+) -> Value {
+    // ⚠️ 两次调用都在锁外（本文件头那条纪律）：`lang` 在第一次取锁时就拷出来了。
+    let lang = session.lang();
+    let summary = match kernel::get_tree_summary(lang, client) {
+        Ok(summary) => summary,
+        Err(why) => {
+            note_failure(session, &why);
+            return api::failure(&why);
+        }
+    };
+    let counts = match kernel::selection_summary(lang, client, selection) {
+        Ok(counts) => counts,
+        Err(why) => {
+            note_failure(session, &why);
+            return api::failure(&why);
+        }
+    };
+
+    let view = session.view();
+    let lang = view.lang;
+    // 与 `whole_tree` 同一条闸（`tree_code == code`）：这里进了锁，码从会话里取。
+    let code = match &view.load {
+        LoadState::Loaded(info) => Some(info.code.as_str()),
+        LoadState::Idle | LoadState::Loading | LoadState::Failed(_) => None,
+    };
+    let progress = ProgressSummary::of_progress(Some(&summary.progress), code, code);
+    // ⚠️ 勾选面（九个候选路径一个都不进回执）：
+    //    · 报上来的那个 —— 本来就是前端手上的，原样回声；
+    //    · 没报 ⇒ **空数组**。整批路径在壳里**没有**（`load_delivery` 带 `tree: false`），
+    //      而空数组在前端/内核两处的语义都是「全下」（`enqueue` 收到空数组按清单现算）。
+    let selected: BTreeSet<String> = selection
+        .map(|paths| paths.iter().cloned().collect())
+        .unwrap_or_default();
+    let echo: &[String] = selection.unwrap_or(&[]);
+    let action = DownloadAction {
+        // 一个勾选面、一处判断：文案与旁边那句「明说」都来自 `DownloadTargets`。
+        button_title: DownloadTargets::button_title(lang, &selected),
+        empty_selection_hint: selected
+            .is_empty()
+            .then(|| DownloadTargets::empty_selection_hint(lang).to_string()),
+        // ⚠️ 与 `whole_tree` **同一条结论**（2026-10-12 起超预算改为分批入队，不再拦截）。
+        //    这条路手上没有整批路径，"整批全选 ⇒ 空数组"那条规则也就无从算起；而它对
+        //    结论没有影响 —— 无论勾了多少，`enqueue_with` 都按 4 MiB 切块依次发。
+        //    喂给既有判据的是**空数组**（"全下"那一支真会发的东西）：句子由
+        //    `DownloadTargets::blocked_reason` 给，本层不新造一个字。
+        blocked_reason: DownloadTargets::blocked_reason(lang, &[]).map(str::to_string),
+    };
+    api::tree::whole(
+        &Breadcrumb::new(""),
+        progress.as_ref(),
+        &SelectionSummary::from_numbers(lang, counts.count, counts.bytes),
+        echo,
+        &action,
+    )
 }
 
 /// 整棵树那一支要发的界面值（**搬自**第二代 `routes.rs:306` 的 `tree_json` 的调用侧）。
@@ -426,6 +521,38 @@ pub fn enqueue(app: tauri::State<'_, Shell>, paths: Vec<String>) -> Value {
     enqueue_with(&app.session, paths)
 }
 
+/// 整批全选 ⇒ **空数组**（C-3 的另一半；树不在壳里时由内核的数回答）。
+///
+/// ⚠️ 为什么需要它：`DownloadTargets::paths` 那条判据要 `all_paths`，而大批次的
+///    `load_delivery` 带 `tree: false`（9.2 万文件时整棵树 33 MB）⇒ 壳手上没有全集。
+///    这一问只有内核答得了：`selection_summary` **只认清单里存在的路径**，所以
+///    `count == total_files` 就是**集合相等**（不重不漏，不会假阳）⇒ 换成空数组，
+///    让内核按清单现算全部 —— 客户那句"没加载完也要能下全"落在这里。
+///
+/// ⚠️ 便宜：`count <= paths.len()`，所以勾选面比整批**短**时一次内核都不问
+///    （日常"勾几项就下"的路径上**零**额外往返）。
+///
+/// ⚠️ 问不到（内核报错）就**照原样发**显式路径：`enqueue_with` 会按预算切块，
+///    "多发了九万条"远好过"点了下载什么都没发生"。
+fn collapse_whole_selection(
+    session: &Arc<Session>,
+    client: &shell_core::client::CoreClient,
+    paths: Vec<String>,
+) -> Vec<String> {
+    let view = session.view();
+    let LoadState::Loaded(info) = &view.load else {
+        return paths;
+    };
+    let total_files = info.total_files;
+    if info.tree.is_some() || paths.is_empty() || (paths.len() as i64) < total_files {
+        return paths;
+    }
+    match kernel::selection_summary(view.lang, client, Some(&paths)) {
+        Ok(counts) if counts.count == total_files => Vec::new(),
+        _ => paths,
+    }
+}
+
 /// `enqueue` 的**命令体**（[`enqueue`] 的唯一实现，单测直接调它）。
 ///
 /// 三步（规格 §5.3）：取数据（**会话快照**里那一批的全部文件）→ 判据（`kernel_paths`
@@ -439,6 +566,9 @@ fn enqueue_with(session: &Arc<Session>, paths: Vec<String>) -> Value {
     // ⚠️ 锁的纪律：`client()` 与 `view()` 都是"读一次就放锁"，两次临界区都在这一行之内，
     //    之后的 `kernel::enqueue` 手里没有会话锁（见文件头那条）。
     let paths = kernel_paths(&session.view().load, &paths);
+    // 🔴 C-3 的另一半：树不在壳里的时候（`load_delivery` 带 `tree: false`），
+    //    `kernel_paths` 判不了"这一串是不是整批" ⇒ 交给内核自己认。
+    let paths = collapse_whole_selection(session, &client, paths);
     // 🔴 大批量不再被拒（2026-10-12）：超出单条请求预算的路径串被切成若干块**依次**发给内核；
     //    内核对每块只同步提交前 100 个、其余后台陆续加入（`pending`），所以每一块都很快返回。
     //    · 单条就超预算的路径不进任何一块（它发出去也只会让内核不回话），逐条作为 rejected 交代；
@@ -546,7 +676,17 @@ const OVERSIZED_PATH_REASON: &str = "这一项路径太长，超过单次请求�
 /// （见 `download_targets.rs` 的模块头）。
 fn kernel_paths(batch: &LoadState, selection: &[String]) -> Vec<String> {
     let all_paths = match batch {
-        LoadState::Loaded(info) => BrowserSelection::all_files_of(&info.tree),
+        // ⚠️ `tree` 是 `Option`：`load_delivery` 带 `"tree": false`（大批次）时内核
+        //    **不发**它 ⇒ 手上没有整批路径 ⇒ "整批全选发空数组"那条规则无从判起，
+        //    于是原样发勾选面（`enqueue_with` 会按 4 MiB 切块，照样发得出去）。
+        //    **代价**：勾满九万多条时不再合并成一条空数组，而是分成十几条发。
+        //    而真正的"全下"不勾任何东西（前端发空数组 ⇒ 内核按清单现算全部），
+        //    那条路一次都不经过这里。
+        LoadState::Loaded(info) => info
+            .tree
+            .as_ref()
+            .map(BrowserSelection::all_files_of)
+            .unwrap_or_default(),
         LoadState::Idle | LoadState::Loading | LoadState::Failed(_) => BTreeSet::new(),
     };
     let selection: BTreeSet<String> = selection.iter().cloned().collect();
@@ -1970,6 +2110,92 @@ mod tests {
         (session, channel)
     }
 
+    /// 一份**大批次**的交付清单：`total_files` 是那个大数，树**不在**
+    /// （壳带 `tree: false` 加载，内核对大批次就是不发树）。
+    fn a_batch_with(files: i64) -> DeliveryInfo {
+        DeliveryInfo {
+            code: "C24-8".to_string(),
+            page_url: "https://d.example/C24-8/index.html".to_string(),
+            base_url: "https://d.example".to_string(),
+            created_at: String::new(),
+            expires_at: String::new(),
+            expired: false,
+            total_files: files,
+            total_bytes: 176_093_003_776,
+            tree: None,
+        }
+    }
+
+    /// `get_tree {"summary_only": true}` 的回执（164 GiB 里下完 40 GiB，12 MB/s）。
+    const BIG_TREE_SUMMARY: &str = r#"{"progress":{"total_bytes":176093003776,"done_bytes":42949672960,"speed":12582912,"percent":24},"default_count":91973,"default_bytes":42949672960,"total_files":91973}"#;
+
+    /// `selection_summary` 的回执：没勾选面 ⇒ 内核按默认面算出来的那一份。
+    const BIG_DEFAULT_COUNTS: &str = r#"{"count":91973,"bytes":42949672960,"pending_count":91970,"pending_bytes":42000000000,"all_selected":true}"#;
+
+    /// `selection_summary` 的回执：用户勾了两项。
+    const BIG_TICKED_COUNTS: &str = r#"{"count":2,"bytes":2048,"pending_count":2,"pending_bytes":2048,"all_selected":false}"#;
+
+    /// 只答「数」的那种内核通道：`get_tree summary_only` 与 `selection_summary` 各回一份。
+    ///
+    /// ⚠️ `Recording` 只会回 enqueue 那句（`added`/`rejected`）—— 大批次那两条路要的是
+    ///    另外两种回执，拿它喂会解码失败（响亮，不是静默）。
+    #[derive(Clone)]
+    struct NumbersOnly {
+        counts: &'static str,
+        written: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl NumbersOnly {
+        fn all_requests(&self) -> Vec<String> {
+            self.written.lock().unwrap().clone()
+        }
+    }
+
+    impl LineChannel for NumbersOnly {
+        fn write_line(&self, line: &str) -> Result<(), ClientError> {
+            self.written.lock().unwrap().push(line.to_string());
+            Ok(())
+        }
+        fn read_line(&self) -> Result<Option<String>, ClientError> {
+            let written = self.written.lock().unwrap();
+            // id = 到目前为止写出去的请求条数（`CoreClient` 从 1 起编号，逐条递增）。
+            let id = written.len();
+            let sent = written.last().cloned().unwrap_or_default();
+            let result = if sent.contains("selection_summary") {
+                self.counts
+            } else if sent.contains("summary_only") {
+                BIG_TREE_SUMMARY
+            } else if sent.contains(r#""method":"enqueue""#) {
+                // 一件都没加的真实回执（`EnqueueFeedback::of` 认的形状）。
+                r#"{"added":[],"rejected":[]}"#
+            } else {
+                // 走到这里说明本用例意外让命令层拉了整棵树（那正是判别力所在）。
+                return Err(ClientError::ReadFailed {
+                    cause: std::io::Error::other(format!(
+                        "大批次那条路只该发两种请求，收到：{sent}"
+                    )),
+                });
+            };
+            Ok(Some(format!(r#"{{"id":{id},"ok":true,"result":{result}}}"#)))
+        }
+        fn close(&self) {}
+    }
+
+    /// 一个**装着大批次**的会话（9.2 万文件，树不在），通道按方法给回执。
+    fn a_big_batch_session(counts: &'static str) -> (Arc<Session>, NumbersOnly) {
+        let channel = NumbersOnly {
+            counts,
+            written: Arc::new(Mutex::new(Vec::new())),
+        };
+        let session = Arc::new(Session::new());
+        session.install_client(
+            Arc::new(CoreClient::new(Box::new(channel.clone()))),
+            r#"{"protocol":2}"#.to_string(),
+        );
+        session.set_load(LoadState::Loaded(a_batch_with(91_973)));
+        (session, channel)
+    }
+
     /// 一个文件叶节点（`FileNode` 的每个键都给 —— 那也是内核真发的那些键）。
     fn a_file(path: &str) -> TreeNode {
         TreeNode::File(FileNode {
@@ -2005,10 +2231,10 @@ mod tests {
             expired: false,
             total_files: paths.len() as i64,
             total_bytes: paths.len() as i64,
-            tree: TreeNode::Dir {
+            tree: Some(TreeNode::Dir {
                 name: String::new(),
                 children,
-            },
+            }),
         }
     }
 
@@ -2204,7 +2430,7 @@ mod tests {
     ///    正是下面那几条用例要分开看的。
     fn a_tree_of(paths: &[String], default_selected: &[String]) -> TreeResult {
         TreeResult {
-            tree: a_batch_of(paths).tree,
+            tree: a_batch_of(paths).tree.expect("夹具的批次带着树"),
             flat: paths
                 .iter()
                 .map(|path| FlatEntry {
@@ -2443,6 +2669,164 @@ mod tests {
             serde_json::Value::Null,
             "整批全选 ⇒ 发空数组 ⇒ 永远在预算之内（这一条不许被挡）：{value}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 大批次：底栏那两个数从内核直接要，不拉整棵树（2026-10-26）
+    // -----------------------------------------------------------------------
+
+    /// 🔴 9.2 万文件那一批：底栏那三格与按钮**只由两个数拼出来**。
+    ///
+    /// 判别力（三条都必须成立，否则真机上是"界面没有下载按钮"那个现场）：
+    ///   · 让 `is_big_batch` 恒 false（回整棵树那条路）⇒ `NumbersOnly` 收到一条
+    ///     `get_tree {}`，直接回错 ⇒ 这条红；
+    ///   · 把 `selection_summary` 的 `None` 改成 `Some(&[])` ⇒ 下面"省略 `paths`"
+    ///     那条红（内核仍按默认面算，但请求形状已经不是"省略"）；
+    ///   · 在命令层自己拼"已选 N 项" ⇒ 文案不再是 `DownloadTargets` 那句。
+    ///
+    /// 那三格数字都是**内核给的数**：`91973` 条、40 GiB、12 MB/s —— 树不在壳里。
+    #[test]
+    fn a_big_batch_fills_the_footer_from_numbers_not_from_the_tree() {
+        let (session, ch) = a_big_batch_session(BIG_DEFAULT_COUNTS);
+        let client = session.client().expect("会话里装着内核");
+        let value = summary_tree(&session, &client, None);
+
+        assert_eq!(value["ok"], serde_json::json!(true), "{value}");
+        assert_eq!(value["data"]["progress"]["percent_text"], serde_json::json!("24%"), "{value}");
+        assert_eq!(
+            value["data"]["progress"]["bytes_text"],
+            serde_json::json!("40.0 GB / 164.0 GB"),
+            "{value}"
+        );
+        assert_eq!(value["data"]["progress"]["speed_text"], serde_json::json!("12.0 MB/s"), "{value}");
+        assert_eq!(
+            value["data"]["selection"]["count_text"],
+            serde_json::json!("已选 91973 项"),
+            "整批的条数来自 `selection_summary`，不是壳自己数出来的：{value}"
+        );
+        assert_eq!(
+            value["data"]["selection"]["size_text"],
+            serde_json::json!("合计 40.0 GB"),
+            "{value}"
+        );
+        assert_eq!(value["data"]["action"]["button_title"], serde_json::json!("全部下载"), "{value}");
+        assert_eq!(
+            value["data"]["action"]["blocked_reason"],
+            serde_json::Value::Null,
+            "与整棵树那条路同一条结论（分批入队，不拦）：{value}"
+        );
+        assert_eq!(
+            value["data"]["selected"],
+            serde_json::json!([]),
+            "整批路径不在壳里 ⇒ 回执不带它（前端读它只为播种，大批次本来就不播种）：{value}"
+        );
+
+        let sent = ch.all_requests();
+        assert_eq!(sent.len(), 2, "两次**只要数**的往返：{sent:?}");
+        assert!(
+            sent[0].contains(r#""method":"get_tree""#) && sent[0].contains(r#""summary_only":true"#),
+            "第一条必须是概要：{}",
+            sent[0]
+        );
+        assert!(
+            sent[1].contains(r#""method":"selection_summary""#),
+            "第二条要勾选面的数：{}",
+            sent[1]
+        );
+        assert!(
+            !sent[1].contains("paths"),
+            "没报勾选面就**省略** `paths`（内核按默认面现算）：{}",
+            sent[1]
+        );
+    }
+
+    /// 大批次 + 用户勾了两项：三格说的是**同一个面**，请求里逐字带着那两条路径。
+    #[test]
+    fn a_big_batch_with_a_ticked_face_speaks_about_that_face() {
+        let (session, ch) = a_big_batch_session(BIG_TICKED_COUNTS);
+        let client = session.client().expect("会话里装着内核");
+        let ticked = v(&["dir/a.bin", "dir/b.bin"]);
+        let value = summary_tree(&session, &client, Some(&ticked));
+
+        assert_eq!(value["data"]["selection"]["count_text"], serde_json::json!("已选 2 项"), "{value}");
+        assert_eq!(value["data"]["selection"]["size_text"], serde_json::json!("合计 2.0 KB"), "{value}");
+        assert_eq!(value["data"]["action"]["button_title"], serde_json::json!("下载选中"), "{value}");
+        assert_eq!(
+            value["data"]["selected"],
+            serde_json::json!(["dir/a.bin", "dir/b.bin"]),
+            "报上来的那个面原样回声（前端只在播种那一拍读它）：{value}"
+        );
+        let sent = ch.all_requests();
+        assert!(
+            sent[1].contains(r#""paths":["dir/a.bin","dir/b.bin"]"#),
+            "勾选面要逐字交给内核：{}",
+            sent[1]
+        );
+    }
+
+    /// 🔴 **整批全选（树不在壳里）⇒ 交给内核的是空数组** —— 内核按清单现算全部。
+    ///
+    /// 这是客户那句「没加载完也要能下全」的落点：壳**不枚举**那 9.2 万条路径。
+    /// 判别力：把 `collapse_whole_selection` 那次调用删掉 ⇒ 这条红（发出去的是
+    /// 91973 条显式路径，请求被切十几块，而"全下"的语义是内核自己算）。
+    #[test]
+    fn a_ticked_full_batch_is_handed_to_the_kernel_as_an_empty_array() {
+        // 内核答：这一串勾选面**就是**整批（`count == total_files` = 集合相等）。
+        let (session, ch) = a_big_batch_session(BIG_DEFAULT_COUNTS);
+        let all: Vec<String> = (0..91_973).map(|i| format!("dir/{i}.bin")).collect();
+
+        let value = enqueue_with(&session, all);
+        assert_eq!(value["ok"], serde_json::json!(true), "{value}");
+
+        let sent = ch.all_requests();
+        let enqueue = sent.last().expect("至少要发一条 enqueue");
+        assert!(enqueue.contains(r#""method":"enqueue""#), "{enqueue}");
+        assert!(
+            enqueue.contains(r#""paths":[]"#),
+            "整批 ⇒ 空数组（内核按清单现算全部）：{enqueue}"
+        );
+    }
+
+    /// 少勾几项 ⇒ **一次额外往返都不花**（那一问只在"可能覆盖整批"时才有意义）。
+    ///
+    /// 判别力：把 `(paths.len() as i64) < total_files` 那道闸去掉 ⇒ 这条红
+    /// （每次点下载都白问内核一次；9.2 万文件那一批上那是每一下都多一条往返）。
+    #[test]
+    fn a_partial_selection_on_a_big_batch_costs_no_extra_round_trip() {
+        let (session, ch) = a_big_batch_session(BIG_TICKED_COUNTS);
+
+        let value = enqueue_with(&session, v(&["dir/a.bin", "dir/b.bin"]));
+        assert_eq!(value["ok"], serde_json::json!(true), "{value}");
+
+        let sent = ch.all_requests();
+        assert_eq!(sent.len(), 1, "只有那一条 enqueue：{sent:?}");
+        assert!(
+            sent[0].contains(r#""paths":["dir/a.bin","dir/b.bin"]"#),
+            "{}",
+            sent[0]
+        );
+    }
+
+    /// 门槛：**大于**三万文件才不拉树（三万本身照旧整棵树）。
+    ///
+    /// 判别力：把 `>` 改成 `>=`、或把门槛改小，这一条红。
+    #[test]
+    fn only_a_batch_over_thirty_thousand_files_skips_the_tree() {
+        assert!(
+            !is_big_batch(&LoadState::Loaded(a_batch_with(BIG_BATCH_FILES))),
+            "三万整还是整棵树"
+        );
+        assert!(
+            is_big_batch(&LoadState::Loaded(a_batch_with(BIG_BATCH_FILES + 1))),
+            "多一个就换路"
+        );
+        assert!(
+            is_big_batch(&LoadState::Loaded(a_batch_with(91_973))),
+            "现场那一批（91,973 个文件 / 163.7 GB）"
+        );
+        assert!(!is_big_batch(&LoadState::Idle), "还没加载完 ⇒ 不判大批次");
+        assert!(!is_big_batch(&LoadState::Loading), "加载中同理");
+        assert!(!is_big_batch(&LoadState::Failed("x".to_string())), "失败没有文件数可判");
     }
 
     /// ⚠️ **没给勾选面（首帧/播种那一拍）⇒ 按内核的 `default_selected` 算**（今天的行为）。

@@ -2044,6 +2044,59 @@
     },
     "ok": true
   },
+  "treeWholeBig": {
+    "data": {
+      "action": {
+        "blocked_reason": null,
+        "button_title": "全部下载",
+        "empty_selection_hint": "未勾选任何项，将下载全部待下载文件"
+      },
+      "breadcrumb": {
+        "path": "",
+        "segments": []
+      },
+      "progress": {
+        "bytes_text": "40.0 GB / 163.7 GB",
+        "fraction": 0.2444233951299409,
+        "percent_text": "24%",
+        "speed_text": "12.0 MB/s"
+      },
+      "selected": [],
+      "selection": {
+        "count_text": "已选 91973 项",
+        "size_text": "合计 163.7 GB"
+      }
+    },
+    "ok": true
+  },
+  "treeWholeBigTicked": {
+    "data": {
+      "action": {
+        "blocked_reason": null,
+        "button_title": "下载选中",
+        "empty_selection_hint": null
+      },
+      "breadcrumb": {
+        "path": "",
+        "segments": []
+      },
+      "progress": {
+        "bytes_text": "40.0 GB / 163.7 GB",
+        "fraction": 0.2444233951299409,
+        "percent_text": "24%",
+        "speed_text": "12.0 MB/s"
+      },
+      "selected": [
+        "01.RawData/reads.fq.gz",
+        "01.RawData/QC 图.png"
+      ],
+      "selection": {
+        "count_text": "已选 2 项",
+        "size_text": "合计 2.0 KB"
+      }
+    },
+    "ok": true
+  },
   "updateCheckDisabled": {
     "data": {
       "headline": "自动检查更新是关着的，刚才没有去查。补救：打开上面那个开关，再点一次「立即检测」。",

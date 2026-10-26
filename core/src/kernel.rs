@@ -2227,7 +2227,8 @@ pub fn dispatch(kernel: &Arc<Mutex<Kernel>>, req: &Request) -> (Response, bool) 
         // 它们各自把"锁外取数 / 锁内安装"分开，见各自的注释。
         "load_delivery" => op_load_delivery(kernel, &req.params),
         "list_dir" => op_list_dir(kernel, &req.params),
-        "get_tree" => op_get_tree(kernel),
+        "get_tree" => op_get_tree(kernel, &req.params),
+        "selection_summary" => op_selection_summary(kernel, &req.params),
         "plan" => op_plan(kernel, &req.params),
         "enqueue" => op_enqueue(kernel, &req.params),
         "transfer_list" => with_kernel(kernel, op_transfer_list),
@@ -2483,6 +2484,10 @@ pub fn op_load_delivery(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<V
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .unwrap_or(delivery::DEFAULT_BASE_URL);
+    // 「要不要整棵树」——**默认要**（macOS 侧仍在用）；Windows 壳改成只要
+    // 一层的 `list_dir` 之后，传 `false` 就不再花 33 MB 的序列化与传输。
+    // 十万文件的批次里，那一棵树是最大的一笔开销（实测 9.2 万文件 33,027,043 B）。
+    let want_tree = params.get("tree").and_then(Value::as_bool).unwrap_or(true);
 
     // 语言：只为"给客户的那句话"取一格，取完立刻放锁（下面全是 I/O）
     let lang = lock(kernel).language;
@@ -2570,9 +2575,10 @@ pub fn op_load_delivery(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<V
     // ⚠️ 出树仍用 `m`（plan **之前**那份克隆）是**对的**：`tree_json` 只消费
     //    path / size / source_mtime，**一个字节的 `crc64` 都不读**（`view::build_tree`）。
     //    两者在这一维上等价 —— 所以不必为了"看起来一致"多克隆一份清单。
-    let tree = tree_json(&mut k, &m);
+    // 只有真要树的时候才序列化它（`tree_json` 要 `&mut k`，并遍历整份清单）。
+    let tree = if want_tree { Some(tree_json(&mut k, &m)) } else { None };
 
-    Ok(json!({
+    let mut out = json!({
         "code": m.code,
         // 交付页地址（`Manifest::url()` 在移植时没带过来，而 Go 版界面用它提示客户：
         // `manifest.go:113`）。壳拿它就能把"去哪儿看交付页"显示成人话。
@@ -2590,7 +2596,80 @@ pub fn op_load_delivery(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<V
         "expired": m.expired(std::time::SystemTime::now()),
         "total_files": m.total_files,
         "total_bytes": m.total_bytes,
-        "tree": tree,
+    });
+    if let Some(tree) = tree {
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("tree".into(), tree);
+        }
+    }
+    Ok(out)
+}
+
+/// `selection_summary`：「勾选面」的规模，**不把路径列回给壳**。
+///
+/// 为什么要有它：十万文件的批次里，壳为了在底栏写「已选 N 个 · M GB」，过去要把整棵树
+/// （连 `flat` 一起）拉回本地再逐条累加 —— 实测 9.2 万文件 61 MB，而它只需要三个数。
+///
+/// 选项集的**身份**仍归壳（勾了哪些 path 它自己知道）；只有「默认面 / 全选」这一档，
+/// 壳把 `paths` 留空，由内核按 [`view::default_selected`] 现算 —— 这样
+/// 「默认勾哪些」全仓只有一个定义，不会出现两边各算一份、结果不一样。
+///
+/// ⚠️ `paths` 为空时要先 `ensure_complete`（锁外），和 `op_enqueue` 同一条理由。
+pub fn op_selection_summary(
+    kernel: &Arc<Mutex<Kernel>>,
+    params: &Value,
+) -> Result<Value, ErrorBody> {
+    let raw: Vec<String> = params
+        .get("paths")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if raw.is_empty() {
+        ensure_complete(kernel);
+    }
+
+    let mut k = lock(kernel);
+    let m = k.require_manifest()?;
+    let (path_map, tasks) = current_tasks(&mut k);
+    let states = view::compose(&m.files, &k.complete, &path_map, &tasks);
+    let default = view::default_selected(&states);
+
+    let sizes: std::collections::BTreeMap<&str, i64> =
+        m.files.iter().map(|f| (f.path.as_str(), f.size)).collect();
+    let selected: std::collections::BTreeSet<String> = if raw.is_empty() {
+        default.clone()
+    } else {
+        // 清单里不存在的路径一律忽略（壳可能拿着上一份批次的选择）。
+        raw.into_iter().filter(|p| sizes.contains_key(p.as_str())).collect()
+    };
+
+    let mut bytes: i64 = 0;
+    let mut pending_count: usize = 0;
+    let mut pending_bytes: i64 = 0;
+    for path in &selected {
+        let Some(size) = sizes.get(path.as_str()) else { continue };
+        bytes += *size;
+        let is_done = states
+            .get(path.as_str())
+            .is_some_and(|st| st.state == crate::view::State::Complete);
+        if !is_done {
+            pending_count += 1;
+            pending_bytes += *size;
+        }
+    }
+
+    Ok(json!({
+        "count": selected.len(),
+        "bytes": bytes,
+        "pending_count": pending_count,
+        "pending_bytes": pending_bytes,
+        "all_selected": selected == default,
     }))
 }
 
@@ -2796,7 +2875,14 @@ fn entries_json(
 /// `flat` 用的是 [`view::flatten`]（树序，与界面上看到的顺序一致），
 /// 让壳不必跨进程边界递归就能渲染大目录；`default_selected` 是给勾选框的默认值
 /// （Go 版界面就是这两处的调用方）。
-pub fn op_get_tree(kernel: &Arc<Mutex<Kernel>>) -> Result<Value, ErrorBody> {
+pub fn op_get_tree(kernel: &Arc<Mutex<Kernel>>, params: &Value) -> Result<Value, ErrorBody> {
+    // `summary_only`：只要**总进度与默认面的规模**，不要树、不要 flat、不要那串路径。
+    // 十万文件的批次里，后三者加起来 61 MB（实测 9.2 万文件），而底栏只用这几个数。
+    let summary_only = params
+        .get("summary_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     ensure_complete(kernel); // 锁外（长）；幂等，只有 `complete_dirty` 时才真算
 
     let mut k = lock(kernel);
@@ -2804,6 +2890,29 @@ pub fn op_get_tree(kernel: &Arc<Mutex<Kernel>>) -> Result<Value, ErrorBody> {
     let (path_map, tasks) = current_tasks(&mut k);
     let states = view::compose(&m.files, &k.complete, &path_map, &tasks);
     let prog = view::progress(&m.files, &k.complete, &path_map, &tasks);
+
+    if summary_only {
+        // 默认面的规模（口径与 `view::default_selected` 同一个定义）。
+        let sizes: std::collections::BTreeMap<&str, i64> =
+            m.files.iter().map(|f| (f.path.as_str(), f.size)).collect();
+        let selected = view::default_selected(&states);
+        let mut bytes: i64 = 0;
+        for path in &selected {
+            bytes += sizes.get(path.as_str()).copied().unwrap_or(0);
+        }
+        return Ok(json!({
+            "progress": {
+                "total_bytes": prog.total_bytes,
+                "done_bytes": prog.done_bytes,
+                "speed": prog.speed,
+                "percent": prog.percent,
+            },
+            "default_count": selected.len(),
+            "default_bytes": bytes,
+            "total_files": m.files.len() as i64,
+        }));
+    }
+
     let root = view::build_tree(&m.files);
 
     let flat: Vec<Value> = view::flatten(&root)
@@ -4337,6 +4446,115 @@ mod tests {
     ///
     /// 两个探针**先收集结果、最后统一断言**，中途一定会放行两个桩：
     /// 这样即使红了也不会把线程留在阻塞里。
+    /// 十万文件的批次里，「整棵树」是最大的一笔开销（实测 9.2 万文件 33 MB）。
+    /// 壳只要一层的 `list_dir` 时，必须能说「别把树给我」。
+    #[test]
+    fn load_delivery_can_skip_the_tree() {
+        const CODE: &str = "AbCdEfGhIjKlMnOpQrSt";
+        let base: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+        let base_m = Arc::clone(&base);
+        let srv = StubHttp::start_with(move |_req| {
+            let b = base_m.get().cloned().unwrap_or_default();
+            RawResponse::new(200).body(format!(
+                r#"{{"code":"{CODE}","base_url":"{b}","files":[{{"path":"t/a.bin","size":6,"crc64":""}},{{"path":"t/b.bin","size":4,"crc64":""}}]}}"#
+            ))
+        });
+        base.set(srv.base()).ok();
+
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(
+            dir.join("dl"),
+            dir.join("s.json"),
+        )));
+
+        let full = op_load_delivery(&kernel, &json!({"code": CODE, "base_url": srv.base()}))
+            .expect("默认要树");
+        assert!(full.get("tree").is_some(), "默认必须仍然带树（macOS 在用）");
+
+        let slim = op_load_delivery(
+            &kernel,
+            &json!({"code": CODE, "base_url": srv.base(), "tree": false}),
+        )
+        .expect("不要树也要成功");
+        assert!(slim.get("tree").is_none(), "tree:false 不该带回树：{slim}");
+        assert_eq!(slim["code"], json!(CODE), "概要不受影响");
+    }
+
+    /// 十万文件的批次里，底栏只要进度与默认面的规模 —— 不该为此拉回一棵树。
+    #[test]
+    fn get_tree_can_answer_without_the_tree() {
+        const CODE: &str = "AbCdEfGhIjKlMnOpQrSt";
+        let base: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+        let base_m = Arc::clone(&base);
+        let srv = StubHttp::start_with(move |_req| {
+            let b = base_m.get().cloned().unwrap_or_default();
+            RawResponse::new(200).body(format!(
+                r#"{{"code":"{CODE}","base_url":"{b}","files":[{{"path":"t/a.bin","size":6,"crc64":""}},{{"path":"t/b.bin","size":4,"crc64":""}}]}}"#
+            ))
+        });
+        base.set(srv.base()).ok();
+
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(
+            dir.join("dl"),
+            dir.join("s.json"),
+        )));
+        op_load_delivery(&kernel, &json!({"code": CODE, "base_url": srv.base()})).expect("装批次");
+
+        let slim = op_get_tree(&kernel, &json!({"summary_only": true})).expect("只要概要");
+        assert!(slim.get("tree").is_none(), "不该带树：{slim}");
+        assert!(slim.get("flat").is_none(), "不该带 flat：{slim}");
+        assert!(slim.get("default_selected").is_none(), "不该带路径串：{slim}");
+        assert_eq!(slim["default_count"], json!(2));
+        assert_eq!(slim["default_bytes"], json!(10));
+        assert_eq!(slim["total_files"], json!(2));
+        assert!(slim["progress"]["total_bytes"].as_i64().unwrap_or(0) > 0);
+
+        // 默认仍要整棵树（macOS 与既有夹具都在用）
+        let full = op_get_tree(&kernel, &json!({})).expect("默认整棵树");
+        assert!(full.get("tree").is_some());
+        assert!(full.get("flat").is_some());
+    }
+
+    /// 底栏那句「已选 N 个 · M GB」只需要三个数 —— 不该为此把十万条路径拉回来。
+    #[test]
+    fn selection_summary_counts_without_shipping_the_paths() {
+        const CODE: &str = "AbCdEfGhIjKlMnOpQrSt";
+        let base: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+        let base_m = Arc::clone(&base);
+        let srv = StubHttp::start_with(move |_req| {
+            let b = base_m.get().cloned().unwrap_or_default();
+            RawResponse::new(200).body(format!(
+                r#"{{"code":"{CODE}","base_url":"{b}","files":[{{"path":"t/a.bin","size":6,"crc64":""}},{{"path":"t/b.bin","size":4,"crc64":""}}]}}"#
+            ))
+        });
+        base.set(srv.base()).ok();
+
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.join("dl")).expect("建下载目录失败");
+        let kernel = Arc::new(Mutex::new(Kernel::new(
+            dir.join("dl"),
+            dir.join("s.json"),
+        )));
+        op_load_delivery(&kernel, &json!({"code": CODE, "base_url": srv.base()})).expect("装批次");
+
+        // 不传 paths ⇒ 默认面（所有未完成的文件），并且它就是「全部」
+        let all = op_selection_summary(&kernel, &json!({})).expect("默认面");
+        assert_eq!(all["count"], json!(2));
+        assert_eq!(all["bytes"], json!(10));
+        assert_eq!(all["pending_count"], json!(2));
+        assert_eq!(all["all_selected"], json!(true));
+
+        // 传了 paths ⇒ 只数这些；清单里没有的忽略（壳可能拿着上一批的选择）
+        let some = op_selection_summary(&kernel, &json!({"paths": ["t/a.bin", "t/./nope"]}))
+            .expect("子集");
+        assert_eq!(some["count"], json!(1), "不存在的路径必须被丢掉");
+        assert_eq!(some["bytes"], json!(6));
+        assert_eq!(some["all_selected"], json!(false), "只选了一个，不是全选");
+    }
+
     #[test]
     fn load_delivery_touches_the_network_without_holding_the_kernel_lock() {
         const CODE: &str = "AbCdEfGhIjKlMnOpQrSt";

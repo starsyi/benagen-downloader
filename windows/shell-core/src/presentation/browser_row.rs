@@ -760,6 +760,26 @@ impl SelectionSummary {
         }
     }
 
+    /// **只有两个数**的时候（`selection_summary` 的回执就是这两个数）：勾选面的条数与字节。
+    ///
+    /// 十万文件的批次里勾选面可能是九万多条路径 —— 底栏这一行只要 `count` 与 `bytes`，
+    /// 让内核现算（`selection_summary`）比把路径拉回壳里再数一遍便宜得多。
+    /// ⚠️ 句子仍从 [`crate::i18n`] 的同一对键取（与 [`of`](Self::of) 一个字都不差）。
+    pub fn from_numbers(lang: crate::i18n::Lang, count: i64, bytes: i64) -> SelectionSummary {
+        SelectionSummary {
+            count_text: crate::i18n::tf(
+                lang,
+                crate::i18n::Key::SelectionCount,
+                &[("n", &count.to_string())],
+            ),
+            size_text: crate::i18n::tf(
+                lang,
+                crate::i18n::Key::SelectionTotal,
+                &[("size", &ByteFormat::text(bytes))],
+            ),
+        }
+    }
+
     /// `get_tree` 的 `flat[]` → 路径 → 大小。**跨目录**的合计要靠它（当前层只有一部分）。
     pub fn size_index(flat: &[FlatEntry]) -> BTreeMap<String, i64> {
         let mut out: BTreeMap<String, i64> = BTreeMap::new();
@@ -1393,12 +1413,12 @@ mod tests {
             "`flat[]` 那一侧"
         );
         assert_eq!(
-            BrowserSelection::all_files_of(&tree_receipt.tree),
+            BrowserSelection::all_files_of(tree_receipt.tree.as_ref().expect("这份回执带着树")),
             want,
             "`load_delivery` 的树那一侧（命令层手上有的就是它）"
         );
         assert_eq!(
-            BrowserSelection::all_files_of(&tree_receipt.tree),
+            BrowserSelection::all_files_of(tree_receipt.tree.as_ref().expect("这份回执带着树")),
             BrowserSelection::all_files(&flat_receipt.flat),
             "两条来源必须是**同一个集合** —— 否则 C-3 那条判据在不同入口上口径不一"
         );

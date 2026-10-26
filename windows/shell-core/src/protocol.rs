@@ -411,6 +411,38 @@ pub struct TreeResult {
     pub progress: Progress,
 }
 
+/// `get_tree {"summary_only": true}` 的回执：**只有数，没有树**。
+///
+/// 十万文件的批次里整棵树那条回执实测 61 MB（9.2 万文件），而底栏只用这几个数
+/// —— 大批次改问这个形状（内核 `1ef12265`）。`default_count`/`default_bytes` 是
+/// 「默认勾选面」的规模（与 [`TreeResult::default_selected`] **同一个定义**）。
+///
+/// ⚠️ 四个键由内核无条件发出 ⇒ 非可选（缺一个就是漂移，响亮地解码失败）。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TreeSummary {
+    pub progress: Progress,
+    pub default_count: i64,
+    pub default_bytes: i64,
+    /// 清单里的文件总数 —— 壳据此判"要不要走概要那条路"。
+    pub total_files: i64,
+}
+
+/// `selection_summary` 的回执：勾选面的**数与字节**，不带路径。
+///
+/// 内核 `d9a1aa36` 新增。省略 `paths` 时算的是**默认面**；`pending_*` 排除了已完成的。
+///
+/// ⚠️ 名字带 `Reply` 是为了不和呈现层的 [`crate::presentation::SelectionSummary`]
+///    （那一个是 `count_text`/`size_text` 两个句子）撞名。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SelectionSummaryReply {
+    pub count: i64,
+    pub bytes: i64,
+    pub pending_count: i64,
+    pub pending_bytes: i64,
+    /// 这一次算的集合是否就是默认面。
+    pub all_selected: bool,
+}
+
 /// 交付清单的树（内核 `core/src/main.rs` 的 `node_json`）。
 ///
 /// 判别键是 `"type"`（`"dir"`/`"file"`），**不是 `is_dir` 之类的布尔**。
@@ -507,7 +539,11 @@ pub struct DeliveryInfo {
     pub expired: bool,
     pub total_files: i64,
     pub total_bytes: i64,
-    pub tree: TreeNode,
+    /// 清单的树。**可缺席**：壳用 `{"tree": false}` 加载大批次时内核**不发这个键**
+    /// （9.2 万文件那一批整棵树实测 33 MB，而加载页只用 `total_files`/`total_bytes`）。
+    /// 缺失 ⇒ `None`，用它的地方（整批路径集合）退化成"问内核要概要"。
+    #[serde(default)]
+    pub tree: Option<TreeNode>,
 }
 
 /// 客户可调的七项（`core/src/settings.rs` 的 `Settings`）。
@@ -1350,8 +1386,9 @@ mod tests {
     /// `DeliveryInfo` —— `load_delivery` 的回执。
     ///
     /// 守：`op_load_delivery`（`core/src/main.rs`）那个 `json!` 里的**每一个键**
-    /// ——`page_url`/`base_url`/`created_at`/`expires_at`/`expired`/`total_files`/`total_bytes`/`tree`
+    /// ——`page_url`/`base_url`/`created_at`/`expires_at`/`expired`/`total_files`/`total_bytes`
     /// 全部 snake_case。少一个键就是硬失败（那是漂移探测器，见文件头）。
+    /// 唯一的例外是 `tree`：`{"tree": false}` 时内核**整个不发这个键**（大批次）。
     /// `expired` 让壳能在下载一个个 404 之前就把过期显示出来。
     #[test]
     fn delivery_info_mirrors_the_load_delivery_receipt() {
@@ -1370,9 +1407,21 @@ mod tests {
         assert!(!d.expired);
         assert_eq!(d.total_files, 2);
         assert_eq!(d.total_bytes, 26);
-        assert_eq!(d.tree, TreeNode::Empty);
+        assert_eq!(d.tree, Some(TreeNode::Empty));
 
-        // 缺一个键就必须红——那是"内核把字段改名了"的信号，不许静默吞掉
+        // 壳用 `{"tree": false}` 加载大批次时，内核**整个不发 `tree` 键** ⇒ `None`。
+        // 判别力：把那个 `#[serde(default)]` 去掉，这一条立刻红（而真机上的表现是
+        // 9.2 万文件那一批**加载后没有下载按钮** —— 壳解不动自己的回执）。
+        let slim: DeliveryInfo = serde_json::from_str(
+            r#"{"code":"c","page_url":"p","base_url":"b","created_at":"","expires_at":"",
+                "expired":false,"total_files":91973,"total_bytes":175718338816}"#,
+        )
+        .expect("tree:false 的回执必须能解");
+        assert_eq!(slim.tree, None, "没有 tree 键 ⇒ None，不是空树");
+        assert_eq!(slim.total_files, 91973, "文件数照旧要给");
+
+        // 缺**别的**键就必须红——那是"内核把字段改名了"的信号，不许静默吞掉
+        // （`tree` 是唯一可缺席的那个键，见上）。
         assert!(
             serde_json::from_str::<DeliveryInfo>(
                 r#"{"code":"c","base_url":"b","created_at":"","expires_at":"",
@@ -1381,6 +1430,33 @@ mod tests {
             .is_err(),
             "缺 page_url 必须解码失败（缺字段是漂移信号，不该静默）"
         );
+    }
+
+    /// 两个概要回执（内核 `d9a1aa36` / `1ef12265`）的键名逐字。
+    ///
+    /// 判别力：`default_count` 写成 `default_selected`、`pending_count` 写成 `pending`
+    /// —— 前者会让概要那条路读到 0（底栏显示「已选 0 项」），后者直接解码失败。
+    #[test]
+    fn the_two_summary_receipts_mirror_their_kernels() {
+        let t: TreeSummary = serde_json::from_str(
+            r#"{"progress":{"total_bytes":175718338816,"done_bytes":42949672960,
+                "speed":12582912,"percent":24},"default_count":91973,
+                "default_bytes":175718338816,"total_files":91973}"#,
+        )
+        .expect("summary_only 的回执必须能解");
+        assert_eq!(t.progress.total_bytes, 175_718_338_816);
+        assert_eq!(t.default_count, 91_973);
+        assert_eq!(t.default_bytes, 175_718_338_816);
+        assert_eq!(t.total_files, 91_973);
+
+        let s: SelectionSummaryReply = serde_json::from_str(
+            r#"{"count":91973,"bytes":175718338816,"pending_count":91970,
+                "pending_bytes":175712000000,"all_selected":true}"#,
+        )
+        .expect("selection_summary 的回执必须能解");
+        assert_eq!(s.count, 91_973);
+        assert_eq!(s.pending_count, 91_970);
+        assert!(s.all_selected);
     }
 
     /// `Settings` —— 客户可调的七项（`core/src/settings.rs`）。

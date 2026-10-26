@@ -164,7 +164,7 @@ fn load_wire(lang: crate::i18n::Lang, load: &LoadState) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{DeliveryInfo, TreeNode};
+    use crate::protocol::DeliveryInfo;
 
     fn a_view() -> SessionView {
         SessionView {
@@ -271,7 +271,8 @@ mod tests {
             expired: false,
             total_files: 2,
             total_bytes: 2048,
-            tree: TreeNode::Empty,
+            // 大批次那张回执可以不带树（`{"tree": false}`）；这个夹具只是要一份合法回执。
+            tree: None,
         }
     }
 

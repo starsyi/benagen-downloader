@@ -62,6 +62,12 @@ const FIX = await (await fetch("/windows/scripts/frontend-stub/wire-fixtures.jso
 const ROOT_ROWS = FIX.treeLevelRoot.data.rows;
 const SUB_ROWS = FIX.treeLevelSub.data.rows;
 const SELECTED = FIX.treeWhole.data.selected;
+/**
+ * 无 `path` 的 `tree()` 那一支回的载荷（`null` = 用夹具里那一份 `treeWhole`）。
+ * ⚠️ 只有「大批次」那一组断言会换成 `treeWholeBig`（91,973 文件、内核只回数不回树）；
+ *    用完放回 `null`。
+ */
+let treeWholePayload = null;
 const CODE = FIX.stateLoaded.data.load.summary.code;
 const SUB_PATH = FIX.treeLevelSub.data.breadcrumb.path;
 // `RowColor` 的五个成员 → 本屏的 CSS 类（**独立写死**，不从被测文件里 import：
@@ -110,7 +116,7 @@ async function invoke(cmd, args) {
   }
   if (cmd === "tree") {
     const path = args && typeof args.path === "string" ? args.path : null;
-    if (path === null) return FIX.treeWhole;
+    if (path === null) return treeWholePayload || FIX.treeWhole;
     if (path === SUB_PATH) return SCENARIO === "fail" ? FIX.treeLevelFailure : FIX.treeLevelSub;
     return FIX.treeLevelRoot;                                       // "" 与回退之后的根
   }
@@ -448,6 +454,44 @@ async function runKept() {
   const enqDir = invocations.filter((i) => i.cmd === "enqueue").pop();
   check("⑦ 目录里勾一个文件 ⇒ 发给内核的是那**一个**（不是刚进来的那个目录、更不是整批）",
     JSON.stringify(enqDir.args.paths) === JSON.stringify([SUB_ROWS[0].path]), JSON.stringify(enqDir.args));
+
+  // ---- ①½ 大批次（91,973 文件 / 163.7 GB）：壳只问数、不问树 ------------------
+  //
+  // 起因：`get_tree` 一条回执实测 61 MB（树 33 MB + flat + 92k 条 `default_selected`），
+  // 超过壳的读上限时整行被丢 ⇒ 界面**没有下载按钮**。概要面那支的形状与整棵树那一支
+  // 一模一样（进度三格 + 勾选摘要 + action），所以这一屏一个字都不用改 —— 这三条
+  // 守的就是"换成概要面之后屏上那三格仍然对"。
+  {
+    // 回根：后面读的是整批那一份（不是子目录那一层）。
+    click(doc().querySelector(".files__crumb"));
+    await sleep(1200);
+    const BIG = FIX.treeWholeBig;
+    treeWholePayload = BIG;
+    click(doc().querySelector("#files-bar-select-none"));
+    await sleep(900);
+    check("①½a 大批次：底栏的项数与合计逐字是载荷里那两句",
+      doc().querySelector("#files-bar-count").textContent === BIG.data.selection.count_text
+        && doc().querySelector("#files-bar-size").textContent === BIG.data.selection.size_text,
+      "「" + doc().querySelector("#files-bar-count").textContent
+        + "」/「" + doc().querySelector("#files-bar-size").textContent + "」");
+    check("①½b 大批次：按钮仍可按下、文案逐字是载荷里那一句（`blocked_reason` 为空）",
+      doc().querySelector("#tb-download").disabled === false
+        && doc().querySelector("#tb-download-title").textContent === BIG.data.action.button_title
+        && BIG.data.action.blocked_reason === null,
+      "disabled=" + doc().querySelector("#tb-download").disabled
+        + " title=「" + doc().querySelector("#tb-download-title").textContent + "」");
+    // 🔴 一项都没勾 ⇒ 发的是**空数组**（内核按清单现算全部）：
+    //    「没加载完也要能下全」在界面这一侧的落点。
+    const beforeBig = invocations.filter((i) => i.cmd === "enqueue").length;
+    click(doc().querySelector("#files-bar-download"));
+    await sleep(900);
+    const enqBig = invocations.filter((i) => i.cmd === "enqueue").pop();
+    check("①½c 大批次：一项都没勾 ⇒ enqueue 收到**空数组**（= 内核按清单现算全部待下载）",
+      invocations.filter((i) => i.cmd === "enqueue").length === beforeBig + 1
+        && Array.isArray(enqBig.args.paths) && enqBig.args.paths.length === 0,
+      JSON.stringify(enqBig && enqBig.args));
+    treeWholePayload = null;
+  }
 }
 
 // ---- 场景 update：提示条的**判据只有 has_newer**（R20）+ **它在壳上、不归文件页** ----
