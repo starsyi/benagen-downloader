@@ -458,12 +458,35 @@ echo "==> 产物"
 find "$APP" -print | sed 's|^|    |'
 du -sh "$APP"
 
-echo "==> 签名状态（本阶段预期为 ad-hoc / 未签名）"
-if codesign -dv "$APP" 2>&1 | sed 's|^|    |'; then
-  :
-else
-  echo "    （codesign 未给出签名信息——即未签名）"
+# --- ad-hoc 签名：**必须**签，否则用户下载后看到的是「已损坏」而不是「未验证开发者」---
+#
+# 现场：0.3.0 的 DMG 传到别人机器上，双击报
+#   「"BenagenDownloader.app"已损坏，无法打开。你应该推出磁盘映像。」
+# 根因不是文件真的坏了，而是**包没有被签名**：
+#   · arm64 可执行文件被链接器自动打了 ad-hoc 签名（`flags=adhoc,linker-signed`），
+#     但那是**单文件**签名，`Sealed Resources=none`；
+#   · 整个 .app 的封印（CodeResources）从来没生成过 ⇒ `codesign --verify` 直接报
+#     `code has no resources but signature indicates they must be present`；
+#   · Gatekeeper 一旦看到带 `com.apple.quarantine` 的包、且校验不成立，就把「没有签名」
+#     判成「文件坏了」，给的是"移到废纸篓"那一档，连"仍要打开"的按钮都没有。
+#
+# 签名的顺序不能反：先签里面三个 Mach-O（主程序、内核、内嵌 aria2c），再签整个包 ——
+# 包签名会把内层二进制的哈希封进 CodeResources，签完包再动内层就全部失效。
+echo "==> ad-hoc 签名（内层三个 Mach-O → 整个 .app）"
+while IFS= read -r bin; do
+  codesign --force --sign - "$bin" || { echo "错误：签名失败 $bin" >&2; exit 1; }
+  echo "    signed $(basename "$bin")"
+done < <(find "$CONTENTS" -type f -print0 | xargs -0 file | grep "Mach-O" | cut -d: -f1)
+
+codesign --force --sign - "$APP" || { echo "错误：签名失败 $APP" >&2; exit 1; }
+
+echo "==> 签名校验（必须通过，否则用户装到别的机器上会报「已损坏」）"
+if ! codesign --verify --deep --strict "$APP"; then
+  echo "错误：codesign --verify --deep --strict 未通过 —— 这个包发出去会被判成「已损坏」" >&2
+  exit 1
 fi
+codesign -dv "$APP" 2>&1 | sed 's|^|    |'
+echo "    ✅ 封印完整（ad-hoc）"
 
 echo "==> 隔离属性（空 = 未带 quarantine，可直接运行）"
 xattr -l "$APP" 2>/dev/null | sed 's|^|    |' || true
