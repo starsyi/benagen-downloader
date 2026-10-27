@@ -18,8 +18,19 @@ pub const DOMESTIC_BASE: &str = crate::delivery::DEFAULT_BASE_URL;
 /// 国际 CDN。
 pub const INTL_BASE: &str = "http://downloadint.benagen.com";
 
-/// 两边各自等多久就判"这一边没有"。
+/// 竞速的"看谁先答"窗口：过了这个点就不再等另一边的**首次响应**。
 pub const RACE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 一侧已经明确答复（例如国际 CDN 回 403 "我这边没有"）、另一侧**还在下清单**时，
+/// 给剩下那一侧的总耐心。
+///
+/// 现场（2026-10-27）：十万文件的批次清单有几十 MB，国内 CDN 慢时 8 秒连头都还没回来，
+/// 而国际 CDN 立刻回 403 ⇒ 竞速在 8 秒就把整次加载判死，界面写"international: HTTP 403"，
+/// 其实国内那一路还在正常下载。**慢不等于没有**，所以这里必须留耐心。
+///
+/// 为什么是 180 秒：`delivery::fetch` 一次尝试（含 5 次重试与 1/2/4/8 秒退避）最坏约 90 秒，
+/// 两倍余量够覆盖慢链路把清单下完，又不至于让真断网的客户干等。
+pub const RACE_PATIENCE: Duration = Duration::from_secs(180);
 
 /// 缓存保鲜期：24 小时（跨天换网络环境就该重新探）。
 pub const CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -227,18 +238,24 @@ where
     }
     drop(tx);
 
-    let deadline = Instant::now() + timeout;
+    let soft = Instant::now() + timeout;
+    let hard = Instant::now() + RACE_PATIENCE;
     let mut failures: Vec<(Origin, String)> = Vec::new();
     // 两边都失败时，归因取"更具体"的那个；先给一个最不具体的兜底。
     let mut worst: Cause = Cause::Unreachable;
     let mut all_failed_line = false;
-    while failures.len() < 2 {
-        let left = deadline.saturating_duration_since(Instant::now());
+    let mut answered = 0usize;
+    while answered < 2 {
+        // 前 `timeout` 之内按"先答者赢"收；之后只可能剩下一路还在下（另一路已失败），
+        // 这时把窗口放宽到 `RACE_PATIENCE`——它慢，不代表它没有。
+        let limit = if Instant::now() < soft { soft } else { hard };
+        let left = limit.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
         }
         match rx.recv_timeout(left) {
             Ok((origin, Ok(m))) => {
+                answered += 1;
                 push_line(&mut lines, Stage::Hit(origin).text(lang));
                 return Ok(Raced {
                     manifest: m,
@@ -247,6 +264,7 @@ where
                 });
             }
             Ok((origin, Err(e))) => {
+                answered += 1;
                 push_line(&mut lines, Stage::OneSideFailed(origin).text(lang));
                 worst = more_specific(cause_of(&e), worst);
                 failures.push((origin, e));
@@ -255,14 +273,24 @@ where
                     push_line(&mut lines, Stage::AllFailed.text(lang));
                 }
             }
-            Err(_) => break,
+            // 软窗口到点但耐心还没用完：不回话的只是"慢"，不是"没有"，继续等。
+            Err(_) => {
+                if Instant::now() >= hard {
+                    break;
+                }
+            }
         }
     }
-    let detail = failures
-        .iter()
-        .map(|(o, e)| format!("{}: {e}", o.wire()))
-        .collect::<Vec<_>>()
-        .join(" | ");
+    let detail = if failures.is_empty() {
+        // 两边都还在跑、耐心用完：不能说"没有"，只能说"没答完"。
+        "no answer within the patience window".to_string()
+    } else {
+        failures
+            .iter()
+            .map(|(o, e)| format!("{}: {e}", o.wire()))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
     push_line(&mut lines, Stage::AllFailed.text(lang));
     Err((detail, worst))
 }
@@ -302,6 +330,36 @@ mod tests {
         assert_eq!(r.manifest.base_url, INTL_BASE);
         assert_eq!(r.lines.first().unwrap(), "正在解析交付码…（同时查国内与国际 CDN）");
         assert_eq!(r.lines.last().unwrap(), "已从国际 CDN 找到");
+    }
+
+    /// 判据（2026-10-27 现场）：一侧已经回了 403「我这边没有」、另一侧**还在下清单**（慢，
+    /// 但没出错）⇒ 必须把耐心留给还在跑的那一侧，不能把整次加载判死。十万文件的清单几十 MB，
+    /// 8 秒连响应头都还没回来是常态。
+    #[test]
+    fn a_403_on_one_side_does_not_abort_the_side_that_is_still_downloading() {
+        let r = race(
+            |o| match o {
+                Origin::Domestic => {
+                    // 比"看谁先答"的窗口（下面传的 30 毫秒）慢得多，但仍在耐心之内
+                    std::thread::sleep(Duration::from_millis(200));
+                    Ok(manifest("X", DOMESTIC_BASE))
+                }
+                Origin::International => Err("HTTP 403".to_string()),
+            },
+            Lang::Zh,
+            Duration::from_millis(30),
+        )
+        .expect("国内那一路只是慢，不该被判成没有");
+        assert_eq!(r.origin, Origin::Domestic);
+        assert_eq!(r.manifest.base_url, DOMESTIC_BASE);
+        assert!(
+            r.lines
+                .iter()
+                .any(|l| l == "国际 CDN 没有找到（国内 CDN 还在查）"),
+            "过程里要说明国际那边已经答了 403、国内还在查：{:?}",
+            r.lines
+        );
+        assert_eq!(r.lines.last().unwrap(), "已从国内 CDN 找到");
     }
 
     /// 判据：两边都失败 ⇒ 归因取**更具体**的那个（DNS 盖过连接），
